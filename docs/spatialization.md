@@ -34,7 +34,7 @@ the 3×3 m roam, against 5.0°/25.5° for tracked DBAP on the same speakers. The
 static decode is the best render on the array at the center, and it loses 3× to the
 tracked panner everywhere else. The physics sets that scale. An order-N decode
 reconstructs the field only within roughly N·c/(2πf) of the center, about 16 cm
-at 1 kHz for 3rd order. No order 26 speakers can drive reaches a 3 m working
+at 1 kHz for 3rd order. No order the CAVE's 26 speakers can drive reaches a 3 m working
 volume.
 
 > **Fixed-observer installs are a supported mode.** The case above is the *moving*,
@@ -195,8 +195,8 @@ specifies the material-driven build-out of that layer.
 Per voice, per frame *if dirty*: produce a gain vector `gtarget`, one entry per
 speaker, from the source position, the listener position (the array render does
 **not** use orientation), and the surveyed speaker layout. The vector is as long
-as the **layout's** speaker count (`bwa_get_channel_count()`, 4..26), never a
-hard-coded 26.
+as the **layout's** speaker count (`bwa_get_channel_count()`, 4..64), never a
+hard-coded count.
 
 `r` (blur) and the distance-attenuation curve are the two tuning knobs. The layout
 file exposes them, so you can dial them against the real array. If the layout omits
@@ -420,8 +420,8 @@ nothing.
 
 #### Why it is off by default
 
-Every delay change is a resampling event on that speaker. A walking listener means all 26
-delay lines gliding at once, which is 26 simultaneous Doppler shifts on everything the
+Every delay change is a resampling event on that speaker. A walking listener means every
+speaker's delay line gliding at once, which is one simultaneous Doppler shift per speaker on everything the
 array plays. That is a global, always-audible failure mode, unlike a local one. Two guards
 keep it usable, and both are yours to tune:
 
@@ -658,7 +658,7 @@ so they cannot drift apart):
   `test_ambi` only checks m≥0 and will not catch a mirror.
 
 **Ambisonic order:** default to **3rd order (16 channels, 3D)** for the
-encode/decode. This is the right balance for a 26-speaker array: order `N` uses
+encode/decode. This is the right balance for the CAVE's 26-speaker array: order `N` uses
 `(N+1)²` channels, so 3rd order is 16 and 4th is 25. By 4th order the ambisonic bus
 is nearly as wide as doing the 26 HRTF convolutions directly, which defeats the
 purpose. 1st–2nd order (4–9 ch) noticeably blurs the directionality the array is

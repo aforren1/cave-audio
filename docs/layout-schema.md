@@ -13,14 +13,16 @@ thread. Three consumers read the result:
 - **the binaural monitor**: the same positions become the virtual-speaker directions
   for the bus→ambisonics→binaural decode.
 
-**The speaker count in this file IS the engine's channel count.** Any N in **4..26** works
-(26 = `BWA_CHANNELS`, the compile-time capacity). The count is fixed for the engine's lifetime and
-readable back with `bwa_get_channel_count` / `bwa_get_speakers`. The CAVE array is 26. A smaller
-collaborator rig loads its own N-speaker file into the same binary.
+**The speaker count in this file IS the engine's channel count.** Any N in **4..64** works
+(64 = `BWA_MAX_CHANNELS`, the compile-time capacity, which is the transport's bound). The count is
+fixed for the engine's lifetime and readable back with `bwa_get_channel_count` /
+`bwa_get_speakers`. The CAVE array is 26. A collaborator rig of any size in that range loads its
+own N-speaker file into the same binary.
 
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json):
 a 3×3×3 boundary grid minus the center = exactly 26 speakers, floor-origin, y layers at
-0 / 1.5 / 3 m, ears nominally at 1.5.
+0 / 1.5 / 3 m, ears nominally at 1.5. That is the same shape as the built-in default grid
+(`BWA_DEFAULT_GRID`, 26 speakers) the engine runs with no file.
 
 ## Authoring with `bwa_layout_tool`
 
@@ -361,7 +363,7 @@ cannot see the problem it most needs to.
       "min_gain_db":         -40.0
     }
   },
-  "speakers": [ /* 4..26 entries - the count IS the engine's channel count; see below */ ]
+  "speakers": [ /* 4..64 entries - the count IS the engine's channel count; see below */ ]
 }
 ```
 
@@ -378,7 +380,7 @@ cannot see the problem it most needs to.
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0; the loader floors it at 0.001 m (1 mm), below any audible blur. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean centroid→speaker distance (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored - the inverse curve is the only one implemented. |
 | `pin_slab_m` | float (optional) | authoring only, engine-ignored: half-height of the ear-plane slab that `"pin": "plane"` speakers are confined to. Written by `bwa_layout_tool` when any speaker is pinned. |
-| `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BWA_CHANNELS` capacity). **The speaker count IS the engine's channel count** - a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
+| `speakers[]` | array | **4..64** speaker records (64 = the compile-time `BWA_MAX_CHANNELS` capacity). **The speaker count IS the engine's channel count** - a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 
 ### Per-speaker record
 
@@ -423,7 +425,7 @@ a time). The calibration writeback maintains both invariants for you.
 `layout_load` rejects a malformed file (the reason surfaces through `bwa_last_error`)
 if any of:
 
-- `speakers.length` is outside `4..26`;
+- `speakers.length` is outside `4..64` (`4..BWA_MAX_CHANNELS`);
 - `index` values are not a permutation of `0..N-1`;
 - a `position` component is missing, non-numeric, non-finite, or beyond ±1000 m;
 - `gain_db` is outside `[-100, 24]`, or `delay_ms` exceeds 1000 ms (a negative
@@ -439,7 +441,7 @@ if any of:
 
 **A present-but-invalid `bwa_desc.layout_path` does not fail `bwa_create`, but it does
 fail `bwa_start`.** `bwa_create` records the reason in `bwa_last_error` and falls back to
-the **26-speaker default grid**, so a desk session can still inspect the engine, but
+the **default grid** (`BWA_DEFAULT_GRID`, 26 speakers), so a desk session can still inspect the engine, but
 `bwa_start` then refuses with `BWA_ERR_LAYOUT`. A session that named a survey never runs
 on the wrong geometry. Only `layout_path = NULL` runs the default grid for real. Check
 `bwa_last_error` after `bwa_create` if you want the reason before you try to start. A

@@ -421,7 +421,7 @@ ordering and normalization. The engine converts it on load. See
 ### Ambisonic order
 
 `N`, where the channel count is `(N+1)^2`. The engine defaults to **3rd order, 16 channels**
-(`BWA_AMBI_CH`), the sweet spot for a 26-speaker array (4th order's 25 channels nearly match the
+(`BWA_AMBI_CH`), the sweet spot for the CAVE's 26-speaker array (4th order's 25 channels nearly match the
 26 HRTF convolutions it exists to avoid; 1st to 2nd visibly blurs). The reflection bed runs
 **lower** order (default 1) on purpose: diffuse energy carries spaciousness, not primary
 localization. See
@@ -822,7 +822,7 @@ Spatially Oriented Format for Acoustics, the standard container for measured HRT
 The efficiency trick behind both headphone profiles: treat each bus channel as a virtual speaker
 at its surveyed direction relative to the head, encode into ambisonics with a fixed matrix, sum
 the [direct binaural field](#direct-binaural-field) in, and run **one** ambisonics-to-binaural
-decode instead of 26 HRTF convolutions. One function (`ambi_encode_phonon`,
+decode instead of one HRTF convolution per speaker. One function (`ambi_encode_phonon`,
 `src/spatial/ambisonics.c:166`) does the encode for both consumers, so they cannot drift in convention.
 
 ## Per-source propagation effects

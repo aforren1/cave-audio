@@ -41,9 +41,9 @@ static float settle_occ(RtCore* rt, uint32_t handle) {
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;
-    RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
+    RtCore* rt = rt_create(64, 64, SR, BWA_DEFAULT_GRID);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     rt_set_layout(rt, &L);
 
     /* the occluded source. No sound is ever bound to it: the occlusion sim keys off the handle
@@ -54,7 +54,7 @@ int main(void) {
     /* listener at the center ear plane, source 3 m to +X on the same line */
     float lp[3] = { 0.0f, 1.5f, 0.0f }, lq[4] = { 0, 0, 0, 1 };
     rt_set_listener(rt, lp, lq); rt_commit(rt);
-    float* bus = (float*)calloc((size_t)BWA_CHANNELS * BLK, sizeof(float));
+    float* bus = (float*)calloc((size_t)BWA_DEFAULT_GRID * BLK, sizeof(float));
     bwa_timestamp ts; memset(&ts, 0, sizeof ts);
     rt_render(rt, bus, BLK, &ts);                 /* promote the pose (published for rt_read_pose) */
 

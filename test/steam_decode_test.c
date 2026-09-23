@@ -11,7 +11,7 @@
 #include "binaural/steam_decode.h"
 #include "core/layout.h"
 #include "core/rt.h"            /* the live-composition probe drives the real DBAP bus + pose plumbing */
-#include "sink/sink.h"          /* BWA_CHANNELS */
+#include "sink/sink.h"          /* BWA_DEFAULT_GRID (from bw_audio.h) */
 
 #include <math.h>
 #include <stdio.h>
@@ -20,7 +20,7 @@
 
 #define N 1024u            /* device block == phonon frameSize */
 
-static float* bus;         /* BWA_CHANNELS * N */
+static float* bus;         /* BWA_DEFAULT_GRID * N */
 static float* out;         /* 2 * N (L at [0,N), R at [N,2N)) */
 static int    fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
@@ -30,7 +30,7 @@ static double e_right(void) { double e = 0; for (uint32_t i = 0; i < N; ++i) e +
 
 static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
-    memset(bus, 0, sizeof(float) * (size_t)BWA_CHANNELS * N);
+    memset(bus, 0, sizeof(float) * (size_t)BWA_DEFAULT_GRID * N);
     /* Drive a TONE in the hearing band, never DC: the default HRTF's per-ear DC gains are laterally
      * OPPOSITE its audible ILD, so a DC-driven laterality assertion passes exactly when the field is
      * mirrored (that trap shipped a mirrored decode once — see steam_decode.c CONVENTION 2b). */
@@ -45,8 +45,8 @@ static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
 }
 
 int main(void) {
-    Layout L = layout_default();
-    bus = (float*)calloc((size_t)BWA_CHANNELS * N, sizeof(float));
+    static Layout L; layout_default(&L);
+    bus = (float*)calloc((size_t)BWA_DEFAULT_GRID * N, sizeof(float));
     out = (float*)calloc((size_t)2 * N, sizeof(float));
     if (!bus || !out) { printf("FAIL: alloc\n"); return 1; }
 
@@ -57,7 +57,7 @@ int main(void) {
     CHECK(steam_monitor_pervoice(m), "per-voice fleet created");
 
     int right = -1, left = -1;     /* pure-lateral speakers (y,z ~ 0) so the HRTF L/R isn't diluted by elevation */
-    for (int k = 0; k < (int)BWA_CHANNELS; ++k) {     /* identity faces +z, so the listener's right is -x */
+    for (int k = 0; k < (int)BWA_DEFAULT_GRID; ++k) {     /* identity faces +z, so the listener's right is -x */
         float x = L.speakers[k].pos[0], y = L.speakers[k].pos[1], z = L.speakers[k].pos[2];
         if (fabsf(y - 1.5f) > 0.01f || fabsf(z) > 0.01f) continue;   /* lateral = at ear height */
         if (x < -1.0f) right = k;
@@ -93,7 +93,7 @@ int main(void) {
      * mirror could hide while every direct-drive check stays green. Source at room +x = the identity
      * listener's LEFT (the room frame is RH, +y up, +z ahead: right ear at -x, bw_audio.h). */
     {
-        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        RtCore* c = rt_create(4, 4, 48000, BWA_DEFAULT_GRID);
         CHECK(c != NULL, "live: rt_create");
         if (c) {
             rt_set_layout(c, &L);
@@ -138,7 +138,7 @@ int main(void) {
      * into the decode alongside the (silent) bus. Pins the rt-direct × phonon seam: encode basis,
      * ACN order, and the decode-side orientation, live. */
     {
-        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        RtCore* c = rt_create(4, 4, 48000, BWA_DEFAULT_GRID);
         CHECK(c != NULL, "direct: rt_create");
         if (c) {
             rt_set_direct_ambi(c, 1);
@@ -164,7 +164,7 @@ int main(void) {
             {   /* the direct field carries the voice; the speaker bus does NOT (it kept the diffuse layer) */
                 double de = 0, be = 0;
                 for (uint32_t i = 0; i < 16 * N && direct; ++i) de += fabs(direct[i]);
-                for (uint32_t i = 0; i < (uint32_t)BWA_CHANNELS * N; ++i) be += fabs(bus[i]);
+                for (uint32_t i = 0; i < (uint32_t)BWA_DEFAULT_GRID * N; ++i) be += fabs(bus[i]);
                 CHECK(de > 1e-3, "direct: the SH field is audible");
                 CHECK(be < 1e-9, "direct: the point voice stays OFF the speaker bus");
             }
@@ -194,7 +194,7 @@ int main(void) {
      * whole mode-2 chain: the point/field power split, the slot render, the dv_view publish, the
      * room->head-local direction handoff, and the effect fleet. */
     {
-        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        RtCore* c = rt_create(4, 4, 48000, BWA_DEFAULT_GRID);
         CHECK(c != NULL, "mode2: rt_create");
         if (c) {
             rt_set_direct_ambi(c, 2);

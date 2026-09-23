@@ -1,8 +1,8 @@
 # bw_audio
 
-Self-hosted spatial audio engine for a 26-speaker CAVE installation. It drives the
-array over ASIO into an RME Digiface Dante. A second path does **binaural HRTF
-headphone rendering**: a first-class direct render, plus an array-audition monitor
+Self-hosted spatial audio engine for a CAVE installation. It drives a speaker array (up
+to 64 channels; the CAVE has 26) over ASIO into an RME Digiface Dante. A second path
+does **binaural HRTF headphone rendering**: a first-class direct render, plus an array-audition monitor
 for desk-side debugging. Game engines and experiment frameworks connect as thin
 control clients over a C ABI. No rendered audio crosses that boundary, only control.
 
@@ -202,9 +202,10 @@ app: the ABI is create/play/position/commit. Game-side audio (UI, menus) stays i
 the game engine's own mixer.
 
 - **Fixed target.** The speaker geometry, including the channel count, is data.
-  A layout file carries 4 to 26 speakers and the engine's channel count follows it.
-  26 is the compile-time capacity, so collaborator arrays with fewer speakers load
-  into the same binary. Still not a general 5.1/Atmos renderer.
+  A layout file carries 4 to 64 speakers (`BWA_MAX_CHANNELS`) and the engine's channel
+  count follows it, so a collaborator's array of any size in that range loads into the
+  same binary. With no layout file, the engine runs a built-in 26-speaker grid
+  (`BWA_DEFAULT_GRID`). Still not a general 5.1/Atmos renderer.
 - **One *tracked* listener.** The multi-listener mode is a panning compromise for
   extra occupants, not per-head rendering.
 - **The array is a Windows path.** ASIO is Windows-only and the Digiface is a Windows
@@ -329,7 +330,7 @@ cmake --build build --config RelWithDebInfo
 
 Authors `cave_layout.json`:
 
-- Place the speakers (4 to 26; the count control sets the array size, and the file's
+- Place the speakers (4 to 64; the count control sets the array size, and the file's
   count *is* the engine's channel count). A speaker's index is its output channel,
   so the built-in test tone tells you which physical speaker is which.
 - Load placement constraints from `constraints.json`.
@@ -405,7 +406,7 @@ pick an ASIO driver instead, and `--device <name or id>` does the same from the 
 line (`--list-devices` prints them). With no device at all the engine falls back to the
 null sink and keeps rendering, visual-only, live, just silent. The render picker switches
 to `binaural` (the direct per-source render, for by-ear A/Bs against the sim) or `cave`
-(the array itself over 26-ch ASIO, the same harness pointed at real speakers on the rig
+(the array itself over ASIO, the same harness pointed at real speakers on the rig
 machine). A headphone-EQ field loads an AutoEq correction for your headphones.
 
 Scenes: localization, occlusion + materials, directivity, channel walk,

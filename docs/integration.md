@@ -69,16 +69,16 @@ conversion with a known-position test source before trusting anything else.
 
 ## Channel count
 
-The engine's channel count is **the layout's speaker count** (4..26), not a constant.
-The CAVE array is 26; a smaller rig loads its own file. Read it back with
-`bwa_get_channel_count` (or `bwa_get_speakers`, which returns the same number) and size any
-meter / speaker-gizmo / channel-test array from it. Never hard-code 26 in a binding.
+The engine's channel count is **the layout's speaker count** (4..`BWA_MAX_CHANNELS`, which is
+64), not a constant. The CAVE array is 26; a smaller or larger rig loads its own file. Read
+it back with `bwa_get_channel_count` (or `bwa_get_speakers`, which returns the same number) and size any
+meter / speaker-gizmo / channel-test array from it. Never hard-code a speaker count in a binding.
 
 The trap: **a failed layout load does not fail `bwa_create`**. `bwa_create` falls back to
-the 26-speaker default grid and records the reason in `bwa_last_error`. The failure
+the default grid (`BWA_DEFAULT_GRID`, 26 speakers) and records the reason in `bwa_last_error`. The failure
 surfaces later, at `bwa_start`, which refuses the fallback with `BWA_ERR_LAYOUT`. Only
 `layout_path = NULL` runs the default grid for real. In the window between the two calls
-`bwa_get_channel_count` reports 26, so on a smaller install the count looks wrong too.
+`bwa_get_channel_count` reports the default grid's 26, so on a smaller install the count looks wrong too.
 Check `bwa_last_error` right after `bwa_create` and fail loudly if the surveyed layout
 didn't load. Then the error names the layout file instead of the start call.
 
@@ -135,7 +135,7 @@ while playing.
 **The settings that fail quietly are the ones to watch.** An unknown material name is
 not an error to the engine (`bwa_material_preset` returns the generic default and
 notes it in `bwa_last_error`). A failed layout load is louder than it looks: `bwa_create`
-falls back to the 26-speaker grid, but `bwa_start` then refuses with `BWA_ERR_LAYOUT`. The binding therefore makes them
+falls back to the default grid, but `bwa_start` then refuses with `BWA_ERR_LAYOUT`. The binding therefore makes them
 unrepresentable where it can (materials are a `BwaMaterialPreset` enum, file paths go
 through a picker that lists what actually exists) and loud where it cannot.
 
@@ -260,7 +260,7 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
 - **Output stage + diagnostics**: `bwa_set_limiter` / `bwa_set_limiter_ceiling`,
   `bwa_get_bus_levels`, `bwa_set_test_signal`, `bwa_get_speakers` / `bwa_get_channel_count`
   (the layout's speaker count; see "Channel count" above; size meter/speaker
-  arrays with it, never a hard-coded 26); and the engine-free device enumeration
+  arrays with it, never a hard-coded count); and the engine-free device enumeration
   `bwa_get_device_count` / `bwa_get_device_name` / `bwa_get_device_id`
   (`Engine.DeviceCount` / `DeviceName` / `DeviceId` / `Devices`, and Godot's
   `BwaEngine.get_devices(backend)`; static, for a device picker before `bwa_create`).

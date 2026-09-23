@@ -25,7 +25,7 @@
 #include "os/os.h"              /* os_sleep_ms, for the streaming-fill wait */
 
 #define N    256
-#define CH   BWA_CHANNELS
+#define CH   BWA_DEFAULT_GRID
 #define RATE 48000u
 
 static float  bus[CH * N];

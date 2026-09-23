@@ -276,7 +276,7 @@ static int run_layout_strict(void) {
         fprintf(stderr, "FAIL[layout]: zero desc fields must resolve to 48000/256\n");
         bwa_destroy(e); return 1;
     }
-    if (bwa_get_channel_count(e) != 26) {   /* the engine sits on the fallback grid... */
+    if (bwa_get_channel_count(e) != BWA_DEFAULT_GRID) {   /* the engine sits on the fallback grid... */
         fprintf(stderr, "FAIL[layout]: fallback channel count is not 26\n");
         bwa_destroy(e); return 1;
     }

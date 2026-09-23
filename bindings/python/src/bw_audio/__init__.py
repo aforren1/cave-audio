@@ -91,6 +91,8 @@ __all__ = [
     "CHANNEL_AUTO",
     "GROUPS",
     "EXTRA_LIS",
+    "MAX_CHANNELS",
+    "DEFAULT_GRID",
     "SINK_FLAG_EXCLUSIVE",
     "ROOM_AHEAD",
     "ROOM_UP",
@@ -151,6 +153,8 @@ class SinkFlags(enum.IntFlag):
 CHANNEL_AUTO = _bwa.CHANNEL_AUTO
 GROUPS = _bwa.GROUPS
 EXTRA_LIS = _bwa.EXTRA_LIS
+MAX_CHANNELS = _bwa.MAX_CHANNELS   # array capacity (64); size a static buffer with it
+DEFAULT_GRID = _bwa.DEFAULT_GRID   # the built-in grid's speaker count (26), used with no layout_path
 SINK_FLAG_EXCLUSIVE = _bwa.SINK_FLAG_EXCLUSIVE
 ROOM_AHEAD = _bwa.ROOM_AHEAD
 ROOM_UP = _bwa.ROOM_UP
@@ -1045,7 +1049,7 @@ class Engine:
 
     @property
     def channel_count(self) -> int:
-        """The layout's ACTIVE speaker count, 4 to 26. Size your meter arrays with it."""
+        """The layout's ACTIVE speaker count, 4 to MAX_CHANNELS. Size your meter arrays with it."""
         return _bwa.get_channel_count(self._raw)
 
     @property

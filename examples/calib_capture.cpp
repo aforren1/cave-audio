@@ -58,8 +58,8 @@ struct Cal {
     long            bufsize;
     int             nspk;                     /* the layout's speaker count; inputs ride slots [nspk..] */
     int             nin;                      /* lockstep inputs: 1 = omni mic, 19 = the ZM-1 (--zylia) */
-    ASIOBufferInfo  bi[BWA_CHANNELS + CAL_MAX_INPUTS];   /* nspk outputs + nin inputs (after them) */
-    ASIOChannelInfo ci[BWA_CHANNELS + CAL_MAX_INPUTS];
+    ASIOBufferInfo  bi[BWA_MAX_CHANNELS + CAL_MAX_INPUTS];   /* nspk outputs + nin inputs (after them) */
+    ASIOChannelInfo ci[BWA_MAX_CHANNELS + CAL_MAX_INPUTS];
     ASIOCallbacks   cb;
     const float*    sweep;
     float*          cap;                      /* [nin][CAL_CAPLEN] flat */
@@ -131,7 +131,7 @@ static long s_lat_in = -1, s_lat_out = -1;
 int calib_asio_open_multi(const char* driver, int in_first, int nin, int nspk, const float* sweep, float* cap) {
     if (in_first < 0) { fprintf(stderr, "calib_capture: first input channel must be >= 0 (got %d)\n", in_first); return 1; }
     if (nin < 1 || nin > CAL_MAX_INPUTS) { fprintf(stderr, "calib_capture: input count %d out of range (1..%d)\n", nin, CAL_MAX_INPUTS); return 1; }
-    if (nspk < 1 || nspk > BWA_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
+    if (nspk < 1 || nspk > BWA_MAX_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
     if (!asio_session_acquire("the calibration sweep (Capture tab / bwa_calibrate)")) return 1;
     memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap; g.nspk = nspk; g.nin = nin;
     if (!open_driver(driver, in_first, nin, nspk)) {

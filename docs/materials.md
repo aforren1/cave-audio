@@ -61,9 +61,9 @@ double-counts. Same trap as matching the measured RT60 ([calibration.md](./calib
 > everything else, so the ASIO array and the binaural monitor both get reflections for free.
 > Protect that property; see [architecture.md](./architecture.md) "the bus seam."
 
-The bus is as wide as the loaded layout has speakers (4..26; 26 in the CAVE; see
+The bus is as wide as the loaded layout has speakers (4..64; 26 in the CAVE; see
 [layout-schema.md](./layout-schema.md)). Everything below decodes to that count, not to a
-hard-wired 26.
+hard-wired one.
 
 ## Where this fits the existing signal flow
 

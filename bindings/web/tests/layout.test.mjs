@@ -44,12 +44,13 @@ function layoutBytes(n = 8, mutate = null) {
   return new TextEncoder().encode(JSON.stringify(doc));
 }
 
-let Host, M;
+let Host, M, MAX_CHANNELS, DEFAULT_GRID;
 const live = [];
 
 before(async () => {
   M = await loadModule();
   ({ Host } = await loadSrc("host.js"));
+  ({ CONSTANTS: { MAX_CHANNELS, DEFAULT_GRID } } = await loadSrc("raw.js"));
 });
 
 after(() => {
@@ -67,7 +68,7 @@ async function openHost(engine, files) {
 }
 
 function speakers(host) {
-  const r = host.invokeBuf("get_speakers", [{ out: "f32", len: 26 * 3 }, 26]);
+  const r = host.invokeBuf("get_speakers", [{ out: "f32", len: MAX_CHANNELS * 3 }, MAX_CHANNELS]);
   return { count: r.value, xyz: r.out[0] };
 }
 
@@ -96,7 +97,7 @@ test("writeFile puts a file where a later engine can open it", async () => {
    * in the same module file system. A second engine on the same module proves the file is really
    * there rather than an argument create happened to keep. */
   const host = await openHost({ profile: PROFILE_CAVE_SIM, sink: SINK_NULL, blockSize: 256 });
-  assert.equal(host.info().channelCount, 26, "no layout should be the default 26-speaker grid");
+  assert.equal(host.info().channelCount, DEFAULT_GRID, "no layout should be the default grid");
   const n = host.handle("writefile", { path: "/later/t6.json", data: layoutBytes(6) });
   assert.ok(n > 0);
   host.handle("destroy", {});
@@ -117,7 +118,8 @@ test("a layout the loader rejects survives create and refuses at start", async (
     { profile: PROFILE_CAVE_SIM, sink: SINK_NULL, blockSize: 256, layoutPath: "/bad.json" },
     { "/bad.json": bad }
   );
-  assert.equal(host.info().channelCount, 26, "a refused layout should leave the default grid");
+  assert.equal(host.info().channelCount, DEFAULT_GRID,
+               "a refused layout should leave the default grid");
   assert.ok(host.info().lastError, "bwa_last_error says nothing about the refused layout");
   assert.throws(() => host.handle("start", {}), /layout/i,
                 "bwa_start accepted an engine whose explicit layout failed to load");

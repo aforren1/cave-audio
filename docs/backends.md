@@ -1024,7 +1024,7 @@ thread (the null-sink loop) so the engine keeps running, per rule 4.
 Four decisions the specification left open, and what each one settled on:
 
 - **Stereo only, said at the open.** Android AUTO already sends a wider request straight to the
-  offline sink, so the only caller that can reach a 26-channel AAudio open is an explicit
+  offline sink, so the only caller that can reach a multichannel AAudio open is an explicit
   `BWA_SINK_AAUDIO` with an array layout. That gets a message naming the width rather than a
   device error, because Android carries no array transport at all.
 - **`setUsage` is never called.** `AAudioStreamBuilder_setUsage` is `__INTRODUCED_IN(28)` and the

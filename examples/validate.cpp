@@ -49,7 +49,7 @@ extern "C" {
 #define MAX_LIS   64
 /* 36 azimuths x 3 elevations of grid, PLUS one speaker-matched target per channel for the physical
  * reference arm. The per-placement scratch arrays below are sized off this, so it has to cover both. */
-#define MAX_TGT   (36 * 3 + BWA_CHANNELS)
+#define MAX_TGT   (36 * 3 + BWA_MAX_CHANNELS)
 #define NPAN      3
 #define MAX_FOCUS 6
 #define MAX_LIST  6        /* values per swept knob (--focus, --hole-spread, --near-spread) */
@@ -384,7 +384,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                 c->lis = li;
                 ++w;
             }
-            double rm[BWA_CHANNELS]; int nr = 0;
+            double rm[BWA_MAX_CHANNELS]; int nr = 0;
             for (int i = 0; i < w; ++i)
                 if (cells[i].lis == li && cells[i].reference == 1 && cells[i].ok) rm[nr++] = cells[i].miss_deg;
             if (nr) {
@@ -396,7 +396,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             /* The comb FLOOR. One speaker alone radiates one coherent copy, so whatever ripple this
              * shows is the stimulus's line structure, the analysis, and the room — never interference.
              * Every phantom comb depth below is only meaningful as an excess over it. */
-            double rc[BWA_CHANNELS]; int nrc = 0;
+            double rc[BWA_MAX_CHANNELS]; int nrc = 0;
             for (int i = 0; i < w; ++i)
                 if (cells[i].lis == li && cells[i].reference == 1 && cells[i].comb_ok) rc[nrc++] = cells[i].comb_db;
             if (nrc) printf("  comb floor: %.2f dB over %d speakers driven alone (no interference to comb)\n",
@@ -704,7 +704,8 @@ int main(int argc, char** argv) {
     if (inject != -1 && (inject < 0 || inject >= ZYLIA_MICS)) {
         fprintf(stderr, "--inject-fault must be 0..%d\n", ZYLIA_MICS-1); return 2; }
 
-    Layout L = layout_default();
+    static Layout L;          /* never a stack local (layout.h); main is not reentrant */
+    layout_default(&L);
     if (layout_path) {
         char err[256] = { 0 };
         if (!layout_load(layout_path, (uint32_t)VAL_FS, &L, err, sizeof err)) {
@@ -933,7 +934,7 @@ int main(int argc, char** argv) {
 #ifdef BWA_HAVE_ASIO
     int have_hw = 0;
     if (!simulate) {
-        ctx.feeds = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * VAL_CAPLEN);
+        ctx.feeds = (float*)malloc(sizeof(float) * (size_t)BWA_MAX_CHANNELS * VAL_CAPLEN);
         if (!ctx.feeds) { fprintf(stderr, "out of memory\n"); return 1; }
         if (valid_asio_open(driver, mic_in, (int)L.count) != 0) {
             fprintf(stderr, "\nNo capture device. Re-run with --simulate to exercise the flow "

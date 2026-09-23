@@ -45,7 +45,7 @@ extern "C" {
 
 #ifdef BWA_HAVE_ASIO
 /* Open `driver` (NULL = the first device exposing >= nspk outputs and 19 inputs from `mic_in`) and
- * start streaming. `nspk` is the LAYOUT's speaker count (4..BWA_CHANNELS) — never assume 26.
+ * start streaming. `nspk` is the LAYOUT's speaker count (4..BWA_MAX_CHANNELS) — never assume 26.
  * Returns 0 on success, 1 on failure (message on stderr). Single instance. */
 int  valid_asio_open(const char* driver, int mic_in, int nspk);
 

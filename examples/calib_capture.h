@@ -6,7 +6,7 @@
  * layout's speaker->mic distances + a deterministic sensitivity wobble, so the whole measure ->
  * solve -> writeback path runs without the rig). One input is the omni-mic survey; 19 is the ZM-1
  * over Dante Via (--zylia), whose capsules ride consecutive inputs on the SAME device as the
- * outputs. The speaker count is the LAYOUT's (Layout.count, 4..BWA_CHANNELS) — never assume 26.
+ * outputs. The speaker count is the LAYOUT's (Layout.count, 4..BWA_MAX_CHANNELS) — never assume 26.
  * The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
  */
 #ifndef BWA_CALIB_CAPTURE_H
@@ -50,7 +50,7 @@ int calib_asio_list(void);                                  /* print them to std
 
 #ifdef BWA_HAVE_ASIO
 /* ASIO full-duplex: open `driver` (NULL = first with >= `nspk` outs + the mic input), start
- * streaming. `nspk` is the layout's speaker count (4..BWA_CHANNELS). calib_asio_capture(ch) plays
+ * streaming. `nspk` is the layout's speaker count (4..BWA_MAX_CHANNELS). calib_asio_capture(ch) plays
  * the sweep out channel `ch` and records CAL_CAPLEN mic samples into the `cap` given at open
  * (blocking, ~10 s watchdog; returns 0 on timeout). Single instance.
  * NOT verified on hardware here — rig bring-up code (mirrors asio_sink.cpp's host sequence). */

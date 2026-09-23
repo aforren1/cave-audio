@@ -30,7 +30,7 @@ static SoundData make_test_pcm(uint16_t channels, uint32_t frames, float value) 
 }
 
 int main(void) {
-    LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
+    layout_default(&LD);                          /* listener stays at the default (the array center, LD.ref) */
     const char* WAV = "bwa_rt_const.wav";
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
 
@@ -534,7 +534,7 @@ int main(void) {
         RtCore* c24 = rt_create(8, 4, RATE, 24);
         CHECK(c24 != NULL, "rt_create (24 ch)");
         if (c24) {
-            Layout L24 = layout_default();
+            static Layout L24; layout_default(&L24);
             L24.count = 24;                              /* the first 24 grid speakers, indices 0..23 */
             layout_compute_ref(&L24);
             rt_set_layout(c24, &L24);
@@ -543,8 +543,8 @@ int main(void) {
             rt_source_play(c24, h24, s24, true);
             rt_source_set_pos(c24, h24, L24.speakers[5].pos[0], L24.speakers[5].pos[1], L24.speakers[5].pos[2]);
             rt_commit(c24);
-            static float b24[CH * N];
-            for (int i = 24 * (int)N; i < CH * (int)N; ++i) b24[i] = 123.f;   /* canary beyond channel 24 */
+            static float b24[BWA_MAX_CHANNELS * N];   /* CAPACITY-sized, so the canary covers every unused plane */
+            for (int i = 24 * (int)N; i < BWA_MAX_CHANNELS * (int)N; ++i) b24[i] = 123.f;   /* canary beyond channel 24 */
             bwa_timestamp t24 = { 0, 0 };
             rt_render(c24, b24, N, &t24); rt_render(c24, b24, N, &t24);
             int best = 0; double bm = -1;
@@ -568,10 +568,36 @@ int main(void) {
                 remove(B24);
             } else CHECK(0, "write 24-ch bed");
             int canary_ok = 1;
-            for (int i = 24 * (int)N; i < CH * (int)N; ++i) if (b24[i] != 123.f) canary_ok = 0;
+            for (int i = 24 * (int)N; i < BWA_MAX_CHANNELS * (int)N; ++i) if (b24[i] != 123.f) canary_ok = 0;
             CHECK(canary_ok, "24-ch: nothing writes beyond the active channel count");
             rt_source_destroy(c24, h24); rt_commit(c24);
             rt_destroy(c24);
+        }
+    }
+
+    /* the channel count is fixed at rt_create: rt_set_layout REFUSES a layout of any other count and
+     * keeps the old one. Without the guard an 8-ch core would take the 26-grid and pan across 8
+     * of its speakers (and a 64-ch core would mix 38 zeroed speakers at the origin). */
+    {
+        RtCore* c8 = rt_create(8, 4, RATE, 8);
+        CHECK(c8 != NULL, "rt_create (8 ch)");
+        if (c8) {
+            CHECK(rt_channels(c8) == 8, "8-ch: rt_channels reports the create-time count");
+            static Layout L8; layout_default(&L8);
+            L8.count = 8;                                /* the first 8 grid speakers */
+            layout_compute_ref(&L8);
+            CHECK(rt_set_layout(c8, &L8), "8-ch: an 8-speaker layout is accepted");
+            static Layout L26; layout_default(&L26);
+            CHECK(!rt_set_layout(c8, &L26), "8-ch: a 26-speaker layout is refused");
+            CHECK(rt_channels(c8) == 8, "8-ch: the channel count is unchanged after the refusal");
+            /* proof the OLD layout survived: rt_set_layout re-centers the listener on the layout's
+             * ref, and L8's (the floor-level centroid, y = 0) differs from the grid's (y = 1.5). */
+            float p[3] = { 0 }, q[4] = { 0 };
+            rt_read_pose(c8, p, q);
+            CHECK(fabsf(p[0] - L8.ref[0]) < 1e-5f && fabsf(p[1] - L8.ref[1]) < 1e-5f &&
+                  fabsf(p[2] - L8.ref[2]) < 1e-5f,
+                  "8-ch: the listener still sits at the 8-speaker layout's ref (old layout kept)");
+            rt_destroy(c8);
         }
     }
 

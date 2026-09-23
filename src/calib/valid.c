@@ -225,7 +225,7 @@ static int ve_open(const Layout* L, uint32_t rate) {
     valid_engine_release();
     g_ve.core = rt_create(4u, 4u, rate, L->count);
     if (!g_ve.core) return 0;
-    rt_set_layout(g_ve.core, L);
+    if (!rt_set_layout(g_ve.core, L)) { valid_engine_release(); return 0; }
     g_ve.bus  = (float*) malloc(sizeof(float)  * (size_t)VE_BLOCK * L->count);
     g_ve.stim = (double*)malloc(sizeof(double) * (size_t)VE_BLOCK);
     g_ve.push = (float*) malloc(sizeof(float)  * (size_t)VE_BLOCK);

@@ -3,7 +3,7 @@
  *
  *   read each line's delayed sample -> per-line 2-band decay filter (one-pole crossover between the
  *   low/high band gains, both derived from that line's length + its DIRECTION-scaled decay times)
- *   -> line outputs y[16] -> bus += gain * Dcomb[26][16] * y (each line rendered as a plane wave
+ *   -> line outputs y[16] -> bus += gain * Dcomb[channels][16] * y (each line rendered as a plane wave
  *   from its Fibonacci-sphere direction) -> Householder feedback (I - 2/N J, orthogonal = lossless
  *   prototype; the decay filters are the only loss) + the aux input (alternating-sign injection)
  *   -> write back into the delay lines.

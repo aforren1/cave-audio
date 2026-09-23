@@ -32,8 +32,8 @@ struct Val {
     long             bufsize;
     int              nspk;                                   /* layout speaker count */
     int              mic_in;                                 /* first Zylia input channel */
-    ASIOBufferInfo   bi[BWA_CHANNELS + ZYLIA_MICS];
-    ASIOChannelInfo  ci[BWA_CHANNELS + ZYLIA_MICS];
+    ASIOBufferInfo   bi[BWA_MAX_CHANNELS + ZYLIA_MICS];
+    ASIOChannelInfo  ci[BWA_MAX_CHANNELS + ZYLIA_MICS];
     ASIOCallbacks    cb;
     const float*     feeds;                                  /* [nspk][VAL_CAPLEN] */
     float*           cap;                                    /* [ZYLIA_MICS][VAL_CAPLEN], internal */
@@ -110,7 +110,7 @@ bool open_driver(const char* want, int mic_in, int nspk) {
 
 int valid_asio_open(const char* driver, int mic_in, int nspk) {
     if (mic_in < 0) { fprintf(stderr, "valid_capture: mic input channel must be >= 0 (got %d)\n", mic_in); return 1; }
-    if (nspk < 4 || nspk > BWA_CHANNELS) { fprintf(stderr, "valid_capture: speaker count %d out of range\n", nspk); return 1; }
+    if (nspk < 4 || nspk > BWA_MAX_CHANNELS) { fprintf(stderr, "valid_capture: speaker count %d out of range\n", nspk); return 1; }
     if (!asio_session_acquire("the validation capture (bwa_validate)")) return 1;
 
     float* cap = (float*)calloc((size_t)ZYLIA_MICS * VAL_CAPLEN, sizeof(float));

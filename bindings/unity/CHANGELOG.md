@@ -4,6 +4,14 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Changed: the speaker-array capacity is 64, and it is no longer the default grid
+
+The engine now drives up to 64 speaker channels (`BWA_MAX_CHANNELS`), the bound of an ASIO, MADI
+or Dante endpoint. A layout file can carry 4 to 64 speakers, and `Engine.ChannelCount` follows it
+as before. The built-in grid you get with no layout file is still 26 speakers, now named
+`BWA_DEFAULT_GRID`. Nothing in the package API changes. If your code sized an array to 26, size it
+from `ChannelCount` instead.
+
 ## [0.16.0]
 
 Synchronized version numbers.

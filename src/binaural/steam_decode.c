@@ -41,9 +41,9 @@ struct SteamMonitor {
     IPLContext                 context;
     IPLHRTF                    hrtf;
     IPLAmbisonicsDecodeEffect  decode;
-    uint32_t                   channels;      /* 26 */
+    uint32_t                   channels;      /* the layout's speaker count (<= BWA_CHANNELS) */
     uint32_t                   frame_size;    /* phonon frameSize == the per-block n (fixed at create) */
-    float                      encode[BWA_CHANNELS][BWA_AMBI_CH];  /* fixed 26→16 SH matrix */
+    float                      encode[BWA_CHANNELS][BWA_AMBI_CH];  /* fixed channels→16 SH matrix */
     float*                     ambi;          /* 16 * frame_size, planar scratch */
     /* per-voice fleet (BWA_PROFILE_BINAURAL mode 2): one binaural effect per rt voice slot. The
      * effect carries overlap state, so a slot RECYCLE (generation change / inactive gap) resets it
@@ -116,7 +116,7 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
         iplHRTFRelease(&m->hrtf); iplContextRelease(&m->context); free(m); return NULL;
     }
 
-    /* fixed 26→16 encode matrix: each speaker is a virtual source at its direction from the
+    /* fixed channels→16 encode matrix: each speaker is a virtual source at its direction from the
      * layout's nominal listening point (the centroid — the origin canonically sits on the floor) */
     for (uint32_t k = 0; k < m->channels; ++k) {
         float pos[3] = { L->speakers[k].pos[0] - L->ref[0],

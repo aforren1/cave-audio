@@ -165,7 +165,7 @@ that implement and configure it. This ASCII version is canonical for structure.)
  + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │
-      ├ cave       26-ch ASIO ► Digiface ► the array
+      ├ cave       N-ch ASIO ► Digiface ► the array
       ├ binaural   DIRECT (SH, unlimited - hard-clamped post-decode) + the bus's
       │            virtual-speaker encode → ONE phonon HRTF decode, then the mode-2
       │            per-voice point taps each through their OWN IPLBinauralEffect,
@@ -205,11 +205,12 @@ The tap ordering is deliberate, not incidental:
 
 ### How wide is the bus?
 
-**The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink/sink.h`) is the compile-time
-*capacity*. The **active** count is whatever the loaded `cave_layout.json` declares
-(any N in 4..26, fixed at `bwa_create`). Everything downstream follows that count.
-The CAVE installation is 26 speakers. That is the target deployment, not an engine
-limit. Details and the failed-load fence: [api.md](./api.md#channel-count).
+**The layout's speaker count.** `BWA_MAX_CHANNELS` (64, `include/bw_audio.h`) is the compile-time
+*capacity*, set by the transport: an ASIO, MADI or Dante endpoint carries 64 channels. The
+**active** count is whatever the loaded `cave_layout.json` declares (any N in
+4..`BWA_MAX_CHANNELS`, fixed at `bwa_create`). With no layout, it is `BWA_DEFAULT_GRID` (26),
+the built-in grid. Everything downstream follows that count. The CAVE installation is 26
+speakers. That is the target deployment, not an engine limit. Details and the failed-load fence: [api.md](./api.md#channel-count).
 
 ## Profiles
 
@@ -251,7 +252,7 @@ orientation component.
 - **Transport: ASIO for the array on Windows; any system backend for a stereo monitor.**
   The array goes over ASIO and nothing else. The consumer paths (WDM, and WASAPI shared mode
   over it) bring their own mixing, resampling and channel limits, and none of them give you the
-  timing hooks below. The CAVE's 26 channels make ASIO mandatory, and the device must expose
+  timing hooks below. An array's channel count makes ASIO mandatory, and the device must expose
   enough outputs for your layout: 26 for the CAVE array. A **stereo monitor** is a different
   problem with a different answer: it wants the device the headphones are already on, it shares
   that device with everything else the machine is playing, and its timing only has to be

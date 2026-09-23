@@ -55,6 +55,8 @@ def test_enum_values_match_the_abi():
     assert int(bwa.LoadFlags.AMBIX) == 2
     assert bwa.CHANNEL_AUTO == -1
     assert bwa.GROUPS == 8
+    assert bwa.MAX_CHANNELS == 64
+    assert bwa.DEFAULT_GRID == 26
 
 
 def test_room_basis_is_the_headers():

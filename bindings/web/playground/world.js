@@ -4,10 +4,10 @@
  * It owns nothing about audio. A scene updates room-space numbers and calls the setters here; the
  * conversion into three.js world space goes through `frame.js` and nowhere else.
  *
- * THE SHARED GIZMOS are the head (with ear and nose markers taken from BWA_ROOM_*), the 26 speaker
- * cones, the source marker, the head-to-source line and the trail. A scene adds its own props to
- * `sceneGroup`, which `clearScene()` empties on every switch, so a scene cannot leak a mesh into
- * the next one.
+ * THE SHARED GIZMOS are the head (with ear and nose markers taken from BWA_ROOM_*), one speaker
+ * cone per layout speaker, the source marker, the head-to-source line and the trail. A scene adds
+ * its own props to `sceneGroup`, which `clearScene()` empties on every switch, so a scene cannot
+ * leak a mesh into the next one.
  *
  * THE CAMERA is a hand-rolled orbit rather than OrbitControls: one addon fewer to vendor and hash,
  * and the demo needs exactly azimuth, elevation, distance and a source drag. The drag is a plane
@@ -15,9 +15,12 @@
  * behavior anyone who has moved a gizmo expects.
  */
 import * as THREE from "../dist/vendor/three/three.module.js";
+import { MAX_CHANNELS } from "../dist/index.js";
 import { defaultCameraRoom, roomToWorld } from "./frame.js";
 
-const SPEAKER_CAP = 26;
+/* One cone per channel the engine can drive, built once and shown up to the layout's count, so an
+ * uploaded layout of any legal size gets its cones without a rebuild of the scene. */
+const SPEAKER_CAP = MAX_CHANNELS;
 
 /** The idle-to-driven speaker colors, and the explicit highlight a scene can ask for. */
 const SPK_IDLE = new THREE.Color(0x4a5568);

@@ -136,7 +136,7 @@ int main(void) {
 
     /* 3. the layout json reader (layout.c -> os_fopen) */
     {
-        Layout L;
+        static Layout L;
         memset(&L, 0, sizeof L);
         err[0] = 0;
         const bool ok = layout_load(JSNF, RATE, &L, err, sizeof err);

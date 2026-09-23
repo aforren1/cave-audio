@@ -718,7 +718,7 @@ namespace BwAudio
         public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
 
         // ---- readback (per-frame-safe: no locks, no allocation in the engine) -------------------------
-        /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..26), NOT a constant.
+        /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..64), NOT a constant.
         /// Size any meter / speaker-gizmo / channel-test array with this; never hard-code 26.</summary>
         public uint ChannelCount => _channels;
         uint _channels;

@@ -2,7 +2,7 @@
  * world_xr.js - the three.js half of the XR page, as a thin layer over the playground's `World`.
  *
  * It EXTENDS `playground/world.js` rather than copying it. Every gizmo the scenes touch (the head,
- * the 26 speaker cones, the source marker, the link line, the trail, `addPanel` / `addBoxWire` /
+ * the speaker cones, the source marker, the link line, the trail, `addPanel` / `addBoxWire` /
  * `addLine` / `addSphere` and `clearScene`) is the playground's, so a scene runs here unmodified
  * and a fix to a gizmo lands on both pages at once. What this class adds is the three things a
  * flat page never needs.

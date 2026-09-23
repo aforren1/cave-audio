@@ -18,7 +18,8 @@ def test_null_sink_lifecycle(null_engine):
     e = null_engine
     assert e.sample_rate == 48000
     assert e.block_size == 256
-    assert 4 <= e.channel_count <= 26
+    assert 4 <= e.channel_count <= bwa.MAX_CHANNELS
+    assert e.channel_count == bwa.DEFAULT_GRID   # no layout_path: the built-in grid
 
     # Before start, get_sink_type reports the POLICY, which is what we asked for.
     assert e.sink_type == bwa.SinkType.NULL

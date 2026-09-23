@@ -1305,12 +1305,19 @@ BWA_API void     bwa_set_panner(bwa_engine* e, bwa_panner panner);
 BWA_API void     bwa_set_spcap_focus(bwa_engine* e, float focus, float density);
 /* The focus value bwa_set_spcap_focus reverts to, for an array given as `n` speaker positions
  * (3 floats each, the bwa_panner_gains_batch convention). Pure, not engine state: a tool can show
- * what an in-progress layout implies before you override it. Returns 0 on bad arguments. */
+ * what an in-progress layout implies before you override it. Returns 0 on bad arguments or when
+ * its scratch allocation fails (it allocates; do not call it from an audio callback). */
 BWA_API float    bwa_spcap_focus_default(const float* positions, uint32_t n);
-/* The engine's ACTIVE channel count = the layout's speaker count (4..26; the 26-grid default with no
- * layout_path). Fixed for the engine's lifetime - size meter/speaker arrays with it. BWA_CHANNELS(26)
- * is only the compile-time CAPACITY; a collaborator's 24-speaker layout loads into the same binary.
- * A failed EXPLICIT layout load leaves the engine on the 26-grid (channel count included) but then
+/* The array-width CAPACITY: the most speaker channels one engine can drive. 64 is the transport's
+ * bound (an ASIO/MADI/Dante endpoint carries 64), so it is a transport fact, not a rig detail. The
+ * ACTIVE count is the layout's, below. BWA_DEFAULT_GRID is the built-in 3x3x3-minus-center grid the
+ * engine runs with no layout_path (and falls back to after a failed explicit load). */
+#define BWA_MAX_CHANNELS 64
+#define BWA_DEFAULT_GRID 26
+/* The engine's ACTIVE channel count = the layout's speaker count (4..BWA_MAX_CHANNELS; BWA_DEFAULT_GRID
+ * with no layout_path). Fixed for the engine's lifetime - size meter/speaker arrays with it, or with
+ * BWA_MAX_CHANNELS for a static buffer. A collaborator's 24-speaker layout loads into the same binary.
+ * A failed EXPLICIT layout load leaves the engine on the default grid (channel count included) but then
  * FAILS bwa_start with BWA_ERR_LAYOUT - a wrong-channel-count session can't start silently. */
 BWA_API uint32_t bwa_get_channel_count(bwa_engine* e);
 /* Dual-band panning (off by default): split each source at ~700 Hz and pan the low band with
@@ -1560,7 +1567,9 @@ BWA_API bool     bwa_get_tuning(bwa_engine* e, bwa_tuning* out);
  * listener `lis`, over a layout of `n` speaker positions (`positions` = n*3 floats, room space). Writes
  * out[i*n + s] (nsrc*n floats); returns nsrc. Default DBAP/distance tuning. Shares the SPCAP/VBAP
  * per-listener cache across the batch (efficient over a grid). Pure AND reentrant - the cache is
- * per-call stack state, no globals, so any thread may call it, concurrently with a running engine.
+ * per-call state, no globals, so any thread may call it, concurrently with a running engine. It
+ * ALLOCATES (one heap scratch layout per call, freed before it returns; returns 0 if that fails), so
+ * never call it from an audio callback.
  * Uses the same panner solves the audio path does, so a tool scores a layout against the ACTUAL
  * panner, not a copy.
  *

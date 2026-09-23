@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CH   BWA_CHANNELS
+#define CH   BWA_DEFAULT_GRID
 #define RATE 48000u
 #define N    256u
 
@@ -64,7 +64,7 @@ static int keep_px(const Layout* L, uint32_t s) { return L->speakers[s].pos[0] >
 static int keep_nx(const Layout* L, uint32_t s) { return L->speakers[s].pos[0] < -1.0f; }
 
 int main(void) {
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     enum { BLOCKS = 400 };                       /* ~2.1 s of tail at 256/48k */
     static double e[BLOCKS];
 

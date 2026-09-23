@@ -32,6 +32,10 @@
   var params = new URLSearchParams(location.search);
   var WANT_XR = params.get("__xr") === "1";
 
+  /* BWA_DEFAULT_GRID. A literal because this classic script cannot import the binding;
+   * constants.test.mjs pins the exported value to the same number. */
+  var DEFAULT_GRID = 26;
+
   var notes = [];
   function ok(m) { notes.push("ok   " + m); }
   function fail(m) { notes.push("FAIL " + m); }
@@ -244,10 +248,12 @@
     else ok('backend "' + s.backend + '"');
     if (s.sinkType !== 9) fail("sink type " + s.sinkType + ", expected 9 (WORKLET)");
     else ok("sink type 9 (WORKLET)");
-    if (s.channelCount !== 26) fail(s.channelCount + " bus channels, expected the 26 of the CAVE layout");
-    else ok("26 bus channels");
-    if (s.speakerCount !== 26) fail("bwa_get_speakers gave " + s.speakerCount + " speakers, expected 26");
-    else ok("bwa_get_speakers read back 26 speaker positions");
+    if (s.channelCount !== DEFAULT_GRID)
+      fail(s.channelCount + " bus channels, expected the " + DEFAULT_GRID + " of the default grid");
+    else ok(DEFAULT_GRID + " bus channels");
+    if (s.speakerCount !== DEFAULT_GRID)
+      fail("bwa_get_speakers gave " + s.speakerCount + " speakers, expected " + DEFAULT_GRID);
+    else ok("bwa_get_speakers read back " + DEFAULT_GRID + " speaker positions");
     if (s.presenting) fail("the page claims to be presenting with no WebXR");
     else ok("not presenting, as there is no device");
 

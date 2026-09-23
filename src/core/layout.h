@@ -46,9 +46,14 @@ typedef struct {
     float    gain_db[BWA_RQ_GRID_MAX][BWA_CHANNELS][BWA_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
 } RoomEqGrid;
 
+/* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~176 KB, almost all
+ * of it the 512-tap FIR each Speaker embeds, and a binding may call in from a 512 KB thread. Keep it
+ * a plain value type, but give it heap or static residency: a member of a heap struct (RtCore,
+ * bwa_engine), a calloc, or a static in non-reentrant code. That is also why layout_default fills
+ * in place rather than returning by value: a by-value return is a hidden stack temporary. */
 typedef struct {
     Speaker  speakers[BWA_CHANNELS];
-    uint32_t count;                 /* == BWA_CHANNELS once validated */
+    uint32_t count;                 /* 4..BWA_CHANNELS once validated (the engine's channel count) */
     /* nominal listening point = the array CENTROID, computed at load. The world-locked decodes
      * (ambisonic/reflection/pathing beds, the monitor's virtual-speaker encode) take their speaker
      * DIRECTIONS from here, and it is the engine's default listener pose — so the room origin can
@@ -74,7 +79,7 @@ typedef struct {
 /* A sane default: a 3 m-cube 3x3x3 boundary grid (minus center), FLOOR-origin — x/z at
  * +/-1.5 m around the room center, y from 0 (floor) to 3 m, ref (ear point) at (0,1.5,0).
  * Unity trim, no delay. Lets the engine run with no layout file (binaural / desk dev / tests). */
-Layout layout_default(void);
+void layout_default(Layout* out);
 
 /* Load + validate cave_layout.json. `sample_rate` converts delay_ms -> samples and the
  * gains from dB. Fails (false + message in `err`) on a missing/unparseable file, a wrong

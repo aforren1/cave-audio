@@ -23,10 +23,10 @@ Two threads carry the core:
   active fields. It never allocates, locks, blocks, or does I/O.
 
 The bus is **N channels wide, where N is the loaded layout's speaker count**
-(`RtCore.channels`, 4..26; 26 for the CAVE array and for the default grid). It is
-fixed for the engine's lifetime: resolved at `bwa_create`, before `rt_create`.
-`BWA_CHANNELS` (26, [`src/sink/sink.h`](../src/sink/sink.h)) is only the compile-time
-*capacity* that sizes the fixed arrays.
+(`RtCore.channels`, 4..`BWA_MAX_CHANNELS`; 26 for the CAVE array, and `BWA_DEFAULT_GRID`
+for the default grid). It is fixed for the engine's lifetime: resolved at `bwa_create`, before
+`rt_create`. `BWA_CHANNELS` ([`src/sink/sink.h`](../src/sink/sink.h), an alias of the public
+`BWA_MAX_CHANNELS`, 64) is only the compile-time *capacity* that sizes the fixed arrays.
 
 The two threads communicate through two SPSC rings:
 

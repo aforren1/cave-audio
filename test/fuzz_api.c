@@ -1417,7 +1417,7 @@ static int run_seed(unsigned long long seed, uint32_t iters) {
         z->e = pe;   /* so FAIL context reads sensibly */
         if (!pe) FAIL("create must survive a failed explicit layout load");
         if (!bwa_last_error(pe)) { bwa_destroy(pe); FAIL("failed layout load left no error at create"); }
-        if (bwa_get_channel_count(pe) != 26) { bwa_destroy(pe); FAIL("layout fallback is not the 26-grid"); }
+        if (bwa_get_channel_count(pe) != BWA_DEFAULT_GRID) { bwa_destroy(pe); FAIL("layout fallback is not the 26-grid"); }
         for (int i = 0; i < 2; ++i)
             if (bwa_start(pe) != BWA_ERR_LAYOUT) { bwa_destroy(pe); FAIL("start #%d did not fail BWA_ERR_LAYOUT", i + 1); }
         bwa_destroy(pe);
@@ -1459,7 +1459,7 @@ static int run_seed(unsigned long long seed, uint32_t iters) {
     if (bwa_get_block_size(e) != z->block) FAIL("block size readback %u != desc %u", bwa_get_block_size(e), z->block);
     z->chan = bwa_get_channel_count(e);
     if (use_layout8) { if (z->chan != 8)  FAIL("8-speaker layout loaded %u channels", z->chan); }
-    else             { if (z->chan != 26) FAIL("default grid is %u channels, not 26", z->chan); }
+    else             { if (z->chan != BWA_DEFAULT_GRID) FAIL("default grid is %u channels, not %d", z->chan, BWA_DEFAULT_GRID); }
     z->out_ch = (z->profile == BWA_PROFILE_BINAURAL || z->profile == BWA_PROFILE_CAVE_SIM) ? 2u : z->chan;
 
     /* load-time config: reverb beds, a room, a tuning — before start, as documented */

@@ -20,7 +20,7 @@
  * way in: a headless browser cannot click a slider and read a cone's color. It exposes the same
  * state the controls write, so the check drives the real scene rather than a test-only path.
  */
-import { Profile } from "../dist/index.js";
+import { Profile, MAX_CHANNELS, DEFAULT_GRID } from "../dist/index.js";
 import { Rig } from "./rig.js";
 import { World } from "./world.js";
 import { renderControls, renderReadout } from "./ui.js";
@@ -101,7 +101,7 @@ async function selectScene(id) {
   app.ctx.highlight = -1;
 
   /* A scene that reads the array bus needs the array. CAVE_SIM is the one profile that both
-   * renders through the 26-channel bus and comes out of headphones, so a bus scene forces it and
+   * renders through the array bus and comes out of headphones, so a bus scene forces it and
    * the page's own choice comes back when you leave. */
   const want = next.needsBus ? Profile.CAVE_SIM : app.wantProfile;
   if (app.rig.profile !== want) {
@@ -178,7 +178,7 @@ function drawControls() {
       kind: "file", label: "speaker layout (cave_layout.json)", accept: ".json,application/json",
       set: (text, name) => loadLayout(text, name),
       hint: "Rebuilds the array on the surveyed geometry in the file, and the cones follow " +
-            "bwa_get_speakers. Leave it alone for the default 26-speaker grid.",
+            `bwa_get_speakers. Leave it alone for the default ${DEFAULT_GRID}-speaker grid.`,
     },
     ...(app.rig.layoutName
       ? [{
@@ -219,7 +219,7 @@ function drawControls() {
  * It is a PRE-check, not the authority. The engine reads the file properly and rejects far more
  * than this (gain and delay ranges, the EQ caps), and its refusal comes back through
  * `bwa_last_error`. What this buys is a readable message for the three mistakes anyone actually
- * makes - the wrong file, a count outside 4..26, a position that is not a number - without a
+ * makes - the wrong file, a count outside 4..BWA_MAX_CHANNELS, a position that is not a number - without a
  * rebuild in between.
  * @param {string} text the file's contents
  * @returns {string|null} the problem, or null when it is worth handing to the engine
@@ -229,8 +229,8 @@ function validateLayout(text) {
   try { doc = JSON.parse(text); } catch (e) { return `not JSON (${e.message})`; }
   const sp = doc && doc.speakers;
   if (!Array.isArray(sp)) return "no \"speakers\" array; this is not a cave_layout.json";
-  if (sp.length < 4 || sp.length > 26) {
-    return `${sp.length} speakers; the engine takes 4 to 26 (26 = BWA_CHANNELS)`;
+  if (sp.length < 4 || sp.length > MAX_CHANNELS) {
+    return `${sp.length} speakers; the engine takes 4 to ${MAX_CHANNELS} (BWA_MAX_CHANNELS)`;
   }
   const seen = new Set();
   for (let i = 0; i < sp.length; ++i) {
@@ -387,7 +387,7 @@ function drawMeters() {
   const ears = `out L ${dbText(app.outHold.l)} R ${dbText(app.outHold.r)}`;
   el("meterText").textContent = app.rig.profile === Profile.BINAURAL
     ? `${bus} - binaural renders point voices straight to the ears, so only the diffuse field ` +
-      `reaches the 26 bus channels and the cones show that. ${ears}`
+      `reaches the ${app.rig.channelCount} bus channels and the cones show that. ${ears}`
     : `${bus}. ${ears}`;
 }
 

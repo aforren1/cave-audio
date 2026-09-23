@@ -70,9 +70,9 @@ float layout_derive_spcap_focus(const Layout* L) {
     return (float)n;
 }
 
-Layout layout_default(void) {
-    Layout L;
-    memset(&L, 0, sizeof L);
+void layout_default(Layout* out) {
+    Layout* const L = out;
+    memset(L, 0, sizeof *L);
     const float ax[3] = { -1.5f, 0.0f, 1.5f };  /* x/z: centered on the room */
     const float ay[3] = {  0.0f, 1.5f, 3.0f };  /* y: FLOOR origin, Motive-style */
     uint32_t k = 0;
@@ -80,23 +80,22 @@ Layout layout_default(void) {
         for (int xi = 0; xi < 3; ++xi)
             for (int zi = 0; zi < 3; ++zi) {
                 if (ax[xi] == 0.0f && ay[yi] == 1.5f && ax[zi] == 0.0f) continue;
-                L.speakers[k].pos[0] = ax[xi];
-                L.speakers[k].pos[1] = ay[yi];
-                L.speakers[k].pos[2] = ax[zi];
-                L.speakers[k].gain_lin = 1.0f;
-                L.speakers[k].delay_samples = 0;
+                L->speakers[k].pos[0] = ax[xi];
+                L->speakers[k].pos[1] = ay[yi];
+                L->speakers[k].pos[2] = ax[zi];
+                L->speakers[k].gain_lin = 1.0f;
+                L->speakers[k].delay_samples = 0;
                 ++k;
             }
-    L.count             = k;                    /* 26 */
-    layout_compute_ref(&L);                            /* (0, 1.5, 0) — the cube's center */
-    L.rolloff_r         = 0.5f;
-    L.spcap_focus       = layout_derive_spcap_focus(&L);   /* ~12.7 on this grid (37.5 deg spacing) */
-    L.spcap_density     = BWA_SPCAP_DENSITY_DEFAULT;
-    L.atten_ref_m       = 1.0f;
-    L.atten_rolloff     = 1.0f;
-    L.atten_min_lin     = db_to_lin(-40.0);
-    L.max_delay_samples = 0;
-    return L;
+    L->count             = k;                    /* 26 */
+    layout_compute_ref(L);                            /* (0, 1.5, 0) — the cube's center */
+    L->rolloff_r         = 0.5f;
+    L->spcap_focus       = layout_derive_spcap_focus(L);   /* ~12.7 on this grid (37.5 deg spacing) */
+    L->spcap_density     = BWA_SPCAP_DENSITY_DEFAULT;
+    L->atten_ref_m       = 1.0f;
+    L->atten_rolloff     = 1.0f;
+    L->atten_min_lin     = db_to_lin(-40.0);
+    L->max_delay_samples = 0;
 }
 
 static char* read_file(const char* path, char* err, size_t errcap) {
@@ -115,7 +114,7 @@ static char* read_file(const char* path, char* err, size_t errcap) {
 }
 
 bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err, size_t errcap) {
-    *out = layout_default();        /* keep sane defaults for any dbap fields the file omits */
+    layout_default(out);            /* keep sane defaults for any dbap fields the file omits */
     if (!path)        { set_err(err, errcap, "layout: null path"); return false; }
     if (sample_rate == 0) { set_err(err, errcap, "layout: zero sample rate"); return false; }
 
@@ -132,7 +131,10 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
      * CAPACITY — collaborator arrays with fewer speakers load into the same binary) */
     const int nspk = cJSON_GetArraySize(speakers);
     if (nspk < 4 || nspk > (int)BWA_CHANNELS) {
-        set_err(err, errcap, "layout: 'speakers' must have 4..26 entries (26 = BWA_CHANNELS cap)"); goto done;
+        if (err && errcap)
+            snprintf(err, errcap, "layout: 'speakers' must have 4..%d entries (%d = BWA_MAX_CHANNELS cap), got %d",
+                     (int)BWA_MAX_CHANNELS, (int)BWA_MAX_CHANNELS, nspk);
+        goto done;
     }
 
     bool have_rolloff = false;
@@ -323,7 +325,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     }
 
     /* a loaded layout with fewer than BWA_CHANNELS speakers leaves the tail entries at the default
-     * grid's values — harmless: count gates every consumer, and the engine's channel count follows it */
+     * grid's values (zeroed past BWA_DEFAULT_GRID) — harmless: count gates every consumer, and the engine's channel count follows it */
     out->count             = (uint32_t)nspk;
     out->max_delay_samples = maxdelay;
     layout_compute_ref(out);                  /* nominal listening point = the surveyed array's centroid */

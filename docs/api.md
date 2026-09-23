@@ -18,7 +18,8 @@ Terms used here without definition are in [glossary.md](./glossary.md).
 ## Feature overview
 
 - Listener-relative spatialization over the speaker array (26 speakers on the
-  CAVE; any 4..26 layout works), recomputed per audio block from the tracked head
+  CAVE; any layout of 4 to `BWA_MAX_CHANNELS` (64) speakers works, and with no layout the
+  engine runs the 26-speaker `BWA_DEFAULT_GRID`), recomputed per audio block from the tracked head
   position: DBAP for a moving listener (the default), SPCAP/VBAP for a fixed one,
   an optional dual-band mode, per-source angular spread. SPCAP's lobe width defaults
   to what the array's own speaker spacing implies. It is a live knob
@@ -92,7 +93,7 @@ bwa_stop(eng); bwa_destroy(eng);
 - **Production** uses `BWA_PROFILE_CAVE`, with `cfg.layout_path` pointing at the
   surveyed `cave_layout.json`. A named layout that fails to load fails `bwa_start` with
   `BWA_ERR_LAYOUT` (a wrong-channel-count session can't start silently); `NULL` opts into
-  the default 26-grid deliberately.
+  the default grid (`BWA_DEFAULT_GRID`, 26 speakers) deliberately.
 - **`bwa_start` never demands hardware**: with no usable ASIO device the engine
   keeps rendering into a silent offline sink. `bwa_get_audio_backend` reports which
   backend you actually got (see [Errors](#errors-and-return-codes)).
@@ -432,7 +433,7 @@ and `clk.off` instead of the live pair and the measured offset.
 ### Develop at the desk, run on the rig
 
 The profile is the only seam. For rig verification use `BWA_PROFILE_CAVE_SIM`: it
-renders the **same 26-channel mix** production plays, through virtual speakers at
+renders the **same speaker-bus mix** production plays, through virtual speakers at
 the surveyed room positions
 ([Profiles and the master bus](#profiles-and-the-master-bus)). Panning, acoustics,
 and gain-staging bugs show up on headphones before the rig exists.
@@ -616,7 +617,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | field            | meaning                                                              |
 |------------------|---------------------------------------------------------------------|
 | `profile`        | `cave` / `binaural` / `cave_sim` / `cave_both` (see [Profiles](#profiles-and-the-master-bus)) |
-| `layout_path`    | surveyed speaker geometry (JSON); cave/cave_both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
+| `layout_path`    | surveyed speaker geometry (JSON); cave/cave_both. NULL = the default grid (`BWA_DEFAULT_GRID`) deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; the headphone profiles             |
 | `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
 | `block_size`     | render quantum, frames; 0 = 256. Also the device *period hint* - a driver or an OS mixer may run its own size, and the sinks adapt, but the quantum handed to the DSP is exactly this regardless; `bwa_get_block_size` reads it back |
@@ -664,9 +665,9 @@ What actually comes back today:
 - `bwa_tracker_connect` returns `BWA_OK`, `BWA_ERR_CONFIG` (NULL args / a static-`room_eq`
   layout), or `BWA_ERR_TRACKER`.
 - A failed **explicit** `layout_path` leaves `bwa_create` usable (the engine sits on the default
-  26-grid; the reason is in `bwa_last_error`, readable right after create) but **fails
-  `bwa_start` with `BWA_ERR_LAYOUT`**: a session that named a layout never silently runs 26
-  channels of the wrong geometry. `layout_path = NULL` means the default grid deliberately.
+  grid; the reason is in `bwa_last_error`, readable right after create) but **fails
+  `bwa_start` with `BWA_ERR_LAYOUT`**: a session that named a layout never silently runs the
+  default grid's channel count and geometry. `layout_path = NULL` means the default grid deliberately.
 - A bad `hrtf_path` does **not** fail `bwa_start`. The monitor degrades to the simple pan and
   records why in `bwa_last_error`; if your session depends on a SOFA HRTF, read
   `bwa_last_error` after a *successful* `bwa_start` to confirm it loaded.
@@ -2393,19 +2394,31 @@ actually panning with.
 ### Channel count
 
 ```c
-uint32_t bwa_get_channel_count(bwa_engine* e);   // the ACTIVE channel count (4..26), fixed at create
+#define BWA_MAX_CHANNELS 64   // capacity: the most speaker channels one engine can drive
+#define BWA_DEFAULT_GRID 26   // the built-in grid's speaker count (no layout_path)
+uint32_t bwa_get_channel_count(bwa_engine* e);   // the ACTIVE channel count (4..BWA_MAX_CHANNELS), fixed at create
 ```
 
-The engine's channel count **is the layout's speaker count**: a `layout_path` file with 4..26
-speakers, or 26 (the default grid) with no path. `BWA_CHANNELS` (26) is only the compile-time
-*capacity*: a collaborator's 24-speaker array loads a 24-entry layout into the same binary, the
-device opens 24 channels, and every consumer (panners, beds, reverb, monitor, calibration) follows.
-Size meter/speaker arrays from this getter, not the constant.
+The engine's channel count **is the layout's speaker count**: a `layout_path` file with
+4..`BWA_MAX_CHANNELS` speakers, or `BWA_DEFAULT_GRID` (the built-in 3x3x3 grid minus the
+center) with no path.
+
+`BWA_MAX_CHANNELS` (64) is only the *capacity*. It is a transport bound, not a rig detail: an
+ASIO, MADI or Dante endpoint carries 64 channels. A collaborator's 24-speaker array loads a
+24-entry layout into the same binary, the device opens 24 channels, and every consumer (panners,
+beds, reverb, monitor, calibration) follows. The CAVE is 26 today. A 36-speaker CAVE is a new
+layout file, not a recompile.
+
+`BWA_DEFAULT_GRID` (26) is the default grid's count, not the capacity. The two numbers were the
+same before the capacity rose to 64, so do not use one where you mean the other.
+
+Size meter/speaker arrays from this getter. Use `BWA_MAX_CHANNELS` only for a static buffer that
+must fit any layout.
 
 The old sharp edge here is now fenced: a **failed** explicit layout load still leaves the engine
-on the 26-grid default (reason in `bwa_last_error`, readable after `bwa_create`), but
+on the default grid (reason in `bwa_last_error`, readable after `bwa_create`), but
 `bwa_start` refuses it with `BWA_ERR_LAYOUT`, so a 24-speaker deployment can no longer silently
-render 26 channels. Only `layout_path = NULL` runs the default grid.
+render the default grid's 26 channels. Only `layout_path = NULL` runs the default grid.
 
 ### Offline panner and bed evaluation
 

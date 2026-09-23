@@ -20,7 +20,7 @@
  * spellings exist where both are useful (`seekFrames` / `seekSeconds`), the way the Godot binding
  * had to learn to do.
  */
-import { makeRaw } from "./raw.js";
+import { makeRaw, CONSTANTS } from "./raw.js";
 
 export class BwaError extends Error {
   constructor(message, result) {
@@ -37,7 +37,22 @@ export const SinkType = {
   AUTO: 0, ASIO: 1, NULL: 2, MANUAL: 3, WASAPI: 4, COREAUDIO: 5, ALSA: 6, AAUDIO: 7, JACK: 8,
   WORKLET: 9,
 };
-export const SinkFlags = { NONE: 0, EXCLUSIVE: 0x1, EXACT_RATE: 0x2, TIGHT_BUFFER: 0x4 };
+export const SinkFlags = {
+  NONE: 0,
+  EXCLUSIVE: CONSTANTS.SINK_FLAG_EXCLUSIVE,
+  EXACT_RATE: CONSTANTS.SINK_FLAG_EXACT_RATE,
+  TIGHT_BUFFER: CONSTANTS.SINK_FLAG_TIGHT_BUFFER,
+};
+
+/* The header's integer constants, the names bindings/python's idiomatic layer uses. Read from the
+ * generated table, so none of them is a second copy of the header. MAX_CHANNELS is the array
+ * CAPACITY (size a static per-speaker buffer with it); an engine's ACTIVE count is its
+ * `channelCount`, which is DEFAULT_GRID with no layout and the layout's count otherwise. */
+export const MAX_CHANNELS = CONSTANTS.MAX_CHANNELS;
+export const DEFAULT_GRID = CONSTANTS.DEFAULT_GRID;
+export const CHANNEL_AUTO = CONSTANTS.CHANNEL_AUTO;
+export const GROUPS = CONSTANTS.GROUPS;
+export const EXTRA_LIS = CONSTANTS.EXTRA_LIS;
 
 const HEALTH_FIELDS = [
   "blocks", "xruns", "droppedFrames", "driverResyncs", "lateBlocks", "streamStarves",

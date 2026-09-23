@@ -121,6 +121,8 @@ NB_MODULE(_bwa, m) {
     m.attr("VERSION_PATCH") = BWA_VERSION_PATCH;
     m.attr("VERSION")       = (uint32_t)BWA_VERSION;   /* the HEADER's, for the DLL cross-check */
     m.attr("GROUPS")        = (uint32_t)BWA_GROUPS;
+    m.attr("MAX_CHANNELS")  = (uint32_t)BWA_MAX_CHANNELS;   /* array capacity; the active count is the layout's */
+    m.attr("DEFAULT_GRID")  = (uint32_t)BWA_DEFAULT_GRID;   /* the built-in grid's speaker count (no layout_path) */
     m.attr("EXTRA_LIS")     = (uint32_t)BWA_EXTRA_LIS;
     m.attr("CHANNEL_AUTO")  = (int32_t)BWA_CHANNEL_AUTO;
     /* bwa_desc.sink_flags bits. They are #defines rather than an enum in the ABI, so they stay

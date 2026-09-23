@@ -39,7 +39,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CH BWA_CHANNELS
+#define CH BWA_DEFAULT_GRID
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
@@ -65,7 +65,7 @@ int main(void) {
     /* 2. hull.c VBAP vs the l1-optimal LP (Franck/Wang/Fazi 2017): same active speakers,
      * same normalized gains, for 64 directions over the default grid's hull */
     {
-        Layout L = layout_default();
+        static Layout L; layout_default(&L);
         float dirs[CH][3];
         for (int s = 0; s < CH; ++s) {
             float p[3] = { L.speakers[s].pos[0] - L.ref[0], L.speakers[s].pos[1] - L.ref[1],
@@ -97,7 +97,7 @@ int main(void) {
 
     /* 3. allrad.c vs the qhull + linprog + scipy rebuild — full matrices, both grids */
     {
-        Layout L = layout_default();
+        static Layout L; layout_default(&L);
         float dec[BWA_CHANNELS][BWA_AMBI_CH];
         CHECK(allrad_build_decode(&L, dec), "allrad builds (grid26)");
         double fro2 = 0, ref2 = 0; float maxerr = 0.f;
@@ -112,7 +112,7 @@ int main(void) {
         CHECK(maxerr < 1e-4f && fro2 / ref2 < 1e-4 * 1e-4,
               "AllRAD decode matrix matches the qhull rebuild (covered grid)");
 
-        Layout LH; memset(&LH, 0, sizeof LH);          /* the floor-less grid: exercises the
+        static Layout LH; memset(&LH, 0, sizeof LH);          /* the floor-less grid: exercises the
                                                         * imaginary nadir speaker in BOTH builds */
         uint32_t nh = 0;
         for (uint32_t s = 0; s < L.count; ++s) {
@@ -157,7 +157,7 @@ int main(void) {
     /* 5. align.c room_eq rendering vs scipy.signal.lfilter: rt.c's LCG noise through the
      * two-section cascade on channel 0, one 4096-sample block, float32 DF-I vs float64 */
     {
-        Layout L = layout_default();
+        static Layout L; layout_default(&L);
         L.speakers[0].room_eq_count = 2;
         L.speakers[0].room_eq[0].fc = 45.f;  L.speakers[0].room_eq[0].gain_db = -8.f; L.speakers[0].room_eq[0].q = 6.f;
         L.speakers[0].room_eq[1].fc = 120.f; L.speakers[0].room_eq[1].gain_db = -5.f; L.speakers[0].room_eq[1].q = 2.f;
@@ -188,7 +188,7 @@ int main(void) {
     /* 6. epad.c vs the numpy SVD rebuild: the polar-factor decode is unique, so the Jacobi
      * eigensolve of YY^T and numpy's SVD must land on the same matrix — both grids */
     {
-        Layout L = layout_default();
+        static Layout L; layout_default(&L);
         float dec[BWA_CHANNELS][BWA_AMBI_CH];
         CHECK(epad_build_decode(&L, dec), "epad builds (grid26)");
         double fro2 = 0, ref2 = 0; float maxerr = 0.f;
@@ -203,7 +203,7 @@ int main(void) {
         CHECK(maxerr < 1e-4f && fro2 / ref2 < 1e-4 * 1e-4,
               "EPAD decode matrix matches the numpy SVD polar factor (covered grid)");
 
-        Layout LH; memset(&LH, 0, sizeof LH);
+        static Layout LH; memset(&LH, 0, sizeof LH);
         uint32_t nh = 0;
         for (uint32_t s = 0; s < L.count; ++s) {
             if (L.speakers[s].pos[1] < 0.1f) continue;

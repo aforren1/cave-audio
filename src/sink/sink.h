@@ -43,10 +43,11 @@
 #include <stdint.h>
 
 /* The array-width CAPACITY — sizes every fixed array (gain vectors, decode matrices, meters). The
- * ACTIVE channel count is the loaded layout's speaker count (4..BWA_CHANNELS, Layout.count; the
- * default grid is exactly BWA_CHANNELS), fixed per engine instance — a collaborator's 24-speaker
- * array loads into the same binary. Raising the cap is a recompile. */
-#define BWA_CHANNELS 26
+ * ACTIVE channel count is the loaded layout's speaker count (4..BWA_CHANNELS, Layout.count), fixed
+ * per engine instance — a collaborator's 24-speaker array loads into the same binary. The public
+ * header owns the number (BWA_MAX_CHANNELS); the default grid is BWA_DEFAULT_GRID speakers, which
+ * is NOT the capacity — never use one where you mean the other. Raising the cap is a recompile. */
+#define BWA_CHANNELS BWA_MAX_CHANNELS
 
 /* TEST HOOK (defined in null_sink.c, exported from the dll; deliberately not in bw_audio.h):
  * when set, observers of the device-bound audio call it — the null sink hands it every block it

@@ -1,6 +1,6 @@
 # bw_audio for Python
 
-Python binding for the bw_audio spatial audio engine: a 26-speaker CAVE array over ASIO, and a
+Python binding for the bw_audio spatial audio engine: a speaker array over ASIO (up to 64 channels; the CAVE has 26), and a
 binaural headphone render. Built with [nanobind](https://github.com/wjakob/nanobind) on the C ABI in
 [`include/bw_audio.h`](../../include/bw_audio.h).
 

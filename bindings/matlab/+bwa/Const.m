@@ -116,6 +116,8 @@ classdef Const
         GROUPS       = 8
         EXTRA_LIS    = 3
         CHANNEL_AUTO = -1
+        MAX_CHANNELS = 64   % array capacity; the active count is the layout's
+        DEFAULT_GRID = 26   % the built-in grid's speaker count (no layout_path)
 
         % The identity-listener basis. Derive forward and right from these rather than
         % re-hardcoding the convention: right-handed, +y up, identity faces +z.

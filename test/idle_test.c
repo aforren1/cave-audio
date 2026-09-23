@@ -61,7 +61,7 @@ int main(void) {
     /* rt_create starts the streaming thread; assets_create does NOT start the loader thread (it is
      * lazy), so the async acquire below is what brings it into existence. Measuring an idle thread
      * that was never started would prove nothing. */
-    RtCore* rt = rt_create(VOICES, SOUNDS, RATE, 26);
+    RtCore* rt = rt_create(VOICES, SOUNDS, RATE, BWA_DEFAULT_GRID);
     CHECK(rt != NULL, "rt_create");
     if (!rt) { os_remove(WAV); return 1; }
     AssetCache* ac = assets_create(rt, RATE, SOUNDS);
@@ -206,7 +206,7 @@ int main(void) {
         CHECK(src != 0, "rt_source_create");
         if (snd && src) {
             const uint32_t BLK = 256;
-            static float bus[26 * 256];
+            static float bus[BWA_DEFAULT_GRID * 256];
             rt_source_set_pos(rt, src, 0.f, 1.5f, -1.f);
             rt_source_play(rt, src, snd, /*loop*/ true);
             rt_commit(rt);

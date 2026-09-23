@@ -15,7 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CH   BWA_CHANNELS
+#define CH   BWA_DEFAULT_GRID
 #define N    64
 #define RATE 48000u
 
@@ -54,7 +54,7 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
 
 int main(void) {
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     Monitor* m = monitor_create(&L, RATE);
     CHECK(m != NULL, "monitor_create");
     if (!m) return 1;

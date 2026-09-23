@@ -32,7 +32,7 @@ This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours
 | Audio Reverb Zone | the shared reverb bed: **Steam Audio reflections**, or the **FDN reverb** (no SDK needed) |
 | occlusion (3rd-party) | `Emitter.occlusion`, ray-traced against the acoustic geometry - or `SetOcclusionManual` from game logic (no SDK needed) |
 | Doppler / rolloff curves | `Emitter.doppler`, `airAbsorption`, `loudnessComp` (all physically derived from distance) |
-| output device / AudioMixer | the engine (ASIO/Dante 26-ch + binaural monitor); Unity's audio output is disabled |
+| output device / AudioMixer | the engine (ASIO/Dante speaker array + binaural monitor); Unity's audio output is disabled |
 
 The big difference: **audio files are raw files in `StreamingAssets`, not imported `AudioClip`s**. The
 engine owns decoding, which also avoids Unity's 8-channel output cap entirely.
@@ -377,7 +377,7 @@ share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD), the room 
 acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
-speaker count - **size meter arrays with it, never hard-code 26**), `BusLevels()` (per-channel output
+speaker count - **size meter arrays with it, never hard-code a speaker count**), `BusLevels()` (per-channel output
 peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
 checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong

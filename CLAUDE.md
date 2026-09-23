@@ -8,8 +8,8 @@ extends the engine or verifies it on hardware, against these specs.
 ## What this is
 
 A self-hosted native (C/C++) spatial audio engine for a CAVE installation. It
-drives a **26-speaker array** over **ASIO** into an **RME Digiface Dante** (a hardware
-Dante endpoint), with **binaural (HRTF) headphone output** as a second path — a
+drives a **speaker array (up to 64 channels; the CAVE installation is 26)** over **ASIO**
+into an **RME Digiface Dante** (a hardware Dante endpoint), with **binaural (HRTF) headphone output** as a second path — a
 first-class direct render (`BWA_PROFILE_BINAURAL`) and an array-audition monitor
 (`BWA_PROFILE_CAVE_SIM`). Unity and
 Unreal are *thin control clients* over a C ABI — no rendered audio crosses that
@@ -24,8 +24,9 @@ and a clean, engine-agnostic core. See `docs/architecture.md` for the why.
 ## The seam that organizes everything
 
 Sources → per-voice **listener-relative DBAP** panning → an in-memory
-**26-channel master bus**. The bus has *consumers*:
-- **ASIO device** (production): writes the 26-ch bus straight to the Digiface.
+**N-channel master bus** (N = the layout's speaker count; 26 on the CAVE). The bus has
+*consumers*:
+- **ASIO device** (production): writes the speaker bus straight to the Digiface.
 - **Array-sim monitor** (`cave_sim`, and `cave_both`'s tap): treats each bus channel
   as a virtual speaker at its room position, HRTFs to stereo, writes to a normal
   output device.
@@ -55,7 +56,7 @@ that are painful to debug, so they are non-negotiable:
    active fields). The control thread owns handle allocation and asset memory.
    They communicate only through the two SPSC rings.
 4. **Gains ramp, never jump.** Per-voice `gcur -> gtarget` interpolated across the
-   block. A discontinuous 26-gain change is audible zipper noise.
+   block. A discontinuous per-speaker gain change is audible zipper noise.
 5. **Generation counts gate handle reuse.** A stale source handle must be dropped,
    not acted on. Sound *buffers* additionally need the retire-ack handshake before
    the control thread frees them.
@@ -204,7 +205,7 @@ src/
     hull.h / hull.c      convex-hull triangulation of unit directions + the VBAP gains within
                          it. Pure and alloc-free; shared by allrad.c (the load-time decode
                          build) and vbap.c. [spatialization]
-    allrad.h / allrad.c  All-Round Ambisonic Decoding for the diffuse layer: the SH->26
+    allrad.h / allrad.c  All-Round Ambisonic Decoding for the diffuse layer: the SH->speaker
                          bed-decode matrix built over a virtual layer (bed_decoder = 1).
                          [spatialization]
     epad.h / epad.c      Energy-Preserving Ambisonic Decoding for the diffuse layer, same
@@ -227,10 +228,10 @@ src/
     fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
     ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
     steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
-    steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
+    steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->speaker bus tap (with-SDK). [materials]
     steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
   binaural/
-    binaural.h/binaural.c  head-oriented 26->stereo monitor + the no-SDK cardioid decode of the
+    binaural.h/binaural.c  head-oriented array->stereo monitor + the no-SDK cardioid decode of the
                          direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
     hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on
                          the headphone profiles' final stereo (bwa_load_headphone_eq). [binaural]
@@ -552,11 +553,17 @@ transmission EQ + directivity), `steam_reflect.c` (the reflection bed), and `ste
 reflections + the FDN late tail for reverb, and manual occlusion cover the same ground. What
 it loses is automatic occlusion, pathing, and the real HRTF monitor.
 
-Channel count is runtime. `BWA_CHANNELS` (26, `sink.h`) is the CAPACITY; the layout's speaker
-count (4..26) is the ACTIVE count, fixed per engine instance and threaded through the rt core,
-sinks, monitor, and FDN. `bwa_get_channel_count()` reads it back. A failed explicit layout load
-leaves `bwa_create` usable on the 26-grid fallback (reason via `bwa_last_error`), but `bwa_start`
-refuses it with `BWA_ERR_LAYOUT` — only `layout_path = NULL` runs the default grid.
+Channel count is runtime. `BWA_MAX_CHANNELS` (64, `bw_audio.h`; `sink.h`'s `BWA_CHANNELS` is an
+alias) is the CAPACITY, a transport fact (an ASIO/MADI/Dante endpoint carries 64), not a rig
+detail. The layout's speaker count (4..BWA_MAX_CHANNELS) is the ACTIVE count, fixed per engine
+instance and threaded through the rt core, sinks, monitor, and FDN. `bwa_get_channel_count()`
+reads it back. `BWA_DEFAULT_GRID` (26) is the built-in 3x3x3-minus-center grid that runs with no
+layout_path. A failed explicit layout load leaves `bwa_create` usable on that grid (reason via
+`bwa_last_error`), but `bwa_start` refuses it with `BWA_ERR_LAYOUT` - only `layout_path = NULL`
+runs the default grid. The capacity and the default grid are DIFFERENT numbers since the cap went
+26 -> 64: never use one where you mean the other. Tests that build a core with no layout use
+`BWA_DEFAULT_GRID`; fixed arrays use `BWA_MAX_CHANNELS`; loops use the active count. The rig is
+26 today and may grow to 36, which is a layout file, not a recompile.
 
 The three GUI tools are on the imgui stack — `calib_view` on imgui + implot + implot3d (win32 +
 d3d11, so WINDOWS-ONLY, and it links the ASIO capture shells too), `layout_tool` and `playground`
@@ -803,6 +810,15 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `-lwasi-emulated-process-clocks`) each have a comment in `tools/wasm/wasi-sdk.toolchain.cmake`.
   Also: `os` under wasmtime is the same sleep-lateness flake the Android emulator shows (32/33 then
   33/33 on back-to-back runs); it passes in isolation.
+- **A `Layout` is never a stack local.** Raising the capacity to 64 grew it from 72 KB to 176 KB,
+  almost all of it the 512-tap FIR each `Speaker` embeds. Four tests (`rt_feature`, `dsp`, `xval`,
+  `valid`) then overflowed the 1 MB main-thread stack with exit `0xC00000FD` BEFORE PRINTING
+  ANYTHING, so the log shows a bare SegFault and no failing check. The fix is residency, not a
+  bigger stack: a binding can call in from a 512 KB thread (a macOS secondary thread), and wasm's
+  shadow stack is 1 MB total. So a `Layout` lives in a heap struct (`RtCore`, `bwa_engine`), a
+  calloc (the pure `bwa_*_batch` helpers), or a static in non-reentrant code (tests, tool mains).
+  `layout_default(Layout*)` fills in place because a by-value return is a hidden stack temporary;
+  do not bring the by-value form back. The note above the struct in `layout.h` says the same.
 - **`git apply` INSIDE a repository is a silent no-op for paths outside the current directory.**
   It resolves the patch's paths against the repository root, and "patched paths outside the
   directory are ignored", so `git -C core/deps/flatbuffers apply` (a directory inside the
@@ -837,7 +853,7 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
 - Do not introduce FMOD/Wwise or route audio through the engine's mixer.
 - Do not use Unity's built-in audio (8-channel cap) or the device's WDM/DirectSound
   driver (a consumer path: its own mixing, resampling, and no timing hooks).
-  26 channels requires ASIO. This is settled.
+  The array's channel count (26 on the CAVE) requires ASIO. This is settled.
 - Do not pan via pure ambisonics for localized point sources — the listener moves
   across ~3×3 m and a single sweet spot fails. DBAP is recomputed per frame from
   tracked position. See `docs/spatialization.md`.

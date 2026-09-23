@@ -24,7 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CH   BWA_CHANNELS
+#define CH   BWA_DEFAULT_GRID
 #define RATE 48000u
 
 static int fails = 0;
@@ -143,12 +143,17 @@ static int write_layout_grid(const char* path, int mode) {
 static int write_layout_n(const char* path, int n, int bad_index) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
-    Layout g = layout_default();
+    static Layout g; layout_default(&g);
     fprintf(f, "{ \"speakers\": [\n");
     for (int k = 0; k < n; ++k) {
         int idx = (k == 0 && bad_index >= 0) ? bad_index : k;
-        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]}%s\n", idx,
-                g.speakers[k].pos[0], g.speakers[k].pos[1], g.speakers[k].pos[2], (k == n - 1) ? "" : ",");
+        float p[3];
+        if (k < BWA_DEFAULT_GRID) { p[0] = g.speakers[k].pos[0]; p[1] = g.speakers[k].pos[1]; p[2] = g.speakers[k].pos[2]; }
+        else {   /* past the grid (capacity tests): distinct points on a 2 m ring, stepped in height */
+            const float a = 0.37f * (float)k;
+            p[0] = 2.f * cosf(a); p[1] = 0.5f + 0.5f * (float)(k % 5); p[2] = 2.f * sinf(a);
+        }
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]}%s\n", idx, p[0], p[1], p[2], (k == n - 1) ? "" : ",");
     }
     fprintf(f, "] }\n");
     fclose(f);
@@ -158,28 +163,26 @@ static int write_layout_n(const char* path, int n, int bad_index) {
 /* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape
  * (speakers mount in the band between the screen cube and the truss, so nothing covers the poles).
  * 24 speakers, 1.5 m radius, ear-height listener. */
-static Layout make_barrel(void) {
-    Layout L;
-    memset(&L, 0, sizeof L);
+static void make_barrel(Layout* L) {
+    memset(L, 0, sizeof *L);
     const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
     uint32_t k = 0;
     for (int ri = 0; ri < 3; ++ri)
         for (int a = 0; a < 8; ++a, ++k) {
             const float th = (float)a * 0.785398163f;          /* 8 azimuths, 45 deg apart */
-            L.speakers[k].pos[0] = rad * cosf(th);
-            L.speakers[k].pos[1] = ys[ri];
-            L.speakers[k].pos[2] = rad * sinf(th);
-            L.speakers[k].gain_lin = 1.f;
+            L->speakers[k].pos[0] = rad * cosf(th);
+            L->speakers[k].pos[1] = ys[ri];
+            L->speakers[k].pos[2] = rad * sinf(th);
+            L->speakers[k].gain_lin = 1.f;
         }
-    L.count = k;
-    layout_compute_ref(&L);
-    L.rolloff_r     = 0.7f;
-    L.spcap_focus   = layout_derive_spcap_focus(&L);
-    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
-    L.atten_ref_m   = 1.f;
-    L.atten_rolloff = 1.f;
-    L.atten_min_lin = 0.01f;
-    return L;
+    L->count = k;
+    layout_compute_ref(L);
+    L->rolloff_r     = 0.7f;
+    L->spcap_focus   = layout_derive_spcap_focus(L);
+    L->spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L->atten_ref_m   = 1.f;
+    L->atten_rolloff = 1.f;
+    L->atten_min_lin = 0.01f;
 }
 
 /* i-th of `n` directions on a Fibonacci sphere (near-uniform coverage, no pole clustering) */
@@ -206,14 +209,14 @@ static double nearest_speaker_deg(const Layout* L, const float lis[3], const flo
 
 int main(void) {
     /* 1. default layout */
-    Layout LD = layout_default();
+    static Layout LD; layout_default(&LD);
     CHECK(LD.count == CH, "default layout has 26 speakers");
 
     /* 2. layout_load parse */
     const char* LJ = "bwa_layout.json";
     CHECK(write_layout_json(LJ), "write layout json");
     char err[256] = {0};
-    Layout L;
+    static Layout L;
     CHECK(layout_load(LJ, RATE, &L, err, sizeof err), err[0] ? err : "layout_load");
     CHECK(L.count == CH, "loaded 26 speakers");
     CHECK(fabs(L.rolloff_r - 0.7) < 1e-5, "parsed dbap.rolloff_r");
@@ -327,7 +330,7 @@ int main(void) {
 
     /* 7. align: gain trim halves a channel; delay shifts the impulse */
     {
-        Layout AL = layout_default();
+        static Layout AL; layout_default(&AL);
         AL.speakers[2].gain_lin = 0.5f;
         AL.speakers[3].delay_samples = 4;
         AL.max_delay_samples = 4;
@@ -351,7 +354,7 @@ int main(void) {
 
     /* 7a. per-speaker correction FIR: a channel's kernel convolves its signal (before gain+delay) */
     {
-        Layout EQ = layout_default();
+        static Layout EQ; layout_default(&EQ);
         EQ.speakers[5].eq_len = 3;
         EQ.speakers[5].eq[0] = 0.5f; EQ.speakers[5].eq[1] = 0.25f; EQ.speakers[5].eq[2] = -0.1f;
         Aligner* a = align_create(CH, &EQ, RATE);
@@ -374,7 +377,7 @@ int main(void) {
     /* 7a2. room_eq modal cut: a -6 dB peaking section at 100 Hz attenuates a 100 Hz tone by ~6 dB
      * and leaves 1 kHz (and other channels) alone. Steady-state RMS over the tail (filter settled). */
     {
-        Layout RQ = layout_default();
+        static Layout RQ; layout_default(&RQ);
         RQ.speakers[4].room_eq_count = 1;
         RQ.speakers[4].room_eq[0].fc = 100.f; RQ.speakers[4].room_eq[0].gain_db = -6.f; RQ.speakers[4].room_eq[0].q = 2.f;
         Aligner* a = align_create(CH, &RQ, RATE);
@@ -407,7 +410,7 @@ int main(void) {
      * mid-slew, not already cut), lands at depth, and releases back to flat. Windowed RMS of a 100 Hz
      * tone on the cut channel, block-sized processing like the audio thread. */
     {
-        Layout G = layout_default();
+        static Layout G; layout_default(&G);
         G.rq_grid.npos = 1;              /* align only reads the ladder — rt.c owns the interpolation */
         G.rq_grid.nsec[4]  = 1;
         G.rq_grid.fc[4][0] = 100.f; G.rq_grid.q[4][0] = 2.f;
@@ -452,7 +455,7 @@ int main(void) {
      * lands where it was aimed (fraction included), the rate limit bounds the per-block delay change,
      * and a gliding tap does not click. rt.c owns turning a listener position into these targets. */
     {
-        Layout T = layout_default();                  /* unity gains, zero delays: align is identity */
+        static Layout T; layout_default(&T);                  /* unity gains, zero delays: align is identity */
         Aligner* a  = align_create(CH, &T, RATE);
         Aligner* rf = align_create(CH, &T, RATE);     /* control: never told about the feature */
         CHECK(a != NULL && rf != NULL, "align_create (tracked align)");
@@ -582,7 +585,7 @@ int main(void) {
     /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
     {
         const char* BJ = "bwa_bad_layout.json";
-        Layout B;
+        static Layout B;
         write_layout_with(BJ, 0.0, 0.0, 0.0);     CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "rolloff_r=0 is rejected");
         write_layout_with(BJ, 0.7, 1000.0, 0.0);  CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "gain_db=1000 is rejected");
         write_layout_with(BJ, 0.7, 0.0, 1.0e7);   CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "huge delay_ms is rejected");
@@ -594,7 +597,7 @@ int main(void) {
      * agree on the ladder (depths interpolate by index); static room_eq + grid don't mix. */
     {
         const char* GJ = "bwa_grid_layout.json";
-        Layout B;
+        static Layout B;
         write_layout_grid(GJ, 0);
         CHECK(layout_load(GJ, RATE, &B, err, sizeof err), err[0] ? err : "room_eq_grid layout loads");
         CHECK(B.rq_grid.npos == 2, "room_eq_grid has both positions");
@@ -611,11 +614,11 @@ int main(void) {
         remove(GJ);
     }
 
-    /* 7b3. runtime channel count: the loader accepts 4..26 speakers whose indices form a complete
+    /* 7b3. runtime channel count: the loader accepts 4..BWA_MAX_CHANNELS speakers whose indices form a complete
      * 0..N-1 permutation — the engine's channel count follows the file (BWA_CHANNELS is the cap). */
     {
         const char* NJ = "bwa_n_layout.json";
-        Layout B;
+        static Layout B;
         write_layout_n(NJ, 24, -1);
         CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a 24-speaker layout loads");
         CHECK(B.count == 24, "count follows the file");
@@ -632,6 +635,17 @@ int main(void) {
         }
         write_layout_n(NJ, 3, -1);
         CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "fewer than 4 speakers is rejected");
+        write_layout_n(NJ, BWA_MAX_CHANNELS, -1);
+        CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a capacity-sized layout loads");
+        CHECK(B.count == BWA_MAX_CHANNELS, "a capacity-sized layout keeps every speaker");
+        write_layout_n(NJ, BWA_MAX_CHANNELS + 1, -1);
+        err[0] = 0;
+        CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "more than BWA_MAX_CHANNELS speakers is rejected");
+        {   /* the message names the real cap, not a stale literal */
+            char want[32];
+            snprintf(want, sizeof want, "4..%d entries", (int)BWA_MAX_CHANNELS);
+            CHECK(strstr(err, want) != NULL, "the over-capacity error names BWA_MAX_CHANNELS");
+        }
         write_layout_n(NJ, 24, 24);                       /* index 24 in a 24-speaker file: gap at 0 */
         CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "an index outside 0..N-1 is rejected");
         remove(NJ);
@@ -641,7 +655,7 @@ int main(void) {
     {
         const char* cands[] = { "examples/cave_layout.json", "../examples/cave_layout.json",
                                 "../../examples/cave_layout.json", "../../../examples/cave_layout.json" };
-        Layout EX;
+        static Layout EX;
         int found = 0;
         for (size_t i = 0; i < sizeof cands / sizeof cands[0]; ++i) {
             FILE* probe = fopen(cands[i], "rb");
@@ -691,7 +705,7 @@ int main(void) {
         const double want[3] = { 19.99, 8.75, 4.82 };
         const float  degs[3] = { 30.f, 45.f, 60.f };
         for (int t = 0; t < 3; ++t) {
-            Layout P; memset(&P, 0, sizeof P);
+            static Layout P; memset(&P, 0, sizeof P);
             P.count = 2;
             float a = degs[t] * 3.14159265358979f / 180.f;
             P.speakers[0].pos[0] =  sinf(0.5f*a); P.speakers[0].pos[2] = cosf(0.5f*a);
@@ -704,14 +718,14 @@ int main(void) {
 
         /* a WIDER array wants a broader lobe (lower focus), a DENSER one a tighter lobe. Six
          * speakers on the axes sit 90 deg apart; a 5x5x5 shell is packed tighter than the 3x3x3. */
-        Layout WIDE = LD;
+        static Layout WIDE; WIDE = LD;
         const float ax6[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
         WIDE.count = 6;
         for (int k = 0; k < 6; ++k) for (int j = 0; j < 3; ++j)
             WIDE.speakers[k].pos[j] = LD.ref[j] + 2.f * ax6[k][j];
         float f_wide = layout_derive_spcap_focus(&WIDE);
 
-        Layout DENSE = LD;                                    /* a 12-speaker ring: 30 deg apart, so
+        static Layout DENSE; DENSE = LD;                                    /* a 12-speaker ring: 30 deg apart, so
                                                                * denser than the grid's 37.5 deg */
         DENSE.count = 12;
         for (int k = 0; k < 12; ++k) {
@@ -838,7 +852,7 @@ int main(void) {
          * discarded, so a straight-down plane wave decodes to (near) nothing instead of smearing full
          * power onto the bottom ring. The cube grid (nadir gap ~55°) takes the unfixed path above. */
         {
-            Layout LH;
+            static Layout LH;
             memset(&LH, 0, sizeof LH);
             uint32_t nh = 0;
             for (uint32_t s = 0; s < LD.count; ++s) {
@@ -924,7 +938,7 @@ int main(void) {
          * toward +x plus 6 covering the rest. E(d) = the decoded energy of a plane wave, swept
          * over a Fibonacci sphere; CV = std/mean of E over the sweep. */
         {
-            Layout LC;
+            static Layout LC;
             memset(&LC, 0, sizeof LC);
             uint32_t nc = 0;
             for (int i = 0; i < 10; ++i) {                       /* the cluster: a cap around +x */
@@ -1125,7 +1139,7 @@ int main(void) {
      *     no holes at all) — the floor must engage on the first and be identically inert on the
      *     second, with no per-layout tuning: the knee is the array's own mean speaker spacing. */
     {
-        const Layout LB = make_barrel();
+        static Layout LB; make_barrel(&LB);
         const float lisB[3] = { 0.f, 1.4f, 0.f };                 /* seated ear height in the barrel */
         const float lisG[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };
         const float NADIR[3] = { 0.f, -1.f, 0.f }, ZENITH[3] = { 0.f, 1.f, 0.f };
@@ -1214,7 +1228,7 @@ int main(void) {
         /* a layout-generation change rebuilds the cache too: raise the bottom ring toward ear height
          * and the nadir hole opens wider, so the floor must rise */
         {
-            Layout LB2 = LB;
+            static Layout LB2; LB2 = LB;
             for (uint32_t k = 0; k < 8; ++k) LB2.speakers[k].pos[1] = 1.0f;
             layout_compute_ref(&LB2);
             hole_block(&hb, &LB2, lisB, 2u);

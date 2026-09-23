@@ -90,8 +90,8 @@ int main(void) {
     bwa_commit(e);
     if (bwa_start(e) != 0) { printf("FAIL: bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
 
-    float spk[26 * 3] = { 0 };
-    bwa_get_speakers(e, spk, 26);
+    float spk[BWA_DEFAULT_GRID * 3] = { 0 };
+    bwa_get_speakers(e, spk, BWA_DEFAULT_GRID);
 
     /* ---- dedup + refcount ---- */
     bwa_sound a1 = bwa_sound_acquire(e, MONO, 0);

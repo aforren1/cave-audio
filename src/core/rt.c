@@ -257,7 +257,7 @@ typedef struct {
     float    re_lp[BWA_AMBI_CH];
     /* image-source early reflections (CMD_SET_ISM). Per image: a gliding fractional read into this
      * voice's ism_ring slice, a one-pole HF damping state (walls absorb HF harder), and a ramped
-     * 26-gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
+     * per-speaker gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
      * and walk-correct). All audio-thread-owned; ism_w is the shared ring write index. */
     bool     ism_on, ism_init, ism_tail;   /* enabled / snap the delays this block / ramping out */
     uint32_t ism_w;
@@ -4785,7 +4785,12 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lim_gain  = 1.0f;
     c->lim_att_a = 1.0f - expf(-1.0f / (0.001f * (float)sample_rate));
     c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
-    c->layout  = layout_default();
+    /* PLACEHOLDER geometry: the default grid whatever `channels` is. Every real caller (engine.c,
+     * valid.c) replaces it with rt_set_layout before the first render, and that call refuses a
+     * layout whose count differs from `channels`, so the placeholder cannot survive into a
+     * mismatched mix unless the caller never sets a layout at all. Only channels ==
+     * BWA_DEFAULT_GRID makes it a usable layout on its own (what the tests rely on). */
+    layout_default(&c->layout);
     c->spcap_focus_blk   = c->layout.spcap_focus;     /* seed the block-resolved pair; rt_render */
     c->spcap_density_blk = c->layout.spcap_density;   /* re-resolves it every block */
     /* default listener POSITION = the layout's nominal listening point (re-set when the real
@@ -4807,10 +4812,11 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
 /* Replace the speaker layout. Control thread, call BEFORE bwa_start (or while stopped) —
  * it swaps the aligner the audio thread reads, so it is not safe concurrently with
  * rt_render. Voices recompute their DBAP gains on the next render (created dirty). */
-void rt_set_layout(RtCore* c, const Layout* L) {
-    if (!c || !L) return;
+bool rt_set_layout(RtCore* c, const Layout* L) {
+    if (!c || !L) return false;
+    if (L->count != c->channels) return false;   /* channel count is fixed at create: keep the old layout */
     Aligner* a = align_create(c->channels, L, c->sample_rate);
-    if (!a) return;                         /* keep the old layout on alloc failure */
+    if (!a) return false;                   /* keep the old layout on alloc failure */
     c->layout = *L;
     align_destroy(c->aligner);
     c->aligner = a;
@@ -4824,7 +4830,10 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     c->layout_gen++;                             /* the SPCAP cache self-invalidates on the next gains call */
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
+    return true;
 }
+
+uint32_t rt_channels(const RtCore* c) { return c ? c->channels : 0; }
 
 /* Direct-binaural mode (BWA_PROFILE_BINAURAL): route point voices onto the 16-ch SH accumulator
  * (and, mode 2, their point share onto per-voice mono taps) instead of the speaker panner — see

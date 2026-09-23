@@ -7,8 +7,8 @@ how those numbers reach the engine. The tool is `bwa_calibrate` (`examples/calib
 full-duplex capture is the only part that needs the rig. Terms used here without definition are in
 [glossary.md](./glossary.md).
 
-**Everything here follows the layout's speaker count** (`n`, 4..26; see
-[`layout-schema.md`](./layout-schema.md)), not a hard-wired 26. The capture opens `n` ASIO outputs
+**Everything here follows the layout's speaker count** (`n`, 4..64; see
+[`layout-schema.md`](./layout-schema.md)), not a hard-wired count. The capture opens `n` ASIO outputs
 plus the mic input (which rides buffer slot `n`, or, with `--zylia`, the ZM-1's 19 capsule inputs
 on slots `n`..`n+18`). It sweeps those `n` speakers and writes `n` records back.
 `bwa_calib_view` likewise sizes its plots from each loaded layout. It refuses to Diff two

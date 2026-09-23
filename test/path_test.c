@@ -20,9 +20,9 @@
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256, ORDER = 1;
-    RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
+    RtCore* rt = rt_create(64, 64, SR, BWA_DEFAULT_GRID);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     rt_set_layout(rt, &L);
 
     SteamScene* scene = steam_scene_create(rt, SR, BLK, 64, 0);

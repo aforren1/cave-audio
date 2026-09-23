@@ -4,7 +4,7 @@
  * speakers the engine is ACTUALLY panning with, so a layout that failed to load and fell
  * back to the default grid looks wrong immediately instead of sounding wrong later.
  *
- * The count comes from the layout, never from a constant. BWA_CHANNELS (26) is the
+ * The count comes from the layout, never from a constant. BWA_MAX_CHANNELS (64) is the
  * compile-time capacity; a 24-speaker rig loads into the same binary.
  */
 #pragma once

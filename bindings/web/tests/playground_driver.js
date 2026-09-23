@@ -16,6 +16,11 @@ const ok = (m) => notes.push("ok   " + m);
 const fail = (m) => notes.push("FAIL " + m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* BWA_DEFAULT_GRID, the page's layout when nothing was uploaded. A literal because this is a
+ * classic script the runner injects and it cannot import the binding; constants.test.mjs pins the
+ * exported value to the same number, so the two cannot drift apart unnoticed. */
+const DEFAULT_GRID = 26;
+
 const db = (x) => (20 * Math.log10(Math.max(x, 1e-9))).toFixed(1);
 
 /* The bound on "a stimulus change is heard". One engine block is 5.3 ms, the worklet sink's own
@@ -55,10 +60,12 @@ async function main() {
   else ok(`backend "${s.backend}"`);
   if (s.sinkType !== 9) fail(`sink type ${s.sinkType}, expected 9 (WORKLET)`);
   else ok("sink type 9 (WORKLET)");
-  if (s.channelCount !== 26) fail(`${s.channelCount} bus channels, expected the 26 of the CAVE layout`);
-  else ok("26 bus channels");
-  if (s.speakerCount !== 26) fail(`bwa_get_speakers gave ${s.speakerCount} speakers, expected 26`);
-  else ok("bwa_get_speakers read back 26 speaker positions");
+  if (s.channelCount !== DEFAULT_GRID)
+    fail(`${s.channelCount} bus channels, expected the ${DEFAULT_GRID} of the default grid`);
+  else ok(`${DEFAULT_GRID} bus channels`);
+  if (s.speakerCount !== DEFAULT_GRID)
+    fail(`bwa_get_speakers gave ${s.speakerCount} speakers, expected ${DEFAULT_GRID}`);
+  else ok(`bwa_get_speakers read back ${DEFAULT_GRID} speaker positions`);
 
   /* ---- SCENE 1: the coordinate seam, on screen and in the ears ---- */
   await pg.selectScene("localization");
@@ -352,7 +359,7 @@ async function main() {
     else ok(`after the rebuild the AudioWorklet is driving again (device_lost 0 after ${live.toFixed(0)} ms)`);
   }
   /* The cones ARE dark in this profile, and that is correct rather than broken: point voices never
-   * reach the 26-channel bus here. The page has to say so where the cones are. */
+   * reach the array bus here. The page has to say so where the cones are. */
   {
     const v = pg.state().view;
     if (!/bypass the bus/.test(String(v.status)) || !/binaural/.test(String(v.meterText)))
@@ -482,14 +489,14 @@ async function layoutChecks(pg) {
   if (refused !== false) fail("the engine accepted a layout with gain_db 99");
   else if (!after.errors.some((e) => /refused that layout/.test(e)))
     fail(`the page did not report the engine's refusal: ${after.errors.join(" | ")}`);
-  else if (after.speakerCount !== 26)
+  else if (after.speakerCount !== DEFAULT_GRID)
     fail(`after the refusal the page is on a ${after.speakerCount}-speaker layout, not the default grid`);
   else if (after.health && after.health.deviceLost !== 0)
     fail("after the refusal the sink is host-pacing silence");
   else ok(`an engine-refused layout is reported and the page falls back to the default grid`);
 
   await pg.loadLayout(null, null);
-  if (pg.state().speakerCount !== 26) fail("the page did not go back to the 26-speaker grid");
+  if (pg.state().speakerCount !== DEFAULT_GRID) fail("the page did not go back to the default grid");
   else ok("the page goes back to the default grid");
 }
 

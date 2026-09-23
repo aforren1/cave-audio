@@ -57,11 +57,12 @@ typedef struct {
 } Voice;
 ```
 
-`BWA_CHANNELS` (26) is defined in [`src/sink/sink.h`](../src/sink/sink.h) and is the
-**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs (gain
+`BWA_CHANNELS` is defined in [`src/sink/sink.h`](../src/sink/sink.h) as an alias of the
+public `BWA_MAX_CHANNELS` (64), and is the **capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs (gain
 vectors, the bed decode matrix, the meters) is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
-speaker count (`Layout.count`, 4..26; 26 for the default grid). `bwa_create`
+speaker count (`Layout.count`, 4..`BWA_CHANNELS`; `BWA_DEFAULT_GRID` for the default grid).
+The default grid's count is not the capacity: never use one where you mean the other. `bwa_create`
 resolves it *before* `rt_create`, and it stays fixed for the engine's lifetime. It is
 what `bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
 `BWA_CHANNELS`: the tail entries belong to no speaker.
@@ -158,8 +159,7 @@ See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
 while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
 channel count. The loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
 complete `0..count-1` permutation. A layout with fewer than `BWA_CHANNELS` speakers
-leaves the tail `speakers[]` entries at the default grid's values (harmless:
-`count` gates every consumer). From [`src/core/layout.h`](../src/core/layout.h):
+leaves the tail `speakers[]` entries unused (harmless: `count` gates every consumer). From [`src/core/layout.h`](../src/core/layout.h):
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */

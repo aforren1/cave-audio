@@ -50,9 +50,9 @@ static void ring(float* pos, uint32_t n, float r) {
 
 /* ---- bwa_spcap_focus_default ---- */
 static void test_focus_default(void) {
-    float pos[BWA_CHANNELS * 3];
+    float pos[BWA_MAX_CHANNELS * 3];
     uint32_t n = cube_grid(pos);
-    CHECK(n == 26, "the fixture grid is 26 speakers");
+    CHECK(n == BWA_DEFAULT_GRID, "the fixture grid is the 26-speaker default grid");
 
     float f = bwa_spcap_focus_default(pos, n);
     printf("      cube grid derives focus %.4f\n", (double)f);
@@ -62,7 +62,7 @@ static void test_focus_default(void) {
      * The public one builds its Layout from `positions` and centers it with layout_compute_ref,
      * so an identically-built Layout must give the identical float. */
     {
-        Layout L;
+        static Layout L;
         memset(&L, 0, sizeof L);
         L.count = n;
         for (uint32_t s = 0; s < n; ++s) {
@@ -80,13 +80,13 @@ static void test_focus_default(void) {
     CHECK(bwa_spcap_focus_default(NULL, n) == 0.f,               "NULL positions returns 0");
     CHECK(bwa_spcap_focus_default(pos, 0) == 0.f,                "n = 0 returns 0");
     CHECK(bwa_spcap_focus_default(pos, 1) == 0.f,                "n = 1 (nothing to separate) returns 0");
-    CHECK(bwa_spcap_focus_default(pos, BWA_CHANNELS + 1) == 0.f, "n > BWA_CHANNELS returns 0");
+    CHECK(bwa_spcap_focus_default(pos, BWA_MAX_CHANNELS + 1) == 0.f, "n > BWA_MAX_CHANNELS returns 0");
     CHECK(bwa_spcap_focus_default(pos, 2) > 0.f,                 "n = 2 is the smallest measurable array");
 
     /* sparser array, broader lobe. Two rings at the same radius, 6 versus 24 speakers: the only
      * thing that differs is the angular spacing. */
     {
-        float wide[BWA_CHANNELS * 3], dense[BWA_CHANNELS * 3];
+        float wide[BWA_MAX_CHANNELS * 3], dense[BWA_MAX_CHANNELS * 3];
         ring(wide,  6, 2.0f);
         ring(dense, 24, 2.0f);
         float fw = bwa_spcap_focus_default(wide, 6);
@@ -114,7 +114,7 @@ static double power(const float* g, uint32_t n) {
 }
 
 static void test_batch_focus(void) {
-    float pos[BWA_CHANNELS * 3];
+    float pos[BWA_MAX_CHANNELS * 3];
     uint32_t n = cube_grid(pos);
     const float lis[3]  = { 0.f, 1.5f, 0.f };            /* the grid's sweet spot */
     /* two off-axis bearings, both INSIDE the default 1 m attenuation reference, so the solve's
@@ -122,7 +122,7 @@ static void test_batch_focus(void) {
     const float srcs[6] = {  0.55f, 1.85f, 0.40f,
                             -0.45f, 1.20f, 0.60f };
     const uint32_t nsrc = 2;
-    float g_def[2 * BWA_CHANNELS], g_lo[2 * BWA_CHANNELS], g_hi[2 * BWA_CHANNELS];
+    float g_def[2 * BWA_MAX_CHANNELS], g_lo[2 * BWA_MAX_CHANNELS], g_hi[2 * BWA_MAX_CHANNELS];
 
     float derived = bwa_spcap_focus_default(pos, n);
 
@@ -144,7 +144,7 @@ static void test_batch_focus(void) {
     /* THE SENTINEL: focus <= 0 must reproduce, bit for bit, what passing the derived value gives.
      * This is what pins the public default to the public derivation. */
     {
-        float g_sent[2 * BWA_CHANNELS], g_expl[2 * BWA_CHANNELS];
+        float g_sent[2 * BWA_MAX_CHANNELS], g_expl[2 * BWA_MAX_CHANNELS];
         bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, nsrc,  0.f,     0.f, g_sent);
         bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, nsrc, derived, 2.f, g_expl);
         int same = 1;
@@ -159,12 +159,12 @@ static void test_batch_focus(void) {
 
         /* the sentinel derives from the CALLER's array, not the default grid: a ring whose derived
          * focus differs must still agree with its own bwa_spcap_focus_default */
-        float rpos[BWA_CHANNELS * 3];
+        float rpos[BWA_MAX_CHANNELS * 3];
         ring(rpos, 12, 2.0f);
         float rderived = bwa_spcap_focus_default(rpos, 12);
         printf("      12-speaker ring derives %.3f (grid derives %.3f)\n", (double)rderived, (double)derived);
         CHECK(fabsf(rderived - derived) > 0.5f, "the ring's derived focus really differs from the grid's");
-        float r_sent[2 * BWA_CHANNELS], r_expl[2 * BWA_CHANNELS];
+        float r_sent[2 * BWA_MAX_CHANNELS], r_expl[2 * BWA_MAX_CHANNELS];
         bwa_panner_gains_batch(BWA_PAN_SPCAP, rpos, 12, lis, srcs, nsrc, 0.f,       0.f, r_sent);
         bwa_panner_gains_batch(BWA_PAN_SPCAP, rpos, 12, lis, srcs, nsrc, rderived, 2.f, r_expl);
         same = 1;
@@ -175,7 +175,7 @@ static void test_batch_focus(void) {
     /* density reaches the placement correction (the cache is per-call, so this also proves the
      * batch does not carry a stale c[] across calls) */
     {
-        float g_d1[2 * BWA_CHANNELS], g_d2[2 * BWA_CHANNELS];
+        float g_d1[2 * BWA_MAX_CHANNELS], g_d2[2 * BWA_MAX_CHANNELS];
         bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, nsrc, derived, 1.0f, g_d1);
         bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, nsrc, derived, 6.0f, g_d2);
         double dmax = 0;
@@ -191,7 +191,7 @@ static void test_batch_focus(void) {
         const bwa_panner other[2] = { BWA_PAN_DBAP, BWA_PAN_VBAP };
         const char* nm[2] = { "DBAP", "VBAP" };
         for (int p = 0; p < 2; ++p) {
-            float a[2 * BWA_CHANNELS], b[2 * BWA_CHANNELS], c[2 * BWA_CHANNELS];
+            float a[2 * BWA_MAX_CHANNELS], b[2 * BWA_MAX_CHANNELS], c[2 * BWA_MAX_CHANNELS];
             bwa_panner_gains_batch(other[p], pos, n, lis, srcs, nsrc,  0.f,  0.f, a);
             bwa_panner_gains_batch(other[p], pos, n, lis, srcs, nsrc, 40.f,  6.f, b);
             bwa_panner_gains_batch(other[p], pos, n, lis, srcs, nsrc,  1.5f, 0.1f, c);
@@ -205,15 +205,15 @@ static void test_batch_focus(void) {
 
     /* argument guards survive the widened signature */
     {
-        float g[2 * BWA_CHANNELS];
+        float g[2 * BWA_MAX_CHANNELS];
         CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, NULL, n, lis, srcs, nsrc, 0.f, 0.f, g) == 0,
               "NULL positions returns 0");
         CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, NULL, srcs, nsrc, 0.f, 0.f, g) == 0,
               "NULL listener returns 0");
         CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, nsrc, 0.f, 0.f, NULL) == 0,
               "NULL out returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, BWA_CHANNELS + 1, lis, srcs, nsrc, 0.f, 0.f, g) == 0,
-              "n > BWA_CHANNELS returns 0");
+        CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, BWA_MAX_CHANNELS + 1, lis, srcs, nsrc, 0.f, 0.f, g) == 0,
+              "n > BWA_MAX_CHANNELS returns 0");
         CHECK(bwa_panner_gains_batch(BWA_PAN_SPCAP, pos, n, lis, srcs, 0, 0.f, 0.f, g) == 0,
               "nsrc = 0 returns 0");
     }

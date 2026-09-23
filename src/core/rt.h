@@ -199,7 +199,11 @@ typedef struct RtCore RtCore;   /* opaque */
 /* ---- lifecycle (control thread; allocates) ---- */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
-void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bwa_start / while stopped */
+/* Replace the layout. REFUSES (returns false, keeps the old layout) when L->count differs from the
+ * channels passed to rt_create: the channel count is fixed for the core's life, and a mismatch would
+ * run the mixer over zeroed speakers at the origin or drop real ones. Call before bwa_start. */
+bool    rt_set_layout(RtCore* c, const Layout* L);
+uint32_t rt_channels(const RtCore* c);              /* the active channel count fixed at rt_create */
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
 /* Direct-binaural render (BWA_PROFILE_BINAURAL): point voices SH-encode at their true listener-
  * relative direction into a 16-ch ambisonic accumulator (phonon monitor basis, ambi_encode_phonon)

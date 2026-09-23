@@ -66,18 +66,18 @@ struct View {
     char   status[512];
 
     /* derived, refreshed on load (not per frame) */
-    float  gainA_db[BWA_CHANNELS], delayA_ms[BWA_CHANNELS];
-    float  gainB_db[BWA_CHANNELS], delayB_ms[BWA_CHANNELS];
-    float  ax[BWA_CHANNELS], ay[BWA_CHANNELS], az[BWA_CHANNELS];    /* 3D plot coords (room x, z, y-up) */
-    float  bx[BWA_CHANNELS], by[BWA_CHANNELS], bz[BWA_CHANNELS];
-    float  dpos_mm[BWA_CHANNELS];
+    float  gainA_db[BWA_MAX_CHANNELS], delayA_ms[BWA_MAX_CHANNELS];
+    float  gainB_db[BWA_MAX_CHANNELS], delayB_ms[BWA_MAX_CHANNELS];
+    float  ax[BWA_MAX_CHANNELS], ay[BWA_MAX_CHANNELS], az[BWA_MAX_CHANNELS];    /* 3D plot coords (room x, z, y-up) */
+    float  bx[BWA_MAX_CHANNELS], by[BWA_MAX_CHANNELS], bz[BWA_MAX_CHANNELS];
+    float  dpos_mm[BWA_MAX_CHANNELS];
     float  eqfreq[EQ_PTS];
-    float  eqmagA[BWA_CHANNELS][EQ_PTS];                          /* dB; only valid where eq_len > 0 */
-    float  eqmagB[BWA_CHANNELS][EQ_PTS];                          /* B too: reviewing what calibration WROTE */
+    float  eqmagA[BWA_MAX_CHANNELS][EQ_PTS];                          /* dB; only valid where eq_len > 0 */
+    float  eqmagB[BWA_MAX_CHANNELS][EQ_PTS];                          /* B too: reviewing what calibration WROTE */
 
-    SoundData ir[BWA_CHANNELS];
-    bool      hasIR[BWA_CHANNELS];
-    float     ir_ms[BWA_CHANNELS];                                /* peak time of each loaded IR */
+    SoundData ir[BWA_MAX_CHANNELS];
+    bool      hasIR[BWA_MAX_CHANNELS];
+    float     ir_ms[BWA_MAX_CHANNELS];                                /* peak time of each loaded IR */
     int       ir_n;
 
     int    sel;                                                  /* selected speaker */
@@ -154,7 +154,7 @@ static void load_layout(int which) {                             /* 0 = A, 1 = B
 static void load_irs(void) {
     char err[256], p[600];
     V.ir_n = 0;
-    uint32_t n = V.hasA ? V.A.count : BWA_CHANNELS;
+    uint32_t n = V.hasA ? V.A.count : BWA_MAX_CHANNELS;
     for (uint32_t i = 0; i < n; ++i) {
         if (V.hasIR[i]) { sound_unload(&V.ir[i]); V.hasIR[i] = false; }
         snprintf(p, sizeof p, "%s_%02u.wav", V.irprefix, i);
@@ -221,7 +221,7 @@ static void tab_array(void) {
     }
     if (V.hasB) {
         ImPlot3D::PlotScatter("B", V.bx, V.by, V.bz, (int)V.B.count);
-        static float seg[3][2 * BWA_CHANNELS];                    /* A->B delta segments (same array only) */
+        static float seg[3][2 * BWA_MAX_CHANNELS];                    /* A->B delta segments (same array only) */
         if (V.diffable) {
         for (uint32_t i = 0; i < V.B.count; ++i) {
             seg[0][2*i] = V.ax[i]; seg[0][2*i+1] = V.bx[i];
@@ -351,9 +351,9 @@ struct CapJob {
     std::atomic<int>  done_count;
     std::atomic<bool> cancel;
     std::atomic<int>  n;                             /* speaker count (worker sets; UI reads concurrently) */
-    float    arrival_ms[BWA_CHANNELS], level[BWA_CHANNELS], rt60[BWA_CHANNELS];
-    uint16_t eqlen[BWA_CHANNELS];
-    float    gain_db[BWA_CHANNELS], trim_ms[BWA_CHANNELS];   /* the solve, valid when state == 2 */
+    float    arrival_ms[BWA_MAX_CHANNELS], level[BWA_MAX_CHANNELS], rt60[BWA_MAX_CHANNELS];
+    uint16_t eqlen[BWA_MAX_CHANNELS];
+    float    gain_db[BWA_MAX_CHANNELS], trim_ms[BWA_MAX_CHANNELS];   /* the solve, valid when state == 2 */
     char     msg[256];
 
     std::thread th;
@@ -382,14 +382,14 @@ static void cap_fail(const char* m) { snprintf(J.msg, sizeof J.msg, "%s", m); J.
 
 static void cap_worker(void) {
     char err[256];
-    Layout L;
+    static Layout L;          /* never a stack local (layout.h); one capture job at a time */
     if (!layout_load(J.ran_layout, (uint32_t)CAL_FS, &L, err, sizeof err)) { cap_fail(err); return; }
     const int n = (int)L.count;
     J.n.store(n);
     static float sweep[CAL_NSWEEP], cap[CAL_CAPLEN], irbuf[CAL_IRLEN];   /* one job at a time; off the stack */
-    static float eq_taps[(size_t)BWA_CHANNELS * BWA_EQ_TAPS];
-    static uint16_t eq_lens[BWA_CHANNELS];
-    static MeasureResult res[BWA_CHANNELS];
+    static float eq_taps[(size_t)BWA_MAX_CHANNELS * BWA_EQ_TAPS];
+    static uint16_t eq_lens[BWA_MAX_CHANNELS];
+    static MeasureResult res[BWA_MAX_CHANNELS];
     memset(eq_lens, 0, sizeof eq_lens);
     measure_sweep(sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS);
 
@@ -443,8 +443,8 @@ static void cap_worker(void) {
     if (asio_up) calib_asio_close();
 #endif
 
-    float gdb[BWA_CHANNELS], dms[BWA_CHANNELS];
-    static float pos[BWA_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
+    float gdb[BWA_MAX_CHANNELS], dms[BWA_MAX_CHANNELS];
+    static float pos[BWA_MAX_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
     for (int i = 0; i < n; ++i) { pos[i][0] = L.speakers[i].pos[0]; pos[i][1] = L.speakers[i].pos[1]; pos[i][2] = L.speakers[i].pos[2]; }
     calib_solve(res, pos, J.mic, n, CAL_FS, gdb, dms);
     memcpy(J.gain_db, gdb, sizeof gdb);
@@ -524,7 +524,7 @@ static void tab_capture(void) {
 
     int dc = J.done_count.load(std::memory_order_acquire);
     int jn = J.n.load();
-    int n  = jn > 0 ? jn : BWA_CHANNELS;
+    int n  = jn > 0 ? jn : BWA_MAX_CHANNELS;
     char ov[64]; snprintf(ov, sizeof ov, "%d / %d speakers", dc, n);
     ImGui::ProgressBar((float)dc / (float)n, ImVec2(-1, 0), ov);
     if (st == 3) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED: %s", J.msg);
@@ -1429,7 +1429,7 @@ int main(int argc, char** argv) {
     destroy_device();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    for (int i = 0; i < BWA_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
+    for (int i = 0; i < BWA_MAX_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
     if (Z.live) zylia_capture_close();
     if (J.th_live) { J.cancel.store(true); J.th.join(); }        /* reap a still-running capture job */
     return rc;

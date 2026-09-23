@@ -250,30 +250,38 @@ static void null_engine_sweep(void) {
 
     /* engine-free pure calls: NULL/zero/degenerate arguments must answer 0/false, never crash */
     {
-        float pos[26 * 3] = { 0 }, lis[3] = { 0 }, srcs[3] = { 0, 1, 2 }, out[26];
-        for (int i = 0; i < 26; ++i) { pos[i * 3] = (float)(i % 5); pos[i * 3 + 1] = 1.f + (float)(i % 3); pos[i * 3 + 2] = (float)(i % 7); }
-        CHECK(bwa_spcap_focus_default(NULL, 26) == 0.f, "spcap default: NULL positions reads 0");
+        /* sized one PAST capacity, so the n > capacity calls below pass a buffer that really holds n
+         * speakers: the refusal must come from the capacity check, not from a short buffer */
+        enum { NS = BWA_DEFAULT_GRID, OVER = BWA_MAX_CHANNELS + 1 };
+        float pos[OVER * 3] = { 0 }, lis[3] = { 0 }, srcs[3] = { 0, 1, 2 }, out[OVER];
+        for (int i = 0; i < OVER; ++i) { pos[i * 3] = (float)(i % 5); pos[i * 3 + 1] = 1.f + (float)(i % 3); pos[i * 3 + 2] = (float)(i % 7); }
+        CHECK(bwa_spcap_focus_default(NULL, NS) == 0.f, "spcap default: NULL positions reads 0");
         CHECK(bwa_spcap_focus_default(pos, 1) == 0.f, "spcap default: n < 2 reads 0");
-        CHECK(bwa_spcap_focus_default(pos, 27) == 0.f, "spcap default: n > capacity reads 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, NULL, 26, lis, srcs, 1, 0, 0, out) == 0,
+        CHECK(bwa_spcap_focus_default(pos, OVER) == 0.f, "spcap default: n > capacity reads 0");
+        /* controls: the SAME buffer at exactly capacity is answered, so the two OVER refusals are the
+         * capacity branch and not something about these positions */
+        CHECK(bwa_spcap_focus_default(pos, OVER - 1) > 0.f, "spcap default: n = capacity is answered");
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, OVER - 1, lis, srcs, 1, 0, 0, out) == 1,
+              "panner batch: n = capacity is answered");
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, NULL, NS, lis, srcs, 1, 0, 0, out) == 0,
               "panner batch: NULL positions returns 0");
         CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 0, lis, srcs, 1, 0, 0, out) == 0,
               "panner batch: n = 0 returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 27, lis, srcs, 1, 0, 0, out) == 0,
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, OVER, lis, srcs, 1, 0, 0, out) == 0,
               "panner batch: n > capacity returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 26, NULL, srcs, 1, 0, 0, out) == 0,
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, NS, NULL, srcs, 1, 0, 0, out) == 0,
               "panner batch: NULL listener returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 26, lis, NULL, 1, 0, 0, out) == 0,
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, NS, lis, NULL, 1, 0, 0, out) == 0,
               "panner batch: NULL sources returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 26, lis, srcs, 0, 0, 0, out) == 0,
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, NS, lis, srcs, 0, 0, 0, out) == 0,
               "panner batch: nsrc = 0 returns 0");
-        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, 26, lis, srcs, 1, 0, 0, NULL) == 0,
+        CHECK(bwa_panner_gains_batch(BWA_PAN_DBAP, pos, NS, lis, srcs, 1, 0, 0, NULL) == 0,
               "panner batch: NULL out returns 0");
-        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, NULL, 26, srcs, 1, out) == 0,
+        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, NULL, NS, srcs, 1, out) == 0,
               "bed batch: NULL positions returns 0");
-        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, 26, NULL, 1, out) == 0,
+        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, NS, NULL, 1, out) == 0,
               "bed batch: NULL directions returns 0");
-        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, 26, srcs, 0, out) == 0,
+        CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, NS, srcs, 0, out) == 0,
               "bed batch: ndir = 0 returns 0");
     }
     {

@@ -3,11 +3,11 @@
  *
  * This code runs on the audio thread of every backend, and CI has no device to catch it on, so
  * the whole thing is pinned here: each format in both layouts, the clamps at and past full
- * scale, the NaN rule, and a 26-channel interleave round trip at the FIFO's stride (the shape
+ * scale, the NaN rule, and a capacity-width interleave round trip at the FIFO's stride (the shape
  * sink_quant hands a backend, where the channel stride is NOT nframes).
  */
 #include "sink/sink_convert.h"
-#include "sink/sink.h"          /* BWA_CHANNELS: the round trip runs at the real bus width */
+#include "sink/sink.h"          /* BWA_CHANNELS (capacity): the round trip runs at the widest bus */
 
 #include <math.h>
 #include <stdio.h>
@@ -151,7 +151,7 @@ static void test_round_trip_26ch_strided(void) {
 
     for (int c = 0; c < CH; ++c)
         for (int i = 0; i < STRIDE; ++i)
-            bus[c * STRIDE + i] = (float)(c * 1000 + i) / 32768.0f;   /* unique, in range */
+            bus[c * STRIDE + i] = (float)(c * 1000 + i) / 65536.0f;   /* unique, in range up to 65 channels */
 
     sink_convert_interleaved(ilv, bus, CH, N, STRIDE, SINK_FMT_F32);
     memset(out, 0, sizeof out);
@@ -162,7 +162,7 @@ static void test_round_trip_26ch_strided(void) {
     for (int c = 0; c < CH; ++c)
         for (int i = 0; i < N; ++i)
             CHECK(out[c * STRIDE + i] == bus[c * STRIDE + i],
-                  "26-ch round trip ch%d frame%d: %f vs %f", c, i,
+                  "%d-ch round trip ch%d frame%d: %f vs %f", (int)CH, c, i,
                   (double)out[c * STRIDE + i], (double)bus[c * STRIDE + i]);
 
     /* Frames past the request must be untouched — a backend converts only what the device asked

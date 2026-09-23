@@ -43,6 +43,8 @@ Same split as `bindings/python`, for the same reason.
 - **`src/raw.js` is the raw layer.** One function per C entry point, named by its C name minus the
   `bwa_` prefix, with the header's arguments in the header's order and units. The table it is built
   from is generated out of `include/bw_audio.h` by `tools/wasm/gen-abi.mjs`, so it cannot drift.
+  The same generator exports `CONSTANTS`: every plain integer `#define BWA_<NAME>` in the header,
+  keyed by the name minus `BWA_`. So `CONSTANTS.MAX_CHANNELS` is `BWA_MAX_CHANNELS`.
 - **`src/engine.js` is the idiomatic layer.** `Engine`, `Sound`, `Source`, `PushSource`, `Bed`,
   `Listener`, with the auto-commit model the Python layer has: a commit-gated write lands at once,
   unless you are inside `frame()`, which defers to one commit at the block's exit.
@@ -113,7 +115,19 @@ number means a burst of frames collapses to its newest state rather than replayi
 
 ```js
 import { BwaEngine, Profile, SinkType, SinkFlags, BwaError } from "./dist/index.js";
+import { MAX_CHANNELS, DEFAULT_GRID, CHANNEL_AUTO, GROUPS, EXTRA_LIS } from "./dist/index.js";
 ```
+
+The second line is the header's integer constants, read from the generated table rather than
+copied. Two of them size things:
+
+- `MAX_CHANNELS` (`BWA_MAX_CHANNELS`, 64) is the array CAPACITY. Size a static per-speaker buffer
+  with it.
+- `DEFAULT_GRID` (`BWA_DEFAULT_GRID`, 26) is the speaker count of the built-in grid, which the
+  engine runs with no layout file.
+
+The ACTIVE count is `engine.info.channelCount`: the layout's speaker count, anywhere from 4 to
+`MAX_CHANNELS`. `CONSTANTS`, the whole table, is exported too.
 
 ### `BwaEngine.create(opts) -> Promise<BwaEngine>`
 
@@ -193,7 +207,7 @@ With any `out` the result is `{value, out: [TypedArray, ...]}`, one entry per `o
 order. With none it is the call's own return.
 
 ```js
-const r = await engine.invokeBuf("get_bus_levels", { out: "f32", len: 26 }, 26);
+const r = await engine.invokeBuf("get_bus_levels", { out: "f32", len: MAX_CHANNELS }, MAX_CHANNELS);
 r.value;     // the count filled
 r.out[0];    // a Float32Array of the last block's per-channel peaks
 
@@ -303,15 +317,15 @@ Six scenes, each self-contained and switchable from the panel:
 | scene | what it shows |
 |-------|---------------|
 | Localization | a click orbiting your head, draggable, with the panner, spread, dual band, Doppler and air absorption knobs |
-| Channel walk | `bwa_set_test_signal` on one bus channel at a time, with the 26 speaker gizmos lit from `bwa_get_bus_levels` |
+| Channel walk | `bwa_set_test_signal` on one bus channel at a time, with the speaker gizmos lit from `bwa_get_bus_levels` |
 | Occlusion and materials | a wall as a dynamic mesh with a material, and the ray tracer's own occlusion factor |
 | Directivity | the weighted-dipole patterns, with `bwa_source_get_directivity` under the drawing of the lobe |
 | Medium boundary | the underwater interface loss, the muffle, the speed of sound and the surface's inverted bounce |
 | Blind A/B/X | two settings of one knob, a hidden X, and a one-sided binomial p-value |
 
 The default profile is `BWA_PROFILE_CAVE_SIM`, because the playground is the CAVE auditioned: every
-point source pans through the real DBAP, SPCAP or VBAP solve into the 26-channel bus, and the bus is
-HRTF-decoded to stereo. So a lit cone is a channel the panner really solved for.
+point source pans through the real DBAP, SPCAP or VBAP solve into the array bus (one channel per
+speaker), and the bus is HRTF-decoded to stereo. So a lit cone is a channel the panner really solved for.
 `BWA_PROFILE_BINAURAL` is in the picker beside it and rebuilds the engine, which is a create-time
 change. The channel walk forces CAVE_SIM for itself, because the binaural profile has no bus to
 walk.
@@ -368,7 +382,7 @@ no starve while the audio thread renders straight through it.
 
 The panel takes a `cave_layout.json` (the format is [docs/layout-schema.md](../../docs/layout-schema.md),
 and `examples/cave_layout.json` is the reference) and rebuilds the array on it. The page checks the
-three mistakes anyone makes first - not JSON, a count outside 4 to 26, a position that is not a
+three mistakes anyone makes first - not JSON, a count outside 4 to `MAX_CHANNELS` (64), a position that is not a
 number - and the engine is the authority for the rest: a file it refuses is reported with its own
 `bwa_last_error` text and the page falls back to the default grid, because an engine whose
 `bwa_start` refused is an engine nobody can hear. The cones are placed from `bwa_get_speakers`
@@ -396,7 +410,7 @@ medium, and no room tail.
 
 With no file uploaded the engine runs its default grid, which IS the geometry
 `examples/cave_layout.json` describes, speaker for speaker: a 3 by 3 by 3 boundary grid at plus or
-minus 1.5 m with `y` at 0, 1.5 and 3, minus the center, 26 in all. The only thing the file adds is
+minus 1.5 m with `y` at 0, 1.5 and 3, minus the center, 26 in all (`DEFAULT_GRID`). The only thing the file adds is
 the measured per-speaker delay trim, which nothing in a browser demo can hear. The page reads the
 positions back with `bwa_get_speakers` rather than assuming them, so the gizmos are the engine's
 layout whatever it turns out to be.
@@ -413,7 +427,7 @@ the orbit is 30 lines in `world.js`, which is one fewer file to pin.
 
 ## XR
 
-`xr/index.html` is the playground with your head in it. Same engine, same scenes, same 26-channel
+`xr/index.html` is the playground with your head in it. Same engine, same scenes, same array
 bus. What it adds is the one thing headphones and a mouse cannot show you: in an `immersive-vr`
 session the viewer pose from every XR animation frame becomes the engine's listener pose, position
 and orientation both, so the binaural render follows your head and a source stays where it is in
@@ -577,6 +591,9 @@ node --test bindings/web/tests
 They run against the module that was just built, under node, with the null and manual sinks: the
 generated table against the module's real exports, engine lifecycle and the commit model on the null
 sink, and a manual-sink render that pins laterality and the frame slab against real samples.
+`constants.test.mjs` needs no module: it pins `MAX_CHANNELS` and `DEFAULT_GRID` in the generated
+table, so a header edit the generator cannot parse fails a test instead of handing a page
+`undefined`.
 
 The AudioWorklet sink needs a browser, so it has its own check:
 
@@ -605,7 +622,7 @@ node bindings/web/tests/run-playground.mjs         # or directly
 script tag to the playground's HTML for a request carrying `?__drive=1`, so the page a visitor loads
 carries no test code and the check still drives the real page through `window.__bwaPlayground`, the
 hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with 26
-bus channels read back from `bwa_get_speakers`, and the Start panel is gone with a status line in
+(`BWA_DEFAULT_GRID`) bus channels read back from `bwa_get_speakers`, and the Start panel is gone with a status line in
 its place; a source at room `+x` draws on the left of the screen AND is louder in the left ear,
 measured by rendering the page's own click through a second engine on the manual sink
 (`playground/probe.js`); the speaker cones and both meter strips MOVE while the default click train

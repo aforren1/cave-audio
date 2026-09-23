@@ -22,7 +22,7 @@
 #include <string.h>
 
 #define N    256
-#define CH   BWA_CHANNELS
+#define CH   BWA_DEFAULT_GRID
 #define RATE 48000u
 
 static float  bus[CH * N];
@@ -68,7 +68,7 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
 
 int main(void) {
-    LD = layout_default();
+    layout_default(&LD);
     const char* WAV_LONG  = "bwa_snd_long.wav";
     const char* WAV_SHORT = "bwa_snd_short.wav";
     if (!write_const_wav(WAV_LONG, 0.5f, 4 * N) || !write_const_wav(WAV_SHORT, 1.0f, 100)) {

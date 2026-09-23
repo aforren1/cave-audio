@@ -47,7 +47,7 @@ for a source that must not move when the listener does.
 ## What the phantom is rendered by
 
 A real engine core. `valid_speaker_feeds` places a push voice at the source, parks the listener at
-the solve position, sets the knobs, and pumps blocks through `rt_render` into the 26-channel speaker
+the solve position, sets the knobs, and pumps blocks through `rt_render` into the speaker
 bus, after `align.c`'s per-speaker trim and delay. What comes back out is what the array would emit.
 
 That matters because the shipping render is much more than a panner solve: dual-band and CAP

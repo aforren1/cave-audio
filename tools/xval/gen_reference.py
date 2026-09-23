@@ -48,7 +48,7 @@ from scipy.signal import bilinear, lfilter
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "..", "test", "xval_data.h")
 AMBI_CH = 16          # 3rd order, (N+1)^2
-CH = 26               # BWA_CHANNELS
+CH = 26               # BWA_DEFAULT_GRID: the golden data is the built-in 26-speaker grid
 RNG = np.random.default_rng(20260712)
 
 # ---------------------------------------------------------------- real SN3D/ACN SH (AmbiX)

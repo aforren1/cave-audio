@@ -18,14 +18,14 @@
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;
-    RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
+    RtCore* rt = rt_create(64, 64, SR, BWA_DEFAULT_GRID);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     rt_set_layout(rt, &L);
 
     float p[3] = { 2.0f, 1.5f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   /* 1 m from the +X wall, at ear height
                                                                               * (the probe plane = mean speaker y = 1.5) */
-    float* bus = (float*)calloc((size_t)BWA_CHANNELS * BLK, sizeof(float));
+    float* bus = (float*)calloc((size_t)BWA_DEFAULT_GRID * BLK, sizeof(float));
     bwa_timestamp ts; memset(&ts, 0, sizeof ts);
     rt_set_listener(rt, p, q); rt_commit(rt); rt_render(rt, bus, BLK, &ts);
 
@@ -43,18 +43,18 @@ int main(void) {
 
     os_sleep_ms(600);                       /* let the sim thread look up + publish the baked reverb */
 
-    double e[BWA_CHANNELS]; for (int s = 0; s < BWA_CHANNELS; ++s) e[s] = 0.0;
+    double e[BWA_DEFAULT_GRID]; for (int s = 0; s < BWA_DEFAULT_GRID; ++s) e[s] = 0.0;
     float aux[256];
     for (int blk = 0; blk < 80; ++blk) {
         for (uint32_t i = 0; i < BLK; ++i) aux[i] = (i == 0) ? 1.0f : 0.0f;
-        memset(bus, 0, (size_t)BWA_CHANNELS * BLK * sizeof(float));
+        memset(bus, 0, (size_t)BWA_DEFAULT_GRID * BLK * sizeof(float));
         steam_reflect_tap(refl, bus, BLK, p, q, aux);
-        for (int s = 0; s < BWA_CHANNELS; ++s)
+        for (int s = 0; s < BWA_DEFAULT_GRID; ++s)
             for (uint32_t i = 0; i < BLK; ++i) { float v = bus[(size_t)s * BLK + i]; e[s] += (double)v * v; }
     }
 
     double ePlusX = 0.0, eMinusX = 0.0; int nPlus = 0, nMinus = 0;
-    for (int s = 0; s < BWA_CHANNELS; ++s) {
+    for (int s = 0; s < BWA_DEFAULT_GRID; ++s) {
         if (L.speakers[s].pos[0] >  0.5f) { ePlusX  += e[s]; ++nPlus;  }
         else if (L.speakers[s].pos[0] < -0.5f) { eMinusX += e[s]; ++nMinus; }
     }

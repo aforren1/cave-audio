@@ -87,7 +87,7 @@ flowchart TD
   ALIGN --> TSIG["+ test signal (raw channel, post-align)<br/><i>bwa_set_test_signal</i>"]
   TSIG --> LIM["linked limiter → per-channel peak meters<br/><i>bwa_set_limiter · _limiter_ceiling · bwa_get_bus_levels</i>"]
 
-  LIM --> CAVE["cave: asio_sink.cpp bufferSwitch →<br/>26-ch ASIO ► Digiface ► the array"]
+  LIM --> CAVE["cave: asio_sink.cpp bufferSwitch →<br/>N-ch ASIO ► Digiface ► the array"]
   LIM --> CSIM["cave_sim: each channel = a virtual speaker →<br/>3rd-order SH encode (ambi_encode_phonon) →<br/>phonon HRTF decode (steam_decode.c;<br/>binaural.c simple-pan fallback) → 2-ch device"]
   LIM --> BINP["binaural: the bus (synthesized-diffuse taps) virtual-speaker-encoded<br/>+ the DIRECT field summed pre-decode → ONE phonon HRTF decode,<br/>+ the mode-2 per-voice point taps (rt_direct_voices) each through<br/>their OWN IPLBinauralEffect, summed<br/>(binaural.c cardioid+pan fallback, field-only) →<br/>hard clamp ±1 → 2-ch device"]
   DIRECT --> BINP

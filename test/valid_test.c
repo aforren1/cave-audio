@@ -265,50 +265,47 @@ static void test_feed_path(const Layout* L, double FS, double C) {
  * the difference matters for tracked alignment, which RE-REFERENCES an existing alignment rather than
  * creating one. This is the same grid with the per-speaker delay a calibration would have written:
  * arrivals coincide at the layout reference. */
-static Layout make_aligned_grid(double fs, double c) {
-    Layout L = layout_default();
+static void make_aligned_grid(Layout* L, double fs, double c) {
+    layout_default(L);
     double d[BWA_CHANNELS], dmax = 0.0;
-    for (uint32_t k = 0; k < L.count; ++k) {
-        double dx = L.speakers[k].pos[0] - L.ref[0];
-        double dy = L.speakers[k].pos[1] - L.ref[1];
-        double dz = L.speakers[k].pos[2] - L.ref[2];
+    for (uint32_t k = 0; k < L->count; ++k) {
+        double dx = L->speakers[k].pos[0] - L->ref[0];
+        double dy = L->speakers[k].pos[1] - L->ref[1];
+        double dz = L->speakers[k].pos[2] - L->ref[2];
         d[k] = sqrt(dx*dx + dy*dy + dz*dz);
         if (d[k] > dmax) dmax = d[k];
     }
     uint32_t mx = 0;
-    for (uint32_t k = 0; k < L.count; ++k) {
-        L.speakers[k].delay_samples = (uint32_t)((dmax - d[k]) / c * fs + 0.5);
-        if (L.speakers[k].delay_samples > mx) mx = L.speakers[k].delay_samples;
+    for (uint32_t k = 0; k < L->count; ++k) {
+        L->speakers[k].delay_samples = (uint32_t)((dmax - d[k]) / c * fs + 0.5);
+        if (L->speakers[k].delay_samples > mx) mx = L->speakers[k].delay_samples;
     }
-    L.max_delay_samples = mx;
-    return L;
+    L->max_delay_samples = mx;
 }
 
 /* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape,
  * open at both poles, and the only geometry on which the hole-aware spread floor does anything. The
  * same construction dsp_test and rt_feature_test use, so the three agree on what a hole is. */
-static Layout make_barrel(void) {
-    Layout L;
-    memset(&L, 0, sizeof L);
+static void make_barrel(Layout* L) {
+    memset(L, 0, sizeof *L);
     const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
     uint32_t k = 0;
     for (int ri = 0; ri < 3; ++ri)
         for (int a = 0; a < 8; ++a, ++k) {
             const float th = (float)a * 0.785398163f;
-            L.speakers[k].pos[0] = rad * cosf(th);
-            L.speakers[k].pos[1] = ys[ri];
-            L.speakers[k].pos[2] = rad * sinf(th);
-            L.speakers[k].gain_lin = 1.f;
+            L->speakers[k].pos[0] = rad * cosf(th);
+            L->speakers[k].pos[1] = ys[ri];
+            L->speakers[k].pos[2] = rad * sinf(th);
+            L->speakers[k].gain_lin = 1.f;
         }
-    L.count = k;
-    layout_compute_ref(&L);
-    L.rolloff_r     = 0.7f;
-    L.spcap_focus   = layout_derive_spcap_focus(&L);
-    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
-    L.atten_ref_m   = 1.f;
-    L.atten_rolloff = 1.f;
-    L.atten_min_lin = 0.01f;
-    return L;
+    L->count = k;
+    layout_compute_ref(L);
+    L->rolloff_r     = 0.7f;
+    L->spcap_focus   = layout_derive_spcap_focus(L);
+    L->spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L->atten_ref_m   = 1.f;
+    L->atten_rolloff = 1.f;
+    L->atten_min_lin = 0.01f;
 }
 
 /* CLAIM 1: with every knob off, the engine render reproduces the pre-engine feed builder.
@@ -403,8 +400,8 @@ static void test_engine_determinism(const Layout* L, double FS, double C) {
  * calibrated case is asserted, because only there is the size of the drop forced by the physics. */
 static void test_engine_knobs(double FS, double C) {
     const uint32_t NC = 8192u;
-    const Layout LG = layout_default();
-    const Layout LA = make_aligned_grid(FS, C);
+    static Layout LG; layout_default(&LG);
+    static Layout LA; make_aligned_grid(&LA, FS, C);
     const float  off[3] = { 0.7f, 1.5f, -0.2f };        /* an off-center listener: where it can matter */
     float src[3] = { LA.ref[0] + 1.4f*0.6f, LA.ref[1] + 1.4f*0.2f, LA.ref[2] - 1.4f*0.77f };
 
@@ -451,7 +448,7 @@ static void test_engine_knobs(double FS, double C) {
 
     /* ---- the hole-aware spread floor, on the one geometry that has holes ---- */
     {
-        const Layout LB = make_barrel();
+        static Layout LB; make_barrel(&LB);
         const float lis[3] = { 0.25f, 1.4f, -0.15f };    /* seated ear height, slightly off the axis */
         /* Straight down FROM THE LISTENER: the barrel's open nadir, where the hull closes the hole
          * with a triangle of distant speakers and the render is a split image rather than a phantom.
@@ -748,7 +745,7 @@ int main(void) {
     test_grid();
 
     const double FS = 48000.0, C = 343.0;
-    Layout L = layout_default();
+    static Layout L; layout_default(&L);
     printf("[layout       ] %u speakers, sweet spot (%.2f, %.2f, %.2f)\n",
            L.count, L.ref[0], L.ref[1], L.ref[2]);
     test_feed_path(&L, FS, C);

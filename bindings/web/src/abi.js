@@ -5,6 +5,18 @@
  */
 export const ABI_VERSION = [0, 16, 0];
 
+/* The header's plain integer #defines, minus the BWA_ prefix. */
+export const CONSTANTS = Object.freeze({
+  CHANNEL_AUTO: -1,
+  DEFAULT_GRID: 26,
+  EXTRA_LIS: 3,
+  GROUPS: 8,
+  MAX_CHANNELS: 64,
+  SINK_FLAG_EXACT_RATE: 0x2,
+  SINK_FLAG_EXCLUSIVE: 0x1,
+  SINK_FLAG_TIGHT_BUFFER: 0x4,
+});
+
 export const ABI = [
   {"name":"bwa_apply_tuning","ret":"num","args":["ptr","ptr"]},
   {"name":"bwa_bed_create","ret":"num","args":["ptr"]},

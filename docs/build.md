@@ -979,7 +979,7 @@ isolation bullets.
 
 - **Driver: ASIO.** The device must expose **enough output channels for your layout**:
   26 for the CAVE array; fewer for a smaller install (the engine's channel count is the
-  layout's speaker count, 4..26). Use the ASIO driver, not the WDM/DirectSound one: WDM is
+  layout's speaker count, 4..64). Use the ASIO driver, not the WDM/DirectSound one: WDM is
   a consumer path with its own mixing and resampling, and it is not the multichannel
   low-latency route the array needs.
 - **Format:** 48 kHz, 24-bit. Match the bit depth end-to-end. Read the driver's reported

@@ -31,7 +31,7 @@
 #define FFTN   32768          /* power of two; ~0.68 s window, ~1.46 Hz/bin */
 #define WARMUP 8192           /* discard while the 2-pole delay settles */
 
-static float bus[BWA_CHANNELS * N];
+static float bus[BWA_DEFAULT_GRID * N];
 
 static int write_sine(const char* path, double freq, uint32_t frames) {
     drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, SR, 32 };
@@ -51,8 +51,8 @@ int main(int argc, char** argv) {
     int    bpc  = argc > 3 ? atoi(argv[3]) : 3;          /* blocks per position commit (~60 fps @ 256/48k) */
     if (bpc < 1) bpc = 1;
 
-    Layout L = layout_default();
-    RtCore* rt = rt_create(8, 4, SR, BWA_CHANNELS);
+    static Layout L; layout_default(&L);
+    RtCore* rt = rt_create(8, 4, SR, BWA_DEFAULT_GRID);
     if (!rt) { printf("FAIL rt_create\n"); return 1; }
     rt_set_layout(rt, &L);
     const char* WAV = "bwa_dop_sine.wav";
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         if (blk % bpc == 0) { rt_source_set_pos(rt, h, dist, L.ref[1], 0.f); rt_commit(rt); }   /* ear plane: distance == dist */
         rt_render(rt, bus, N, &ts);
         for (uint32_t i = 0; i < N; ++i) {
-            double s = 0; for (int ch = 0; ch < BWA_CHANNELS; ++ch) s += bus[(size_t)ch * N + i];
+            double s = 0; for (int ch = 0; ch < BWA_DEFAULT_GRID; ++ch) s += bus[(size_t)ch * N + i];
             if (warm < WARMUP) { ++warm; continue; }
             if (cap < FFTN) re[cap++] = s;               /* mono sum = source * sum(gains) */
         }

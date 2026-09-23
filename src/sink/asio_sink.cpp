@@ -46,15 +46,15 @@ namespace {
 struct AsioSink {
     bwa_sink          base;
     uint32_t        sample_rate;
-    uint32_t        channels;        /* requested (26) */
+    uint32_t        channels;        /* requested (the layout's count, 26 on the rig) */
     long            buffer_size;     /* frames per block, chosen from ASIOGetBufferSize */
     long            output_latency;  /* driver-reported render->DAC frames (ASIOGetLatencies); 0 = unknown */
     uint64_t        qpc_freq;        /* QueryPerformanceFrequency, for the synthesized host stamp */
     bwa_render_fn      render;
     void*           user;
-    ASIOBufferInfo  bufferInfos[64];
-    ASIOChannelInfo channelInfos[64];
-    sink_fmt        fmt[64];         /* channelInfos[c].type resolved at open (see asio_fmt) */
+    ASIOBufferInfo  bufferInfos[BWA_CHANNELS];
+    ASIOChannelInfo channelInfos[BWA_CHANNELS];
+    sink_fmt        fmt[BWA_CHANNELS]; /* channelInfos[c].type resolved at open (see asio_fmt) */
     ASIOCallbacks   callbacks;
     float*          bus;             /* planar channels * buffer_size; engine renders here */
     uint64_t        fallback_pos;    /* internal block counter for when the driver's sample position is invalid */
@@ -354,7 +354,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
                                      bwa_render_fn render, void* user,
                                      char* err, size_t errcap) {
     if (g_sink)                 { set_err(err, errcap, "asio: a driver is already open"); return nullptr; }
-    if (!render || channels == 0 || channels > 64) { set_err(err, errcap, "asio: bad arguments"); return nullptr; }
+    if (!render || channels == 0 || channels > BWA_CHANNELS) { set_err(err, errcap, "asio: bad arguments"); return nullptr; }
 
     /* Auto-pick: bwa_desc.asio_driver if set, else the first registered driver that opens with
      * enough output channels (so binaural finds a 2-ch headphone driver — ASIO4ALL / FlexASIO /

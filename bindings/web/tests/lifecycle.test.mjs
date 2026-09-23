@@ -19,11 +19,12 @@ if (!haveModule) {
 const SINK_NULL = 2;
 const PROFILE_BINAURAL = 1;
 
-let Host, host, M;
+let Host, host, M, DEFAULT_GRID;
 
 before(async () => {
   M = await loadModule();
   ({ Host } = await loadSrc("host.js"));
+  ({ CONSTANTS: { DEFAULT_GRID } } = await loadSrc("raw.js"));
   host = new Host();
   await host.init({
     moduleFactory: async () => M,
@@ -39,7 +40,7 @@ test("create reports the engine's own geometry", () => {
   const i = host.info();
   assert.equal(i.sampleRate, 48000);
   assert.equal(i.blockSize, 256);
-  assert.equal(i.channelCount, 26);        /* the default grid; the binaural profile still renders it */
+  assert.equal(i.channelCount, DEFAULT_GRID);  /* the binaural profile still renders the grid */
   assert.equal(i.sinkType, SINK_NULL);
 });
 

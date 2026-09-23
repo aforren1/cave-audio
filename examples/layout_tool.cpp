@@ -1,7 +1,7 @@
 /*
  * layout_tool.cpp — interactive speaker-layout authoring for the CAVE array.
  *
- * Define where the 26 speakers physically are and export a valid cave_layout.json (the file the
+ * Define where the speakers (4..BWA_MAX_CHANNELS, the default grid's 26) physically are and export a valid cave_layout.json (the file the
  * engine loads via bwa_desc.layout_path; see docs/layout-schema.md). The killer feature is identify-
  * by-ear: each speaker's INDEX is its bus/output channel, so selecting speaker N and enabling the
  * tone drives that exact channel with the built-in test signal (bwa_set_test_signal) out the cave profile
@@ -80,7 +80,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NSPK           26         /* array CAPACITY (== BWA_CHANNELS); g_nspk is the layout's ACTUAL count */
+#define NSPK           BWA_MAX_CHANNELS   /* array CAPACITY, from the public header; g_nspk is the layout's ACTUAL count */
 #define NSPK_MIN       4          /* the engine's layout loader accepts 4..NSPK speakers */
 #define SR             48000u
 /* Speed of sound for the delay-alignment derivation below. Seeded from the layout's
@@ -93,7 +93,7 @@ static float speed_of_sound = (float)BWA_SOS_REF_MPS;
 
 typedef struct { Vector3 pos; float gain_db; int pin; } Spk;   /* pin: 1 = held to the ear-plane slab */
 static Spk spk[NSPK];
-static int g_nspk = NSPK;         /* speakers in the edited layout (4..NSPK) — the engine's channel count */
+static int g_nspk = BWA_DEFAULT_GRID;  /* speakers in the edited layout (4..NSPK) — the engine's channel count */
 
 /* dbap knobs (round-tripped through the file; defaults match layout_default) */
 static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min_db = -40.0f;
@@ -1476,8 +1476,12 @@ static void draw_panel(void) {
               }
           }
       } }
-    bwTip("speakers in this layout (4-26) - the file's count IS the engine's channel count, so a "
-          "24-speaker array is a 24-entry file; growing adds one on the dome, shrinking drops the last");
+    { static char tip[192];
+      if (!tip[0])
+          snprintf(tip, sizeof tip, "speakers in this layout (%d-%d) - the file's count IS the engine's "
+                   "channel count, so a 24-speaker array is a 24-entry file; growing adds one on the "
+                   "dome, shrinking drops the last", NSPK_MIN, NSPK);
+      bwTip(tip); }
     if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= g_nspk) sel = g_nspk - 1; }
     bwTip("the speaker's index IS its output/bus channel; [ ] steps, or click a sphere");
     ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
@@ -1748,8 +1752,9 @@ static void register_tests(ImGuiTestEngine* te) {
         spk[3].pos = Vector3{ 1.25f, 2.0f, -0.75f }; spk[3].gain_db = -4.5f; dbap_r = 0.77f;
         spk[3].pin = 1; pin_slab_m = 0.4f;                       /* the allocation tag rides the file too */
         IM_CHECK(save_json(TEST_OUT));
+        const int saved = g_nspk;                                /* the count the file carries */
         seed_default(); dbap_r = 0.5f; pin_slab_m = 0.3f;
-        IM_CHECK_EQ(load_json(TEST_OUT), NSPK);
+        IM_CHECK_EQ(load_json(TEST_OUT), saved);
         IM_CHECK_LT(fabsf(spk[3].pos.x - 1.25f), 1e-3f);
         IM_CHECK_LT(fabsf(spk[3].pos.z + 0.75f), 1e-3f);
         IM_CHECK_LT(fabsf(spk[3].gain_db + 4.5f), 1e-2f);
@@ -1769,7 +1774,7 @@ static void register_tests(ImGuiTestEngine* te) {
         g_nspk = 24; seed_default();
         spk[23].pos = Vector3{ -0.5f, 1.8f, 1.1f };
         IM_CHECK(save_json(TEST_OUT));
-        g_nspk = NSPK; seed_default();                           /* clobber, then read the count back */
+        g_nspk = BWA_DEFAULT_GRID; seed_default();               /* clobber, then read the count back */
         IM_CHECK_EQ(load_json(TEST_OUT), 24);
         IM_CHECK_EQ(g_nspk, 24);
         IM_CHECK_LT(fabsf(spk[23].pos.z - 1.1f), 1e-3f);
@@ -1780,7 +1785,7 @@ static void register_tests(ImGuiTestEngine* te) {
         bwa_engine* te2 = bwa_create(&cfg);
         IM_CHECK(te2 != NULL);
         if (te2) {
-            IM_CHECK(bwa_last_error(te2) == NULL);                /* not silently defaulted to the 26 grid */
+            IM_CHECK(bwa_last_error(te2) == NULL);                /* not silently defaulted to the grid */
             IM_CHECK_EQ(bwa_get_channel_count(te2), 24u);
             bwa_destroy(te2);
         }
@@ -2124,11 +2129,14 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->ItemInputValue("**/count", 24);
         IM_CHECK_EQ(g_nspk, 24);
         IM_CHECK_EQ(sel, 23);                                    /* the retired selection moved in-range */
-        ctx->ItemInputValue("**/count", 26);
-        IM_CHECK_EQ(g_nspk, 26);
-        IM_CHECK_GT(Vector3Length(spk[25].pos), 0.1f);           /* the re-added speaker landed on the dome */
+        ctx->ItemInputValue("**/count", BWA_DEFAULT_GRID);
+        IM_CHECK_EQ(g_nspk, BWA_DEFAULT_GRID);
+        IM_CHECK_GT(Vector3Length(spk[BWA_DEFAULT_GRID - 1].pos), 0.1f);  /* the re-added speaker landed on the dome */
         ctx->ItemInputValue("**/count", 2);                      /* below the engine's minimum: clamped */
         IM_CHECK_EQ(g_nspk, NSPK_MIN);
+        ctx->ItemInputValue("**/count", NSPK + 1);               /* above the capacity: clamped */
+        IM_CHECK_EQ(g_nspk, NSPK);
+        IM_CHECK_GT(Vector3Length(spk[NSPK - 1].pos), 0.1f);     /* the whole capacity is placeable */
         g_nspk = keep; seed_default(); sel = 0; layout_dirty = 1;
     };
 

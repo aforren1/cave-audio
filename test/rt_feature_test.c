@@ -68,32 +68,30 @@ static void lc_settle(RtCore* c, int nb) {              /* silence: let the comp
 
 /* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape,
  * open at both poles. 24 speakers, so its RtCore is 24 channels wide, not 26. */
-static Layout make_barrel(void) {
-    Layout L;
-    memset(&L, 0, sizeof L);
+static void make_barrel(Layout* L) {
+    memset(L, 0, sizeof *L);
     const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
     uint32_t k = 0;
     for (int ri = 0; ri < 3; ++ri)
         for (int a = 0; a < 8; ++a, ++k) {
             const float th = (float)a * 0.785398163f;
-            L.speakers[k].pos[0] = rad * cosf(th);
-            L.speakers[k].pos[1] = ys[ri];
-            L.speakers[k].pos[2] = rad * sinf(th);
-            L.speakers[k].gain_lin = 1.f;
+            L->speakers[k].pos[0] = rad * cosf(th);
+            L->speakers[k].pos[1] = ys[ri];
+            L->speakers[k].pos[2] = rad * sinf(th);
+            L->speakers[k].gain_lin = 1.f;
         }
-    L.count = k;
-    layout_compute_ref(&L);
-    L.rolloff_r     = 0.7f;
-    L.spcap_focus   = layout_derive_spcap_focus(&L);
-    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
-    L.atten_ref_m   = 1.f;
-    L.atten_rolloff = 1.f;
-    L.atten_min_lin = 0.01f;
-    return L;
+    L->count = k;
+    layout_compute_ref(L);
+    L->rolloff_r     = 0.7f;
+    L->spcap_focus   = layout_derive_spcap_focus(L);
+    L->spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L->atten_ref_m   = 1.f;
+    L->atten_rolloff = 1.f;
+    L->atten_min_lin = 0.01f;
 }
 
 int main(void) {
-    LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
+    layout_default(&LD);                          /* listener stays at the default (the array center, LD.ref) */
     const char* WAV = "bwa_rt_fconst.wav";          /* distinct from rt_core_test's scratch wav */
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
     char err[256] = {0};
@@ -392,7 +390,7 @@ int main(void) {
         RtCore* cg = rt_create(8, 4, RATE, CH);
         CHECK(cg != NULL, "rt_create (tracked room eq)");
         if (cg) {
-            Layout G = layout_default();
+            static Layout G; layout_default(&G);
             G.rq_grid.npos = 2;
             G.rq_grid.pos[0][0] = -0.5f; G.rq_grid.pos[0][1] = 1.5f; G.rq_grid.pos[0][2] = 0.f;
             G.rq_grid.pos[1][0] =  0.5f; G.rq_grid.pos[1][1] = 1.5f; G.rq_grid.pos[1][2] = 0.f;
@@ -773,7 +771,7 @@ int main(void) {
      * covers the bearing, plus everywhere on the surrounding default grid. */
     {
         memset(bus, 0, sizeof bus);                      /* the barrel is 24-wide: park channels 24-25 */
-        const Layout LBAR = make_barrel();
+        static Layout LBAR; make_barrel(&LBAR);
         RtCore* ch = rt_create(8, 4, RATE, LBAR.count);
         CHECK(ch != NULL, "rt_create (hole spread)");
         if (ch) {

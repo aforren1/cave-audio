@@ -524,7 +524,7 @@ namespace BwAudio
 
         // ---- channel test / diagnostics (drives a raw output channel; speaker-check tool) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_test_signal(IntPtr e, uint channel, BwaTestKind kind, float gain);
-        // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
+        // The engine's active channel count = the layout's speaker count (4..64, BWA_MAX_CHANNELS). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
         // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against

@@ -29,9 +29,12 @@
  *         below; the views are GETTERS because -sALLOW_MEMORY_GROWTH detaches and replaces them
  *         whenever the heap grows, and a cached view would silently read a dead buffer.
  */
-import { ABI, ABI_VERSION } from "./abi.js";
+import { ABI, ABI_VERSION, CONSTANTS } from "./abi.js";
 
-export { ABI, ABI_VERSION };
+/* CONSTANTS is the header's plain integer #defines, BWA_ prefix dropped the way a call's bwa_ is
+ * (`CONSTANTS.MAX_CHANNELS` is BWA_MAX_CHANNELS). A module export beside ABI rather than a
+ * property of the raw object, so the name-to-call lookups the host does can only find calls. */
+export { ABI, ABI_VERSION, CONSTANTS };
 
 function wrap(M, f) {
   const fn = M["_" + f.name];

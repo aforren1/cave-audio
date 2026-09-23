@@ -118,7 +118,7 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-devices, every bac
       WASAPI and bursts. Deviations at that scale on the Digiface are a real problem.
 
 `bwa_minimal` opens a 2-ch device (binaural profile), so this only proves the ASIO plumbing.
-Stage 1 proves the full 26-out Digiface open: `layout_tool` demands a real device and
+Stage 1 proves the full array-width Digiface open: `layout_tool` demands a real device and
 fails loudly if the Digiface won't open at the layout's channel count.
 
 ## Stage 1: wiring + initial speaker positions

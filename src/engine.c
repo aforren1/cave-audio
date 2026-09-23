@@ -402,18 +402,18 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * back to the default grid so create still succeeds (bwa_last_error has the reason, readable
      * NOW), but it is recorded and bwa_start refuses with BWA_ERR_LAYOUT — a session that named a
      * layout must not silently run 26 channels of the wrong geometry. NULL path = the default
-     * grid deliberately. */
-    Layout L = layout_default();
+     * grid deliberately. Loads straight into e->layout (heap): a Layout is never a stack local. */
+    layout_default(&e->layout);                     /* kept for the Steam decoder, built at bwa_start */
     if (e->cfg.layout_path && e->cfg.layout_path[0]) {
-        if (!layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf)) {
+        if (!layout_load(e->cfg.layout_path, e->cfg.sample_rate, &e->layout, e->errbuf, sizeof e->errbuf)) {
             set_error(e, e->errbuf[0] ? e->errbuf : "bwa_create: layout load failed");
             e->layout_failed = 1;
             snprintf(e->layout_errbuf, sizeof e->layout_errbuf, "%s", e->errbuf);
+            layout_default(&e->layout);             /* a failed load can leave out half-written: re-seed the grid */
         }
     }
-    e->layout = L;                                  /* kept for the Steam decoder, built at bwa_start */
 
-    e->rt = rt_create(BWA_VOICE_CAP, BWA_SOUND_CAP, e->cfg.sample_rate, L.count);
+    e->rt = rt_create(BWA_VOICE_CAP, BWA_SOUND_CAP, e->cfg.sample_rate, e->layout.count);
     if (!e->rt) { free(e); return NULL; }
     e->assets = assets_create(e->rt, e->cfg.sample_rate, BWA_SOUND_CAP);   /* bounded by the sound table */
     if (!e->assets) { rt_destroy(e->rt); free(e); return NULL; }
@@ -423,7 +423,14 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * without a second list to keep in sync. Nothing asserts that today: if you move a default in
      * rt_create, move it in bwa_tuning_preset too. */
     bwa_tuning_preset(BWA_SETUP_DEFAULT, &e->cur);
-    rt_set_layout(e->rt, &L);
+    if (!rt_set_layout(e->rt, &e->layout) && !e->layout_failed) {
+        /* the core was created at e->layout.count, so only an alloc failure lands here: the core still holds
+         * its placeholder grid, so refuse the start rather than mix the wrong geometry */
+        snprintf(e->layout_errbuf, sizeof e->layout_errbuf, "%s",
+                 "bwa_create: the layout could not be installed in the render core");
+        set_error(e, e->layout_errbuf);
+        e->layout_failed = 1;
+    }
     /* diffuse-bed decoder is create-time config: the SH->speaker decode matrix is (re)built here on
      * the control thread — it must not race mix_bed once the audio thread runs. */
     /* public decoder -> the rt/fdn-internal id (1 = AllRAD, 2 = EPAD). Internal 0 is the sampling
@@ -506,6 +513,13 @@ bwa_result bwa_start(bwa_engine* e) {
      * was preserved from create (start's error clear above would have eaten it). */
     if (e->layout_failed) {
         set_error(e, e->layout_errbuf[0] ? e->layout_errbuf : "bwa_start: layout_path failed to load at bwa_create");
+        return BWA_ERR_LAYOUT;
+    }
+    /* The rt core's channel count and the engine's layout must agree: every sink, capture and
+     * monitor below is sized from e->layout.count while the mixer writes rt_channels() planes. They
+     * agree by construction today (rt_create takes e->layout.count); this keeps it that way. */
+    if (rt_channels(e->rt) != e->layout.count) {
+        set_error(e, "bwa_start: render core channel count differs from the layout's speaker count");
         return BWA_ERR_LAYOUT;
     }
 
@@ -1502,16 +1516,18 @@ void bwa_set_headphone_eq(bwa_engine* e, bool on) {
  * same "for layout scoring/optimization in tools" contract as bwa_panner_gains_batch below. */
 float bwa_spcap_focus_default(const float* positions, uint32_t n) {
     if (!positions || n < 2 || n > BWA_CHANNELS) return 0.f;
-    Layout L;
-    memset(&L, 0, sizeof L);
-    L.count = n;
+    Layout* L = (Layout*)calloc(1, sizeof *L);       /* never a stack local (layout.h) */
+    if (!L) return 0.f;
+    L->count = n;
     for (uint32_t s = 0; s < n; ++s) {
-        L.speakers[s].pos[0] = positions[s*3+0];
-        L.speakers[s].pos[1] = positions[s*3+1];
-        L.speakers[s].pos[2] = positions[s*3+2];
+        L->speakers[s].pos[0] = positions[s*3+0];
+        L->speakers[s].pos[1] = positions[s*3+1];
+        L->speakers[s].pos[2] = positions[s*3+2];
     }
-    layout_compute_ref(&L);                          /* the derivation is centroid-relative */
-    return layout_derive_spcap_focus(&L);
+    layout_compute_ref(L);                           /* the derivation is centroid-relative */
+    const float f = layout_derive_spcap_focus(L);
+    free(L);
+    return f;
 }
 
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
@@ -1524,16 +1540,18 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
                                const float lis[3], const float* srcs, uint32_t nsrc,
                                float focus, float density, float* out) {
     if (!positions || !lis || !srcs || !out || n == 0 || n > BWA_CHANNELS || nsrc == 0) return 0;
-    Layout L = layout_default();                         /* default rolloff_r / distance attenuation */
-    L.count = n;
+    Layout* L = (Layout*)malloc(sizeof *L);              /* never a stack local (layout.h) */
+    if (!L) return 0;
+    layout_default(L);                                   /* default rolloff_r / distance attenuation */
+    L->count = n;
     for (uint32_t s = 0; s < n; ++s) {
-        L.speakers[s].pos[0] = positions[s*3+0];
-        L.speakers[s].pos[1] = positions[s*3+1];
-        L.speakers[s].pos[2] = positions[s*3+2];
-        L.speakers[s].gain_lin = 1.0f;
-        L.speakers[s].delay_samples = 0;
+        L->speakers[s].pos[0] = positions[s*3+0];
+        L->speakers[s].pos[1] = positions[s*3+1];
+        L->speakers[s].pos[2] = positions[s*3+2];
+        L->speakers[s].gain_lin = 1.0f;
+        L->speakers[s].delay_samples = 0;
     }
-    layout_compute_ref(&L);          /* keep the struct coherent (the panners themselves are listener-relative) */
+    layout_compute_ref(L);          /* keep the struct coherent (the panners themselves are listener-relative) */
     SpcapState sp; VbapState vb;
     if (panner == BWA_PAN_SPCAP) {
         /* the same <= 0 sentinel bwa_set_spcap_focus honors: revert to the default for THIS array,
@@ -1541,19 +1559,20 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
          * grid's. Only SPCAP reads these and the derivation is O(N^2), so DBAP/VBAP skip it — a
          * layout optimizer calls this in a hot loop. That is also what makes the two arguments
          * INERT for those panners: nothing downstream of here looks at them. */
-        L.spcap_focus   = (focus   > 0.f) ? focus   : layout_derive_spcap_focus(&L);
-        L.spcap_density = (density > 0.f) ? density : BWA_SPCAP_DENSITY_DEFAULT;
+        L->spcap_focus   = (focus   > 0.f) ? focus   : layout_derive_spcap_focus(L);
+        L->spcap_density = (density > 0.f) ? density : BWA_SPCAP_DENSITY_DEFAULT;
         spcap_reset(&sp);
     }
     else if (panner == BWA_PAN_VBAP) vbap_reset(&vb);
     for (uint32_t i = 0; i < nsrc; ++i) {
         const float* src = &srcs[(size_t)i * 3];
         float* o = &out[(size_t)i * n];
-        if (panner == BWA_PAN_SPCAP)     spcap_gains(&sp, src, lis, &L, 1u, L.spcap_focus,   /* cache reused */
-                                                     L.spcap_density, 1.0f, o);              /* across the batch */
-        else if (panner == BWA_PAN_VBAP) vbap_gains(&vb, src, lis, &L, 1u, 1.0f, o);
-        else                            dbap_gains(src, lis, &L, 1.0f, o);
+        if (panner == BWA_PAN_SPCAP)     spcap_gains(&sp, src, lis, L, 1u, L->spcap_focus,   /* cache reused */
+                                                     L->spcap_density, 1.0f, o);              /* across the batch */
+        else if (panner == BWA_PAN_VBAP) vbap_gains(&vb, src, lis, L, 1u, 1.0f, o);
+        else                            dbap_gains(src, lis, L, 1.0f, o);
     }
+    free(L);
     return nsrc;
 }
 
@@ -1565,20 +1584,22 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
                              const float* positions, uint32_t n,
                              const float* dirs, uint32_t ndir, float* out) {
     if (!positions || !dirs || !out || n == 0 || n > BWA_CHANNELS || ndir == 0) return 0;
-    Layout L = layout_default();
-    L.count = n;
+    Layout* L = (Layout*)malloc(sizeof *L);              /* never a stack local (layout.h) */
+    if (!L) return 0;
+    layout_default(L);
+    L->count = n;
     for (uint32_t s = 0; s < n; ++s) {
-        L.speakers[s].pos[0] = positions[s*3+0];
-        L.speakers[s].pos[1] = positions[s*3+1];
-        L.speakers[s].pos[2] = positions[s*3+2];
-        L.speakers[s].gain_lin = 1.0f;
-        L.speakers[s].delay_samples = 0;
+        L->speakers[s].pos[0] = positions[s*3+0];
+        L->speakers[s].pos[1] = positions[s*3+1];
+        L->speakers[s].pos[2] = positions[s*3+2];
+        L->speakers[s].gain_lin = 1.0f;
+        L->speakers[s].delay_samples = 0;
     }
-    layout_compute_ref(&L);          /* the decode aims from the array centroid, like the engine's */
-    float dec[BWA_CHANNELS][BWA_AMBI_CH];                        /* ~1.6 KB stack; keeps the call pure */
-    int ok = (resolve_bed_decoder(decoder) == 2) ? epad_build_decode(&L, dec)
-                                                 : allrad_build_decode(&L, dec);
-    if (!ok) ambi_sad_decode(&L, n, dec);                        /* the engine's own degenerate fallback */
+    layout_compute_ref(L);          /* the decode aims from the array centroid, like the engine's */
+    float dec[BWA_CHANNELS][BWA_AMBI_CH];                        /* ~4 KB stack at capacity 64 */
+    int ok = (resolve_bed_decoder(decoder) == 2) ? epad_build_decode(L, dec)
+                                                 : allrad_build_decode(L, dec);
+    if (!ok) ambi_sad_decode(L, n, dec);                        /* the engine's own degenerate fallback */
     float w[BWA_AMBI_CH];
     if (max_re) ambi_max_re_weights(BWA_AMBI_ORDER, w);
     for (uint32_t i = 0; i < ndir; ++i) {
@@ -1593,6 +1614,7 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
             o[s] = acc;
         }
     }
+    free(L);
     return ndir;
 }
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap) {

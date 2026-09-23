@@ -25,7 +25,7 @@ extern "C" {
 #include "calib/calib.h"
 #include "core/layout.h"
 #include "calib/zylia.h"
-#include "sink/sink.h"          /* BWA_CHANNELS */
+#include "sink/sink.h"          /* BWA_CHANNELS (== BWA_MAX_CHANNELS, the public name used below) */
 #include "dsp/sos.h"           /* room-temperature speed of sound: --temp / --c, or the layout's */
 }
 #include "calib_capture.h" /* sweep constants + the simulate/ASIO capture backends */
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
     char err[256] = {0};
-    Layout L;
+    static Layout L;                                          /* never a stack local (layout.h); main is not reentrant */
     if (!layout_load(layout_path, (uint32_t)FS, &L, err, sizeof err)) {
         fprintf(stderr, "calibrate: %s\n", err); return 1;
     }
@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
          * setting). Median over speakers — per-speaker latency should agree, it is one system. */
         { long il = 0, ol = 0;
           if (!simulate && calib_asio_latencies(&il, &ol)) {
-              double lats[BWA_CHANNELS]; int nl = 0;
+              double lats[BWA_MAX_CHANNELS]; int nl = 0;
               for (int s = 0; s < n; ++s) if (latv[s] >= 0.0) lats[nl++] = latv[s];
               if (nl > 0) {
                   for (int a = 1; a < nl; ++a) { double v = lats[a]; int b = a;   /* tiny insertion sort */

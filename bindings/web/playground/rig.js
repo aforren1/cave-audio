@@ -26,21 +26,21 @@
  *
  * WHY CAVE_SIM IS THE DEFAULT PROFILE. The playground is the CAVE, auditioned. In
  * `BWA_PROFILE_CAVE_SIM` every point source pans through the real DBAP/SPCAP/VBAP solve into the
- * 26-channel bus, and the bus is then HRTF-decoded to stereo for headphones - so the speaker
- * gizmos light from `bwa_get_bus_levels`, which is the array's own output and not a drawing of
- * one. `BWA_PROFILE_BINAURAL` is offered beside it because it is the other thing the engine does:
- * point voices bypass the panner entirely and get their own HRTF convolution. Switching between
- * them is a CREATE-time change, so it rebuilds the engine.
+ * array bus (one channel per layout speaker), and the bus is then HRTF-decoded to stereo for
+ * headphones - so the speaker gizmos light from `bwa_get_bus_levels`, which is the array's own
+ * output and not a drawing of one. `BWA_PROFILE_BINAURAL` is offered beside it because it is the
+ * other thing the engine does: point voices bypass the panner entirely and get their own HRTF
+ * convolution. Switching between them is a CREATE-time change, so it rebuilds the engine.
  *
  * TWO METERS, because the two profiles put the audio in different places.
- *   `busPeaks` is `bwa_get_bus_levels`: the 26 array channels, which is what the speaker cones
+ *   `busPeaks` is `bwa_get_bus_levels`: the array channels, which is what the speaker cones
  *   draw. It is the LAST BLOCK's peak, so it has to be sampled faster than a block (see
  *   `meterTick`).
  *   `outLevels` is the stereo the AudioContext is actually playing, read through an AnalyserNode
  *   on the sink's own node (`BwaEngine.outputNode`). In BINAURAL the point voices never reach the
  *   bus at all, so this is the only meter with anything in it there.
  */
-import { BwaEngine, Profile } from "../dist/index.js";
+import { BwaEngine, Profile, MAX_CHANNELS } from "../dist/index.js";
 import { SIGNALS } from "./stimulus.js";
 import { encodeWavFloat32, foldToMono } from "./wav.js";
 
@@ -65,10 +65,12 @@ export class Rig {
     this.signal = 0;
     this.profile = Profile.CAVE_SIM;
     this.channelCount = 0;
-    this.speakers = new Float32Array(26 * 3);
+    /* Sized to the CAPACITY, not the active count, so a layout upload never reallocates them.
+     * Everything that reads them stops at channelCount / speakerCount. */
+    this.speakers = new Float32Array(MAX_CHANNELS * 3);
     this.speakerCount = 0;
-    this.busPeaks = new Float32Array(26);     /* peak-held since the last takeBusPeaks() */
-    this.lastPeaks = new Float32Array(26);    /* the last set taken, which is what the page drew */
+    this.busPeaks = new Float32Array(MAX_CHANNELS);   /* peak-held since the last takeBusPeaks() */
+    this.lastPeaks = new Float32Array(MAX_CHANNELS);  /* the last set taken, which the page drew */
     this.outLevels = { l: 0, r: 0 };          /* the same, for the stereo the context plays */
     this.outProbe = ZERO_PROBE();             /* the same measurement, on a check's own clock */
     this.activeVoices = 0;
@@ -97,7 +99,7 @@ export class Rig {
     this.ctx = audioContext;
     this.profile = profile;
     this.layoutBytes = layoutBytes;
-    /* No layoutPath by default. The engine's default grid IS the 26-speaker geometry
+    /* No layoutPath by default. The engine's default grid IS the BWA_DEFAULT_GRID (26) geometry
      * examples/cave_layout.json describes (a 3x3x3 boundary grid at +/-1.5 m, y 0/1.5/3, minus the
      * center), and the page reads the positions back with bwa_get_speakers rather than assuming
      * them - so the gizmos are the engine's layout whatever it turns out to be. An UPLOADED layout
@@ -122,7 +124,8 @@ export class Rig {
     await this.engine.start();
 
     this.channelCount = this.engine.info.channelCount;
-    const got = await this.engine.invokeBuf("get_speakers", { out: "f32", len: 26 * 3 }, 26);
+    const got = await this.engine.invokeBuf("get_speakers", { out: "f32", len: MAX_CHANNELS * 3 },
+                                           MAX_CHANNELS);
     this.speakers = got.out[0];
     this.speakerCount = got.value;
 
@@ -284,7 +287,8 @@ export class Rig {
     if (this._meterBusy || !this.engine) return;
     this._meterBusy = true;
     try {
-      const r = await this.engine.invokeBuf("get_bus_levels", { out: "f32", len: 26 }, 26);
+      const r = await this.engine.invokeBuf("get_bus_levels", { out: "f32", len: MAX_CHANNELS },
+                                             MAX_CHANNELS);
       const v = r.out[0];
       for (let i = 0; i < this.busPeaks.length; ++i) {
         if (v[i] > this.busPeaks[i]) this.busPeaks[i] = v[i];
