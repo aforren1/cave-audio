@@ -36,6 +36,7 @@ int sink_quant_init(SinkQuant* q, uint32_t sample_rate, uint32_t block, uint32_t
     q->slots    = (uint32_t)slots;
     q->render   = render;
     q->user     = user;
+    q->clock_ns = sink_quant_now_ns;
     return 0;
 }
 
@@ -85,16 +86,23 @@ static void quant_render_one(SinkQuant* q, uint64_t host_now_ns) {
     float* bus = quant_slot(q, q->wr_slot);
 
     BWA_ZONE_BEGIN(zb, "quant block");
-    const uint64_t t0 = sink_quant_now_ns();
+    const uint64_t t0 = q->clock_ns();
     q->render(q->user, bus, q->block, &ts);
-    const uint64_t ns = sink_quant_now_ns() - t0;
+    const uint64_t t1 = q->clock_ns();
     BWA_ZONE_END(zb);
     BWA_FRAME_MARK();
+
+    /* A clock that steps BACKWARD across the render must not wrap: t1 - t0 would be ~1.8e19 ns and
+     * read as a load of trillions of percent. It is not hypothetical. On the web worklet the only
+     * clock is Date.now (os_posix.c), which is wall time and follows the system clock when it is
+     * corrected. Such a block has no measurable render time, so it books 0: it cannot be late and
+     * cannot raise the peak. The stamp above is already protected by its own never-backward rule. */
+    const uint64_t ns = (t1 >= t0) ? t1 - t0 : 0;
 
     /* Overrunning the block period is what eventually becomes a device dropout, and it is OUR
      * half of the measurement (the device's half needs a device). Two counter reads, no syscall. */
     if (ns > block_ns) q->h_late++;                       /* the budget IS one block period */
-    if (ns > q->h_render_ns_peak) q->h_render_ns_peak = ns;
+    sink_peak_note(&q->h_peak, q->rendered, q->rate, ns);
     q->h_blocks++;
 
     q->rendered += q->block;
@@ -171,7 +179,7 @@ void sink_quant_health(const SinkQuant* q, bwa_sink_health* out) {
     out->dropped_frames = q->h_dropped_frames;
     out->driver_resyncs = 0;                 /* the backend's to fill: only the device API knows */
     out->late_blocks    = q->h_late;
-    out->render_ns_peak = q->h_render_ns_peak;
+    out->render_ns_peak = sink_peak_recent(&q->h_peak);
     out->period_ns      = q->rate ? (uint64_t)q->block * 1000000000ull / (uint64_t)q->rate : 0;
     out->measured       = q->measured;
 }

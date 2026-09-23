@@ -1231,8 +1231,12 @@ typedef struct bwa_health {
     uint64_t driver_resyncs;  /* the driver reporting a discontinuity itself (ASIO kAsioResyncRequest) */
     uint64_t late_blocks;     /* our render overran the block period - we are the cause             */
     uint64_t stream_starves;  /* a streamed voice's ring ran dry without the asset having ended     */
-    float    peak_load;       /* worst single-block render time / block period. 1.0 = exactly at
-                               * budget, so anything approaching it is living dangerously           */
+    float    peak_load;       /* worst single-block render time / block period, over the LAST 4-5 s
+                               * of stream time (whole-second buckets), not since start. 1.0 =
+                               * exactly at budget, so anything approaching it is living
+                               * dangerously. Windowed after 0.16.0 (2026-09-23) so a slow first
+                               * block or one old stall stops pinning it; same field, same layout,
+                               * so no ABI bump. On the web worklet the clock under it is 1 ms     */
     uint32_t device_lost;     /* nonzero: the device went away (unplugged, a driver reset, the
                                * session torn down). The engine keeps rendering, paced from the
                                * host clock, so clocks and playheads stay live and the audio is

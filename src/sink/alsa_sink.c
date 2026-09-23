@@ -184,7 +184,8 @@ typedef struct {
 
     /* Written on the render thread, read from the control thread. Relaxed: independent monotonic
      * counts that order nothing else, the same call null_sink.c makes. */
-    _Atomic uint64_t h_blocks, h_dropouts, h_dropped_frames, h_resyncs, h_late, h_render_ns_peak;
+    _Atomic uint64_t h_blocks, h_dropouts, h_dropped_frames, h_resyncs, h_late;
+    SinkPeakWindow   h_peak;      /* recent render peak: one writer, packed words (sink.h) */
     _Atomic uint32_t lost;
     _Atomic uint32_t latency_frames;   /* snd_pcm_delay, latched on the first good write        */
 
@@ -273,12 +274,7 @@ static void alsa_thread(void* arg) {
         BWA_FRAME_MARK();
 
         if (render_ns > block_ns) atomic_fetch_add_explicit(&s->h_late, 1u, memory_order_relaxed);
-        for (;;) {                          /* CAS-max: one writer, so it settles at once */
-            uint64_t peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
-            if (render_ns <= peak) break;
-            if (atomic_compare_exchange_weak_explicit(&s->h_render_ns_peak, &peak, render_ns,
-                                                      memory_order_relaxed, memory_order_relaxed)) break;
-        }
+        sink_peak_note(&s->h_peak, pos, s->sample_rate, render_ns);
         atomic_fetch_add_explicit(&s->h_blocks, 1u, memory_order_relaxed);
 
         if (s->fmt_24_in_32)
@@ -412,7 +408,7 @@ static void alsa_health(bwa_sink* base, bwa_sink_health* out) {
     out->dropped_frames = atomic_load_explicit(&s->h_dropped_frames, memory_order_relaxed);
     out->driver_resyncs = atomic_load_explicit(&s->h_resyncs, memory_order_relaxed);
     out->late_blocks    = atomic_load_explicit(&s->h_late, memory_order_relaxed);
-    out->render_ns_peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
+    out->render_ns_peak = sink_peak_recent(&s->h_peak);
     out->period_ns      = (uint64_t)s->block * 1000000000ull / (uint64_t)s->sample_rate;
     out->device_lost    = atomic_load_explicit(&s->lost, memory_order_relaxed);
     out->measured       = true;

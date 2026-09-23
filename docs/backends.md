@@ -272,7 +272,7 @@ Where each backend gets the pair:
 | JACK      | `jack_get_cycle_times` at the top of the process callback: `current_frames` and `current_usecs`, the server's DLL-filtered pair in microseconds on `CLOCK_MONOTONIC`. Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
 | AAudio    | `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. Fails until the stream has run a little; keep the previous pair and set `measured` only after the first success |
-| Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat, and it is invisible: under `-sAUDIO_WORKLET` Emscripten resolves `emscripten_get_now` per scope, and `AudioWorkletGlobalScope` has no `performance`, so the audio thread's monotonic clock falls back to `Date.now`. Same epoch as the control thread's, a thousand times coarser, and not guaranteed monotonic, which makes the adapter's never-step-backward rule load-bearing rather than defensive |
+| Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat, and it is invisible: `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. Until 2026-09-23 `os_monotonic_ns` ignored that and returned uninitialized stack there (measured: one constant, so render times read 0 and the first one read a whole second). It now falls back to `emscripten_get_now`, which is `Date.now` in that scope: same epoch as the control thread's, a thousand times coarser, and not monotonic. That makes both of the adapter's backward-step rules load-bearing rather than defensive: a stamp never steps back, and a render time that would go negative books 0 |
 
 ### 4. Health
 
@@ -280,7 +280,11 @@ Where each backend gets the pair:
 backend can observe the device's own position, so a zero dropout count means "none happened"
 and not "could not know". The gap arithmetic stays in `sink_position_gap`, and the adapter
 measures `late_blocks` and `render_ns_peak` for every backend it serves, the way the null sink
-does today.
+does today. `render_ns_peak` is the worst block over the last 4 to 5 s of STREAM time
+(`SinkPeakWindow` in `sink.h`: whole-second buckets, one packed 64-bit word each, no lock), not
+since start, so a slow first block or one old stall stops pinning `bwa_health.peak_load`. Every
+backend that measures a render time feeds the same window: the adapter, the null sink, ASIO and
+ALSA.
 
 | field            | WASAPI                                                   | CoreAudio                                  | JACK                                        | ALSA                                              | AAudio                              |
 |------------------|----------------------------------------------------------|--------------------------------------------|---------------------------------------------|---------------------------------------------------|-------------------------------------|
@@ -295,8 +299,9 @@ advances by exactly one quantum per callback whether or not the output starved, 
 renders several quanta back to back inside one system audio callback, so a per-callback
 host-interval rule would false-positive on every ordinary batch. So `measured` is **false**, which
 is the contract's way of saying "cannot know". `late_blocks` and `render_ns_peak` are real, because
-the adapter measures those for every backend it serves, and they are the numbers a page should
-watch. `device_lost` is set while the sink is host-pacing, which on this platform means a suspended
+the adapter measures those for every backend it serves, but the clock under them is `Date.now`
+(whole milliseconds, see rule 3 above), so they are coarse. The XR page reads a dropout signal off
+the main thread instead: `AudioContext.currentTime` against `performance.now()` (docs/web.md). `device_lost` is set while the sink is host-pacing, which on this platform means a suspended
 AudioContext as often as a lost one.
 
 One field is added to the public `bwa_health` in the same ABI bump (see

@@ -66,9 +66,14 @@ typedef struct {
      * monotonic count nobody synchronizes ON, and a reader that sees one field a block stale is
      * reading a monotonic count either way — the same call the ASIO sink's relaxed atomics make.
      * Plain uint64_t here keeps the file off the /experimental:c11atomics list. --- */
-    uint64_t      h_blocks, h_dropouts, h_dropped_frames, h_late, h_render_ns_peak;
+    uint64_t      h_blocks, h_dropouts, h_dropped_frames, h_late;
+    SinkPeakWindow h_peak;         /* worst render time over the last few seconds (sink.h)       */
     uint64_t      h_passthrough;   /* pulls that took the no-residue fast path (accounting only) */
     bool          measured;        /* the device reported a position at least once               */
+
+    /* The clock a block's RENDER TIME is measured with. sink_quant_now_ns unless a test swaps it
+     * after init, which is how the test injects a slow block or a clock that steps backward. */
+    uint64_t    (*clock_ns)(void);
 } SinkQuant;
 
 /* Allocate the slots and latch the geometry. `max_request` is the largest nframes the device can

@@ -126,7 +126,8 @@ typedef struct {
     uint64_t dropped_frames;   /* frames those gaps swallowed                                */
     uint64_t driver_resyncs;   /* the driver itself reporting a discontinuity (kAsioResyncRequest) */
     uint64_t late_blocks;      /* OUR render overran the block period — we are the cause     */
-    uint64_t render_ns_peak;   /* worst single-block render time                             */
+    uint64_t render_ns_peak;   /* worst single-block render time over the last 5 s of stream
+                                * time (SinkPeakWindow), NOT since start: see below            */
     uint64_t period_ns;        /* the block period that budget is measured against; 0 = none */
     uint32_t device_lost;      /* the device went away; the sink is host-pacing SILENCE       */
     bool     measured;         /* false = this backend cannot observe dropouts at all        */
@@ -138,6 +139,34 @@ typedef struct {
  * be counted as one. Factored out of the backends so the accounting can be tested without a device
  * (test/health_test.c); `block` bounds the sane-jump window. */
 uint64_t sink_position_gap(uint64_t expected, uint64_t actual, uint32_t block);
+
+/* THE RECENT RENDER PEAK. A since-start peak is a number nobody can act on: the first blocks after
+ * a start pay for lazy work (page faults, wasm compilation, a cold cache), a single stall early in a
+ * session pins it for the rest of it, and a live monitor then shows the same worst case forever.
+ * So render_ns_peak is the worst block over a short trailing WINDOW: whole-second buckets, the
+ * current one plus the SINK_PEAK_WINDOW_S - 1 before it, so it covers the last 4 to 5 s.
+ *
+ * Buckets are indexed by STREAM time (frames rendered / rate), not by a host clock. That keeps the
+ * window deterministic in a test, and it means a backend whose host clock is coarse or steps (the
+ * web worklet's, see os_posix.c) still ages its peaks at the rate the audio actually advances.
+ *
+ * One writer (the audio thread) and one reader (the control thread), no lock and no atomics, the
+ * same call sink_quant's other health counters make. What makes that safe to read is the packing:
+ * each bucket is ONE 64-bit word, (second << 40) | ns, so a reader can never pair one second's tag
+ * with another second's peak. 40 bits of ns is 18 minutes, far past any block; 24 bits of second
+ * wraps after 194 days of stream, where a stale bucket could alias once. Allocation-free, O(1) on
+ * the audio thread. */
+#define SINK_PEAK_WINDOW_S 5u
+#define SINK_PEAK_BUCKETS  8u            /* > SINK_PEAK_WINDOW_S; a power of two */
+typedef struct {
+    uint64_t bucket[SINK_PEAK_BUCKETS];
+    uint64_t latest;                     /* the newest second written, plus one; 0 = none yet */
+} SinkPeakWindow;
+/* Record one block's render time. `stream_frame` is the stream position of the block's first
+ * frame. Audio thread. */
+void     sink_peak_note(SinkPeakWindow* w, uint64_t stream_frame, uint32_t rate, uint64_t render_ns);
+/* The worst render time in the window, 0 before any block. Control thread. */
+uint64_t sink_peak_recent(const SinkPeakWindow* w);
 
 /* Copy a UTF-8 device name into a caller buffer under the contract bwa_get_device_name states:
  * always NUL-terminated, truncated to cap-1, never failed for want of room. The one thing plain

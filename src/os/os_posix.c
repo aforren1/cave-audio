@@ -26,6 +26,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>     /* mkdir: the UTF-8 path family is plain POSIX here */
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>   /* emscripten_get_now: os_monotonic_ns's worklet fallback */
+#endif
 
 /* No thread SCHEDULING on this target. Two ways to get here and they fail DIFFERENTLY, which is
  * why one macro covers both rather than each branch naming a platform:
@@ -230,7 +233,22 @@ uint64_t os_monotonic_ns(void) {
     return (t / tb.denom) * tb.numer + (t % tb.denom) * tb.numer / tb.denom;
 #else
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#if defined(__EMSCRIPTEN__)
+        /* AN AUDIO WORKLET HAS NO MONOTONIC CLOCK. AudioWorkletGlobalScope exposes no
+         * `performance` (WebAudio/web-audio-api#2527), so emscripten's CLOCK_MONOTONIC returns
+         * ENOSYS on that one thread and leaves `ts` untouched. Reading it anyway returned whatever
+         * the stack held: on Chrome 153 a constant 1069547520, so every render time after the
+         * first read 0 and the first read a whole second. emscripten_get_now is Date.now there,
+         * which is the only clock the scope has: 1 ms resolution, the same Unix epoch as
+         * performance.timeOrigin + performance.now on every other thread, and WALL time, so it
+         * can step backward. Callers that subtract two readings must allow for that
+         * (sink_quant.c does). Every other emscripten thread takes the branch above. */
+        return (uint64_t)(emscripten_get_now() * 1.0e6);
+#else
+        return 0;       /* cannot happen for CLOCK_MONOTONIC on a POSIX host; never read `ts` */
+#endif
+    }
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 #endif
 }

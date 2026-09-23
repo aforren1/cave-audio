@@ -325,7 +325,7 @@ renders several quanta back to back inside one system audio callback, so the "`c
 advanced by more than a quantum" rule this note proposed before the sink existed would
 false-positive on every ordinary batch. So `measured` is **false** and `device_pos_valid` is false:
 a zero dropout count means "cannot know". `late_blocks` and `render_ns_peak` come from the adapter
-and are real. `AudioContext.baseLatency + outputLatency` is the output latency, read once at open
+and are real, on a 1 ms clock (below). `AudioContext.baseLatency + outputLatency` is the output latency, read once at open
 off the context object, because `webaudio.h` has no accessor for either.
 
 **The clock, and a trap that is invisible.** `sample_pos` is the adapter's own stream position, not
@@ -333,11 +333,22 @@ off the context object, because `webaudio.h` has no accessor for either.
 what the adapter counts, and while the node is connected `currentFrame` minus its value at the
 first callback IS that number. Reading it would cost a wasm-to-JS transition per quantum for a
 value the sink holds. The host half is `os_monotonic_ns` like every other backend, and here is the
-trap: under `-sAUDIO_WORKLET` Emscripten resolves `emscripten_get_now` PER SCOPE, and
-`AudioWorkletGlobalScope` has no `performance`, so the audio thread's monotonic clock falls back to
-`Date.now`. Same epoch as the control thread's `performance.timeOrigin + performance.now`, a
-thousand times coarser, and not guaranteed monotonic. The adapter's rule that a stamp never steps
-backward is load-bearing here rather than defensive.
+trap: `AudioWorkletGlobalScope` has no `performance` (checked in Chrome 153: `typeof performance`
+is `"undefined"` inside a processor), so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the
+audio thread and writes nothing. Until 2026-09-23 `os_monotonic_ns` did not check, and returned
+whatever the stack held. Measured through a debug export in headless Chrome: `clock_gettime`
+returned -1 with errno 52 on every quantum, and the value read back was the constant 1069547520.
+So every render time read 0 except the first, which read 1.07 s and pinned `peak_load` at 401
+(40108 %), which is the "percentages with many digits" a Galaxy XR showed. Now it falls back to
+`emscripten_get_now`, which Emscripten itself resolves to `Date.now` in that scope: the only clock
+the scope has. Same epoch as the control thread's `performance.timeOrigin + performance.now`, a
+thousand times coarser, and not monotonic. There is no better clock to find: Emscripten 6.0.10
+has no worklet time source past this, `currentTime` and `currentFrame` are the audio clock (they do
+not move during a `process()` call), and a Worker spinning `performance.now()` into shared memory
+would burn a core to fix a readout. So on this backend a render time is whole milliseconds against
+a 2.67 ms quantum, `late_blocks` can be off by one near the budget either way, and both of the
+adapter's backward-step rules are load-bearing: a stamp never steps back, and a render time that
+would go negative books 0 instead of wrapping to 1.8e19 ns.
 
 **Channel count**: stereo, said at the open. AUTO sends anything wider to the offline sink, the way
 Android's AAudio sink does.
@@ -602,11 +613,15 @@ wasm32 phonon staged:
   it against `BWA_ROOM_AHEAD`, `BWA_ROOM_UP` and `BWA_ROOM_RIGHT` rather than against the algebra
   the module derives. Every assertion in both was broken on purpose and confirmed red first.
   Since 2026-09-23 it also pins the Galaxy XR fixes: the head gizmo is hidden in session and back
-  in the flat preview, the engine opens at block 128, the status table reads `128 / 128 = 1` and
-  carries both peak-load rows, the session asks for `hand-tracking`, a gamepad-less hand input
-  grabs on a pinch and carries the source in height and depth, the panel's move buttons move it,
-  and a block-256 rebuild and a `playback` latency-hint rebuild both come back driven by the
-  worklet. Each new pin was broken once and went red.
+  in the flat preview, the engine opens at block 128, the status table reads `128 / 128 = 1`,
+  the session asks for `hand-tracking`, a gamepad-less hand input grabs on a pinch and carries the
+  source in height and depth, the panel's move buttons move it, and a block-256 rebuild and a
+  `playback` latency-hint rebuild both come back driven by the worklet. The health readout is
+  pinned too: the status table leads with the audio clock slip over a full 5 s window, the render
+  peak row reads whole milliseconds and says "(1 ms clock)", the percentage rows are gone, and the
+  in-world health line leads with the slip and wraps to at most two lines at the panel's own font
+  and width. `tests/xr_slip.test.mjs` pins the slip's sign, window, suspended state and
+  per-context reset under node. Each new pin was broken once and went red.
 
 **Not verified** on the XR page: that three.js renders it. Headless Chrome has no XR device, so
 the fake session cannot be bound to a framebuffer, and the page is deliberately built so the pose
@@ -618,7 +633,7 @@ page exists to ask, which is whether the image stays put when you turn your head
 what the check proves is that the path runs and is paced by the audio clock, not that the HRTF
 image is correct - and the wasm build uses phonon's real HRTF, so a by-ear pass is worth having.
 Also unverified: the `baseLatency` read (headless Chrome reports one, but not one anybody has
-compared against a stopwatch), the `Date.now` clock fallback's effect on `bwa_get_clock_model`, and
+compared against a stopwatch), the `Date.now` clock's effect on `bwa_get_clock_model`, and
 anything on a browser that is not Chromium.
 
 ## Hosting
@@ -885,12 +900,39 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   and the AudioContext. No new gesture is needed, because the Enter VR press already unlocked
   audio for the document.
 
-  What to read on the headset: the panel's "audio health" line. Late blocks in the last 5 s is
-  the number for an A/B. Peak load runs since the engine started, so it includes the start-up
-  blocks: headless desktop Chrome shows 330 to 480 percent from those alone, with 2 to 4 late
-  blocks. "Per process() call" is the peak scaled by block over quantum, because a bigger block
-  still renders inside one call. If the audio crackles while late blocks stay flat, the render is
-  keeping up and the device buffer is not, so try `playback`.
+  What to read on the headset: the panel's "audio health" line, two lines, numbers first. The
+  first number is the **audio clock slip**: over the last 5 s, wall time from `performance.now()`
+  minus audio time from `AudioContext.currentTime`, both read on the main thread every animation
+  frame (`xr/slip.js`). It is the one dropout signal this platform has. When the render thread
+  misses a deadline Chrome plays fallback silence and the graph does not advance, so the audio
+  clock falls behind: 0 is healthy, positive is the audio thread not keeping up. Beside it is the
+  count of animation frames over 30 ms in the same window, which tells a stalled main thread (long
+  frames, no slip; the main thread samples both clocks late, not apart) from a stalled audio thread
+  (slip, no long frames). Then late blocks in the window, then the render peak in milliseconds
+  against the block budget, marked "(1 ms clock)" because on the worklet that is what it is. There
+  is no percentage and no "per process() call" figure any more: both multiplied a 1 ms reading.
+  Headless desktop Chrome, measured by `run-xr.mjs`: in the first 5 s after a start the slip reads
+  2 to 3 percent (the context's clock sits at 0 for its first few hundred ms) and the render peak
+  7 to 13 ms (the first blocks pay for wasm compilation); once the start is out of the window it
+  reads 0.1 percent (3 ms) and 1 ms. A plain oscillator page reads the same 0.1 percent, so that is
+  the resolution of `currentTime` on the main thread, not a loss. The direction and the scale
+  were checked with a worklet that busy-waits on purpose, headless Chrome 153, 5 s windows: no
+  stall reads -0.1 percent, a 20 ms stall once a second reads 0.1 percent (the device buffer
+  absorbs it), a 100 ms stall once a second reads +2.4 percent (119 ms). So the slip counts the part
+  of a stall that outlasted the buffer, which is the silence you hear, not the stall itself. The 330 to 480 percent peaks this
+  section used to quote were not start-up cost at all: they were the worklet's uninitialized clock
+  (see "The clock, and a trap that is invisible" above).
+
+  **Why a bigger block gives fewer but longer glitches here.** The adapter renders a whole engine
+  block synchronously inside ONE `process()` call, and the browser cannot hand the device that
+  quantum until the call returns. So a render that overruns stalls the output for the whole render,
+  not for the part that overran. At 512 a block renders once every four quanta and costs about four
+  times as much, so an overrun happens a quarter as often and stalls about four times longer: fewer,
+  longer bursts, which is what the Galaxy XR showed. At 128 the same cost is spread over every
+  call. Block size moves the glitches around; it does not remove them. The cure is render cost
+  (fewer voices, `binaural` instead of `cave_sim`, a cheaper scene), or a device buffer with more
+  headroom (`playback`). If the slip stays at 0 while the audio crackles, the render is keeping up
+  and the problem is downstream of it.
 
   The page also asks for `hand-tracking` as an optional feature. A pinch is `select`, so
   pinch-and-hold grabs the source and carries it on all three axes. A hand has no thumbstick, so

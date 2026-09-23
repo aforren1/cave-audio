@@ -158,7 +158,7 @@ namespace BwAudio
         public ulong driverResyncs;   // the driver reporting a discontinuity itself
         public ulong lateBlocks;      // our render overran the block period
         public ulong streamStarves;   // a streamed voice's ring ran dry without the asset ending
-        public float peakLoad;        // worst block's render time / block period; 1.0 = at budget
+        public float peakLoad;        // worst block's render time / block period, last 4-5 s; 1.0 = at budget
         // Nonzero: the device went away (unplugged, a driver reset, the session torn down). The
         // engine keeps rendering from the host clock, so clocks and playheads stay live, and the
         // audio is SILENT. Nothing reopens on its own — Stop() then Start(), or leave it.

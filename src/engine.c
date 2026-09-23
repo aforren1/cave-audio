@@ -1198,6 +1198,8 @@ bool bwa_get_health(bwa_engine* e, bwa_health* out) {
     /* The stream ring is the engine's, not the device's — it starves under ANY sink, so it is
      * reported whether or not the device could be measured. */
     out->stream_starves = rt_stream_starves(e->rt);
+    /* WINDOWED, not since start (sink.h, SinkPeakWindow): the first blocks and any one early stall
+     * used to pin this for the whole session, which made it useless as a live reading. */
     out->peak_load      = h.period_ns ? (float)((double)h.render_ns_peak / (double)h.period_ns) : 0.f;
     /* Reported whether or not the device could be measured: "the device went away" is a fact the
      * sink observed, not an inference from a position it may never have been given. */

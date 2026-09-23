@@ -12,6 +12,13 @@ as before. The built-in grid you get with no layout file is still 26 speakers, n
 `BWA_DEFAULT_GRID`. Nothing in the package API changes. If your code sized an array to 26, size it
 from `ChannelCount` instead.
 
+### Changed: `peak_load` covers the last 5 seconds, not the whole run
+
+The health block's `peak_load` is now the worst single block's render time over the last 4 to 5
+seconds of audio. It used to be the worst since start, so one slow first block or one old stall
+pinned it for the rest of the session. The field and the struct layout did not change. Every count
+beside it is still since start.
+
 ## [0.16.0]
 
 Synchronized version numbers.

@@ -48,7 +48,9 @@
  * the same honest answer AAudio gives for its position and the manual sink gives for everything:
  * a zero dropout count here means "cannot know", not "none happened". What IS real is our own half
  * of the measurement, which the adapter takes for every backend it serves: late_blocks and
- * render_ns_peak. Those are the numbers a web page should watch.
+ * render_ns_peak, both on a 1 ms clock here (see below). A page that wants a dropout signal needs
+ * one that does not come from this thread; bindings/web/xr/slip.js reads AudioContext.currentTime
+ * against performance.now on the main thread.
  *
  * WHY sample_pos IS NOT currentFrame. Rule 3 defines sample_pos as the frames the sink handed to
  * the device before this block, counted from the sink's start, which is exactly what the adapter
@@ -56,12 +58,15 @@
  * callback)` IS that number, by construction: one process() call per quantum. Reading it would
  * cost a wasm-to-JS transition per quantum for a value we hold, so the sink does not read it. The
  * pair's host half is os_monotonic_ns through sink_quant_now_ns, like every other backend - with
- * one platform caveat worth writing down, because it is invisible: under -sAUDIO_WORKLET
- * Emscripten resolves emscripten_get_now PER SCOPE, and AudioWorkletGlobalScope has no
- * `performance`, so the worklet thread's monotonic clock falls back to Date.now (milliseconds,
- * and not guaranteed monotonic). Same epoch as the control thread's
- * performance.timeOrigin + performance.now, and a thousand times coarser. The adapter's rule that
- * a stamp never steps backward is therefore load-bearing here rather than defensive.
+ * one platform caveat worth writing down, because it is invisible: AudioWorkletGlobalScope has no
+ * `performance`, so emscripten's CLOCK_MONOTONIC returns ENOSYS on this thread, and until
+ * 2026-09-23 os_monotonic_ns returned uninitialized stack here (measured: a constant, so every
+ * render time read 0 except the first, which read a second and pinned peak_load at 401). It now
+ * falls back to Date.now: milliseconds, not monotonic, same epoch as the control thread's
+ * performance.timeOrigin + performance.now and a thousand times coarser. So on this backend a
+ * render time is a whole number of milliseconds, late_blocks can be off by a block either way near
+ * the budget, and the adapter's two backward-step rules (the stamp never steps back, a render time
+ * that would go negative books 0) are load-bearing rather than defensive.
  *
  * AUDIO THREAD. worklet_process is the AudioWorklet's own rendering thread. Everything it touches
  * is allocated at open: no malloc, no JS call, no console, no proxying.
@@ -471,9 +476,10 @@ static uint32_t worklet_output_latency(bwa_sink* base) {
 
 /* `measured` is FALSE, always, and the file header says why: Web Audio reports no dropout, no
  * device position and no xrun count, so a zero here would mean "could not know" dressed as a clean
- * bill. late_blocks and render_ns_peak come from the adapter and ARE real. device_lost reports the
- * host-paced state, which on this platform means either a suspended context or a setup chain that
- * failed - both cases where the sink is pacing silence so the engine's clocks keep advancing. */
+ * bill. late_blocks and render_ns_peak come from the adapter and are real, on a 1 ms clock (see the
+ * file header). device_lost reports the host-paced state, which on this platform means either a
+ * suspended context or a setup chain that failed - both cases where the sink is pacing silence so
+ * the engine's clocks keep advancing. */
 static void worklet_health(bwa_sink* base, bwa_sink_health* out) {
     WorkletSink* s = (WorkletSink*)base;
     sink_quant_health(&s->quant, out);

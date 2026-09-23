@@ -76,7 +76,7 @@ struct AsioSink {
     std::atomic<uint64_t> h_dropped_frames{0};
     std::atomic<uint64_t> h_resyncs{0};
     std::atomic<uint64_t> h_late{0};
-    std::atomic<uint64_t> h_render_ns_peak{0};
+    SinkPeakWindow        h_peak{};   /* recent render peak: one writer, packed words (sink.h) */
     std::atomic<bool>     pos_measured{false};
     uint64_t        predicted_pos;   /* where the NEXT valid callback should land; 0 = nothing to compare yet */
 };
@@ -170,8 +170,9 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
                              + (ticks % s->qpc_freq) * 1000000000ull / s->qpc_freq;
         const uint64_t budget_ns = (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate;
         if (ns > budget_ns) s->h_late.fetch_add(1, std::memory_order_relaxed);
-        uint64_t peak = s->h_render_ns_peak.load(std::memory_order_relaxed);
-        while (ns > peak && !s->h_render_ns_peak.compare_exchange_weak(peak, ns, std::memory_order_relaxed)) {}
+        /* Bucketed by blocks rendered, which is stream time at the driver's fixed buffer size. */
+        sink_peak_note(&s->h_peak, s->h_blocks.load(std::memory_order_relaxed) * (uint64_t)s->buffer_size,
+                       s->sample_rate, ns);
     }
     s->h_blocks.fetch_add(1, std::memory_order_relaxed);
 
@@ -264,7 +265,7 @@ void asio_health(bwa_sink* base, bwa_sink_health* out) {
     out->dropped_frames = s->h_dropped_frames.load(std::memory_order_relaxed);
     out->driver_resyncs = s->h_resyncs.load(std::memory_order_relaxed);
     out->late_blocks    = s->h_late.load(std::memory_order_relaxed);
-    out->render_ns_peak = s->h_render_ns_peak.load(std::memory_order_relaxed);
+    out->render_ns_peak = sink_peak_recent(&s->h_peak);
     out->period_ns      = s->sample_rate
             ? (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate : 0;
     /* Not "no dropouts" — "we were in a position to see one". A driver that never flags a valid

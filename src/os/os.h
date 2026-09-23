@@ -101,7 +101,9 @@ void     os_sleep_ms(unsigned ms);
 
 /* The platform monotonic clock in nanoseconds: QPC on Windows, mach_absolute_time scaled by
  * mach_timebase_info on Apple, CLOCK_MONOTONIC elsewhere. Arbitrary epoch — only DIFFERENCES
- * mean anything, which is exactly what bwa_timestamp.system_time_ns promises. */
+ * mean anything, which is exactly what bwa_timestamp.system_time_ns promises. ONE EXCEPTION: on
+ * a browser's AudioWorklet thread it is Date.now (1 ms, wall time, can step backward), because
+ * that scope has no other clock (os_posix.c). */
 uint64_t os_monotonic_ns(void);
 
 /* Sleep until an ABSOLUTE deadline on the os_monotonic_ns clock; returns at once when the deadline

@@ -32,7 +32,8 @@ import { XrWorld } from "./world_xr.js";
 import { MenuPanel } from "./panel.js";
 import { Hands, stepSource } from "./hands.js";
 import { XrRuntime } from "./session.js";
-import { buildOptions, statusRows, profileName, DEFAULT_LEAD_S, XR_DEFAULT_BLOCK } from "./options.js";
+import { buildOptions, statusRows, healthLine, profileName, DEFAULT_LEAD_S, XR_DEFAULT_BLOCK } from "./options.js";
+import { ClockSlip } from "./slip.js";
 import { qrot, earSideOf } from "./frame_xr.js";
 
 const el = (id) => document.getElementById(id);
@@ -56,6 +57,7 @@ const app = {
   slowT: 0,
   errors: [],
   xrSupported: false,
+  slip: new ClockSlip(),
 };
 
 function log(msg, bad) {
@@ -246,6 +248,9 @@ function step(nowMs, frame, runtime) {
   if (!app.running) return;
   const dt = Math.min(0.1, app.lastT ? (nowMs - app.lastT) / 1000 : 0.016);
   app.lastT = nowMs;
+  /* Every frame, flat or in session: the slip is the only dropout signal the page has (slip.js),
+   * and the frame time it is handed is also what the long-frame count reads. */
+  app.slip.sample(nowMs, app.rig.ctx);
 
   /* ---- the head ---- */
   if (frame && runtime) {
@@ -328,9 +333,9 @@ function busPeaks() {
 }
 
 /**
- * Keep five seconds of health samples so the panel can show a RECENT late-block rate. peak_load
- * and the totals run since the engine started and so carry the start-up blocks (the first renders
- * build the decoder state); a count over the last few seconds is what an A/B on the headset reads.
+ * Keep five seconds of health samples so the panel can show a RECENT late-block rate. The totals
+ * run since the engine started; a count over the last few seconds is what an A/B on the headset
+ * reads. (bwa_health.peak_load is already windowed by the engine.)
  */
 function noteHealth(nowMs) {
   const h = app.rig.health;
@@ -492,6 +497,10 @@ globalThis.__bwaXr = {
   setEngineOptions,
   stepSource: (what) => app.stepSource(what),
   statusRows: () => statusRows(app).map(([k, v]) => [k, String(v)]),
+  /** The in-world health text, and how many lines the panel would draw it in. */
+  healthLine: () => healthLine(app),
+  panelLines: (text) => app.panel?.lineCount(text) ?? null,
+  slip: () => app.slip.reading(),
   state: () => ({
     xrSupported: app.xrSupported,
     presenting: !!app.xr?.presenting,

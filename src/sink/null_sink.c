@@ -33,7 +33,8 @@ typedef struct {
 
     /* Health counters (bwa_sink_health): written on the render thread, read from the control
      * thread. Relaxed — each is an independent count that orders nothing else. */
-    _Atomic uint64_t h_blocks, h_dropouts, h_dropped_frames, h_late, h_render_ns_peak;
+    _Atomic uint64_t h_blocks, h_dropouts, h_dropped_frames, h_late;
+    SinkPeakWindow   h_peak;      /* recent render peak: one writer, packed words (sink.h) */
 } NullSink;
 
 /* TEST HOOK — declared in sink.h (exported from the dll there), deliberately not in bw_audio.h:
@@ -117,12 +118,7 @@ static void null_thread(void* arg) {
          * the pacing loop below is what enforces it. On a device it is what eventually becomes a
          * dropout, so counting it off-hardware is the honest half of the measurement CI can do. */
         if (render_ns > budget_ns) atomic_fetch_add_explicit(&s->h_late, 1u, memory_order_relaxed);
-        for (;;) {                                        /* CAS-max: one writer, so it settles at once */
-            uint64_t peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
-            if (render_ns <= peak) break;
-            if (atomic_compare_exchange_weak_explicit(&s->h_render_ns_peak, &peak, render_ns,
-                                                      memory_order_relaxed, memory_order_relaxed)) break;
-        }
+        sink_peak_note(&s->h_peak, sample_pos, s->sample_rate, render_ns);
         atomic_fetch_add_explicit(&s->h_blocks, 1u, memory_order_relaxed);
 
         sample_pos  += s->block_size;
@@ -178,7 +174,7 @@ static void null_health(bwa_sink* base, bwa_sink_health* out) {
     out->dropped_frames = atomic_load_explicit(&s->h_dropped_frames, memory_order_relaxed);
     out->driver_resyncs = 0;                    /* no driver to report one */
     out->late_blocks    = atomic_load_explicit(&s->h_late, memory_order_relaxed);
-    out->render_ns_peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
+    out->render_ns_peak = sink_peak_recent(&s->h_peak);
     out->period_ns      = s->sample_rate
             ? (uint64_t)s->block_size * 1000000000ull / (uint64_t)s->sample_rate : 0;
     out->device_lost    = 0;                    /* no device to lose */

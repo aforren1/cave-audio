@@ -41,15 +41,6 @@ export function quantumOf(app) {
 
 function pct(x) { return `${Math.round(x * 100)}%`; }
 
-/**
- * The render load in one line, for the in-world panel (the DOM status table is out of sight in a
- * headset). ASCII only: it can reach a console through the log.
- *
- * peakLoad is bwa_health.peak_load: the WORST single block's render time over one BLOCK period,
- * since the engine started. When the block is bigger than the quantum the whole block still
- * renders inside ONE process() call, so the number that matters for that call is the same time
- * over one QUANTUM period: peakLoad * block / quantum.
- */
 /** Late blocks over the recent window main.js keeps, or null before there are two samples. */
 export function recentLate(app) {
   const hist = app.healthHist;
@@ -58,19 +49,57 @@ export function recentLate(app) {
   return { late: b.late - a.late, blocks: b.blocks - a.blocks, seconds: (b.t - a.t) / 1000 };
 }
 
+/**
+ * The audio-clock slip over the trailing window (slip.js), as short text, or a reason it has none.
+ * THE FIRST NUMBER TO READ, because it is the only dropout signal this platform has: Web Audio
+ * reports no xrun, and the engine's own render times come from a 1 ms clock on the worklet.
+ */
+export function slipText(app) {
+  const s = app.slip?.reading();
+  if (!s) return "slip: measuring";
+  if (s.state !== "running") return `slip: context ${s.state}`;
+  return `slip ${s.slipPct.toFixed(1)}% (${Math.round(s.slipMs)} ms/${(s.spanMs / 1000).toFixed(0)} s)`;
+}
+
+/**
+ * bwa_health.peak_load is the worst single block's render time over the last 4 to 5 s, as a
+ * fraction of one block period. On the web worklet the clock under it is Date.now, whole
+ * milliseconds (src/os/os_posix.c), so a percentage of a 2.7 ms period would claim precision the
+ * measurement does not have. Say it in ms, and say what the clock is. The old per-process()-call
+ * figure is gone for the same reason: it multiplied a 1 ms reading by block / quantum.
+ */
+export function renderPeak(app) {
+  const i = app.rig.engine?.info;
+  const h = app.rig.health;
+  if (!i || !h) return null;
+  const budgetMs = (1000 * i.blockSize) / i.sampleRate;
+  const peakMs = h.peakLoad * budgetMs;
+  const coarse = /^worklet/.test(i.backend || "");
+  return {
+    budgetMs,
+    peakMs,
+    coarse,
+    text: coarse ? `${Math.round(peakMs)} ms of ${budgetMs.toFixed(1)} (1 ms clock)`
+                 : `${peakMs.toFixed(2)} ms of ${budgetMs.toFixed(1)} (${pct(h.peakLoad)})`,
+  };
+}
+
+/**
+ * The render health for the in-world panel (the DOM status table is out of sight in a headset).
+ * TWO LINES, numbers first, because the panel is 476 px of 17 px text and a paragraph there is
+ * unreadable at arm's length. ASCII only: it can reach a console through the log.
+ */
 export function healthLine(app) {
   const i = app.rig.engine?.info;
   const h = app.rig.health;
   if (!i || !h) return "audio health: waiting for the first poll";
-  const q = quantumOf(app);
-  const ratio = i.blockSize / q;
-  const perCall = h.peakLoad * ratio;
+  const s = app.slip?.reading();
   const r = recentLate(app);
-  const recent = r ? `${r.late} of ${r.blocks} in the last ${r.seconds.toFixed(0)} s` : "measuring";
-  return `Audio: block ${i.blockSize} / quantum ${q} (${ratio >= 1 ? ratio : ratio.toFixed(2)} ` +
-         `quanta per block). Late blocks: ${recent}; ${h.lateBlocks} of ${h.blocks} since start. ` +
-         `Peak render since start (includes start-up): ${pct(h.peakLoad)} of a block, ` +
-         `${pct(perCall)} of one process() call. Latency hint "${app.latencyHint ?? "interactive"}".`;
+  const late = r ? `late ${r.late}/${r.blocks}` : "late -";
+  const long = s ? `, ${s.longFrames} long frames` : "";
+  const p = renderPeak(app);
+  return `${slipText(app)}${long}, ${late}\n` +
+         `peak ${p.text}, block ${i.blockSize}/${quantumOf(app)}, ${app.latencyHint ?? "interactive"}`;
 }
 
 export function profileName(p) {
@@ -166,7 +195,11 @@ export function statusRows(app) {
   const i = app.rig.engine?.info;
   const h = app.rig.health;
   const x = app.xr;
+  const sl = app.slip?.reading();
   const rows = [
+    /* FIRST, because it is the one dropout signal this platform has (slip.js). */
+    ["audio clock slip (5 s)", slipText(app).replace(/^slip:? /, "")],
+    ["long frames > 30 ms (5 s)", sl ? `${sl.longFrames} of ${sl.frames}` : "-"],
     ["mode", x?.presenting ? "immersive-vr" : "flat preview"],
     ["reference space", x?.refSpaceType ?? "-"],
     ["menu", x?.presenting ? (x.domOverlay ? "DOM overlay" : "in-world panel") : "DOM"],
@@ -197,10 +230,8 @@ export function statusRows(app) {
     rows.push(["late blocks (since start)", h.lateBlocks]);
     const r = recentLate(app);
     if (r) rows.push(["late blocks (recent)", `${r.late} of ${r.blocks} in ${r.seconds.toFixed(1)} s`]);
-    /* bwa_health.peak_load: worst block render time over one block period, since start, so it
-     * includes the start-up blocks. */
-    rows.push(["peak load (per block)", pct(h.peakLoad)]);
-    if (i) rows.push(["peak load (per process() call)", pct(h.peakLoad * i.blockSize / quantumOf(app))]);
+    const p = renderPeak(app);
+    if (p) rows.push(["render peak (last 5 s)", p.text]);
     rows.push(["device lost (host-paced)", h.deviceLost]);
   }
   return rows;

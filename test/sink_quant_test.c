@@ -160,6 +160,90 @@ static void test_stamps_never_go_backward(void) {
     sink_quant_free(&q);
 }
 
+/* ---- the render-time clock, injected. The adapter times each render with q->clock_ns; these
+ * tests swap in a fake one the render itself moves, so "this block took 50 ms" or "the clock
+ * stepped back 1 s during this block" is exact rather than a sleep and a hope. ---- */
+static uint64_t fake_now_ns;
+static int64_t  fake_cost_ns;          /* what the NEXT render moves the fake clock by; may be < 0 */
+static uint64_t fake_clock(void) { return fake_now_ns; }
+static void render_costly(void* user, float* bus, uint32_t nframes, const bwa_timestamp* ts) {
+    render(user, bus, nframes, ts);
+    fake_now_ns = (uint64_t)((int64_t)fake_now_ns + fake_cost_ns);
+}
+static void pull_blocks(SinkQuant* q, uint32_t nblocks) {
+    for (uint32_t i = 0; i < nblocks; ++i) {
+        sink_quant_pull(q, BLOCK, 0, false, fake_now_ns, NULL, NULL);
+        fake_now_ns += (uint64_t)BLOCK * 1000000000ull / 48000ull;   /* the wall between callbacks */
+    }
+}
+
+/* THE WINDOW FORGETS. peak_load used to be a since-start maximum, so one slow block (the first
+ * one, or one stall) pinned it for the rest of the session and a live monitor could never recover.
+ * One 50 ms block, then ordinary 0.1 ms ones: the peak must show the spike while it is recent and
+ * drop back once 6 s of stream have passed. Broken on purpose twice before it was trusted green:
+ * a reader that skips the age test went red at 6 s, a writer that maxes into a stale bucket instead
+ * of recycling it went red at 14 s. */
+static void test_peak_window_forgets(void) {
+    SinkQuant q;
+    memset(&g, 0, sizeof g);
+    CHECK(sink_quant_init(&q, 48000, BLOCK, CHANS, MAXREQ, render_costly, &g) == 0, "init");
+    q.clock_ns = fake_clock;
+    fake_now_ns = 5000000000ull;
+    const uint64_t cheap = 100000ull, spike = 50000000ull;
+    const uint32_t per_s = 48000u / BLOCK;
+
+    fake_cost_ns = (int64_t)cheap;  pull_blocks(&q, per_s / 2);
+    fake_cost_ns = (int64_t)spike;  pull_blocks(&q, 1);
+    fake_cost_ns = (int64_t)cheap;  pull_blocks(&q, per_s * 2);
+
+    bwa_sink_health h;
+    sink_quant_health(&q, &h);
+    CHECK(h.render_ns_peak == spike, "2 s after a 50 ms block the peak reads %llu ns, want %llu",
+          (unsigned long long)h.render_ns_peak, (unsigned long long)spike);
+    CHECK(h.late_blocks == 1, "one 50 ms block against a 1.3 ms period is one late block, got %llu",
+          (unsigned long long)h.late_blocks);
+
+    pull_blocks(&q, per_s * 4);                          /* 6 s after the spike, in all */
+    sink_quant_health(&q, &h);
+    CHECK(h.render_ns_peak == cheap, "6 s after the spike the peak still reads %llu ns, want %llu: "
+          "the window does not forget", (unsigned long long)h.render_ns_peak, (unsigned long long)cheap);
+    CHECK(h.late_blocks == 1, "late_blocks is a since-start count and must not forget (%llu)",
+          (unsigned long long)h.late_blocks);
+
+    /* Past one lap of the bucket ring: a window that stopped RECYCLING its buckets would read 0
+     * here (every bucket stale), and one that stopped AGING them would still read the spike. */
+    pull_blocks(&q, per_s * 8);
+    sink_quant_health(&q, &h);
+    CHECK(h.render_ns_peak == cheap, "14 s in, the peak reads %llu ns, want %llu",
+          (unsigned long long)h.render_ns_peak, (unsigned long long)cheap);
+    sink_quant_free(&q);
+}
+
+/* A CLOCK THAT STEPS BACKWARD during a render. On the web worklet the render clock is Date.now,
+ * which follows the system clock when it is corrected; t1 - t0 then wrapped to ~1.8e19 ns, a
+ * peak_load of trillions of percent, and a late block. It must book nothing instead. Broken on
+ * purpose (the plain subtraction back) and this went red. */
+static void test_backward_render_clock(void) {
+    SinkQuant q;
+    memset(&g, 0, sizeof g);
+    CHECK(sink_quant_init(&q, 48000, BLOCK, CHANS, MAXREQ, render_costly, &g) == 0, "init");
+    q.clock_ns = fake_clock;
+    fake_now_ns = 5000000000ull;
+    fake_cost_ns = 200000;                       pull_blocks(&q, 10);
+    fake_cost_ns = -1000000000;                  pull_blocks(&q, 1);    /* the clock steps back 1 s */
+    fake_cost_ns = 200000;                       pull_blocks(&q, 10);
+
+    bwa_sink_health h;
+    sink_quant_health(&q, &h);
+    CHECK(h.render_ns_peak == 200000ull, "a backward clock step read as a render peak of %llu ns",
+          (unsigned long long)h.render_ns_peak);
+    CHECK(h.late_blocks == 0, "a backward clock step counted %llu late blocks",
+          (unsigned long long)h.late_blocks);
+    for (uint32_t i = 1; i < g.nrenders && i < 4096; ++i)
+        CHECK(g.stamp_ns[i] > g.stamp_ns[i - 1], "block %u stamp stepped back with the clock", i);
+    sink_quant_free(&q);
+}
+
 /* A backend can book a dropout it detected some other way than the queued-depth rule (WASAPI
  * shared mode measures the release interval). It must land on the same counters, and an absurd
  * frame estimate must be clamped rather than believed. */
@@ -300,6 +384,8 @@ int main(void) {
     test_stamps_never_go_backward();
     test_backend_reported_dropout();
     test_dropout_and_measured();
+    test_peak_window_forgets();
+    test_backward_render_clock();
 
     if (fails) { fprintf(stderr, "sink_quant: %d failure(s)\n", fails); return 1; }
     printf("sink_quant OK\n");

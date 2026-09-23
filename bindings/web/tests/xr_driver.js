@@ -341,12 +341,30 @@
     if (rows["block / quantum"] !== XR_BLOCK + " / 128 = 1")
       fail('the status table reads block / quantum "' + rows["block / quantum"] + '"');
     else ok('the status table reads block / quantum "' + rows["block / quantum"] + '"');
-    if (!/^\d+%$/.test(rows["peak load (per block)"] || "") ||
-        !/^\d+%$/.test(rows["peak load (per process() call)"] || ""))
-      fail("the status table has no peak load rows: " + JSON.stringify(rows));
-    else ok("peak load " + rows["peak load (per block)"] + " per block, " +
-            rows["peak load (per process() call)"] + " per process() call, late blocks " +
+    /* The render peak is whole milliseconds on the worklet (its only clock is Date.now), so the
+     * row must say so rather than print a percentage of a 2.7 ms period. */
+    if (!/^\d+ ms of \d+\.\d \(1 ms clock\)$/.test(rows["render peak (last 5 s)"] || ""))
+      fail('the status table has no honest render peak row: "' + rows["render peak (last 5 s)"] + '"');
+    else ok('render peak "' + rows["render peak (last 5 s)"] + '", late blocks ' +
             rows["late blocks (since start)"] + " (headless desktop, not a headset)");
+    if (rows["peak load (per block)"] !== undefined || rows["peak load (per process() call)"] !== undefined)
+      fail("the status table still carries the percentage peak-load rows");
+    /* THE SLIP IS FIRST, in the table and on the panel: it is the one dropout signal this
+     * platform has. Wait for a full window, then read it. */
+    await waitFor(function () { var r = xr.slip(); return r && r.spanMs >= 4900; }, 15000, "a full 5 s slip window");
+    var firstRow = xr.statusRows()[0];
+    var sl = xr.slip();
+    if (!firstRow || firstRow[0] !== "audio clock slip (5 s)" || !/^-?\d+\.\d% \(-?\d+ ms\/5 s\)$/.test(firstRow[1]))
+      fail("the first status row is not the audio clock slip: " + JSON.stringify(firstRow));
+    else ok("audio clock slip " + firstRow[1] + " over " + (sl.spanMs / 1000).toFixed(2) + " s, " +
+            sl.longFrames + " frames over 30 ms of " + sl.frames + " (headless desktop)");
+    if (!(Math.abs(sl.slipPct) < 100)) fail("the slip reading is not a sane percentage: " + sl.slipPct);
+    var line = xr.healthLine();
+    var nLines = xr.panelLines(line);
+    if (!/^slip -?\d+\.\d%/.test(line)) fail('the health line does not lead with the slip: "' + line + '"');
+    else if (!(nLines >= 1 && nLines <= 2)) fail("the health line takes " + nLines + ' panel lines: "' + line + '"');
+    else ok("the health line leads with the slip and fits in " + nLines + ' panel lines: "' +
+            line.replace("\n", " / ") + '"');
     if (s.refSpaceType !== "local-floor")
       fail('the page took a "' + s.refSpaceType + '" reference space, expected local-floor');
     else ok("local-floor reference space, so room y is the real floor with no offset");
@@ -662,6 +680,14 @@
       if (Math.abs(up1 - up0 - 0.25) > 0.01) fail('the "up" button moved the source ' + r3(up1 - up0) + " m in y");
       else ok('the panel "up" button raises the source 0.25 m, no thumbstick needed');
     }
+
+    /* A READING, not an assertion: the same two numbers again, now that the start-up blocks are
+     * well outside both 5 s windows. What a healthy headless desktop shows is worth having in the
+     * log beside the first reading, which still carried the start. */
+    var lateRows = {};
+    xr.statusRows().forEach(function (r) { lateRows[r[0]] = r[1]; });
+    ok("steady state: audio clock slip " + lateRows["audio clock slip (5 s)"] + ", long frames " +
+       lateRows["long frames > 30 ms (5 s)"] + ', render peak "' + lateRows["render peak (last 5 s)"] + '"');
 
     /* ---- the engine block and latency hint A/B: each rebuilds engine and context ---- */
     await xr.setEngineOptions({ blockSize: 256 });

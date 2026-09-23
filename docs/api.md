@@ -2192,7 +2192,7 @@ speaker gizmo from this.
 ```c
 typedef struct bwa_health {
     uint64_t blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves;
-    float    peak_load;      // worst block's render time / block period
+    float    peak_load;      // worst block's render time / block period, last 4-5 s
     uint32_t device_lost;    // nonzero: the device went away; the engine is host-pacing silence
 } bwa_health;
 bool     bwa_get_health(bwa_engine* e, bwa_health* out);  // false = this setup cannot measure
@@ -2212,7 +2212,11 @@ The fields answer two different questions with two different fixes:
 - **`late_blocks`** is *us* overrunning the block period, which is what eventually produces xruns.
   Fix downstream: a cheaper scene, fewer voices, and watch `peak_load`; it is the worst single block's
   render time as a fraction of the period, so 1.0 means a block exactly consumed its budget and
-  anything near it is living dangerously.
+  anything near it is living dangerously. It covers the **last 4 to 5 seconds** of stream time, not
+  the whole run, so a slow first block or one old stall stops showing once it is 5 s old. Up to
+  0.16.0 it was a since-start maximum; the field and the struct layout did not change. On the web
+  AudioWorklet sink the clock under it is `Date.now`, whole milliseconds, so read it in ms there
+  rather than as a percentage of a 2.7 ms period.
 - **`stream_starves`** is neither. The device kept its deadline and a *streamed voice* had nothing to
   give it, because the disk thread didn't refill in time; that block's tail rendered silence. It
   sounds identical to a clip ending, which is exactly why it is counted separately.
@@ -2242,7 +2246,7 @@ else if (h.xruns)
 
 Check the boolean once after `bwa_start` on an unfamiliar driver; poll `bwa_get_xruns` for a HUD
 afterwards. Both are control-thread, per-frame-safe (relaxed atomic reads), and every count is
-monotonic since start.
+monotonic since start. `peak_load` is the one field that is not a count, and it is windowed.
 
 ### Output capture (recording / golden checks)
 

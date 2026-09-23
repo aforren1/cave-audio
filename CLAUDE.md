@@ -824,6 +824,17 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   calloc (the pure `bwa_*_batch` helpers), or a static in non-reentrant code (tests, tool mains).
   `layout_default(Layout*)` fills in place because a by-value return is a hidden stack temporary;
   do not bring the by-value form back. The note above the struct in `layout.h` says the same.
+- **An AudioWorklet has NO monotonic clock, and an unchecked `clock_gettime` reads stack garbage.**
+  An AudioWorkletGlobalScope has no `performance` object, so Emscripten's `clock_time_get` returns
+  ENOSYS there (its `nowIsMonotonic` is `!!globalThis.performance?.now`), and `os_monotonic_ns`
+  ignored the return value and read the never-written `timespec`: the constant 1069547520 every
+  quantum. Every render time on the worklet read 0 except the first (1.07 s), so `peak_load` sat at
+  40108% on the headset, `late_blocks` was dead on that sink, and the "330 to 480% start-up peak"
+  docs/web.md once claimed was this bug. `os_monotonic_ns` now checks the return and falls back to
+  `emscripten_get_now` (Date.now in that scope: 1 ms, wall time, can step BACKWARD, which is why
+  `sink_quant` books a backward step as a zero-length render). Two rules: never present a web render
+  time as a percentage of a 2.7 ms quantum from a 1 ms clock, and a health number needs a test that
+  proves the clock behind it ticks (`test_sink_quant`'s injectable clock).
 - **`git apply` INSIDE a repository is a silent no-op for paths outside the current directory.**
   It resolves the patch's paths against the repository root, and "patched paths outside the
   directory are ignored", so `git -C core/deps/flatbuffers apply` (a directory inside the

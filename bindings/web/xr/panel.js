@@ -27,6 +27,7 @@ const CANVAS_H = 896;
 const PANEL_W = 0.52;                       /* meters. About an A4 page held at arm's length. */
 const PANEL_H = 0.91;
 const PAD = 18;
+const NOTE_FONT = "17px system-ui, sans-serif";
 
 const INK = "#dde3ea";
 const DIM = "#97a3b2";
@@ -202,6 +203,13 @@ export class MenuPanel {
    * it to point a controller at a real control rather than calling `activate()` behind the
    * panel's back, which would prove nothing about the hit test.
    */
+  /** How many lines a NOTE with this text takes on the panel: same font, same width, same wrap. */
+  lineCount(text) {
+    const g = this.canvas.getContext("2d");
+    g.font = NOTE_FONT;
+    return wrapLines(g, text, CANVAS_W - 2 * PAD).length;
+  }
+
   describe() {
     return {
       visible: this.mesh.visible,
@@ -350,7 +358,7 @@ export class MenuPanel {
     switch (it.kind) {
       case "note": {
         g.fillStyle = DIM;
-        g.font = "17px system-ui, sans-serif";
+        g.font = NOTE_FONT;
         return wrap(g, it.text, PAD, y, w, 21);
       }
       case "toggle": {
@@ -426,15 +434,23 @@ function rowHeight(g, it) {
   }
 }
 
-function wrap(g, text, x, y, w, lh) {
-  const words = String(text).split(/\s+/);
-  let ln = "";
-  for (const word of words) {
-    const t = ln ? ln + " " + word : word;
-    if (g.measureText(t).width > w && ln) { g.fillText(ln, x, y); y += lh; ln = word; }
-    else ln = t;
+/** Greedy word wrap to width `w`. A "\n" in the text is a hard break (the health note uses it). */
+function wrapLines(g, text, w) {
+  const out = [];
+  for (const para of String(text).split("\n")) {
+    let ln = "";
+    for (const word of para.split(/\s+/).filter(Boolean)) {
+      const t = ln ? ln + " " + word : word;
+      if (g.measureText(t).width > w && ln) { out.push(ln); ln = word; }
+      else ln = t;
+    }
+    if (ln) out.push(ln);
   }
-  if (ln) { g.fillText(ln, x, y); y += lh; }
+  return out;
+}
+
+function wrap(g, text, x, y, w, lh) {
+  for (const ln of wrapLines(g, text, w)) { g.fillText(ln, x, y); y += lh; }
   return y;
 }
 

@@ -348,3 +348,34 @@ uint64_t sink_position_gap(uint64_t expected, uint64_t actual, uint32_t block) {
     const uint64_t sane = (uint64_t)(block ? block : 1u) * 4096ull;
     return gap <= sane ? gap : 0;
 }
+
+#define SINK_PEAK_NS_BITS  40u
+#define SINK_PEAK_NS_MASK  ((1ull << SINK_PEAK_NS_BITS) - 1u)
+#define SINK_PEAK_SEC_MASK ((1ull << (64u - SINK_PEAK_NS_BITS)) - 1u)
+
+void sink_peak_note(SinkPeakWindow* w, uint64_t stream_frame, uint32_t rate, uint64_t render_ns) {
+    if (!w || !rate) return;
+    const uint64_t sec = (stream_frame / rate) & SINK_PEAK_SEC_MASK;
+    if (render_ns > SINK_PEAK_NS_MASK) render_ns = SINK_PEAK_NS_MASK;
+    uint64_t* b = &w->bucket[sec % SINK_PEAK_BUCKETS];
+    const uint64_t cur = *b;
+    /* A bucket still tagged with an older second is RECYCLED, not maxed: that is the forgetting. */
+    if ((cur >> SINK_PEAK_NS_BITS) != sec || (cur & SINK_PEAK_NS_MASK) < render_ns)
+        *b = (sec << SINK_PEAK_NS_BITS) | render_ns;
+    w->latest = sec + 1u;
+}
+
+uint64_t sink_peak_recent(const SinkPeakWindow* w) {
+    if (!w || !w->latest) return 0;
+    const uint64_t now = w->latest - 1u;
+    uint64_t peak = 0;
+    for (uint32_t i = 0; i < SINK_PEAK_BUCKETS; ++i) {
+        const uint64_t word = w->bucket[i];
+        /* Modular age, so the 24-bit second wrapping does not read as a bucket from the future. A
+         * bucket the stream skipped past without rewriting is simply too old and drops out here. */
+        const uint64_t age = (now - (word >> SINK_PEAK_NS_BITS)) & SINK_PEAK_SEC_MASK;
+        const uint64_t ns  = word & SINK_PEAK_NS_MASK;
+        if (age < SINK_PEAK_WINDOW_S && ns > peak) peak = ns;
+    }
+    return peak;
+}
