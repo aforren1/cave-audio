@@ -215,7 +215,7 @@ function step(nowMs, frame, runtime) {
   if (app.panel) {
     app.panel.visible = !!runtime?.presenting && !runtime.domOverlay;
     if (app.panel.visible) {
-      app.panel.follow(app.ctx.headRoom, app.ctx.headQuat, dt, qrot);
+      app.panel.follow(app.ctx.headRoom, app.ctx.headQuat, dt, qrot, app.hands?.gazeOnly() ?? false);
       app.panel.draw();
     }
   }
@@ -393,6 +393,8 @@ globalThis.__bwaXr = {
   /** The room point a canvas pixel of the in-world panel occupies, for aiming a controller. */
   menuPointAt: (x, y) => app.panel?.pointAt(x, y) ?? null,
   hands: () => app.hands?.report() ?? null,
+  /** What the scene draws for hand `i` (grip, ray, reticle), so a gaze input can be checked. */
+  handVisual: (i) => app.world?.handVisual(i) ?? null,
   /**
    * The pose the PAGE'S OWN engine is rendering with, read back through `bwa_get_listener_pose`.
    * Everything else here reports what the page computed; this reports what the engine received,

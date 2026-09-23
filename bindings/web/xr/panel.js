@@ -64,6 +64,7 @@ export class MenuPanel {
     this.hoverU = 0;
     this._dirty = true;
     this._frozen = false;
+    this._gazeMode = false;
   }
 
   get visible() { return this.mesh.visible; }
@@ -98,7 +99,33 @@ export class MenuPanel {
    * @param {number} dt seconds
    * @param {function} rot a quaternion-rotate helper, `(q, v) => v`
    */
-  follow(head, q, dt, rot) {
+  follow(head, q, dt, rot, gazeOnly = false) {
+    /* A change of input KIND re-parks at once: a panel the controller policy left 0.34 m to the
+     * left is inside the gaze policy's 40 degree hold and would never come into view otherwise. */
+    if (gazeOnly !== this._gazeMode) { this._gazeMode = gazeOnly; this._placed = false; }
+    if (gazeOnly) {
+      /* A GAZE pointer (a phone viewer, no controller) cannot reach a panel that follows every
+       * head turn: this one parks 0.34 m left of the gaze line and is 0.52 m wide, so the gaze
+       * always missed it by 8 cm (found from a phone, 2026-09-22). With a gaze the menu has to
+       * be a thing in the ROOM you can look at: centered ahead, a little below eye height, and
+       * HELD there while the gaze stays within 40 degrees of it. Only when the user looks well
+       * away does it drift back in front of them, slowly enough to read as "the menu followed
+       * me" and not as "the menu dodged". */
+      const want = rot(q, [0, -0.10, 0.72]);
+      const target = [head[0] + want[0], head[1] + want[1], head[2] + want[2]];
+      if (!this._placed) { this.center = target; this._placed = true; }
+      else {
+        const ahead = rot(q, [0, 0, 1]);
+        const to = norm([this.center[0] - head[0], this.center[1] - head[1], this.center[2] - head[2]]) || ahead;
+        const cosang = dot(ahead, to);
+        if (cosang < 0.766) {                       /* more than 40 degrees off: re-park */
+          const k = Math.min(1, 3.0 * dt);           /* about half a second to settle */
+          for (let i = 0; i < 3; ++i) this.center[i] += (target[i] - this.center[i]) * k;
+        }
+      }
+      this._aimAt(head);
+      return;
+    }
     /* Head-local, in the ROOM convention: ahead is +z, up is +y, LEFT is +x. So this sits three
      * quarters of a meter ahead, a third of a meter to the left and a little below eye height,
      * which is where a person naturally parks a clipboard. */

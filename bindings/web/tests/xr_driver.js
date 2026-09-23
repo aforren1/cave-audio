@@ -455,6 +455,76 @@
       }
     }
 
+    /* ---- a gaze input (a phone viewer) draws no controller at the eyes ---- */
+    /* A Cardboard-style runtime reports ONE input with targetRayMode "gaze" whose ray starts at
+     * the viewer. The page used to draw it as a hand, which put the grip sphere on the user's
+     * face (reported from a phone, 2026-09-22). Swap the two controllers for a gaze that follows
+     * the head and check what is drawn in two head poses. The session holds `fake.controllers`
+     * by reference, so the array is mutated in place, never reassigned. */
+    var savedControllers = fake.controllers.slice();
+    var gaze = {
+      handedness: "none",
+      targetRayMode: "gaze",
+      targetRaySpace: { __space: "gaze" },
+      gripSpace: null,
+      gamepad: null,
+      present: true,
+      get pos() { return fake.pos; },
+      get quat() { return fake.quat; },
+    };
+    fake.controllers.length = 0;
+    fake.controllers.push(gaze);
+    var gazeStates = [];
+    /* Expected states, from the gaze follow policy: the panel parks centered 0.72 m ahead and
+     * 0.10 m down (0.52 by 0.91 m, so about 20 degrees wide and 32 degrees tall from the eyes),
+     * holds while the gaze is within 40 degrees, and re-parks beyond that. */
+    var poses = [
+      ["ahead", [0, 0, 0, 1], true],                                       /* on the panel */
+      ["30 degrees to one side", [0, 0.2588190, 0, 0.9659258], false],   /* past its edge, inside the hold */
+      ["straight up", [-0.7071068, 0, 0, 0.7071068], true],              /* 90 degrees: it re-parks */
+    ];
+    for (var gi = 0; gi < poses.length; ++gi) {
+      await head([0, 1.6, 0], poses[gi][1]);
+      await sleep(900);                        /* the panel's re-park has to settle */
+      var gh = xr.hands();
+      var gv = xr.handVisual(0);
+      var other = xr.handVisual(1);
+      gazeStates.push({ name: poses[gi][0], hands: gh, visual: gv });
+      if (gh && gh[0].present && gh[0].pointingAtMenu !== poses[gi][2])
+        fail("looking " + poses[gi][0] + ": the gaze is " + (gh[0].pointingAtMenu ? "on" : "off") +
+             " the menu, expected " + (poses[gi][2] ? "on" : "off") + " (the panel is not parking for a gaze)");
+      else if (gh && gh[0].present)
+        ok("looking " + poses[gi][0] + ": the gaze is " + (gh[0].pointingAtMenu ? "on" : "off") + " the menu, as the gaze follow policy says");
+      if (!gh || !gh[0].present || gh[0].mode !== "gaze")
+        fail("the gaze input is not reported as present with mode gaze (" + JSON.stringify(gh && gh[0]) + ")");
+      if (!gv) fail("handVisual(0) returned nothing for the gaze input");
+      else {
+        if (gv.grip || gv.ray)
+          fail("looking " + poses[gi][0] + ": the gaze input draws a grip or a ray at the eyes (grip " +
+               gv.grip + ", ray " + gv.ray + ")");
+        else ok("looking " + poses[gi][0] + ": the gaze input draws no grip and no ray");
+        if (gv.reticle !== gh[0].pointingAtMenu)
+          fail("looking " + poses[gi][0] + ": the gaze reticle is " + (gv.reticle ? "shown" : "hidden") +
+               " while the gaze is " + (gh[0].pointingAtMenu ? "on" : "off") + " the menu");
+        else ok("looking " + poses[gi][0] + ": the gaze reticle is " + (gv.reticle ? "shown" : "hidden") +
+                ", matching the gaze being " + (gh[0].pointingAtMenu ? "on" : "off") + " the menu");
+      }
+      if (other && (other.grip || other.ray || other.reticle))
+        fail("the empty second input slot draws something while only a gaze input exists");
+    }
+    var sawOn = false, sawOff = false;
+    for (var si = 0; si < gazeStates.length; ++si) {
+      var st = gazeStates[si].hands;
+      if (st && st[0].pointingAtMenu) sawOn = true; else sawOff = true;
+    }
+    if (!(sawOn && sawOff))
+      fail("the gaze reticle was not checked in both states (on the menu: " + sawOn + ", off: " + sawOff + ")");
+    else ok("the gaze reticle was checked both on and off the menu");
+    fake.controllers.length = 0;
+    for (var ri = 0; ri < savedControllers.length; ++ri) fake.controllers.push(savedControllers[ri]);
+    await head([0, 1.6, 0], [0, 0, 0, 1]);
+    await sleep(200);
+
     /* ---- the grab ---- */
     await head([0, 1.6, 0], [0, 0, 0, 1]);
     xr.setSourceRoom([0.0, 1.5, 1.2]);

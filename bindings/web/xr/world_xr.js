@@ -57,7 +57,17 @@ export class XrWorld extends World {
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
     const ray = new THREE.Line(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 }));
     group.add(ray);
-    return { group, grip, ray, color: new THREE.Color(color) };
+    /* The gaze reticle: a 1.2 cm dot at the END of the ray, shown only while the gaze is on the
+     * menu. A gaze input's ray starts at the eyes, so its grip sphere would sit on the user's face;
+     * this is the one thing a gaze input draws, and it draws it where the user is looking. */
+    const reticle = new THREE.Mesh(
+      new THREE.SphereGeometry(0.012, 10, 8),
+      new THREE.MeshBasicMaterial({ color, depthTest: false })
+    );
+    reticle.renderOrder = 10;
+    reticle.visible = false;
+    group.add(reticle);
+    return { group, grip, ray, reticle, color: new THREE.Color(color) };
   }
 
   /**
@@ -67,12 +77,25 @@ export class XrWorld extends World {
    * @param {number[]} dir a unit aim direction in room space
    * @param {number} len how far the ray reaches before it hits something, meters
    * @param {boolean} hot true while this controller is grabbing or pointing at the menu
+   * @param {"tracked-pointer"|"gaze"|"screen"} mode the input's targetRayMode: a tracked
+   *        controller gets the grip and the ray; a gaze gets a reticle at the ray's end while it
+   *        is on the menu and nothing otherwise; a screen tap draws nothing
    */
-  setHand(i, p, dir, len = 1.2, hot = false) {
+  setHand(i, p, dir, len = 1.2, hot = false, mode = "tracked-pointer") {
     const h = this.hands[i];
     if (!h) return;
-    if (!p) { h.group.visible = false; return; }
+    if (!p || mode === "screen") { h.group.visible = false; return; }
     h.group.visible = true;
+    if (mode === "gaze") {
+      h.grip.visible = false;
+      h.ray.visible = false;
+      h.reticle.visible = hot;
+      h.reticle.position.set(p[0] + dir[0] * len, p[1] + dir[1] * len, p[2] + dir[2] * len);
+      return;
+    }
+    h.grip.visible = true;
+    h.ray.visible = true;
+    h.reticle.visible = false;
     h.grip.position.set(p[0], p[1], p[2]);
     const a = h.ray.geometry.attributes.position;
     a.array[0] = p[0]; a.array[1] = p[1]; a.array[2] = p[2];
@@ -86,6 +109,14 @@ export class XrWorld extends World {
 
   hideHands() {
     for (const h of this.hands) h.group.visible = false;
+  }
+
+  /** What hand `i` currently draws, for the check: each flag is the effective visibility. */
+  handVisual(i) {
+    const h = this.hands[i];
+    if (!h) return null;
+    const on = h.group.visible;
+    return { grip: on && h.grip.visible, ray: on && h.ray.visible, reticle: on && h.reticle.visible };
   }
 
   /**

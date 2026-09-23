@@ -443,6 +443,22 @@ knobs reach XR with no XR code in the scene.
 A press is resolved in that order, because a ray that lands on the panel is unambiguous and a grab
 is not. The page prints the table beside the view.
 
+**A phone viewer has no controller.** A Cardboard-style runtime reports one input whose
+`targetRayMode` is `gaze`, with the ray starting at the eyes, and a tap on the screen as a
+one-frame `screen` input. Both press. Neither is a hand, and the first build drew the gaze as
+one, which put the grip sphere on the user's face. Now a gaze draws nothing but a 1.2 cm dot at
+the end of its ray, and only while that ray is on the menu; a screen tap draws nothing.
+
+The menu changes its follow policy for a gaze as well. The controller policy parks the panel
+0.34 m to the left of the gaze line and moves it with every head turn, which a hand can reach
+and a gaze never can (the panel is 0.52 m wide, so the gaze missed it by 8 cm, always). With a
+gaze the panel is a thing in the room: centered ahead, a little below eye height, held there
+while you look within 40 degrees of it, and re-parked in front of you over about half a second
+once you look further away. The mode switches the moment the set of inputs changes, so a panel
+a controller left to one side comes into view at once. `run-xr.mjs` pins all three states with
+a fake gaze input: on the menu looking ahead, off it at 30 degrees, and on it again after a look
+straight up.
+
 ### Pose prediction, and why the page does it
 
 `bwa_set_pose_prediction` leads the pose the engine's OWN tracker publishes. `src/core/rt.c` reads

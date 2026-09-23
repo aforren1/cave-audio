@@ -302,12 +302,15 @@ tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 buil
                        the shadow-stack one is the trap below. Null and manual sinks only: the AudioWorklet
                        sink is the HOST's job. os_posix.c is the shim (BWA_OS_NO_SCHED + wasi socket stubs),
                        following the Android precedent. Decided 2026-09-21: faithful two-thread over
-                       SharedArrayBuffer, control on a Worker, COOP/COEP accepted. docs/web.md. [wasm]
-tools/wasm/            build-wasm.sh (THE engine recipe for wasm32: wasi-sdk or emsdk, and
-                       BWA_WASM_PROXY=1 for the -sPROXY_TO_PTHREAD shape docs/web.md's decision
-                       wants), wasi-sdk.toolchain.cmake, build-web.sh (THE shippable-page recipe:
-                       BWA_WITH_WORKLET + BWA_BUILD_WEB, staged into bindings/web/dist/) and
-                       gen-abi.mjs (the web binding's raw layer + export list, from the header).
+                       SharedArrayBuffer, control on a Worker, COOP/COEP accepted. The files:
+                       build-wasm.sh (THE engine recipe for wasm32: wasi-sdk or emsdk, BWA_WASM_PROXY=1
+                       for the -sPROXY_TO_PTHREAD shape the decision wants, CMAKE_MAKE_PROGRAM forwarded
+                       for a host whose ninja is off PATH, ctest under a 600 s per-test timeout because
+                       a broken wasm test hangs rather than fails), wasi-sdk.toolchain.cmake,
+                       build-web.sh (THE shippable-page recipe: BWA_WITH_WORKLET + BWA_BUILD_WEB, staged
+                       into bindings/web/dist/, three.js fetched by fetch-web-vendor.sh with sha256
+                       pins) and gen-abi.mjs (the web binding's raw layer + export list, from the
+                       header). docs/web.md. [wasm]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -492,10 +495,15 @@ platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of 
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
 example"), so a change to the stimulus is a change to five files plus the web page.
-`-DBWA_BUILD_WEB=ON` is EMSCRIPTEN-ONLY and adds two (`web_bindings`, 17 node tests against the
-module that was just linked; `web_browser`, the AudioWorklet sink driven in headless Chromium),
-each SKIPPING rather than failing when node or a browser is missing. It changes no desktop count,
-because a desktop configure refuses the option with a status line.
+`-DBWA_BUILD_WEB=ON` is EMSCRIPTEN-ONLY and adds four (`web_bindings`, the node tests against the
+module that was just linked, 32 of them as of 2026-09-22 including the per-profile master-gain pin
+and the XR frame seam; `web_browser`, the AudioWorklet sink driven in headless Chromium;
+`web_playground` and `web_xr`, the two demo pages driven the same way, each with a `--site` mode
+that drives the STAGED copy with its content-addressed dist), each SKIPPING rather than failing
+when node or a browser is missing. It changes no desktop count, because a desktop configure
+refuses the option with a status line. The two page checks are load-sensitive (a 4 ms meter tick
+against a 2 ms click): one ran red while the full native suite ran beside it and green twice
+after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
@@ -891,8 +899,11 @@ freely. It still follows the US English rule above.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus.
 - `docs/integration.md` — Unity + Godot bindings + the per-engine coordinate seams; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, Dante config.
-- `docs/web.md` — the browser target: the settled two-thread decision, the toolchain measurements,
-  the AudioWorklet sink and the JS binding as built, and the list of what a browser has never run.
+- `docs/web.md` — the browser target: the settled two-thread decision, the measured toolchain
+  verdicts (wasi-sdk, Emscripten, zig), the OS shim under wasm, the AudioWorklet sink and the JS
+  binding as built, the "main" topology deviation and its ways out, phonon under wasm and its
+  exception-model residue, GitHub Pages hosting through the service worker, the playground and XR
+  pages, and the list of what a browser has never run. Live at aforren1.github.io/cave-audio.
 - `docs/backends.md` — the sink contract + the backends beside ASIO. WASAPI (Windows), JACK + ALSA
   (Linux) are IMPLEMENTED; CoreAudio and AAudio are still spec.
   The 10-rule sink contract (fixed quantum, timestamp pair, health, exact-rate policy), the fixed-quantum
@@ -914,8 +925,3 @@ freely. It still follows the US English rule above.
   ambisonic decoders, spread/decorrelation, acoustics paths, binaural, calibration + validation
   coinages), each entry short, formula-cited to `file:line`, and linked to the doc that owns it.
   Threading vocabulary is deliberately excluded (concurrency.md owns it).
-- `docs/web.md` — the WebAssembly target: measured toolchain verdicts (wasi-sdk, Emscripten, zig),
-  the OS shim under wasm, the threading decision (two threads over SharedArrayBuffer, control on a
-  Worker) and the alternatives considered, the SPSC rings over SAB, the AudioWorklet sink through
-  `sink_quant`, which invariants survive, the JS/TS binding shape, COOP/COEP hosting, phonon under
-  wasm. Nothing browser-side is built yet; the offline core is.

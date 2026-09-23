@@ -115,6 +115,12 @@ export class Hands {
       if (!pose) { world?.setHand(i, null, [0, 0, 1]); h.pending = false; continue; }
       const { p, q } = xrTransformToRoom(pose.transform);
       h.present = true;
+      /* WHAT KIND of input this is decides what gets drawn, not whether it is handled. A phone
+       * viewer (Cardboard-style WebXR) exposes a GAZE input whose target ray starts at the eyes,
+       * and a tap on the screen is a SCREEN input that lives for one frame. Both select; neither is
+       * a hand, and drawing the grip sphere at a gaze pose put a dot in front of the user's eyes
+       * (reported from a phone, 2026-09-22). */
+      h.mode = src.targetRayMode || "tracked-pointer";
       h.p = p;
       h.q = q;
       /* The target ray points down the controller's own -z, like every other XR "forward". Once
@@ -195,9 +201,9 @@ export class Hands {
     /* ---- draw ---- */
     for (let i = 0; i < 2; ++i) {
       const h = this.state[i];
-      if (!h.present) { world?.setHand(i, null, [0, 0, 1]); continue; }
+      if (!h.present || h.mode === "screen") { world?.setHand(i, null, [0, 0, 1]); continue; }
       const len = h.hit ? h.hit.t : (this.grabbing === i ? 0.25 : 1.2);
-      world?.setHand(i, h.p, h.dir, len, this.grabbing === i || !!h.hit);
+      world?.setHand(i, h.p, h.dir, len, this.grabbing === i || !!h.hit, h.mode);
     }
   }
 
@@ -217,9 +223,21 @@ export class Hands {
   }
 
   /** For the readout and for the test hook. */
+  /** True when every present input is a gaze or a screen tap: the menu must then park for the eyes. */
+  gazeOnly() {
+    let present = 0, pointers = 0;
+    for (const h of this.state) {
+      if (!h.present) continue;
+      present += 1;
+      if (h.mode === "tracked-pointer") pointers += 1;
+    }
+    return present > 0 && pointers === 0;
+  }
+
   report() {
     return this.state.map((h, i) => ({
       present: h.present,
+      mode: h.present ? h.mode : null,
       grabbing: this.grabbing === i,
       pointingAtMenu: !!h.hit,
       position: h.present ? h.p.map((v) => Math.round(v * 1000) / 1000) : null,
@@ -229,7 +247,7 @@ export class Hands {
 
 function newHand() {
   return {
-    present: false, p: [0, 0, 0], q: [0, 0, 0, 1], dir: [0, 0, 1],
+    present: false, mode: "tracked-pointer", p: [0, 0, 0], q: [0, 0, 0, 1], dir: [0, 0, 1],
     select: false, squeeze: false, pending: false, hit: null,
     axes: [0, 0], grabOffset: [0, 0, 0],
   };
