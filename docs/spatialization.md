@@ -84,6 +84,18 @@ volume.
 > *sparse* panner: with non-negative gains, the l1-optimal speaker-gain solution is
 > exactly VBAP over a Delaunay triangulation (Franck, Wang and Fazi 2017, IEEE TASLP).
 >
+> The hull is incremental (`hull.c`). It starts from a tetrahedron, adds speakers in
+> index order, and replaces the faces each new speaker can see with a cone to their
+> rim. That is O(n^2) at worst, under 30 microseconds at 64 speakers, with no allocation, so the
+> panner rebuilds it on the audio thread whenever the tracked listener moves. A hull on
+> n speakers has at most 2n-4 triangles (48 at 26, 124 at 64). A coplanar ring, such as
+> a barrel's top cap, gets one triangulation of its polygon, not every triple of its
+> points. Which triangulation depends on speaker order, and every one covers the cap
+> exactly once. A speaker within 1e-5 of the hull surface, about half a degree from a
+> neighbor, counts as on it and merges into that neighbor. Faces the listener sees from
+> the front only exist when it stands outside the array. The hull drops them, because
+> the far faces already cover those bearings.
+>
 > **Pick DBAP for a moving observer, SPCAP for a fixed one.** The layout tool's
 > preview `B` key A/Bs the panners live, with the focus and density sliders beside
 > it.
@@ -691,7 +703,7 @@ non-triangulable fallback.
   (its convex-hull triangulation), then energy-normalize to the sampling decode.
   The virtual layer is uniform, so the decode is well-conditioned there. VBAP
   absorbs the real array's irregularity. Robust on a lopsided survey, at the cost
-  of a heavier load-time build: a brute-force hull + VBAP over ~240 virtual
+  of a heavier load-time build: a convex hull + VBAP over ~240 virtual
   directions. The audio thread still only applies the matrix.
 
   A pole with no real speaker within ~60° gets an **imaginary loudspeaker** (IEM

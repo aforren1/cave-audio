@@ -12,6 +12,7 @@
 #include "spatial/dbap.h"
 #include "spatial/spcap.h"
 #include "spatial/vbap.h"
+#include "spatial/hull.h"
 #include "spatial/cap.h"
 #include "spatial/hole.h"
 #include "spatial/align.h"
@@ -205,6 +206,178 @@ static double nearest_speaker_deg(const Layout* L, const float lis[3], const flo
     if (best >  1.0) best =  1.0;
     if (best < -1.0) best = -1.0;
     return acos(best) * 57.2957795;
+}
+
+/* ---- hull.c pins ----------------------------------------------------------------------------------
+ * The ORACLE is the brute-force hull hull.c used to be (every triple against every point), kept here
+ * verbatim so the replacement is checked against the thing it replaced. It is exact on a generic set
+ * and wrong on a coplanar one (it emits every triple of a coplanar cap), which is why coplanar sets
+ * get the validity checks instead. */
+#define HT_MAXPTS (BWA_MAX_CHANNELS + 2)
+#define HT_BIGTRI 8192
+static float ho_dot(const float a[3], const float b[3]) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+static void  ho_cross(const float a[3], const float b[3], float o[3]) {
+    o[0] = a[1]*b[2] - a[2]*b[1]; o[1] = a[2]*b[0] - a[0]*b[2]; o[2] = a[0]*b[1] - a[1]*b[0];
+}
+static float ho_triple(const float a[3], const float b[3], const float c[3]) {
+    float bc[3]; ho_cross(b, c, bc); return ho_dot(a, bc);
+}
+static int hull_oracle(float (*dirs)[3], uint32_t n, int (*tri)[3], float* det, int maxtri) {
+    int ntri = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t j = i + 1; j < n; ++j)
+    for (uint32_t k = j + 1; k < n; ++k) {
+        float e1[3] = { dirs[j][0]-dirs[i][0], dirs[j][1]-dirs[i][1], dirs[j][2]-dirs[i][2] };
+        float e2[3] = { dirs[k][0]-dirs[i][0], dirs[k][1]-dirs[i][1], dirs[k][2]-dirs[i][2] };
+        float nrm[3]; ho_cross(e1, e2, nrm);
+        float nl = sqrtf(ho_dot(nrm, nrm));
+        if (nl < 1e-9f) continue;
+        nrm[0]/=nl; nrm[1]/=nl; nrm[2]/=nl;
+        float off = ho_dot(nrm, dirs[i]);
+        if (off < 0.f) { nrm[0]=-nrm[0]; nrm[1]=-nrm[1]; nrm[2]=-nrm[2]; off=-off; }
+        int face = 1;
+        for (uint32_t m = 0; m < n; ++m) if (ho_dot(nrm, dirs[m]) > off + 1e-5f) { face = 0; break; }
+        if (face) {
+            if (ntri >= maxtri) return 0;
+            tri[ntri][0]=(int)i; tri[ntri][1]=(int)j; tri[ntri][2]=(int)k;
+            det[ntri] = ho_triple(dirs[i], dirs[j], dirs[k]);
+            ++ntri;
+        }
+    }
+    return ntri;
+}
+
+/* Orientation-free canonical form: flip to positive det, rotate the lowest index first, sort. The
+ * oracle emits sorted index triples whatever their orientation; hull.c emits outward ones. */
+typedef struct { int v[3]; float det; } HtTri;
+static int ht_cmp(const void* pa, const void* pb) {
+    const HtTri *a = (const HtTri*)pa, *b = (const HtTri*)pb;
+    for (int q = 0; q < 3; ++q) if (a->v[q] != b->v[q]) return a->v[q] < b->v[q] ? -1 : 1;
+    return 0;
+}
+static void ht_canon(int (*tri)[3], const float* det, int nt, HtTri* out) {
+    for (int t = 0; t < nt; ++t) {
+        int v[3] = { tri[t][0], tri[t][1], tri[t][2] }; float d = det[t];
+        if (d < 0.f) { int x = v[1]; v[1] = v[2]; v[2] = x; d = -d; }
+        int r = (v[0] < v[1] && v[0] < v[2]) ? 0 : (v[1] < v[2] ? 1 : 2);
+        for (int q = 0; q < 3; ++q) out[t].v[q] = v[(r + q) % 3];
+        out[t].det = d;
+    }
+    qsort(out, (size_t)nt, sizeof *out, ht_cmp);
+}
+
+/* In general position: no point other than a face's own three within 1e-4 of its plane, and the
+ * origin not within 1e-4 of it either. Judged on the ORACLE's faces, so hull.c does not grade
+ * its own input. */
+static int ht_generic(float (*dirs)[3], uint32_t n, int (*tri)[3], int nt) {
+    for (int t = 0; t < nt; ++t) {
+        const float *a = dirs[tri[t][0]], *b = dirs[tri[t][1]], *c = dirs[tri[t][2]];
+        float e1[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] }, e2[3] = { c[0]-a[0], c[1]-a[1], c[2]-a[2] }, nr[3];
+        ho_cross(e1, e2, nr);
+        float l = sqrtf(ho_dot(nr, nr)); nr[0] /= l; nr[1] /= l; nr[2] /= l;
+        float off = ho_dot(nr, a);
+        if (fabsf(off) < 1e-4f) return 0;
+        for (uint32_t m = 0; m < n; ++m) {
+            if ((int)m == tri[t][0] || (int)m == tri[t][1] || (int)m == tri[t][2]) continue;
+            if (fabsf(ho_dot(nr, dirs[m]) - off) < 1e-4f) return 0;
+        }
+    }
+    return 1;
+}
+
+/* hull.c against the oracle as a face SET, with dets. Returns 1 on a match. */
+static int ht_match(float (*dirs)[3], uint32_t n, const char* name) {
+    static int to[HT_BIGTRI][3], tn[VBAP_MAXTRI][3];
+    static float dO[HT_BIGTRI], dN[VBAP_MAXTRI];
+    static HtTri co[HT_BIGTRI], cn[VBAP_MAXTRI];
+    int no = hull_oracle(dirs, n, to, dO, HT_BIGTRI);
+    int nn = hull_triangulate(dirs, n, tn, dN, VBAP_MAXTRI);
+    if (no <= 0 || nn != no) { printf("  hull %s (n=%u): %d faces vs oracle %d\n", name, n, nn, no); return 0; }
+    ht_canon(to, dO, no, co); ht_canon(tn, dN, nn, cn);
+    for (int t = 0; t < no; ++t) {
+        if (ht_cmp(&co[t], &cn[t]) != 0 || fabsf(co[t].det - cn[t].det) > 1e-5f) {
+            printf("  hull %s (n=%u): face %d differs (%d %d %d / %g vs %d %d %d / %g)\n", name, n, t,
+                   cn[t].v[0], cn[t].v[1], cn[t].v[2], cn[t].det, co[t].v[0], co[t].v[1], co[t].v[2], co[t].det);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* A valid triangulated hull, for sets the oracle gets wrong: every point on or inside every face
+ * plane, no more than 2n-4 faces, no sliver, outward faces with det > 0, every point a vertex, each
+ * directed edge used once and its reverse once (a closed manifold), and hull_vbap solving 1000
+ * random bearings to finite, non-negative, unit-power gains. */
+static int ht_valid_ex(float (*dirs)[3], uint32_t n, const char* name, uint32_t seed, int all_vertices) {
+    static int tri[VBAP_MAXTRI][3]; static float det[VBAP_MAXTRI];
+    static unsigned char edge[HT_MAXPTS][HT_MAXPTS];
+    int nt = hull_triangulate(dirs, n, tri, det, VBAP_MAXTRI);
+    int ok = 1;
+#define HT_BAD(...) do { printf("  hull %s (n=%u): ", name, n); printf(__VA_ARGS__); printf("\n"); ok = 0; } while (0)
+    if (nt <= 0) { HT_BAD("did not triangulate"); return 0; }
+    if (nt > 2 * (int)n - 4) HT_BAD("%d faces > 2n-4", nt);
+    memset(edge, 0, sizeof edge);
+    int used[HT_MAXPTS] = { 0 };
+    for (int t = 0; t < nt; ++t) {
+        const float *a = dirs[tri[t][0]], *b = dirs[tri[t][1]], *c = dirs[tri[t][2]];
+        float e1[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] }, e2[3] = { c[0]-a[0], c[1]-a[1], c[2]-a[2] }, nr[3];
+        ho_cross(e1, e2, nr);
+        float l = sqrtf(ho_dot(nr, nr));
+        if (l < 1e-6f) { HT_BAD("face %d is a sliver (|cross| %g)", t, l); continue; }
+        nr[0] /= l; nr[1] /= l; nr[2] /= l;
+        float off = ho_dot(nr, a);
+        if (!(det[t] > 0.f) || fabsf(det[t] - ho_triple(a, b, c)) > 1e-6f) HT_BAD("face %d det %g not outward", t, det[t]);
+        for (uint32_t m = 0; m < n; ++m)
+            if (ho_dot(nr, dirs[m]) > off + 2e-5f) HT_BAD("point %u outside face %d by %g", m, t, ho_dot(nr, dirs[m]) - off);
+        for (int q = 0; q < 3; ++q) { ++edge[tri[t][q]][tri[t][(q + 1) % 3]]; used[tri[t][q]] = 1; }
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!used[i] && all_vertices) HT_BAD("point %u is not a vertex", i);
+        for (uint32_t j = 0; j < n; ++j) {
+            if (edge[i][j] > 1) HT_BAD("edge %u->%u used %d times", i, j, edge[i][j]);
+            if (edge[i][j] != edge[j][i]) HT_BAD("edge %u-%u is open (not a closed manifold)", i, j);
+        }
+    }
+    for (int r = 0; r < 1000; ++r) {
+        float d[3], l2;
+        do { d[0] = lcg_noise(&seed); d[1] = lcg_noise(&seed); d[2] = lcg_noise(&seed); l2 = d[0]*d[0] + d[1]*d[1] + d[2]*d[2]; }
+        while (l2 < 1e-4f || l2 > 1.f);
+        float il = 1.f / sqrtf(l2); d[0] *= il; d[1] *= il; d[2] *= il;
+        int spk[3]; float g[3];
+        if (!hull_vbap(d, dirs, tri, det, nt, spk, g)) { HT_BAD("hull_vbap failed a bearing"); break; }
+        float p = g[0]*g[0] + g[1]*g[1] + g[2]*g[2];
+        if (!isfinite(p) || g[0] < 0.f || g[1] < 0.f || g[2] < 0.f || fabsf(p - 1.f) > 1e-4f) {
+            HT_BAD("bad gains %g %g %g", g[0], g[1], g[2]); break; }
+    }
+#undef HT_BAD
+    return ok;
+}
+static int ht_valid(float (*dirs)[3], uint32_t n, const char* name, uint32_t seed) {
+    return ht_valid_ex(dirs, n, name, seed, 1);
+}
+
+/* A fixed set is compared to the oracle when it is in general position and checked for validity
+ * when it is not; the caller learns which, so a set cannot silently drop out of the comparison. */
+static int ht_check(float (*dirs)[3], uint32_t n, const char* name, uint32_t seed, int* compared) {
+    static int to[HT_BIGTRI][3]; static float dO[HT_BIGTRI];
+    int no = hull_oracle(dirs, n, to, dO, HT_BIGTRI);
+    if (no > 0 && ht_generic(dirs, n, to, no)) { ++*compared; return ht_match(dirs, n, name); }
+    printf("hull: %s (n=%u) is not in general position (oracle %d faces): validity only\n", name, n, no);
+    return ht_valid(dirs, n, name, seed);
+}
+
+static void ht_norm(float v[3]) { float l = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); v[0] /= l; v[1] /= l; v[2] /= l; }
+
+/* The 64-speaker barrel: 4 rings of 16 around a centered listener, so the top and bottom rings are
+ * coplanar caps. `stagger` offsets alternate rings by half a step. */
+static void ht_barrel64(float (*d)[3], int stagger) {
+    const float ys[4] = { -1.2f, -0.4f, 0.4f, 1.2f };
+    int k = 0;
+    for (int r = 0; r < 4; ++r)
+        for (int a = 0; a < 16; ++a, ++k) {
+            const float th = (float)a * 6.2831853f / 16.f + (stagger && (r & 1) ? 0.19634954f : 0.f);
+            d[k][0] = 2.f * cosf(th); d[k][1] = ys[r]; d[k][2] = 2.f * sinf(th); ht_norm(d[k]);
+        }
 }
 
 int main(void) {
@@ -1012,6 +1185,117 @@ int main(void) {
         for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 1e-4f) ++active; }
         CHECK(fabs(sqrt(p) - gain) < 0.02, "VBAP is constant-power (||g|| ~ user_gain)");
         CHECK(active >= 1 && active <= 3, "VBAP uses at most 3 speakers (the containing triangle)");
+    }
+
+    /* 11b. hull.c: the incremental hull equals the old brute force as a face set on generic input,
+     *      and is a valid closed triangulation where the brute force was not (coplanar caps). */
+    {
+        static float hd[HT_MAXPTS][3];
+        int generic_ok = 1, compared = 0;
+
+        /* the default grid and the 24-speaker layout the load test builds, from their own refs */
+        for (uint32_t k = 0; k < LD.count; ++k) unit_dir(LD.ref, LD.speakers[k].pos, hd[k]);
+        if (!ht_check(hd, LD.count, "default grid", 21u, &compared)) generic_ok = 0;
+        {
+            static Layout L24; L24 = LD; L24.count = 24; layout_compute_ref(&L24);
+            for (uint32_t k = 0; k < 24; ++k) unit_dir(L24.ref, L24.speakers[k].pos, hd[k]);
+            if (!ht_check(hd, 24, "24-speaker grid subset", 22u, &compared)) generic_ok = 0;
+        }
+        static const int fibn[] = { 8, 12, 16, 20, 26, 32, 40, 48, 56, 64 };
+        for (size_t i = 0; i < sizeof fibn / sizeof fibn[0]; ++i) {
+            for (int k = 0; k < fibn[i]; ++k) fib_dir(k, fibn[i], hd[k]);
+            if (!ht_check(hd, (uint32_t)fibn[i], "Fibonacci sphere", 23u + (uint32_t)i, &compared)) generic_ok = 0;
+        }
+        printf("hull: %d of 12 fixed sets compared to the oracle, the rest checked for validity\n", compared);
+        CHECK(generic_ok, "hull matches the oracle (or is valid where the set is degenerate): grid, 24-subset, Fibonacci 8..64");
+        CHECK(compared >= 10, "the fixed-set comparison is not vacuous (the default grid and the Fibonacci spheres are generic)");
+
+        /* 200 random sets in general position, sizes 4..64. A draw the oracle cannot answer (a point
+         * within 1e-4 of a face plane, where it emits BOTH triangulations) is redrawn and counted. */
+        {
+            static int to[HT_BIGTRI][3]; static float dO[HT_BIGTRI];
+            uint32_t seed = 0x5eed1234u;
+            int matched = 0, redrawn = 0, bad = 0;
+            while (matched + bad < 200 && redrawn < 2000) {
+                const uint32_t n = 4u + (uint32_t)((matched + bad) % 61);
+                for (uint32_t k = 0; k < n; ++k) {
+                    float l2;
+                    do { hd[k][0] = lcg_noise(&seed); hd[k][1] = lcg_noise(&seed); hd[k][2] = lcg_noise(&seed);
+                         l2 = hd[k][0]*hd[k][0] + hd[k][1]*hd[k][1] + hd[k][2]*hd[k][2]; } while (l2 < 1e-4f || l2 > 1.f);
+                    ht_norm(hd[k]);
+                }
+                int no = hull_oracle(hd, n, to, dO, HT_BIGTRI);
+                if (no <= 0 || !ht_generic(hd, n, to, no)) { ++redrawn; continue; }
+                if (ht_match(hd, n, "random")) ++matched; else ++bad;
+            }
+            printf("hull: %d/200 random sets match the oracle (%d near-degenerate draws redrawn)\n", matched, redrawn);
+            CHECK(matched == 200, "hull matches the brute-force oracle on 200 random sets (n 4..64)");
+        }
+
+        /* coplanar sets: the oracle is wrong here, so assert validity instead */
+        int valid_ok = 1;
+        ht_barrel64(hd, 0); valid_ok &= ht_valid(hd, 64, "64 barrel, aligned", 11u);
+        ht_barrel64(hd, 1); valid_ok &= ht_valid(hd, 64, "64 barrel, staggered", 12u);
+        {
+            uint32_t js = 77u;                                          /* 1e-6 survey jitter */
+            ht_barrel64(hd, 0);
+            for (int k = 0; k < 64; ++k) { for (int q = 0; q < 3; ++q) hd[k][q] += 1e-6f * lcg_noise(&js); ht_norm(hd[k]); }
+            valid_ok &= ht_valid(hd, 64, "64 barrel, jittered", 13u);
+            int k = 0;
+            for (int ix = -1; ix <= 1; ix += 2) for (int iy = -1; iy <= 1; iy += 2) for (int iz = -1; iz <= 1; iz += 2, ++k) {
+                hd[k][0] = (float)ix; hd[k][1] = (float)iy; hd[k][2] = (float)iz; ht_norm(hd[k]); }
+            valid_ok &= ht_valid(hd, 8, "cube corners", 14u);
+            for (k = 0; k < 8; ++k) { for (int q = 0; q < 3; ++q) hd[k][q] += 1e-6f * lcg_noise(&js); ht_norm(hd[k]); }
+            valid_ok &= ht_valid(hd, 8, "cube corners, jittered", 15u);
+        }
+        {
+            for (int k = 0; k < 8; ++k) { const float th = (float)k * 0.785398163f;
+                hd[k][0] = cosf(th); hd[k][1] = 0.f; hd[k][2] = sinf(th); }
+            hd[8][0] = 0.f; hd[8][1] =  1.f; hd[8][2] = 0.f;
+            hd[9][0] = 0.f; hd[9][1] = -1.f; hd[9][2] = 0.f;
+            valid_ok &= ht_valid(hd, 10, "ring + two poles", 16u);
+        }
+        {
+            static Layout LB24; make_barrel(&LB24);                     /* the 24-speaker CAVE barrel */
+            for (uint32_t k = 0; k < LB24.count; ++k) unit_dir(LB24.ref, LB24.speakers[k].pos, hd[k]);
+            valid_ok &= ht_valid(hd, LB24.count, "24 barrel", 17u);
+        }
+        CHECK(valid_ok, "hull is a valid closed triangulation on coplanar sets (barrels, cube, ring + poles)");
+
+        /* a speaker doubled at float-rounding distance: inside the tolerance it must merge into its
+         * twin rather than cut sliver faces (this is the case HULL_EPS exists for) */
+        {
+            for (uint32_t k = 0; k < LD.count; ++k) unit_dir(LD.ref, LD.speakers[k].pos, hd[k]);
+            hd[26][0] = hd[5][0] + 3e-7f; hd[26][1] = hd[5][1] - 2e-7f; hd[26][2] = hd[5][2]; ht_norm(hd[26]);
+            CHECK(ht_valid_ex(hd, 27, "grid + near-duplicate", 18u, 0),
+                  "hull merges a near-duplicate speaker instead of emitting slivers");
+        }
+
+        /* the 64 barrel through the panner: the brute force overflowed VBAP_MAXTRI there and VBAP
+         * silently fell back to DBAP */
+        {
+            static int to[HT_BIGTRI][3]; static float dO[HT_BIGTRI];
+            ht_barrel64(hd, 0);
+            CHECK(hull_oracle(hd, 64, to, dO, VBAP_MAXTRI) == 0,
+                  "the brute-force hull overflows VBAP_MAXTRI on the 64 barrel (so the next checks discriminate)");
+            static Layout LB64; memset(&LB64, 0, sizeof LB64);
+            for (int k = 0; k < 64; ++k) {
+                LB64.speakers[k].pos[0] = 2.f * hd[k][0] * 2.5f;        /* any radius: only bearings matter */
+                LB64.speakers[k].pos[1] = 1.5f + 2.f * hd[k][1] * 2.5f;
+                LB64.speakers[k].pos[2] = 2.f * hd[k][2] * 2.5f;
+                LB64.speakers[k].gain_lin = 1.f;
+            }
+            LB64.count = 64; layout_compute_ref(&LB64);
+            LB64.rolloff_r = 0.7f; LB64.atten_ref_m = 1.f; LB64.atten_rolloff = 1.f; LB64.atten_min_lin = 0.01f;
+            static VbapState vb; vbap_reset(&vb);
+            float lis[3] = { 0.f, 1.5f, 0.f }, src[3] = { 0.9f, 1.8f, 0.4f }, g[BWA_MAX_CHANNELS];
+            vbap_gains(&vb, src, lis, &LB64, 1u, 1.0f, g);
+            int active = 0;
+            for (int k = 0; k < 64; ++k) if (g[k] > 1e-4f) ++active;
+            printf("hull: 64 barrel -> %d VBAP triangles, %d active speakers\n", vb.ntri, active);
+            CHECK(vb.ntri > 0 && vb.ntri <= 2 * 64 - 4, "the 64 barrel triangulates within 2n-4 faces under VBAP_MAXTRI");
+            CHECK(active >= 1 && active <= 3, "VBAP on the 64 barrel pans on a triangle (no DBAP fallback)");
+        }
     }
 
     /* 12. CAP: the dual-band low band projected so the rendered ITD matches a real source's, for the

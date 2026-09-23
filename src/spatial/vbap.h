@@ -11,7 +11,8 @@
 
 #include "core/layout.h"
 
-#define VBAP_MAXTRI 256    /* hull-triangle cap (a generic 26-speaker hull is ~48; overflow -> DBAP fallback) */
+#define VBAP_MAXTRI 256    /* hull-triangle cap: a hull has at most 2n-4 faces (48 at 26, 124 at 64), so
+                              this only binds past 130 speakers; overflow -> DBAP fallback */
 
 typedef struct {
     float    sdir[BWA_CHANNELS][3];    /* listener-relative unit speaker directions */

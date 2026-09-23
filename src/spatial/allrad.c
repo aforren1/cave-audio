@@ -5,7 +5,7 @@
  *   3. accumulate decode = G * D_virt and energy-normalize to the sampling decode's diffuse level.
  * The virtual layer is uniform so the sampling decoder is well-behaved there; VBAP absorbs the real
  * array's irregularity. (Standard AllRAD, Zotter & Frank 2012, with a Fibonacci virtual layer in
- * place of a t-design and a brute-force hull — fine for 26 points.)
+ * place of a t-design; the hull is hull.c's incremental one.)
  */
 #include "spatial/allrad.h"
 #include "spatial/hull.h"
