@@ -316,16 +316,28 @@ contract, so they share a **wait-free try-lock**: whoever finds it taken bails i
 worklet writes one quantum of silence, the host thread skips one period. It is not a mutex and the
 audio thread never blocks, which is what keeps invariant 1. It is contended only in the single
 quantum where a context resumes or suspends. The host thread decides the worklet is live from a
-heartbeat `process()` bumps, and stands down after eight quiet block periods.
+heartbeat `process()` bumps, and stands down after a quiet window of `max(8 blocks, 3 x
+baseLatency)`: a deep output buffer makes the browser render in bursts as long as the buffer, and a
+fixed eight blocks let the host thread take over inside every burst gap under a 0.05 hint.
 
-**What it cannot measure, which is everything the device would have told you.** Web Audio exposes
-no xrun counter, no device position and no underrun signal. `currentFrame` in the processor scope
-advances by exactly one quantum per callback whether or not the output starved, and a browser
-renders several quanta back to back inside one system audio callback, so the "`currentTime`
-advanced by more than a quantum" rule this note proposed before the sink existed would
-false-positive on every ordinary batch. So `measured` is **false** and `device_pos_valid` is false:
-a zero dropout count means "cannot know". `late_blocks` and `render_ns_peak` come from the adapter
-and are real, on a 1 ms clock (below). `AudioContext.baseLatency + outputLatency` is the output latency, read once at open
+**The slack for a slow render is the browser's output buffer.** A render longer than the 2.7 ms
+quantum overruns its callback; what absorbs that is the browser's own output buffer, held by the
+audio thread that has priority. A page asks for a deeper one with the AudioContext latencyHint, and
+`BWA_SINK_FLAG_DEEP_BUFFER` asks for `"playback"` on a context the sink creates. An adopted context
+keeps its page's hint, so the XR page makes its context with `latencyHint: 0.05` itself. A render
+thread filling a ring was tried first and rejected, because a Worker has no priority: see
+backends.md's worklet notes for the table, and "What is verified" below.
+
+**What it measures, and only where the browser says.** Web Audio gives the worklet no xrun counter
+and no device position. `currentFrame` in the processor scope advances by exactly one quantum per
+callback whether or not the output starved, and a browser renders several quanta back to back
+inside one system audio callback, so the "`currentTime` advanced by more than a quantum" rule this
+note proposed before the sink existed would false-positive on every ordinary batch. What Chromium
+does expose is `AudioContext.playbackStats`, the browser's own underrun count and duration. The
+sink reads it in `health()` on the control thread and books it as `dropouts` / `dropped_frames`, and
+`measured` is **true** exactly when the browser has it; elsewhere a zero means "cannot know".
+`device_pos_valid` stays false. `late_blocks` and `render_ns_peak` come from the adapter and are
+real, on a 1 ms clock (below). `AudioContext.baseLatency + outputLatency` is the output latency, read once at open
 off the context object, because `webaudio.h` has no accessor for either.
 
 **The clock, and a trap that is invisible.** `sample_pos` is the adapter's own stream position, not
@@ -572,7 +584,7 @@ wasm32 phonon staged:
   ok   451 blocks in 2.43 s of wall time (2.41 s of audio)
   ok   the render is paced by the audio clock
   ok   device_lost is 0: the AudioWorklet is driving, not the host-paced fallback
-  ok   health.measured is false, as the backend promises
+  ok   health.measured is true: playbackStats exists in this browser
   ok   suspended: 107 blocks in 600 ms, device_lost 1
   ok   resumed:   112 blocks in 600 ms, device_lost 0
   ok   destroy returned
@@ -613,14 +625,17 @@ wasm32 phonon staged:
   it against `BWA_ROOM_AHEAD`, `BWA_ROOM_UP` and `BWA_ROOM_RIGHT` rather than against the algebra
   the module derives. Every assertion in both was broken on purpose and confirmed red first.
   Since 2026-09-23 it also pins the Galaxy XR fixes: the head gizmo is hidden in session and back
-  in the flat preview, the engine opens at block 128, the status table reads `128 / 128 = 1`,
-  the session asks for `hand-tracking`, a gamepad-less hand input grabs on a pinch and carries the
-  source in height and depth, the panel's move buttons move it, and a block-256 rebuild and a
-  `playback` latency-hint rebuild both come back driven by the worklet. The health readout is
-  pinned too: the status table leads with the audio clock slip over a full 5 s window, the render
-  peak row reads whole milliseconds and says "(1 ms clock)", the percentage rows are gone, and the
-  in-world health line leads with the slip and wraps to at most two lines at the panel's own font
-  and width. `tests/xr_slip.test.mjs` pins the slip's sign, window, suspended state and
+  in the flat preview, the session asks for `hand-tracking`, a gamepad-less hand input grabs on a
+  pinch and carries the source in height and depth, and the panel's move buttons move it. Since
+  2026-09-24: the engine opens at block 256 on a context made with latencyHint 0.05, whose reported
+  latency is the context's own plus one block; the status table reads `256 / 128 = 2`; a block-128
+  rebuild keeps the deep hint; the standard `"interactive"` rebuild comes back driven by the worklet
+  with a smaller baseLatency than the deep one (10 ms against 50). The health readout is pinned too:
+  the status table leads with the device underrun count (playbackStats, through the health block)
+  and puts the audio clock slip second, the render peak row reads whole milliseconds and says
+  "(1 ms clock)", the in-world health line leads with the underruns and wraps to at most two lines
+  at the panel's own font and width, and the diagnostics dump shows 1 Hz lines carrying every
+  field. `tests/xr_slip.test.mjs` pins the slip's sign, window, suspended state and
   per-context reset under node. Each new pin was broken once and went red.
 
 **Not verified** on the XR page: that three.js renders it. Headless Chrome has no XR device, so
@@ -629,12 +644,40 @@ path does not care. Stereo rendering, the projection layer, a real runtime's con
 gamepad layout, reprojection, and every latency number are headset work. So is the question the
 page exists to ask, which is whether the image stays put when you turn your head.
 
+- **the output buffer as the fix for a slow render, measured.** The load section of
+  `run-browser.mjs` calibrates a load on the manual sink (the page times `bwa_render_block` itself
+  and stops past a mean of 1.15 quanta), plays it through the worklet sink on a context made at a
+  chosen latencyHint (`?hint=`, `"playback"` by default), and reads Chrome's `playbackStats` underrun
+  time over 3 s. Paired runs of the render-in-process sink alone, hints alternated at one pinned load
+  (`?sources=N`), 2026-09-24, with ten to fourteen of the owner's CPU-bound R jobs running through
+  every run (a 16-thread laptop at 90 to 100 percent):
+
+| sources (mean block, main thread) | `interactive` (10 ms buffer) | `playback` (20 ms) | `0.05` (50 ms) |
+|-----------------------------------|------------------------------|--------------------|----------------|
+| 96 (3.1 to 7.8 ms)                | 1.25, 1.11 s                 | 1.03, 1.26, 0.56 s | 0.58, 0.45 s   |
+| 112 (3.7 to 8.2 ms)               | 1.88, 1.74, 1.83 s           | 1.08, 1.04, 1.31 s | 0.70, 0.72 s   |
+
+  Two 96-source runs produced no result (the page timed out; the runner's timeout is 180 s now) and
+  one 112-source 0.05 run is left out: its calibration read a 14.3 ms mean, past the 5.3 ms block
+  period, where no buffer can help. So a deeper buffer cuts the underrun time substantially, about
+  40 percent with `"playback"` and 60 percent with 0.05 at 112 sources, and it does NOT remove it on
+  a machine this busy. There the calibrated mean itself sat at or past the block period (3.1 to
+  8.2 ms against 5.3), which is a render that does not keep up on AVERAGE, and for that the cure is
+  less render cost, not more buffer. With four jobs running, `"playback"` at 96 sources (a 3.13 ms
+  mean) played 0.0 ms of underrun. The check asserts at most 60 ms of underrun in 3 s at the
+  calibrated load under `"playback"`, which is a quiet-machine bound: on the machine above it goes
+  red, and `?hint=interactive&sources=112` goes red by 1.9 s. The health block's booking is checked
+  against the browser's own numbers in the same run (62 events and 649.6 ms booked, 62 and 649.6
+  reported). The busy-main-thread check stays, judged against the run's own underrun rate, because a
+  spinning main thread on a saturated machine takes a core from the audio thread too.
+
 **Not verified**: that it sounds right. Nobody has listened. A headless browser has no speaker, so
 what the check proves is that the path runs and is paced by the audio clock, not that the HRTF
 image is correct - and the wasm build uses phonon's real HRTF, so a by-ear pass is worth having.
 Also unverified: the `baseLatency` read (headless Chrome reports one, but not one anybody has
 compared against a stopwatch), the `Date.now` clock's effect on `bwa_get_clock_model`, and
-anything on a browser that is not Chromium.
+anything on a browser that is not Chromium. What the deeper output buffer buys on the Galaxy XR's
+Android Chrome, and what baseLatency a 0.05 hint gets there, is the headset's to report.
 
 ## Hosting
 
@@ -887,23 +930,36 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   inert for a pushed pose. `tests/run-xr.mjs` and `tests/xr_frame.test.mjs` are its checks, and
   `bindings/web/README.md` has the derivation in full.
 
-  The XR page opens the engine at block 128, one Web Audio render quantum, and not the rig's
-  default 256. At 256 the worklet sink's fixed-quantum adapter renders a whole 256-frame block
-  inside every second `process()` call and only copies out in the call between, so the render
-  cost lands in half the callbacks at twice the size. At 128 every call renders one block
-  straight into its slot and copies it out, which is the adapter's pass-through case, and the
-  adapter holds no extra block of latency. Nothing in the engine refuses 128: phonon's frame size
-  is whatever the engine block is, and the scratch buffers are sized to the 8192-frame ceiling.
-  This came from a Galaxy XR report of crackle under `cave_sim`. It is a hypothesis about a
-  mobile SoC, not a measurement, and per-block overhead is higher at 128, so the panel offers
-  128, 256 and 512 and an `interactive` or `playback` latency hint. Either one rebuilds the engine
-  and the AudioContext. No new gesture is needed, because the Enter VR press already unlocked
-  audio for the document.
+  The XR page opens the engine at block 256 on an AudioContext it creates with `latencyHint: 0.05`,
+  the page's side of `BWA_SINK_FLAG_DEEP_BUFFER` (the engine adopts the page's context, so the page
+  sets the hint). Block 128 was tried first (2026-09-23), when the crackle looked like a 256 block
+  landing whole in every other callback; the fix for a render that overruns its quantum turned out to
+  be the browser's output buffer, so the page takes the block with half the per-block overhead. On
+  the Windows desktop the deep context reports baseLatency 50 ms and the engine 2656 frames
+  (55.3 ms) of output latency; the standard `"interactive"` context 10 ms and 736 frames (15.3 ms).
+  The panel offers 128, 256 and 512, and deep or standard for the buffer. Either rebuilds the engine
+  and the AudioContext. No new gesture is needed, because the Enter VR press already unlocked audio
+  for the document. The flat playground stays `"interactive"`.
+
+  **The diagnostics dump** is for the headset, where nobody can attach a debugger. `xr/diag.js`
+  keeps the last 30 s at 1 Hz: device underruns and their ms (playbackStats through the health
+  block), the browser's average output latency, late blocks, the render peak against the block
+  period, the output latency, the slip, the context state and rate, the JS heap
+  (`performance.memory`, Chromium only), frames that second with the longest frame interval, how
+  long ago the last frame ran, how long ago a health poll came back (or "poll STUCK" after 2 s), and
+  any page error. It shows as plain text in a textarea when the session ends, or on the "copy
+  diagnostics" button in the flat view. No network, no storage. If the page freezes, the 1 Hz timer
+  stops with it, so the LAST line is the state just before: a stopped frame loop reads as a growing
+  `lastframe`, a poll that never returned as `poll STUCK`, memory growth as a climbing `heap`.
 
   What to read on the headset: the panel's "audio health" line, two lines, numbers first. The
-  first number is the **audio clock slip**: over the last 5 s, wall time from `performance.now()`
-  minus audio time from `AudioContext.currentTime`, both read on the main thread every animation
-  frame (`xr/slip.js`). It is the one dropout signal this platform has. When the render thread
+  first number is the **device underrun count** since start, with the silence it cost in ms: the
+  browser's own `playbackStats`, which the sink reads into `bwa_health` (dropouts and dropped
+  frames). Then the render peak against the block period and the late blocks in the window. The
+  second line leads with the **audio clock slip**: over the last 5 s, wall time from
+  `performance.now()` minus audio time from `AudioContext.currentTime`, both read on the main
+  thread every animation frame (`xr/slip.js`). It is the cruder estimate of the same silence, and
+  the only one on a browser without playbackStats. When the render thread
   misses a deadline Chrome plays fallback silence and the graph does not advance, so the audio
   clock falls behind: 0 is healthy, positive is the audio thread not keeping up. Beside it is the
   count of animation frames over 30 ms in the same window, which tells a stalled main thread (long
@@ -931,7 +987,8 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   longer bursts, which is what the Galaxy XR showed. At 128 the same cost is spread over every
   call. Block size moves the glitches around; it does not remove them. The cure is render cost
   (fewer voices, `binaural` instead of `cave_sim`, a cheaper scene), or a device buffer with more
-  headroom (`playback`). If the slip stays at 0 while the audio crackles, the render is keeping up
+  headroom (the deep latencyHint, now the XR default; "What is verified" has what it bought on a
+  busy desktop). If the slip stays at 0 while the audio crackles, the render is keeping up
   and the problem is downstream of it.
 
   The page also asks for `hand-tracking` as an optional feature. A pinch is `select`, so

@@ -1,8 +1,10 @@
 /**
  * slip.js - a dropout signal that needs no clock on the audio thread.
  *
- * WHY THIS EXISTS. Web Audio reports no xrun, no underrun and no device position, so the engine's
- * health block cannot count a dropout on this backend (`measured` is false). And the AudioWorklet
+ * WHY THIS EXISTS. Web Audio gives the worklet no xrun and no device position. Chromium's
+ * AudioContext.playbackStats does count the browser's underruns, and the sink reads it into the
+ * health block (the "device underruns" row, first); this slip is the SECOND, cruder number, and
+ * the only one on a browser without playbackStats. And the AudioWorklet
  * thread has no `performance`, so the render times the engine does measure there come from
  * Date.now: whole milliseconds against a 2.67 ms quantum (src/os/os_posix.c). The MAIN thread has
  * both clocks a dropout needs: `performance.now()`, the wall clock, and `AudioContext.currentTime`,

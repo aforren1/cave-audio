@@ -20,18 +20,25 @@ import { SCENES } from "../playground/scenes/index.js";
 export const DEFAULT_LEAD_S = 0.03;
 
 /**
- * The engine block the XR page opens with: ONE Web Audio render quantum. At 256 the worklet sink's
- * fixed-quantum adapter renders a whole 256-frame block inside every OTHER process() call and only
- * copies out in the one between, so the render cost lands in half the callbacks at twice the size.
- * On a mobile SoC running cave_sim (an HRTF convolution per virtual speaker) that spike was the
- * crackle reported from a Galaxy XR (2026-09-23). At 128 every callback renders one block straight
- * into its slot and copies it out: the adapter's pass-through case. The panel lets you A/B it.
+ * The engine block the XR page opens with: 256. 128 was tried first (2026-09-23), when the crackle
+ * reported from a Galaxy XR looked like the 256 block landing whole in every other process() call.
+ * The fix for a render that overruns its quantum turned out to be the BROWSER'S output buffer, not
+ * the block size (docs/web.md), so the page takes the block with half the per-block overhead and
+ * gets its slack from the latency hint below. The panel still offers 128 and 512.
  */
-export const XR_DEFAULT_BLOCK = 128;
+export const XR_DEFAULT_BLOCK = 256;
 export const BLOCK_CHOICES = [128, 256, 512];
-/** AudioContext latencyHint values offered. "interactive" is the default; "playback" asks the
- * browser for a bigger device buffer, trading latency for headroom. */
-export const LATENCY_HINTS = ["interactive", "playback"];
+/**
+ * The AudioContext latencyHint, which is the one output-buffer knob a page has, and the page's side
+ * of BWA_SINK_FLAG_DEEP_BUFFER: the engine ADOPTS this page's context, so the sink cannot set the
+ * hint and the page does. 0.05 s (DEEP, the default here) asks the browser for a 50 ms output buffer,
+ * the slack a render longer than one quantum needs, held by the audio thread that already has
+ * priority. "interactive" (STANDARD) is the shortest buffer the browser gives. Head-tracked audio a
+ * few tens of ms later beats audio that chops. The flat playground stays "interactive".
+ */
+export const LATENCY_HINTS = [0.05, "interactive"];
+export const XR_DEFAULT_HINT = LATENCY_HINTS[0];
+export const isDeep = (hint) => hint !== "interactive";
 
 /** Web Audio's render quantum: 128 in 1.0; a 1.1 context may report its own. */
 export function quantumOf(app) {
@@ -50,9 +57,23 @@ export function recentLate(app) {
 }
 
 /**
+ * The browser's own output underruns since the context started, as short text: the FIRST number to
+ * read. worklet_sink.c reads AudioContext.playbackStats into bwa_health (dropouts = underrun
+ * events, dropped frames = underrun time), and sets `measured` only when the browser has it.
+ */
+export function underrunText(app) {
+  const i = app.rig.engine?.info;
+  const h = app.rig.health;
+  if (!i || !h) return "underruns -";
+  if (!h.measured) return "underruns - (no playbackStats)";
+  const ms = (1000 * h.droppedFrames) / i.sampleRate;
+  return `underruns ${h.xruns} (${ms.toFixed(0)} ms)`;
+}
+
+/**
  * The audio-clock slip over the trailing window (slip.js), as short text, or a reason it has none.
- * THE FIRST NUMBER TO READ, because it is the only dropout signal this platform has: Web Audio
- * reports no xrun, and the engine's own render times come from a 1 ms clock on the worklet.
+ * The SECOND number: a cruder estimate of the same silence, and the only one on a browser without
+ * playbackStats.
  */
 export function slipText(app) {
   const s = app.slip?.reading();
@@ -98,8 +119,9 @@ export function healthLine(app) {
   const late = r ? `late ${r.late}/${r.blocks}` : "late -";
   const long = s ? `, ${s.longFrames} long frames` : "";
   const p = renderPeak(app);
-  return `${slipText(app)}${long}, ${late}\n` +
-         `peak ${p.text}, block ${i.blockSize}/${quantumOf(app)}, ${app.latencyHint ?? "interactive"}`;
+  return `${underrunText(app)}, peak ${p.text}, ${late}\n` +
+         `${slipText(app)}${long}, block ${i.blockSize}/${quantumOf(app)}, ` +
+         `${isDeep(app.latencyHint) ? "deep" : "standard"}`;
 }
 
 export function profileName(p) {
@@ -136,21 +158,22 @@ export function buildOptions(app) {
     },
     {
       kind: "select", label: "engine block (frames)",
-      options: BLOCK_CHOICES.map((b) => (b === XR_DEFAULT_BLOCK ? `${b} (one quantum, default)` : `${b}`)),
+      options: BLOCK_CHOICES.map((b) => (b === XR_DEFAULT_BLOCK ? `${b} (default)` : `${b}`)),
       get: () => Math.max(0, BLOCK_CHOICES.indexOf(app.blockSize ?? XR_DEFAULT_BLOCK)),
       set: (v) => { app.setEngineOptions({ blockSize: BLOCK_CHOICES[v] }); },
       hint: "A create-time choice, so switching rebuilds the engine and the AudioContext. " +
-            "128 renders one block per Web Audio callback; bigger blocks render a whole block " +
-            "inside one callback and nothing in the next.",
+            "A block renders inside one Web Audio callback, so a bigger block is a bigger render " +
+            "in one callback and nothing in the next; the output buffer below is the slack for it.",
     },
     {
-      kind: "select", label: "output latency hint",
-      options: ["interactive (default)", "playback (bigger device buffer)"],
-      get: () => Math.max(0, LATENCY_HINTS.indexOf(app.latencyHint ?? "interactive")),
+      kind: "select", label: "output buffer (latencyHint)",
+      options: ["deep, 0.05 s (default)", "standard, interactive"],
+      get: () => (isDeep(app.latencyHint ?? XR_DEFAULT_HINT) ? 0 : 1),
       set: (v) => { app.setEngineOptions({ latencyHint: LATENCY_HINTS[v] }); },
-      hint: "Fixed when an AudioContext is created, so switching builds a new context and a new " +
-            "engine. It needs no new gesture: the Enter VR press already unlocked audio for this " +
-            "page. Try playback if the audio crackles and the late-block count stays at 0.",
+      hint: "The AudioContext's latencyHint, fixed when a context is created, so switching builds " +
+            "a new context and a new engine. It needs no new gesture: the Enter VR press already " +
+            "unlocked audio for this page. Deep gives a render that overruns its callback room to " +
+            "finish before the output runs dry.",
     },
     {
       kind: "select", label: "stimulus", options: app.rig.stimulusNames(),
@@ -197,7 +220,9 @@ export function statusRows(app) {
   const x = app.xr;
   const sl = app.slip?.reading();
   const rows = [
-    /* FIRST, because it is the one dropout signal this platform has (slip.js). */
+    /* FIRST: the browser's own count of the silence it played (playbackStats, via bwa_health). */
+    ["device underruns (since start)", underrunText(app).replace(/^underruns /, "")],
+    /* SECOND: the cruder estimate, and the only one without playbackStats (slip.js). */
     ["audio clock slip (5 s)", slipText(app).replace(/^slip:? /, "")],
     ["long frames > 30 ms (5 s)", sl ? `${sl.longFrames} of ${sl.frames}` : "-"],
     ["mode", x?.presenting ? "immersive-vr" : "flat preview"],
@@ -213,10 +238,12 @@ export function statusRows(app) {
     rows.push(["backend", i.backend]);
     rows.push(["sample rate / block", `${i.sampleRate} Hz / ${i.blockSize}`]);
     rows.push(["bus channels", `${i.channelCount}`]);
-    rows.push(["output latency", `${i.outputLatencyFrames} frames`]);
+    rows.push(["output latency", `${i.outputLatencyFrames} frames ` +
+                                 `(${((1000 * i.outputLatencyFrames) / i.sampleRate).toFixed(1)} ms)`]);
   }
   const c = app.rig.ctx;
-  rows.push(["latency hint", app.latencyHint ?? "interactive"]);
+  rows.push(["output buffer (latencyHint)", `${isDeep(app.latencyHint) ? "deep" : "standard"}, ` +
+                                            `${app.latencyHint ?? "interactive"}`]);
   if (c && Number.isFinite(c.baseLatency)) {
     const out = Number.isFinite(c.outputLatency) ? `${(c.outputLatency * 1000).toFixed(1)} ms` : "-";
     rows.push(["context latency (base / output)", `${(c.baseLatency * 1000).toFixed(1)} ms / ${out}`]);

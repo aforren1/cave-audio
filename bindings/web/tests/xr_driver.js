@@ -35,8 +35,24 @@
   /* BWA_DEFAULT_GRID. A literal because this classic script cannot import the binding;
    * constants.test.mjs pins the exported value to the same number. */
   var DEFAULT_GRID = 26;
-  /* The XR page's engine block: one Web Audio render quantum (xr/options.js XR_DEFAULT_BLOCK). */
-  var XR_BLOCK = 128;
+  /* The XR page's engine block and output buffer (xr/options.js): block 256, and the page creates
+   * its AudioContext with latencyHint 0.05 (DEEP, the page's side of BWA_SINK_FLAG_DEEP_BUFFER).
+   * The A/B below switches to OTHER_BLOCK and to the "interactive" hint and back. */
+  var XR_BLOCK = 256;
+  var OTHER_BLOCK = 128;
+  var DEEP_HINT = 0.05;
+  function ctxFrames(s) {
+    return Math.round((s.contextBaseLatency + (s.contextOutputLatency || 0)) * s.sampleRate);
+  }
+  /* worklet_sink.c's rule 5 figure: the context's own latency plus one block the adapter can hold,
+   * or nothing when the block IS the 128-frame quantum (the pass-through case). The sink reads outputLatency ONCE, at open, and a browser often
+   * reports 0 there and a real figure a moment later, so accept either reading of it. */
+  function latencyHolds(s) {
+    var base = Math.round(s.contextBaseLatency * s.sampleRate);
+    var extra = s.outputLatencyFrames - base - (s.blockSize === 128 ? 0 : s.blockSize);
+    return extra === 0 || extra === Math.round((s.contextOutputLatency || 0) * s.sampleRate);
+  }
+  var deepBaseLatency = 0;
 
   var notes = [];
   function ok(m) { notes.push("ok   " + m); }
@@ -261,7 +277,18 @@
     if (s.presenting) fail("the page claims to be presenting with no WebXR");
     else ok("not presenting, as there is no device");
     if (s.blockSize !== XR_BLOCK) fail("the engine opened at block " + s.blockSize + ", expected " + XR_BLOCK);
-    else ok("the engine opened at block " + XR_BLOCK + ", one render quantum");
+    else ok("the engine opened at block " + XR_BLOCK);
+    /* THE DEEP OUTPUT BUFFER: the page made its context with latencyHint 0.05, and the sink's
+     * reported latency is that context's own plus the one block the adapter holds. */
+    if (s.latencyHint !== DEEP_HINT) fail("the XR page did not create its context with latencyHint " + DEEP_HINT +
+                                          " (" + JSON.stringify(s.latencyHint) + ")");
+    else if (!latencyHolds(s))
+      fail("output latency " + s.outputLatencyFrames + " is not the context's " + ctxFrames(s) + " + one block");
+    else {
+      deepBaseLatency = s.contextBaseLatency;
+      ok("deep output buffer: baseLatency " + (1000 * s.contextBaseLatency).toFixed(1) + " ms, output latency " +
+         s.outputLatencyFrames + " frames (" + (1000 * s.outputLatencyFrames / s.sampleRate).toFixed(1) + " ms)");
+    }
     if (s.headGizmoVisible !== true) fail("the flat preview hides the head gizmo (" + s.headGizmoVisible + ")");
     else ok("the flat preview draws the head gizmo");
 
@@ -273,7 +300,7 @@
 
     var labels = labelsOf(xr.menuItems());
     var want = ["scene", "render profile", "audio health", "engine block (frames)",
-                "output latency hint", "stimulus", "master gain", "pose prediction lead",
+                "output buffer (latencyHint)", "stimulus", "master gain", "pose prediction lead",
                 "move source (no thumbstick needed)"];
     for (var i = 0; i < want.length; ++i) {
       if (labels.indexOf(want[i]) < 0) fail('the menu has no "' + want[i] + '" control');
@@ -338,7 +365,7 @@
     await waitFor(function () { return xr.state().health; }, 15000, "the first health poll in session");
     var rows = {};
     xr.statusRows().forEach(function (r) { rows[r[0]] = r[1]; });
-    if (rows["block / quantum"] !== XR_BLOCK + " / 128 = 1")
+    if (rows["block / quantum"] !== XR_BLOCK + " / 128 = " + (XR_BLOCK / 128))
       fail('the status table reads block / quantum "' + rows["block / quantum"] + '"');
     else ok('the status table reads block / quantum "' + rows["block / quantum"] + '"');
     /* The render peak is whole milliseconds on the worklet (its only clock is Date.now), so the
@@ -349,21 +376,29 @@
             rows["late blocks (since start)"] + " (headless desktop, not a headset)");
     if (rows["peak load (per block)"] !== undefined || rows["peak load (per process() call)"] !== undefined)
       fail("the status table still carries the percentage peak-load rows");
-    /* THE SLIP IS FIRST, in the table and on the panel: it is the one dropout signal this
-     * platform has. Wait for a full window, then read it. */
+    /* THE DEVICE UNDERRUNS ARE FIRST, in the table and on the panel: the browser's own count of
+     * the silence it played (playbackStats, read into bwa_health by the sink), which headless
+     * Chrome has. The slip is second. Wait for a full slip window, then read both. */
     await waitFor(function () { var r = xr.slip(); return r && r.spanMs >= 4900; }, 15000, "a full 5 s slip window");
-    var firstRow = xr.statusRows()[0];
+    var allRows = xr.statusRows();
+    var firstRow = allRows[0];
+    var secondRow = allRows[1];
     var sl = xr.slip();
-    if (!firstRow || firstRow[0] !== "audio clock slip (5 s)" || !/^-?\d+\.\d% \(-?\d+ ms\/5 s\)$/.test(firstRow[1]))
-      fail("the first status row is not the audio clock slip: " + JSON.stringify(firstRow));
-    else ok("audio clock slip " + firstRow[1] + " over " + (sl.spanMs / 1000).toFixed(2) + " s, " +
+    if (!firstRow || firstRow[0] !== "device underruns (since start)" || !/^\d+ \(\d+ ms\)$/.test(firstRow[1]))
+      fail("the first status row is not the device underrun count: " + JSON.stringify(firstRow));
+    else ok("device underruns " + firstRow[1] + " (headless desktop, playbackStats)");
+    if (!secondRow || secondRow[0] !== "audio clock slip (5 s)" || !/^-?\d+\.\d% \(-?\d+ ms\/5 s\)$/.test(secondRow[1]))
+      fail("the second status row is not the audio clock slip: " + JSON.stringify(secondRow));
+    else ok("audio clock slip " + secondRow[1] + " over " + (sl.spanMs / 1000).toFixed(2) + " s, " +
             sl.longFrames + " frames over 30 ms of " + sl.frames + " (headless desktop)");
     if (!(Math.abs(sl.slipPct) < 100)) fail("the slip reading is not a sane percentage: " + sl.slipPct);
     var line = xr.healthLine();
     var nLines = xr.panelLines(line);
-    if (!/^slip -?\d+\.\d%/.test(line)) fail('the health line does not lead with the slip: "' + line + '"');
+    if (!/^underruns \d+ \(\d+ ms\), peak \d+ ms of \d+\.\d \(1 ms clock\), /.test(line))
+      fail('the health line does not lead with the underruns and the render peak: "' + line + '"');
+    else if (line.indexOf("slip") < 0) fail('the health line lost the slip: "' + line + '"');
     else if (!(nLines >= 1 && nLines <= 2)) fail("the health line takes " + nLines + ' panel lines: "' + line + '"');
-    else ok("the health line leads with the slip and fits in " + nLines + ' panel lines: "' +
+    else ok("the health line leads with the underruns and fits in " + nLines + ' panel lines: "' +
             line.replace("\n", " / ") + '"');
     if (s.refSpaceType !== "local-floor")
       fail('the page took a "' + s.refSpaceType + '" reference space, expected local-floor');
@@ -686,36 +721,64 @@
      * log beside the first reading, which still carried the start. */
     var lateRows = {};
     xr.statusRows().forEach(function (r) { lateRows[r[0]] = r[1]; });
-    ok("steady state: audio clock slip " + lateRows["audio clock slip (5 s)"] + ", long frames " +
+    ok("steady state: device underruns " + lateRows["device underruns (since start)"] + ", audio clock slip " +
+       lateRows["audio clock slip (5 s)"] + ", long frames " +
        lateRows["long frames > 30 ms (5 s)"] + ', render peak "' + lateRows["render peak (last 5 s)"] + '"');
 
     /* ---- the engine block and latency hint A/B: each rebuilds engine and context ---- */
-    await xr.setEngineOptions({ blockSize: 256 });
-    await waitFor(function () { return xr.state().health; }, 15000, "health after the block-256 rebuild");
+    await xr.setEngineOptions({ blockSize: OTHER_BLOCK });
+    await waitFor(function () { return xr.state().health; }, 15000, "health after the block rebuild");
     var b0 = xr.state();
-    if (b0.blockSize !== 256) fail("after choosing block 256 the engine runs at " + b0.blockSize);
-    else ok("choosing block 256 rebuilt the engine at 256");
+    if (b0.blockSize !== OTHER_BLOCK) fail("after choosing block " + OTHER_BLOCK + " the engine runs at " + b0.blockSize);
+    else ok("choosing block " + OTHER_BLOCK + " rebuilt the engine at " + OTHER_BLOCK + ", latency " +
+            b0.outputLatencyFrames + " frames (" + (1000 * b0.outputLatencyFrames / b0.sampleRate).toFixed(1) + " ms)");
+    if (b0.latencyHint !== DEEP_HINT || !latencyHolds(b0))
+      fail("the block rebuild lost the deep output buffer: hint " + JSON.stringify(b0.latencyHint) +
+           ", latency " + b0.outputLatencyFrames);
     var bh0 = b0.health;
     await sleep(700);
     var bh1 = xr.state().health;
     if (bh1.blocks - bh0.blocks < 40 || bh1.deviceLost !== 0)
-      fail("after the block-256 rebuild the worklet is not driving (" + (bh1.blocks - bh0.blocks) +
+      fail("after the block-" + OTHER_BLOCK + " rebuild the worklet is not driving (" + (bh1.blocks - bh0.blocks) +
            " blocks in 700 ms, device_lost " + bh1.deviceLost + ")");
-    else ok("the block-256 engine renders (" + (bh1.blocks - bh0.blocks) + " blocks in 700 ms)");
-    await xr.setEngineOptions({ blockSize: XR_BLOCK, latencyHint: "playback" });
-    await waitFor(function () { return xr.state().health; }, 15000, "health after the playback rebuild");
+    else ok("the block-" + OTHER_BLOCK + " engine renders (" + (bh1.blocks - bh0.blocks) + " blocks in 700 ms)");
+    deepBaseLatency = xr.state().contextBaseLatency;     /* the deep context, before the switch */
+    await xr.setEngineOptions({ blockSize: XR_BLOCK, latencyHint: "interactive" });
+    await waitFor(function () { return xr.state().health; }, 15000, "health after the standard-buffer rebuild");
     var p0 = xr.state();
-    if (p0.blockSize !== XR_BLOCK || p0.latencyHint !== "playback")
-      fail("after choosing block " + XR_BLOCK + " and playback the page reads block " + p0.blockSize +
-           ', hint "' + p0.latencyHint + '"');
-    else ok("block " + XR_BLOCK + ' with latency hint "playback" rebuilt the engine');
+    if (p0.blockSize !== XR_BLOCK || p0.latencyHint !== "interactive")
+      fail("after choosing block " + XR_BLOCK + " and the standard buffer the page reads block " + p0.blockSize +
+           ", hint " + JSON.stringify(p0.latencyHint));
+    else if (!latencyHolds(p0))
+      fail("standard buffer: output latency " + p0.outputLatencyFrames + " is not the context's " + ctxFrames(p0) + " + one block");
+    else if (!(p0.contextBaseLatency < deepBaseLatency))
+      fail("the interactive context's baseLatency (" + p0.contextBaseLatency + ") is not below the deep one's (" +
+           deepBaseLatency + "): the hint did not reach the context");
+    else ok("standard output buffer: baseLatency " + (1000 * p0.contextBaseLatency).toFixed(1) + " ms (deep " +
+            (1000 * deepBaseLatency).toFixed(1) + "), output latency " + p0.outputLatencyFrames + " frames (" +
+            (1000 * p0.outputLatencyFrames / p0.sampleRate).toFixed(1) + " ms)");
     var ph0 = p0.health;
     await sleep(700);
     var ph1 = xr.state().health;
     if (ph1.blocks - ph0.blocks < 40 || ph1.deviceLost !== 0)
-      fail("after the playback rebuild the worklet is not driving (" + (ph1.blocks - ph0.blocks) + " blocks)");
-    else ok("the playback-hint engine renders (" + (ph1.blocks - ph0.blocks) + " blocks in 700 ms)");
-    await xr.setEngineOptions({ latencyHint: "interactive" });
+      fail("after the standard-buffer rebuild the worklet is not driving (" + (ph1.blocks - ph0.blocks) + " blocks)");
+    else ok("the standard-buffer engine renders (" + (ph1.blocks - ph0.blocks) + " blocks in 700 ms)");
+    await xr.setEngineOptions({ latencyHint: DEEP_HINT });
+    await waitFor(function () { return xr.state().health; }, 15000, "health after the deep rebuild");
+    await sleep(1500);                       /* two diagnostics lines with this engine's health */
+
+    /* THE DIAGNOSTICS DUMP: 1 Hz lines with the numbers the headset owner pastes back. By now the
+     * page has run for well over the 30 s window, so it is full. */
+    var dg = xr.diagnostics();
+    var dl = dg.text.split("\n");
+    var last = dl[dl.length - 1] || "";
+    if (!dg.shown) fail("the diagnostics textarea did not show");
+    else if (dl.length < 20 || dl.length > 33) fail("the diagnostics log has " + dl.length + " lines, want about 32");
+    else if (!/underruns=\d+ \(\d+ms\) late=\d+ peak=[\d.]+\/[\d.]+ms/.test(last) || !/avglat=\d+ms/.test(last) ||
+             !/ctx=running@\d+/.test(last) || !/lastframe=[\d.]+s/.test(last) || !/poll=[\d.]+s/.test(last))
+      fail('the last diagnostics line is missing a field: "' + last + '"');
+    else if (/[^\x09\x0a\x20-\x7e]/.test(dg.text)) fail("the diagnostics text is not plain ASCII");
+    else ok(dl.length + ' diagnostics lines, the last: "' + last + '"');
 
     /* ---- the scene picker, from inside the session ---- */
     var sceneBefore = xr.state().sceneId;

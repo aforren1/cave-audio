@@ -42,6 +42,7 @@ export const SinkFlags = {
   EXCLUSIVE: CONSTANTS.SINK_FLAG_EXCLUSIVE,
   EXACT_RATE: CONSTANTS.SINK_FLAG_EXACT_RATE,
   TIGHT_BUFFER: CONSTANTS.SINK_FLAG_TIGHT_BUFFER,
+  DEEP_BUFFER: CONSTANTS.SINK_FLAG_DEEP_BUFFER,
 };
 
 /* The header's integer constants, the names bindings/python's idiomatic layer uses. Read from the

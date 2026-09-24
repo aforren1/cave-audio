@@ -297,12 +297,17 @@ The **Wasm Audio Worklet** has no column because every cell would say the same t
 reports no device position, no xrun count and no underrun signal of any kind. `currentFrame`
 advances by exactly one quantum per callback whether or not the output starved, and a browser
 renders several quanta back to back inside one system audio callback, so a per-callback
-host-interval rule would false-positive on every ordinary batch. So `measured` is **false**, which
-is the contract's way of saying "cannot know". `late_blocks` and `render_ns_peak` are real, because
-the adapter measures those for every backend it serves, but the clock under them is `Date.now`
-(whole milliseconds, see rule 3 above), so they are coarse. The XR page reads a dropout signal off
-the main thread instead: `AudioContext.currentTime` against `performance.now()` (docs/web.md). `device_lost` is set while the sink is host-pacing, which on this platform means a suspended
-AudioContext as often as a lost one.
+host-interval rule would false-positive on every ordinary batch. What Chromium DOES expose is
+`AudioContext.playbackStats`: `underrunEvents` and `underrunDuration`, the browser's own count of the
+silence its output played because a render came back late. The sink reads it in `health()`, on the
+control thread (a main-thread JavaScript read, never the audio thread), books it as `dropouts` and
+`dropped_frames`, and sets `measured` **true exactly when the browser has it**. On a browser without
+it `measured` stays false, the contract's way of saying "cannot know". `late_blocks` and
+`render_ns_peak` are real, because the adapter measures those for every backend it serves, but the
+clock under them is `Date.now` (whole milliseconds, see rule 3 above), so they are coarse. The XR
+page also reads `AudioContext.currentTime` against `performance.now()` on the main thread, a cruder
+estimate and the only one without playbackStats (docs/web.md). `device_lost` is set while the sink
+is host-pacing, which on this platform means a suspended AudioContext as often as a lost one.
 
 One field is added to the public `bwa_health` in the same ABI bump (see
 [ABI](#abi-changes)): `device_lost`. A lost device makes the sink behave like the null sink,
@@ -321,7 +326,7 @@ nothing). Nothing reopens on its own.
 | JACK      | the max over the sink's ports of `jack_port_get_latency_range(port, JackPlaybackLatency)`, read after the connections are made (the server recomputes on connect) |
 | ALSA      | `snd_pcm_delay` right after a write, which is the buffer fill                                            |
 | AAudio    | `getFramesWritten - pos` from the timestamp pair, extrapolated to now at the nominal rate; `getBufferSizeInFrames` when the timestamp is not yet available |
-| Wasm Audio Worklet | `AudioContext.baseLatency + outputLatency`, in seconds, read once at open. `webaudio.h` has no accessor for either, so the sink reads the two properties off the context object itself. 0 when the browser reports neither, which is "unknown" and not "none" |
+| Wasm Audio Worklet | `AudioContext.baseLatency + outputLatency`, in seconds, read once at open. `webaudio.h` has no accessor for either, so the sink reads the two properties off the context object itself. 0 when the browser reports neither, which is "unknown" and not "none". `BWA_SINK_FLAG_DEEP_BUFFER` moves it: a context the sink creates gets latencyHint `"playback"` (baseLatency 20 ms on the Windows desktop, 1216 frames in all at block 256, against 736 with `"interactive"`); a page that hands the sink its own context sets the hint itself (0.05 on the XR page: 50 ms, 2656 frames) |
 
 The adapter adds the frames it holds in its FIFO. The value stays constant for the life of the
 sink, as the header promises.
@@ -1123,6 +1128,40 @@ thread never blocks, which is what keeps invariant 1. It is contended only in th
 where a context resumes or suspends, so bailing is the right answer rather than a cost. The host
 thread decides the worklet is live from a heartbeat the `process()` callback bumps, and stands
 down after eight quiet block periods.
+
+**The host thread's quiet window is at least three browser callbacks.** A deep output buffer makes
+the browser render its quanta in bursts as long as that buffer (50 ms of quanta back to back, then
+nothing, under a 0.05 hint), and the old fixed window of eight blocks is only 43 ms at 256 frames.
+When the XR page moved to 0.05 the heartbeat went quiet inside every burst gap, the host thread took
+over, `device_lost` flapped, and the two pullers alternated on one adapter (`run-xr` caught it at
+block 128). The window is now `max(8 blocks, 3 x baseLatency)`, read at open; putting the fixed
+eight back turns that check red again.
+
+**Render ahead was tried and rejected, and the reasons should stop anyone rebuilding it.** Rendering
+a 256-frame block inside a 128-frame `process()` puts 5.3 ms of work inside a 2.7 ms deadline, and a
+Galaxy XR headset chopped. On 2026-09-24 the obvious fix was built, tested and measured: a render
+thread (a pthread Worker) filling a ring of blocks while `process()` only copied, then a hybrid in
+which `process()` rendered a rescue block when the ring ran dry and the render thread was idle. It
+lost, for one reason: a Worker has NO priority, and the AudioWorklet thread is the one thread a page
+owns that the OS treats as audio. On a busy laptop (a 12-core hybrid i7-1360P running several
+CPU-bound jobs) the render thread was descheduled mid-render for 40 to 200 ms, and it held the
+non-reentrant render at exactly the moments a rescue would have helped (14 rescues against about
+380 starves over eight hybrid runs). Paired runs, builds alternated at one pinned load, 3 s each:
+
+| sources (mean block) | render in `process()`: device underrun | render ahead alone: ring starve | hybrid (rescue): ring starve |
+|----------------------|----------------------------------------|---------------------------------|------------------------------|
+| 64 (2.2 to 3.7 ms)   | 0, 0, 0, 0 s                           | 0.13, 0.03, 0, 0.03 s           | 0.20, 0, 0, 0.11 s           |
+| 96 (3.1 to 5.3 ms)   | 0.18, 0.30 s                           | 0.31, 0.10 s                    | 0.11, 0.59 s                 |
+
+Render ahead never beat rendering in `process()` at any load. The slack an overrun needs has to
+come from the BROWSER'S output buffer, which the priority thread already owns, and that is what
+`BWA_SINK_FLAG_DEEP_BUFFER` asks for. docs/web.md has the latencyHint measurement.
+
+**Nothing on the audio path waits on the main thread**, audited 2026-09-24 after a headset froze
+with its window (cause still unknown). Every `emscripten_proxy_sync` in the sink is on the control
+thread (open, start, close, the `health()` playbackStats read, and a context-state read nobody
+calls), and in the one topology this sink opens in the control thread IS the main thread, so none
+of them proxies. `process()` and the host-paced thread call nothing proxied.
 
 **Teardown has no thread to join.** Returning `false` from `process()` is the only "this processor
 is done" the API offers. `close()` sets a flag, destroys the node on the main thread (which stops

@@ -183,10 +183,17 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
  *   WASAPI: no-op. Exclusive mode already runs a one-period buffer, and shared mode's buffer
  *           belongs to the OS mixer.
  *   ASIO/JACK: no-op, the driver or the server owns the buffer.
+ * DEEP_BUFFER asks for a DEEPER OUTPUT BUFFER: more latency, more slack for a render that
+ * overruns its callback. Only the browser uses it:
+ *   WORKLET: a context the sink creates (device NULL) gets latencyHint "playback" instead of
+ *            "interactive". An ADOPTED context (device = a handle) keeps the hint its page gave it,
+ *            so a page that wants this creates its AudioContext with the hint itself.
+ *   Every other backend: no-op.
  * bwa_get_output_latency_frames reports what you actually got. */
 #define BWA_SINK_FLAG_EXCLUSIVE    0x1u
 #define BWA_SINK_FLAG_EXACT_RATE   0x2u
 #define BWA_SINK_FLAG_TIGHT_BUFFER 0x4u
+#define BWA_SINK_FLAG_DEEP_BUFFER  0x8u
 
 /* Engine configuration. Zero-init and set what you need - every field's zero is its default. */
 typedef struct {

@@ -17,6 +17,18 @@
  * the bus layout, so the adapter's runs copy straight out - no convert, no interleave, the same
  * property jack_sink.c has.
  *
+ * RENDER AHEAD WAS TRIED AND REJECTED (2026-09-24), and this is the note that should stop anyone
+ * rebuilding it. Rendering a 256-frame block inside a 128-frame callback puts 5.3 ms of work inside
+ * a 2.7 ms deadline, and a Galaxy XR headset chopped. The obvious fix is a render thread that fills
+ * a ring while process() only copies, and it was built, tested and measured. It lost: the render
+ * thread is a Worker and a Worker has NO priority, while this callback's thread is the one thread a
+ * page owns that the OS treats as audio. On a busy laptop the render thread was descheduled
+ * mid-render for 40 to 200 ms and the ring ran dry where this shape kept playing; a rescue render
+ * from process() could not help, because the render thread held the (non-reentrant) render at
+ * exactly those moments. Paired runs are in docs/web.md. The slack an overrun needs has to come from
+ * the BROWSER'S output buffer, which the priority thread already owns: that is what
+ * BWA_SINK_FLAG_DEEP_BUFFER asks for (a "playback" latencyHint, below).
+ *
  * STEREO ONLY, said at the open rather than discovered as silence. A page can build a wide
  * AudioContext, but none of the array profiles has a transport here and a 26-channel browser
  * output is a speaker set nobody has. AUTO sends anything wider straight to the offline sink, the
@@ -40,17 +52,18 @@
  * pressed. The handoff between the host-paced thread and the worklet is the interesting part; see
  * "THE PULL GATE" below.
  *
- * WHAT IT CANNOT MEASURE. Web Audio exposes no xrun counter, no device position and no underrun
- * signal of any kind. `currentFrame` in the processor's scope advances by exactly one quantum per
- * process() call whether or not the output starved, and a browser renders several quanta
- * back-to-back inside one system audio callback, so a per-callback host-time interval rule would
- * false-positive on every ordinary batch. So `measured` is FALSE and `device_pos_valid` is false,
- * the same honest answer AAudio gives for its position and the manual sink gives for everything:
- * a zero dropout count here means "cannot know", not "none happened". What IS real is our own half
- * of the measurement, which the adapter takes for every backend it serves: late_blocks and
- * render_ns_peak, both on a 1 ms clock here (see below). A page that wants a dropout signal needs
- * one that does not come from this thread; bindings/web/xr/slip.js reads AudioContext.currentTime
- * against performance.now on the main thread.
+ * WHAT IT MEASURES, AND ONLY WHERE THE BROWSER SAYS. Web Audio exposes no xrun counter and no device
+ * position to the worklet: `currentFrame` advances by exactly one quantum per process() call
+ * whether or not the output starved, and a browser renders several quanta back to back inside one
+ * system audio callback, so a per-callback host-interval rule would false-positive on every batch.
+ * What Chromium does expose is AudioContext.playbackStats (underrunDuration, underrunEvents): the
+ * browser's own count of the silence its output played because a render came back late. That is a
+ * real device-dropout figure, so worklet_health reads it on the CONTROL thread (a main-thread JS
+ * read, never the audio thread) and books it as dropouts / dropped_frames, and `measured` is TRUE
+ * exactly when the browser has it. On a browser without it, `measured` stays false and a zero means
+ * "cannot know". late_blocks and render_ns_peak are the adapter's, on a 1 ms clock (see below).
+ * bindings/web/xr/slip.js reads AudioContext.currentTime against performance.now on the main thread
+ * as a second, cruder signal for browsers without playbackStats.
  *
  * WHY sample_pos IS NOT currentFrame. Rule 3 defines sample_pos as the frames the sink handed to
  * the device before this block, counted from the sink's start, which is exactly what the adapter
@@ -102,6 +115,14 @@
  * stall on a suspended context. */
 #define WORKLET_QUIET_BLOCKS 8u
 
+/* ...and never less than this many browser callbacks. A deep output buffer (latencyHint "playback"
+ * or 0.05) makes the browser render its quanta in BURSTS as long as that buffer, 50 ms of quanta
+ * back to back and then nothing, and eight 256-frame blocks is only 43 ms. Found when the XR page
+ * moved to a 0.05 hint: the heartbeat went quiet inside every burst gap, the host-paced thread took
+ * over, device_lost flapped, and two pullers alternated on one adapter. The burst is baseLatency,
+ * read at open, the same figure rule 5 reports. */
+#define WORKLET_QUIET_BURSTS 3u
+
 /* The setup chain's state, readable from the control thread. It is async and its failures land
  * after open() has returned, so there has to be somewhere to put them. */
 enum { WK_IDLE = 0, WK_STARTING = 1, WK_LIVE = 2, WK_FAILED = 3 };
@@ -114,6 +135,7 @@ typedef struct {
     uint32_t quantum;           /* the context's render quantum, 128 in Web Audio 1.0     */
     uint32_t q_capacity;        /* frames the adapter can serve in one pull               */
     uint32_t latency_frames;    /* rule 5, latched at open; the header promises constant  */
+    uint32_t quiet_blocks;      /* heartbeat silence, in blocks, before the host thread paces */
     bool     owns_ctx;          /* false when the page handed us its own AudioContext     */
 
     EMSCRIPTEN_WEBAUDIO_T ctx;
@@ -150,10 +172,18 @@ static void wk_set_err(char* err, size_t cap, const char* msg) {
 /* ---- running a step on the browser main thread ---------------------------------------------- */
 
 /* Control thread only. Direct when we are already the main runtime thread (a page that loaded the
- * module on the main thread and drives the engine from there), proxied otherwise (the shipping
- * shape: the control thread is a Worker). emscripten_proxy_sync blocks until the main thread's
- * event loop runs the step, which is allowed on a Worker and is why docs/web.md puts the control
- * thread on one. */
+ * module on the main thread and drives the engine from there), proxied otherwise (a control
+ * thread on a Worker). emscripten_proxy_sync blocks until the main thread's event loop runs it.
+ *
+ * WHO WAITS ON THE MAIN THREAD, audited 2026-09-24 after a headset froze with its window (cause
+ * still unknown). Every caller is on the CONTROL thread: the open (create or adopt the context, and
+ * teardown on a failed open), start (the setup chain's first step), close (destroy the node and an
+ * owned context), health (the playbackStats read) and sink_worklet_context_state (no caller). In
+ * the one topology this sink opens in ("main", bindings/web/src/client.js) the control thread IS
+ * the main thread, so none of them proxies at all. process() and the host-paced thread call
+ * nothing proxied. What main waits for in return: close waits at most ~200 ms for the worklet
+ * heartbeat to go quiet (the worklet never waits on main) and joins the host-paced thread, whose
+ * only wait is an absolute-deadline sleep. */
 static bool wk_on_main(void (*fn)(void*), void* arg) {
     if (emscripten_is_main_runtime_thread()) { fn(arg); return true; }
     return emscripten_proxy_sync(emscripten_proxy_get_system_queue(),
@@ -254,9 +284,9 @@ static void worklet_host_thread(void* arg) {
 
         const uint64_t tick = atomic_load_explicit(&s->ticks, memory_order_acquire);
         if (tick != last_tick) { last_tick = tick; quiet = 0; }
-        else if (quiet < WORKLET_QUIET_BLOCKS) { quiet++; }
+        else if (quiet < s->quiet_blocks) { quiet++; }
 
-        const bool take_over = (quiet >= WORKLET_QUIET_BLOCKS);
+        const bool take_over = (quiet >= s->quiet_blocks);
         atomic_store_explicit(&s->host_paced, take_over ? 1u : 0u, memory_order_relaxed);
 
         if (take_over && atomic_load_explicit(&s->running, memory_order_relaxed)
@@ -327,12 +357,14 @@ typedef struct {
     uint32_t want_rate;
     uint32_t want_channels;
     int32_t  adopt;              /* >0: adopt this existing handle instead of creating one */
+    bool     deep;               /* BWA_SINK_FLAG_DEEP_BUFFER: ask for the deeper output buffer */
     /* out */
     EMSCRIPTEN_WEBAUDIO_T ctx;
     bool     owns;
     uint32_t rate;
     uint32_t quantum;
     uint32_t latency_frames;
+    uint32_t burst_frames;       /* baseLatency alone: how long a browser render burst can be */
     int      ctx_state;
 } WkOpen;
 
@@ -343,10 +375,14 @@ static void worklet_open_context(void* arg) {
         o->owns = false;
     } else {
         /* "interactive" is the latencyHint a game wants: the shortest buffer the browser will
-         * give. The rate is REQUESTED, and a browser honors it by resampling its own output if it
-         * has to - which it does not report, so neither does this sink (see rule 6 below). */
+         * give. DEEP_BUFFER asks for "playback" instead, the browser's deeper output buffer, which
+         * is the slack a render that overruns its quantum needs, held by the thread that already
+         * has audio priority (the file header says why that and not a ring). webaudio.h takes the
+         * hint as a string, so the numeric form a page can pass (0.05) is not available here. The
+         * rate is REQUESTED, and a browser honors it by resampling its own output if it has to -
+         * which it does not report, so neither does this sink (see rule 6 below). */
         EmscriptenWebAudioCreateAttributes attr = {
-            .latencyHint = "interactive",
+            .latencyHint = o->deep ? "playback" : "interactive",
             .sampleRate = o->want_rate,
             .renderSizeHint = AUDIO_CONTEXT_RENDER_SIZE_DEFAULT,
         };
@@ -373,6 +409,11 @@ static void worklet_open_context(void* arg) {
     }, (int)o->ctx);
     o->latency_frames = (lat_s > 0.0 && o->rate)
         ? (uint32_t)(lat_s * (double)o->rate + 0.5) : 0u;
+    const double base_s = EM_ASM_DOUBLE({
+        var c = emscriptenGetAudioObject($0);
+        return c ? (c.baseLatency || 0) : 0;
+    }, (int)o->ctx);
+    o->burst_frames = (base_s > 0.0 && o->rate) ? (uint32_t)(base_s * (double)o->rate + 0.5) : 0u;
 }
 
 typedef struct { EMSCRIPTEN_WEBAUDIO_T ctx; EMSCRIPTEN_WEBAUDIO_T node; bool owns; } WkTeardown;
@@ -474,17 +515,49 @@ static uint32_t worklet_output_latency(bwa_sink* base) {
     return ((WorkletSink*)base)->latency_frames;
 }
 
-/* `measured` is FALSE, always, and the file header says why: Web Audio reports no dropout, no
- * device position and no xrun count, so a zero here would mean "could not know" dressed as a clean
- * bill. late_blocks and render_ns_peak come from the adapter and are real, on a 1 ms clock (see the
- * file header). device_lost reports the host-paced state, which on this platform means either a
- * suspended context or a setup chain that failed - both cases where the sink is pacing silence so
- * the engine's clocks keep advancing. */
+/* The browser's own output underruns, read on the main thread (health() runs on the control
+ * thread, which is the main thread in the one topology this sink opens in; from a control Worker
+ * wk_on_main proxies it). Cumulative since the context started, which is what bwa_health's counts
+ * are too. `ok` is 0 when the browser has no playbackStats (every engine but Chromium's today). */
+typedef struct { EMSCRIPTEN_WEBAUDIO_T ctx; uint32_t rate; int ok; double events; double frames; } WkStats;
+static void worklet_read_stats(void* arg) {
+    WkStats* w = (WkStats*)arg;
+    /* Two scalar reads rather than a write into the heap: an EM_ASM that stores through HEAPF64
+     * would need the growable-heap view refresh a -pthread + ALLOW_MEMORY_GROWTH build does not
+     * promise inside EM_ASM. -1 means the browser has no playbackStats. */
+    w->events = EM_ASM_DOUBLE({
+        var c = emscriptenGetAudioObject($0);
+        var s = c && c.playbackStats;
+        return (s && typeof s.underrunEvents === "number") ? s.underrunEvents : -1;
+    }, (int)w->ctx);
+    if (w->events < 0.0) { w->ok = 0; return; }
+    w->frames = EM_ASM_DOUBLE({
+        var s = emscriptenGetAudioObject($0).playbackStats;
+        return (s.underrunDuration || 0) * $1;
+    }, (int)w->ctx, (int)w->rate);
+    w->ok = 1;
+}
+
+/* late_blocks and render_ns_peak come from the adapter and are real, on a 1 ms clock (see the file
+ * header). The DROPOUT half comes from the browser: AudioContext.playbackStats, where it exists,
+ * is the silence the output really played, so it is booked as dropouts / dropped_frames and makes
+ * `measured` true. Where it does not exist, `measured` stays false, because Web Audio gives this
+ * sink no other way to see a dropout and a zero would be "could not know" dressed as a clean bill.
+ * device_lost reports the host-paced state, which on this platform means either a suspended
+ * context or a setup chain that failed - both cases where the sink is pacing silence so the
+ * engine's clocks keep advancing. CONTROL THREAD: the stats read is a main-thread JS read and must
+ * never move to the audio path. */
 static void worklet_health(bwa_sink* base, bwa_sink_health* out) {
     WorkletSink* s = (WorkletSink*)base;
     sink_quant_health(&s->quant, out);
     out->measured    = false;
     out->device_lost = atomic_load_explicit(&s->host_paced, memory_order_relaxed);
+    WkStats w = { s->ctx, s->sample_rate, 0, 0.0, 0.0 };
+    if (s->ctx && wk_on_main(worklet_read_stats, &w) && w.ok) {
+        out->dropouts       = (uint64_t)(w.events > 0.0 ? w.events : 0.0);
+        out->dropped_frames = (uint64_t)(w.frames > 0.0 ? w.frames + 0.5 : 0.0);
+        out->measured       = true;
+    }
 }
 
 /* Internal readbacks (declared in sink.h, deliberately not in bw_audio.h). The setup chain is
@@ -538,8 +611,11 @@ bool sink_worklet_device_id(uint32_t index, char* buf, uint32_t cap) {
 bwa_sink* bwa_worklet_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                                 const char* device, uint32_t flags, bool exact_rate,
                                 bwa_render_fn render, void* user, char* err, size_t errcap) {
-    (void)flags;   /* none of the three bits has a meaning here: a page cannot take the device
-                    * exclusively, cannot choose the buffer depth, and rule 6 is handled below */
+    /* One bit means something here, DEEP_BUFFER, and only when the sink creates the context: an
+     * ADOPTED context's latencyHint was fixed by the page that made it, so the page must pass the
+     * hint itself (bindings/web/README.md, and the XR page does). EXCLUSIVE and TIGHT_BUFFER have no
+     * browser meaning, and rule 6 is handled below whatever EXACT_RATE says. */
+    const bool deep = (flags & BWA_SINK_FLAG_DEEP_BUFFER) != 0;
     if (!render || channels == 0 || block_size == 0 || sample_rate == 0) {
         wk_set_err(err, errcap, "worklet: bad arguments");
         return NULL;
@@ -572,7 +648,9 @@ bwa_sink* bwa_worklet_sink_open(uint32_t sample_rate, uint32_t block_size, uint3
         adopt = (int32_t)v;
     }
 
-    WkOpen o = { sample_rate, channels, adopt, 0, false, 0, 128u, 0, AUDIO_CONTEXT_STATE_SUSPENDED };
+    /* Designated, so a new field cannot silently shift the others. */
+    WkOpen o = { .want_rate = sample_rate, .want_channels = channels, .adopt = adopt, .deep = deep,
+                 .quantum = 128u, .ctx_state = AUDIO_CONTEXT_STATE_SUSPENDED };
     if (!wk_on_main(worklet_open_context, &o)) {
         wk_set_err(err, errcap, "worklet: the browser main thread could not be reached to create "
                                 "the AudioContext; the page must keep its event loop running");
@@ -617,6 +695,10 @@ bwa_sink* bwa_worklet_sink_open(uint32_t sample_rate, uint32_t block_size, uint3
     s->ctx            = o.ctx;
     s->owns_ctx       = o.owns;
     s->latency_frames = o.latency_frames;
+    {
+        const uint32_t bursts = (WORKLET_QUIET_BURSTS * o.burst_frames + block_size - 1u) / block_size;
+        s->quiet_blocks = bursts > WORKLET_QUIET_BLOCKS ? bursts : WORKLET_QUIET_BLOCKS;
+    }
 
     /* The adapter is sized for ONE quantum, because that is the most a process() call can ask for:
      * Web Audio 1.0 fixes it at 128 and the 1.1 renderSizeHint only moves it, never makes it vary.

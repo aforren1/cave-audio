@@ -13,7 +13,12 @@
       one that distinguishes "the worklet is driving" from "the sink is pacing silence because the
       context never started", and both produce blocks;
     - the render is paced by the AUDIO clock and not by a runaway host thread, which is the
-      elapsed-versus-rendered check.
+      elapsed-versus-rendered check;
+    - the health block's dropout half is the browser's own AudioContext.playbackStats, booked by
+      the sink, and `measured` says whether the browser has it;
+    - under a render load heavier than one 128-frame quantum, with the page's context made at
+      latencyHint "playback", the browser's underrun time stays under a measured bound, and a busy
+      main thread costs nothing (the render runs on the AudioWorklet thread, not on main).
 
   It posts its verdict back to the runner's server, because a headless browser has no other way to
   tell a script what it found.
@@ -24,6 +29,29 @@
 <pre id="out">running</pre>
 <script type="module">
 import { BwaEngine, Profile } from "../dist/index.js";
+import { pink } from "../playground/stimulus.js";
+import { encodeWavFloat32 } from "../playground/wav.js";
+
+/* ?load=0 skips the render-load section. ?sources=N pins its load at N sources instead of
+ * calibrating one, which is how two settings are compared on one machine. ?hint= sets the load
+ * section's AudioContext latencyHint ("playback" by default, or "interactive", or seconds).
+ * ?bound= overrides the underrun bound, in ms per 3 s. */
+const PARAMS = new URLSearchParams(location.search);
+const RUN_LOAD = PARAMS.get("load") !== "0";
+const FIXED_SOURCES = Number(PARAMS.get("sources")) || 0;
+const HINT_RAW = PARAMS.get("hint") || "playback";
+const HINT = Number.isFinite(Number(HINT_RAW)) ? Number(HINT_RAW) : HINT_RAW;
+const UNDERRUN_BOUND_MS = Number(PARAMS.get("bound")) || 60;
+
+/** The numeric fields of AudioContext.playbackStats, or null where the browser has none. */
+function statsOf(ctx) {
+  const ps = ctx.playbackStats;
+  if (!ps) return null;
+  const o = {};
+  for (const k in ps) if (typeof ps[k] === "number") o[k] = ps[k];
+  return o;
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 const notes = [];
 const fail = (m) => { notes.push("FAIL " + m); };
@@ -63,6 +91,13 @@ async function main() {
      `(context baseLatency ${ctx.baseLatency}, outputLatency ${ctx.outputLatency})`);
   if (!engine.info.outputLatencyFrames)
     fail("output_latency is 0: the baseLatency read did not work");
+  {
+    const ctxFrames = Math.round((ctx.baseLatency + (ctx.outputLatency || 0)) * engine.info.sampleRate);
+    const added = engine.info.outputLatencyFrames - ctxFrames;
+    if (added !== engine.info.blockSize)
+      fail(`the sink adds ${added} frames to the context's ${ctxFrames}; it holds one block, ${engine.info.blockSize}`);
+    else ok(`output latency = context ${ctxFrames} + one block ${added}`);
+  }
   engine.listener.setPose(0, 0, 0, 0, 0, 0, 1);
   src.setPosition(0, 0, 2);
   engine.pushFrame();
@@ -104,8 +139,18 @@ async function main() {
     fail("device_lost is set: the sink is host-pacing silence, so process() is NOT being called");
   else ok("device_lost is 0: the AudioWorklet is driving, not the host-paced fallback");
 
-  if (h1.measured !== false) fail("health.measured should be false on this backend");
-  else ok("health.measured is false, as the backend promises");
+  /* `measured` is earned only by the browser's playbackStats, and the dropout counts are its. */
+  {
+    const s0 = statsOf(ctx);
+    const hm = await engine.health();
+    const s1 = statsOf(ctx);
+    if (hm.measured !== !!s1) fail(`health.measured is ${hm.measured} but playbackStats ${s1 ? "exists" : "is absent"}`);
+    else ok(`health.measured is ${hm.measured}: playbackStats ${s1 ? "exists" : "is absent"} in this browser`);
+    if (s0 && s1 && !(hm.xruns >= s0.underrunEvents && hm.xruns <= s1.underrunEvents))
+      fail(`health.xruns ${hm.xruns} is not the browser's underrun count (${s0.underrunEvents}..${s1.underrunEvents})`);
+    else if (s1) ok(`health.xruns ${hm.xruns} and droppedFrames ${hm.droppedFrames} are playbackStats' ` +
+                    `(${s1.underrunEvents} events, ${(s1.underrunDuration * 1000).toFixed(1)} ms)`);
+  }
 
   /* THE SUSPENDED-CONTEXT HANDOFF, in both directions. This is the most novel code in the sink
    * and the only place two things pull one SinkQuant, so it is the part most worth driving from a
@@ -137,9 +182,13 @@ async function main() {
 
   if (ctx.state !== "running") fail(`the context ended as "${ctx.state}"`);
 
+  const module = engine.module;
   await engine.destroy();
   ok("destroy returned");
   await ctx.close();
+
+  if (RUN_LOAD) await loadCheck(module);
+  else ok("render-load section skipped (?load=0)");
 
   /* THE DEFAULT TOPOLOGY, which node cannot reach: a real module Worker holding the engine, the
    * postMessage protocol, and the frame slab across a thread boundary. It runs on the NULL sink,
@@ -191,6 +240,176 @@ async function main() {
   } else {
     ok(`the worklet sink is not reachable from a Worker, as expected: ${outcome.why}`);
   }
+}
+
+/* THE LOAD SECTION, and what it decides. A render heavier than one 128-frame quantum (2.7 ms at
+ * 48 kHz) runs inside process() and overruns the callback. The slack for that is the BROWSER'S
+ * output buffer, held by the audio thread that has priority, and a page asks for it with the
+ * AudioContext latencyHint (BWA_SINK_FLAG_DEEP_BUFFER on a context the sink makes). So: calibrate a
+ * load past one quantum, play it through a context made at `HINT`, and bound the browser's own
+ * underrun time (playbackStats). A render thread filling a ring was tried instead and rejected;
+ * docs/web.md has the paired runs.
+ *
+ * The stimulus is pink noise looped from MEMFS (the playground rig's route), because a push feed
+ * would put the MAIN thread in the audio path, and the busy-loop check stalls the main thread. */
+async function loadCheck(module) {
+  const rate = 48000;
+  const block = 256;
+  const periodMs = (block / rate) * 1000;
+  const quantumMs = (128 / rate) * 1000;
+  const wav = encodeWavFloat32(pink(rate), rate);
+  const path = "/stim/pink.wav";
+
+  /* Sources in a ring around the head, each looping the noise with a wide spread and
+   * decorrelation on, which is the costliest per-voice path through the binaural render. */
+  const addSources = async (engine, snd, srcs, k) => {
+    for (let i = 0; i < k; ++i) {
+      const s = await engine.createSource();
+      const a = (srcs.length * 2.399963) % (2 * Math.PI);
+      s.setPosition(Math.sin(a) * 2, 0.3 * Math.cos(srcs.length), -Math.cos(a) * 2);
+      await s.setGain(0.05);
+      await s.setSpread(0.6);
+      await s.play(snd, true);
+      srcs.push(s);
+    }
+    engine.pushFrame();
+  };
+
+  /* CALIBRATE on the manual sink, where the page times bwa_render_block itself (performance.now,
+   * 5 us in an isolated page): the MEAN block cost, so every block and not one spike is past the
+   * quantum. Stops past 1.15 quanta, well inside a block period. */
+  const calib = await BwaEngine.create({ topology: "main", module, sink: 3, profile: Profile.BINAURAL,
+                                         sampleRate: rate, blockSize: block });
+  await calib.writeFile(path, wav);
+  const csnd = await calib.invoke("load_sound", path);
+  await calib.invoke("set_decorrelation", true);
+  await calib.start();
+  calib.listener.setPose(0, 0, 0, 0, 0, 0, 1);
+  calib.pushFrame();
+  const csrcs = [];
+  let meanMs = 0;
+  let maxMs = 0;
+  while (csrcs.length < 256) {
+    await addSources(calib, csnd, csrcs, 16);
+    for (let i = 0; i < 20; ++i) await calib.renderBlock();
+    const n = 100;
+    let sum = 0;
+    maxMs = 0;
+    for (let i = 0; i < n; ++i) {
+      const t = performance.now();
+      await calib.renderBlock();
+      const d = performance.now() - t;
+      sum += d;
+      if (d > maxMs) maxMs = d;
+    }
+    meanMs = sum / n;
+    if (FIXED_SOURCES ? csrcs.length >= FIXED_SOURCES : meanMs > quantumMs * 1.15) break;
+  }
+  const nsrc = csrcs.length;
+  await calib.destroy();
+  ok(`calibrated load: ${nsrc} sources cost a MEAN ${meanMs.toFixed(2)} ms per block ` +
+     `(max ${maxMs.toFixed(2)}) against a ${quantumMs.toFixed(2)} ms quantum and a ` +
+     `${periodMs.toFixed(2)} ms block`);
+  if (!FIXED_SOURCES && meanMs <= quantumMs)
+    fail(`could not make a mean block cost more than one quantum (${meanMs.toFixed(2)} ms at ${nsrc} sources)`);
+
+  const ctx = new AudioContext({ latencyHint: HINT, sampleRate: rate });
+  await ctx.resume();
+  await ctx.audioWorklet.addModule("./gap_recorder.js");
+  const engine = await BwaEngine.create({ audioContext: ctx, module, profile: Profile.BINAURAL,
+                                          blockSize: block });
+  await engine.writeFile(path, wav);
+  const snd = await engine.invoke("load_sound", path);
+  if (!snd) { fail("could not load the pink-noise stimulus"); await engine.destroy(); await ctx.close(); return; }
+  await engine.invoke("set_decorrelation", true);
+  await engine.start();
+  engine.listener.setPose(0, 0, 0, 0, 0, 0, 1);
+  engine.pushFrame();
+  ok(`load context: latencyHint ${JSON.stringify(HINT)}, baseLatency ${(ctx.baseLatency * 1000).toFixed(1)} ms, ` +
+     `engine output latency ${engine.info.outputLatencyFrames} frames ` +
+     `(${(1000 * engine.info.outputLatencyFrames / rate).toFixed(1)} ms)`);
+
+  /* The tap: a processor that sees every sample the sink's node emits (gap_recorder.js). */
+  let node = null;
+  for (let i = 0; i < 200 && !node; ++i) { node = engine.outputNode(); if (!node) await sleep(10); }
+  if (!node) { fail("the sink's AudioWorkletNode never appeared"); await engine.destroy(); await ctx.close(); return; }
+  const rec = new AudioWorkletNode(ctx, "bwa-gap-recorder", { numberOfInputs: 1, numberOfOutputs: 1,
+                                                             outputChannelCount: [1] });
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  node.connect(rec);
+  rec.connect(mute);
+  mute.connect(ctx.destination);
+  const recReport = () => new Promise((r) => { rec.port.onmessage = (e) => r(e.data); rec.port.postMessage("report"); });
+  const resetRec = () => rec.port.postMessage("reset");
+
+  const srcs = [];
+  while (srcs.length < nsrc) await addSources(engine, snd, srcs, 16);
+  await sleep(1500);                                   /* past the start-up blocks */
+
+  /* THE RUN: 3 s at that load. */
+  const hA = await engine.health();
+  const sA = statsOf(ctx);
+  resetRec();
+  await sleep(3000);
+  const r = await recReport();
+  const hB = await engine.health();
+  const sB = statsOf(ctx);
+  const uMs = sA && sB ? (sB.underrunDuration - sA.underrunDuration) * 1000 : NaN;
+  const uEv = sA && sB ? sB.underrunEvents - sA.underrunEvents : NaN;
+  const bookedMs = (1000 * (hB.droppedFrames - hA.droppedFrames)) / rate;
+  ok(`3 s under load, latencyHint ${JSON.stringify(HINT)}: browser underrun ${uMs.toFixed(1)} ms in ${uEv} events ` +
+     `(health booked ${(hB.xruns - hA.xruns)} events, ${bookedMs.toFixed(1)} ms); graph gaps >= 5 ms: ${r.gaps}; ` +
+     `${hB.lateBlocks - hA.lateBlocks} late of ${hB.blocks - hA.blocks} blocks`);
+  if (!sA) ok("this browser has no playbackStats: the underrun bound cannot be checked");
+  else {
+    /* The bound judges the BUFFER, so it only applies while the render keeps up on average. When a
+     * large share of blocks overran the block period the render itself fell behind (a saturated
+     * CPU: ten R jobs beside the check produced 155 late of 538 and 359 ms of underrun), and no
+     * output buffer can cover a producer that is slower than real time. That is a premise failure,
+     * reported as such, not a red: the same bound went red under load and green the moment the
+     * load cleared, which is the definition of a flake. */
+    const lateShare = (hB.lateBlocks - hA.lateBlocks) / Math.max(1, hB.blocks - hA.blocks);
+    if (lateShare > 0.15)
+      ok(`NOT JUDGED: ${(100 * lateShare).toFixed(0)}% of blocks overran the block period, so the render ` +
+         `itself fell behind on this machine and the ${UNDERRUN_BOUND_MS} ms buffer bound does not apply ` +
+         `(underrun ${uMs.toFixed(1)} ms). Rerun on a quiet machine.`);
+    else if (!(uMs <= UNDERRUN_BOUND_MS))
+      fail(`the browser played ${uMs.toFixed(1)} ms of underrun in 3 s, over the ${UNDERRUN_BOUND_MS} ms bound`);
+    else ok(`underrun time ${uMs.toFixed(1)} ms is within the ${UNDERRUN_BOUND_MS} ms bound`);
+    if (Math.abs(bookedMs - uMs) > 25 || (hB.xruns - hA.xruns) !== uEv)
+      fail(`the health block booked ${bookedMs.toFixed(1)} ms / ${hB.xruns - hA.xruns} events, the browser ` +
+           `reports ${uMs.toFixed(1)} ms / ${uEv}`);
+  }
+  if (r.frames < rate * 2.5) fail(`the recorder watched only ${r.frames} frames in 3 s`);
+  if (r.gaps !== 0) fail(`the graph itself went silent for 5 ms or more ${r.gaps} times`);
+
+  /* A BUSY MAIN THREAD. In the "main" topology the control thread IS the main thread, and the
+   * worklet sink can only open there. The render runs on the AudioWorklet thread, so it must not
+   * care. */
+  const sC = statsOf(ctx);
+  resetRec();
+  const t0 = performance.now();
+  while (performance.now() - t0 < 400) { /* spin: no event loop, no timers, no postMessage */ }
+  await sleep(200);
+  const r2 = await recReport();
+  const sD = statsOf(ctx);
+  const u2 = sC && sD ? (sD.underrunDuration - sC.underrunDuration) * 1000 : 0;
+  /* Judged against what the same load already cost per unit time in the run above, because on a
+   * machine with every core busy the spinning main thread takes a core from the audio thread too,
+   * and that is contention, not a dependency. A render path that WAITED on main would go silent for
+   * the whole 400 ms, far past twice the ambient rate. */
+  const ambient = Number.isFinite(uMs) ? (uMs / 3000) * 600 : 0;
+  const allowed = 2 * ambient + UNDERRUN_BOUND_MS / 5;
+  ok(`400 ms busy main thread: ${r2.gaps} graph gaps, ${u2.toFixed(1)} ms of browser underrun in the ` +
+     `600 ms window (the run's own rate predicts ${ambient.toFixed(1)} ms)`);
+  if (r2.gaps !== 0 || u2 > allowed)
+    fail(`a busy main thread cost ${u2.toFixed(1)} ms of audio, past ${allowed.toFixed(1)} ms: something on the ` +
+         `render path waits on main`);
+  else ok("a busy main thread cost no gap and no underrun past twice the load's own rate");
+
+  await engine.destroy();
+  await ctx.close();
 }
 
 main().then(() => report(null)).catch((e) => report(e));

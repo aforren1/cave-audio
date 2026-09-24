@@ -157,7 +157,7 @@ The ACTIVE count is `engine.info.channelCount`: the layout's speaker count, anyw
 | `stop()`, `destroy()` | promise | |
 | `createSource()`, `createPushSource()`, `createBed()` | promise | |
 | `pushFrame()` | sync | publishes the staged frame |
-| `health()` | promise | `blocks`, `xruns`, `droppedFrames`, `driverResyncs`, `lateBlocks`, `streamStarves`, `peakLoad`, `deviceLost`, `measured` |
+| `health()` | promise | `blocks`, `xruns`, `droppedFrames`, `driverResyncs`, `lateBlocks`, `streamStarves`, `peakLoad`, `deviceLost`, `measured`. On the worklet sink `xruns` and `droppedFrames` are the browser's own output underruns (see "Reading the health numbers") |
 | `renderBlock()` | promise | manual sink only. `{channels, nframes, data}`, planar, a copy |
 | `setMasterGain(linear)` | promise | |
 | `invoke(name, ...args)` | promise | any raw call that takes the engine pointer |
@@ -377,6 +377,34 @@ one row for it, `stream starves`, and it stays at zero because nothing on the pa
 engine any more. If you hear a dropout now, it is the audio thread, and the `late blocks` row is
 where it shows. `run-playground.mjs` asserts both halves: the switch bound, and the stall making
 no starve while the audio thread renders straight through it.
+
+### Reading the health numbers
+
+On the worklet sink the dropout numbers come from the browser. `AudioContext.playbackStats`, where
+the browser has it (Chromium), counts the silence its output played because a render came back
+late, and the sink reads it into the health block:
+
+- **`xruns`** is `underrunEvents` and **`droppedFrames`** is `underrunDuration` in frames, both since
+  the context started. `measured` is true exactly when the browser has playbackStats; elsewhere a
+  zero means "cannot know". These are the numbers to read on a headset.
+- **`peakLoad`** is the worst render over the last 4 to 5 s as a fraction of the block period, on
+  the worklet's 1 ms clock. The render runs inside `process()`, so a render longer than the
+  128-frame quantum overruns that callback, and the browser's output buffer is what absorbs it.
+- **the XR page's audio-clock slip** is the cruder estimate of the same silence, and the only one
+  on a browser without playbackStats.
+
+The output buffer is the knob. `SinkFlags.DEEP_BUFFER` (`BWA_SINK_FLAG_DEEP_BUFFER`) asks for a
+deeper one: when the sink creates the context itself it uses latencyHint `"playback"`. When you
+hand the engine your own context (`create({ audioContext })`, the usual case, because only a page
+may resume one) the hint is YOURS: create it with `new AudioContext({ latencyHint: 0.05 })` or
+`"playback"`. On a Windows desktop `"interactive"` gives baseLatency 10 ms and 736 frames of output
+latency at block 256, `"playback"` 20 ms and 1216, and 0.05 50 ms and 2656 (55 ms). The XR page uses
+0.05 by default; the flat playground stays `"interactive"`. A render thread filling a ring ahead of
+`process()` was tried instead and rejected: a Worker has no priority (docs/web.md).
+
+The XR page also keeps a **diagnostics dump** for a headset: the last 30 s at 1 Hz of underruns,
+late blocks, render peak, slip, context state, JS heap, frame intervals and health-poll age, shown
+as text to copy when the session ends or on "copy diagnostics".
 
 ### The layout upload
 
@@ -620,7 +648,14 @@ node bindings/web/tests/run-browser.mjs            # or directly
 It serves the repo cross-origin isolated, drives `tests/browser.html` in headless Chromium, and
 waits for the page to post its verdict back. It skips when it finds no browser. What it proves: the
 async setup chain, the node connect, `process()` pulling the adapter on the AudioWorklet thread, the
-render paced by the audio clock, and the suspended-to-running handoff in both directions. It also
+render paced by the audio clock, the suspended-to-running handoff in both directions, and a health
+block whose dropouts are the browser's playbackStats. Then a LOAD section: it times
+`bwa_render_block` on the manual sink until a looped pink-noise scene costs more than 1.15 quanta per
+block on average, plays it through a context made at latencyHint `"playback"` with
+`tests/gap_recorder.js` tapped onto the sink's node, and bounds the browser's underrun time (60 ms
+per 3 s), then checks that a 400 ms busy main thread costs no more than the load already does.
+`--query` passes `load=0`, `sources=N`, `hint=` or `bound=` to the page. The load section needs a
+quiet machine; docs/web.md has what a busy one does. It also
 drives the `"worker"` topology on the null sink, which is the only place that path runs at all:
 node has no `Worker`, so the module Worker, the postMessage protocol and the frame slab across a
 thread boundary are browser-only. What it cannot prove is that it sounds right; nobody has listened

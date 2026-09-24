@@ -626,7 +626,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
-| `sink_flags`     | backend options for the PRIMARY device (like `device`, they do not reach the `cave_both` monitor); 0 is the default, and every bit is opt-in. `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode (AAudio: the MMAP path), which takes the device from every other application on the machine, so a monitor that shares its endpoint with the game, the browser and the OS leaves it off. `BWA_SINK_FLAG_EXACT_RATE` fails the open when the device cannot run at `sample_rate`, instead of accepting the OS resampler. `BWA_SINK_FLAG_TIGHT_BUFFER` takes the smallest device buffer the backend can, trading dropout margin for latency. See [Latency classes](#latency-classes) |
+| `sink_flags`     | backend options for the PRIMARY device (like `device`, they do not reach the `cave_both` monitor); 0 is the default, and every bit is opt-in. `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode (AAudio: the MMAP path), which takes the device from every other application on the machine, so a monitor that shares its endpoint with the game, the browser and the OS leaves it off. `BWA_SINK_FLAG_EXACT_RATE` fails the open when the device cannot run at `sample_rate`, instead of accepting the OS resampler. `BWA_SINK_FLAG_TIGHT_BUFFER` takes the smallest device buffer the backend can, trading dropout margin for latency. `BWA_SINK_FLAG_DEEP_BUFFER` is the opposite trade, and only the browser sink uses it. See [Latency classes](#latency-classes) |
 | `reserved[3]`    | zero; room to grow without an ABI break                             |
 
 ## Errors and return codes
@@ -770,14 +770,15 @@ message is the only thing that tells you the room is about to be quiet.
 
 ### Latency classes
 
-`bwa_desc.sink_flags` holds three opt-in bits. Each one trades something a shared, resampling,
-comfortably buffered device gives you for free:
+`bwa_desc.sink_flags` holds four opt-in bits. The first three trade something a shared,
+resampling, comfortably buffered device gives you for free; the fourth trades latency for margin:
 
 | flag | what the backend does |
 |------|-----------------------|
 | `BWA_SINK_FLAG_EXCLUSIVE` (0x1) | WASAPI opens the endpoint in exclusive mode, AAudio asks for the MMAP path. ASIO, JACK and a `hw:` ALSA PCM are already exclusive, so it is a no-op there |
 | `BWA_SINK_FLAG_EXACT_RATE` (0x2) | the open fails, naming both rates, when the device cannot run at `sample_rate`. WASAPI shared mode drops its auto-convert flag, ALSA turns the library resampler off, AAudio checks its device-rate probe. The array sinks behave this way already |
 | `BWA_SINK_FLAG_TIGHT_BUFFER` (0x4) | the smallest device buffer the backend can take: ALSA asks for 2 periods instead of 3, AAudio for 1 burst instead of 2. WASAPI exclusive mode already runs one period and shared mode's buffer belongs to the OS mixer, so it is a no-op there, and so are ASIO and JACK |
+| `BWA_SINK_FLAG_DEEP_BUFFER` (0x8) | a DEEPER OUTPUT BUFFER: more latency, more slack for a render that overruns its callback. The browser sink only: a context it creates gets latencyHint `"playback"` instead of `"interactive"` (on a Windows desktop 20 ms of browser buffer instead of 10, 1216 frames of output latency instead of 736 at block 256). A context the PAGE hands over keeps the hint the page gave it, so a page that wants this creates its AudioContext with the hint itself; the web XR page uses 0.05 s. A no-op on every other backend |
 
 None of them reaches the `cave_both` monitor. Like `device`, they describe the primary device, and
 an exclusive grab is a decision about the array's interface rather than about the machine's

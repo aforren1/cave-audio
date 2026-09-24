@@ -32,8 +32,10 @@ import { XrWorld } from "./world_xr.js";
 import { MenuPanel } from "./panel.js";
 import { Hands, stepSource } from "./hands.js";
 import { XrRuntime } from "./session.js";
-import { buildOptions, statusRows, healthLine, profileName, DEFAULT_LEAD_S, XR_DEFAULT_BLOCK } from "./options.js";
+import { buildOptions, statusRows, healthLine, profileName, DEFAULT_LEAD_S, XR_DEFAULT_BLOCK,
+         XR_DEFAULT_HINT } from "./options.js";
 import { ClockSlip } from "./slip.js";
+import { Diag } from "./diag.js";
 import { qrot, earSideOf } from "./frame_xr.js";
 
 const el = (id) => document.getElementById(id);
@@ -51,20 +53,36 @@ const app = {
   masterGain: 1,
   leadSeconds: DEFAULT_LEAD_S,
   blockSize: XR_DEFAULT_BLOCK,
-  latencyHint: "interactive",
+  latencyHint: XR_DEFAULT_HINT,        /* deep: 0.05 s (options.js says why) */
   rebuilding: Promise.resolve(),
   lastT: 0,
   slowT: 0,
   errors: [],
   xrSupported: false,
   slip: new ClockSlip(),
+  diag: new Diag(),
 };
+
+/* Page errors go to the diagnostics log as well as the console, because on a headset the log is
+ * the only thing anybody will read. */
+globalThis.addEventListener("error", (e) => app.diag.noteError(`error: ${e.message}`));
+globalThis.addEventListener("unhandledrejection",
+                            (e) => app.diag.noteError(`rejection: ${e.reason?.message ?? e.reason}`));
 
 function log(msg, bad) {
   const p = document.createElement("div");
   p.textContent = msg;
-  if (bad) { p.className = "bad"; app.errors.push(msg); }
+  if (bad) { p.className = "bad"; app.errors.push(msg); app.diag.noteError(msg); }
   el("log").appendChild(p);
+}
+
+/** The numeric fields of AudioContext.playbackStats, or null where the browser has none. */
+function statsOf(ctx) {
+  const ps = ctx?.playbackStats;
+  if (!ps) return null;
+  const o = {};
+  for (const k in ps) if (typeof ps[k] === "number") o[k] = ps[k];
+  return o;
 }
 
 /* ------------------------------------------------------------------ the three states */
@@ -223,7 +241,8 @@ async function setEngineOptions({ blockSize, latencyHint } = {}) {
   const info = await rebuildEngine();
   await app.scene?.enter(app.ctx);
   await app.rig.engine.setMasterGain(app.masterGain);
-  log(`engine rebuilt: block ${info.blockSize}, latency hint "${app.latencyHint}"`);
+  log(`engine rebuilt: block ${info.blockSize}, latency hint ${JSON.stringify(app.latencyHint)}, ` +
+      `${info.outputLatencyFrames} frames of output latency`);
   refreshMenu();
   return info;
 }
@@ -251,6 +270,7 @@ function step(nowMs, frame, runtime) {
   /* Every frame, flat or in session: the slip is the only dropout signal the page has (slip.js),
    * and the frame time it is handed is also what the long-frame count reads. */
   app.slip.sample(nowMs, app.rig.ctx);
+  app.diag.noteFrame(nowMs);
 
   /* ---- the head ---- */
   if (frame && runtime) {
@@ -297,7 +317,9 @@ function step(nowMs, frame, runtime) {
   if (nowMs - app.slowT > 250) {
     app.slowT = nowMs;
     app.panel?.refresh();          /* a scene's own state moves under the menu; repaint at 4 Hz */
+    app.diag.notePollStart();
     app.rig.poll().then(() => {
+      app.diag.notePollDone();
       if (!app.running) return;
       noteHealth(nowMs);
       renderReadout(el("readout"), app.scene ? app.scene.readout(app.ctx) : []);
@@ -370,6 +392,8 @@ async function startEngine() {
 
   const info = await app.rig.open({ audioContext: ctx, profile: app.wantProfile,
                                    blockSize: app.blockSize });
+  app.diag.start(app);
+  el("diagBtn").disabled = false;
   log(`engine up: ${info.sampleRate} Hz, block ${info.blockSize}, ${info.channelCount} bus ` +
       `channels, backend "${info.backend}"`);
   if (info.lastError) log(`open note: ${info.lastError}`);
@@ -436,6 +460,7 @@ async function enterVr() {
         app.ctx.headQuat = [0, 0, 0, 1];
         app.lastT = 0;
         log("the XR session ended; back to the flat preview");
+        showDiagnostics();
         el("enter").disabled = false;
         requestAnimationFrame((t) => step(t, null, null));
         refreshMenu();
@@ -457,6 +482,17 @@ async function enterVr() {
 
 el("enter").addEventListener("click", enterVr);
 el("flat").addEventListener("click", startFlat);
+
+/** The rolling log as text in the page, selected so a person can copy it. No network, no storage. */
+function showDiagnostics() {
+  const box = el("diagOut");
+  app.diag.sample();                     /* one fresh line, so the text ends at "now" */
+  box.value = app.diag.text();
+  box.hidden = false;
+  box.focus();
+  box.select();
+}
+el("diagBtn").addEventListener("click", showDiagnostics);
 
 /* ------------------------------------------------------------------ the test hook */
 
@@ -501,6 +537,8 @@ globalThis.__bwaXr = {
   healthLine: () => healthLine(app),
   panelLines: (text) => app.panel?.lineCount(text) ?? null,
   slip: () => app.slip.reading(),
+  /** The diagnostics text as the button would show it, and whether the textarea is showing. */
+  diagnostics: () => { showDiagnostics(); return { text: el("diagOut").value, shown: !el("diagOut").hidden }; },
   state: () => ({
     xrSupported: app.xrSupported,
     presenting: !!app.xr?.presenting,
@@ -517,6 +555,10 @@ globalThis.__bwaXr = {
     sampleRate: app.rig.engine?.info.sampleRate ?? 0,
     blockSize: app.rig.engine?.info.blockSize ?? 0,
     latencyHint: app.latencyHint,
+    outputLatencyFrames: app.rig.engine?.info.outputLatencyFrames ?? 0,
+    contextBaseLatency: app.rig.ctx?.baseLatency ?? 0,
+    contextOutputLatency: app.rig.ctx?.outputLatency ?? 0,
+    playbackStats: app.rig.ctx?.playbackStats ? { ...statsOf(app.rig.ctx) } : null,
     headGizmoVisible: app.world?.headGizmoVisible() ?? null,
     channelCount: app.rig.engine?.info.channelCount ?? 0,
     speakerCount: app.rig.speakerCount ?? 0,

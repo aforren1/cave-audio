@@ -1,7 +1,8 @@
 /**
  * xr_slip.test.mjs - the audio-clock slip (bindings/web/xr/slip.js), checked under node.
  *
- * The slip is the XR page's only dropout signal, so its SIGN and its window are what matter: an
+ * The slip is the XR page's second dropout signal (playbackStats is the first, where the browser
+ * has it) and its only one elsewhere, so its SIGN and its window are what matter: an
  * audio clock that runs slow must read POSITIVE, by the amount it ran slow, over the last window
  * only, and a suspended context must say so instead of reading 100 %. A fake context stands in
  * for the AudioContext; the module only reads `state` and `currentTime`.

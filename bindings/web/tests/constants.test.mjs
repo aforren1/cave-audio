@@ -46,5 +46,6 @@ test("the idiomatic layer re-exports them rather than keeping its own copy", () 
   assert.equal(eng.CHANNEL_AUTO, CONSTANTS.CHANNEL_AUTO);
   assert.equal(eng.GROUPS, CONSTANTS.GROUPS);
   assert.equal(eng.EXTRA_LIS, CONSTANTS.EXTRA_LIS);
-  assert.deepEqual(eng.SinkFlags, { NONE: 0, EXCLUSIVE: 0x1, EXACT_RATE: 0x2, TIGHT_BUFFER: 0x4 });
+  assert.deepEqual(eng.SinkFlags, { NONE: 0, EXCLUSIVE: 0x1, EXACT_RATE: 0x2, TIGHT_BUFFER: 0x4,
+                                    DEEP_BUFFER: 0x8 });
 });

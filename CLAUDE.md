@@ -177,9 +177,19 @@ src/
                          resume it. A SUSPENDED context is the normal state and is treated as rule
                          4's host-paced degradation (silence, clocks keep advancing, device_lost
                          set), which means two pullers on one SinkQuant: they share a WAIT-FREE
-                         try-lock where whoever finds it taken BAILS, never waits. Health is
-                         measured=false, because Web Audio reports no position, no xrun and no
-                         underrun of any kind; late_blocks and render_ns_peak are still real.
+                         try-lock where whoever finds it taken BAILS, never waits. The host thread's
+                         quiet window is max(8 blocks, 3 x baseLatency), because a deep output buffer
+                         renders in bursts as long as the buffer. Dropouts are the browser's own
+                         AudioContext.playbackStats, read in health() on the CONTROL thread, and
+                         measured=true only where the browser has it; late_blocks and render_ns_peak
+                         are the adapter's, on a 1 ms clock. BWA_SINK_FLAG_DEEP_BUFFER = latencyHint
+                         "playback" on a context the sink creates (an adopted context keeps its page's
+                         hint; the XR page makes its own at 0.05). RENDER AHEAD WAS TRIED AND REJECTED
+                         (2026-09-24): a render thread filling a ring, then a hybrid with a rescue
+                         render in process(), both lost to rendering in process() because a Worker has
+                         no priority (descheduled mid-render for 40 to 200 ms on a busy laptop, and
+                         holding the non-reentrant render when a rescue was needed). The slack for a
+                         slow render is the BROWSER's output buffer; docs/backends.md has the table.
                          VERIFIED in headless Chrome (bindings/web/tests/run-browser.mjs, the
                          `web_browser` ctest): worklet:1 renders at the audio clock and the
                          suspend/resume handoff flips device_lost both ways. Nobody has LISTENED

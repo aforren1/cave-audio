@@ -7,7 +7,10 @@
  * ctest skip code) when it cannot find one, rather than failing a build on a machine that has no
  * browser. CI runners usually do have one; the rig machines do not have to.
  *
- *   node bindings/web/tests/run-browser.mjs [--browser <path>] [--keep]
+ *   node bindings/web/tests/run-browser.mjs [--browser <path>] [--keep] [--query "sources=64"]
+ *
+ * --query passes a query string to the page: `load=0` skips the render-load section, `sources=N`
+ * pins its load at N sources rather than calibrating one (browser.html says why).
  *
  * It serves the repo root with the two cross-origin isolation headers (the same pair
  * example/serve.mjs sets, because without them SharedArrayBuffer is undefined and the engine
@@ -103,10 +106,19 @@ server.listen(PORT, async () => {
     "--no-first-run",
     "--no-default-browser-check",
     "--autoplay-policy=no-user-gesture-required",
+    /* A headless browser counts as a BACKGROUND one, and Chrome throttles those: on a hybrid
+     * Windows CPU it puts a background renderer under EcoQoS, which parks its Workers (the engine's
+     * render thread among them) on the efficiency cores. A page in an XR session or a focused tab
+     * is foreground, so these four make the headless run measure the sink rather than Chrome's
+     * power policy. The audio rendering thread is exempt either way. */
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-features=UseEcoQoSForBackgroundProcess",
     `--user-data-dir=${profile}`,
     "--enable-logging=stderr",
     "--v=0",
-    `http://localhost:${PORT}/bindings/web/tests/browser.html`,
+    `http://localhost:${PORT}/bindings/web/tests/browser.html${argOf("--query") ? "?" + argOf("--query") : ""}`,
   ], { stdio: ["ignore", "pipe", "pipe"] });
 
   let stderr = "";
@@ -114,8 +126,8 @@ server.listen(PORT, async () => {
   child.stdout.on("data", (c) => { stderr += c; });
 
   const timeout = setTimeout(() => {
-    done({ pass: false, notes: ["the page never reported back within 60 s"] });
-  }, 60000);
+    done({ pass: false, notes: ["the page never reported back within 180 s"] });
+  }, 180000);
 
   const result = await verdict;
   clearTimeout(timeout);
