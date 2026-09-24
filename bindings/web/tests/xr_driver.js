@@ -818,6 +818,26 @@
     if (!globalThis.crossOriginIsolated) throw new Error("the page is not cross-origin isolated");
     ok("cross-origin isolated");
     var xr = await waitFor(function () { return globalThis.__bwaXr; }, 20000, "window.__bwaXr");
+    /* The runner's layout pass (tests/layout_cdp.mjs): one load per viewport, the layout and
+     * nothing else. It runs with the fake device, so Enter VR is live, and it holds Enter VR to
+     * "on screen without scrolling" both before the start and in the flat preview, where the
+     * button is how you get from the preview into the headset. */
+    if (params.has("__layout")) {
+      var probe = await import("/__bwa_layout_probe.mjs");
+      await probe.layoutPass({
+        ok: ok, fail: fail,
+        startButtons: ["enter", "flat"],
+        runButtons: ["enter"],
+        start: async function () {
+          if ((await xr.supportReady) !== true) fail("the fake device is not reported as an immersive-vr device");
+          document.getElementById("flat").click();
+          var started = await Promise.race([xr.ready, sleep(60000).then(function () { return "timeout"; })]);
+          if (started !== true) throw new Error("the flat preview did not start (" + started + "); page log: " + pageLog());
+          if (document.getElementById("enter").disabled) fail("Enter VR is disabled in the flat preview");
+        },
+      });
+      return;
+    }
     if (WANT_XR) await xrPass(xr);
     else await noXrPass(xr);
     var errs = xr.state().errors;

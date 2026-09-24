@@ -9,6 +9,7 @@
  * browser, no engine build, or no vendored three.js.
  *
  *   node bindings/web/tests/run-playground.mjs [--browser <path>] [--keep] [--site <staged dir>]
+ *                                              [--no-layout | --layout-only] [--shots <dir>]
  *
  * WHAT IT DRIVES, and what run-browser.mjs already covers so this does not. run-browser.mjs proves
  * the SINK: the setup chain, process() on the worklet thread, the audio clock, the suspend and
@@ -19,6 +20,11 @@
  * THE DRIVER IS INJECTED, not shipped. The server appends one script tag to the playground's HTML
  * for a request carrying `?__drive=1`, so the page a visitor loads has no test code in it and the
  * check still runs against the real page. The assertions live in tests/playground_driver.js.
+ *
+ * THEN THE LAYOUT PASS (tests/layout_cdp.mjs, skipped with --no-layout): the same page at phone,
+ * headset-window and desktop sizes, one load each, with the driver in its `__layout` mode.
+ * --shots <dir> saves a screenshot of every state it checks, which is how a person looks at what
+ * the numbers passed.
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -26,6 +32,7 @@ import { createReadStream, existsSync, mkdtempSync, readFileSync, rmSync, statSy
 import { tmpdir } from "node:os";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { LayoutCheck } from "./layout_cdp.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const PORT = 8190;
@@ -45,6 +52,7 @@ const SITE = argOf("--site") ? resolve(argOf("--site")) : null;
 const SERVE_ROOT = SITE || ROOT;
 const PAGE = SITE ? "/playground/index.html" : "/bindings/web/playground/index.html";
 const DRIVER = "/__bwa_playground_driver.js";
+const PROBE = "/__bwa_layout_probe.mjs";
 
 const CANDIDATES = [
   argOf("--browser"),
@@ -93,16 +101,28 @@ const ISOLATION = {
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
+/* One verdict per page load: the driver pass, then one per layout viewport. */
 let done = null;
-const verdict = new Promise((r) => { done = r; });
+function nextVerdict(ms, what = "the page") {
+  return new Promise((settle) => {
+    const t = setTimeout(() => finish({ pass: false, notes: [`${what} never reported back within ${ms / 1000} s`] }), ms);
+    const finish = (r) => { clearTimeout(t); done = null; settle(r); };
+    done = finish;
+  });
+}
+
+const layout = new LayoutCheck({
+  browser, name: "playground", shotsDir: argOf("--shots") ? resolve(argOf("--shots")) : null,
+});
 
 const server = createServer((req, res) => {
+  if (layout.handle(req, res)) return;
   if (req.method === "POST" && req.url === "/__result") {
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       res.writeHead(204).end();
-      try { done(JSON.parse(body)); } catch { done({ pass: false, notes: ["bad verdict: " + body] }); }
+      try { done?.(JSON.parse(body)); } catch { done?.({ pass: false, notes: ["bad verdict: " + body] }); }
     });
     return;
   }
@@ -123,6 +143,11 @@ const server = createServer((req, res) => {
     createReadStream(join(ROOT, "bindings/web/tests/playground_driver.js")).pipe(res);
     return;
   }
+  if (path === PROBE) {
+    res.writeHead(200, { ...ISOLATION, "Content-Type": TYPES[".js"] });
+    createReadStream(join(ROOT, "bindings/web/tests/layout_probe.mjs")).pipe(res);
+    return;
+  }
 
   const file = join(SERVE_ROOT, normalize(path));
   if (!file.startsWith(SERVE_ROOT)) { res.writeHead(403).end(); return; }
@@ -137,7 +162,8 @@ const server = createServer((req, res) => {
   createReadStream(file).pipe(res);
 });
 
-server.listen(PORT, async () => {
+/** The driver's main pass: one browser, one page load, one verdict. */
+async function mainPass() {
   const profile = mkdtempSync(join(tmpdir(), "bwa-pg-"));
   const child = spawn(browser, [
     "--headless=new",
@@ -156,14 +182,8 @@ server.listen(PORT, async () => {
   child.stderr.on("data", (c) => { stderr += c; });
   child.stdout.on("data", (c) => { stderr += c; });
 
-  const timeout = setTimeout(() => {
-    done({ pass: false, notes: ["the page never reported back within 150 s"] });
-  }, 150000);
-
-  const result = await verdict;
-  clearTimeout(timeout);
+  const result = await nextVerdict(150000);
   child.kill();
-  server.close();
   if (!args.includes("--keep")) { try { rmSync(profile, { recursive: true, force: true }); } catch {} }
 
   for (const n of result.notes) console.log(n);
@@ -171,6 +191,21 @@ server.listen(PORT, async () => {
     const noise = stderr.split("\n").filter((l) => /ERROR|Uncaught|audio|WebGL/i.test(l)).slice(0, 25);
     if (noise.length) console.log("\nbrowser output:\n" + noise.join("\n"));
   }
-  console.log(result.pass ? "\nplayground check OK" : "\nplayground check FAILED");
-  process.exit(result.pass ? 0 : 1);
+  return result.pass;
+}
+
+server.listen(PORT, async () => {
+  /* --layout-only skips the driver's main pass, for work on the pages' CSS. */
+  let pass = args.includes("--layout-only") ? true : await mainPass();
+  if (!args.includes("--no-layout")) {
+    const url = (vp) => `http://localhost:${PORT}${PAGE}?__drive=1&__layout=${vp.label}&__mode=${vp.mode}&__vw=${vp.w}` +
+                        (vp.rotate ? `&__rotate=${vp.rotate}` : "");
+    const lr = await layout.run(url, (ms) => nextVerdict(ms, "a layout pass"));
+    console.log("\n---- layout ----");
+    for (const n of lr.notes) console.log(n);
+    if (!lr.pass) pass = false;
+  }
+  server.close();
+  console.log(pass ? "\nplayground check OK" : "\nplayground check FAILED");
+  process.exit(pass ? 0 : 1);
 });

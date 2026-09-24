@@ -9,6 +9,7 @@
  * no browser, no engine build, or no vendored three.js.
  *
  *   node bindings/web/tests/run-xr.mjs [--browser <path>] [--keep] [--site <staged dir>]
+ *                                      [--no-layout | --layout-only] [--shots <dir>]
  *
  * IT RUNS THE PAGE TWICE, because the page has three states and two of them are decided before
  * any script of ours could change them:
@@ -33,6 +34,11 @@
  * code. It has to be in the head and classic because the fake `navigator.xr` must exist BEFORE
  * xr/main.js runs, and a module script is deferred: the page's own module would run first and ask
  * the real navigator.xr whether a headset exists.
+ *
+ * THEN THE LAYOUT PASS (tests/layout_cdp.mjs, skipped with --no-layout): the page at phone,
+ * headset-window and desktop sizes, one load each with the fake device installed, so Enter VR is
+ * live and the check can hold it to "on screen without scrolling". --shots <dir> saves a
+ * screenshot of every state it checks.
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -40,6 +46,7 @@ import { createReadStream, existsSync, mkdtempSync, readFileSync, rmSync, statSy
 import { tmpdir } from "node:os";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { LayoutCheck } from "./layout_cdp.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const PORT = 8191;
@@ -59,6 +66,7 @@ const SITE = argOf("--site") ? resolve(argOf("--site")) : null;
 const SERVE_ROOT = SITE || ROOT;
 const PAGE = SITE ? "/xr/index.html" : "/bindings/web/xr/index.html";
 const DRIVER = "/__bwa_xr_driver.js";
+const PROBE = "/__bwa_layout_probe.mjs";
 
 const CANDIDATES = [
   argOf("--browser"),
@@ -108,7 +116,20 @@ const ISOLATION = {
 };
 
 let done = null;
+const layout = new LayoutCheck({
+  browser, name: "xr", shotsDir: argOf("--shots") ? resolve(argOf("--shots")) : null,
+});
+/** The layout pass's verdicts arrive on the same /__result as the driver passes'. */
+function nextVerdict(ms) {
+  return new Promise((settle) => {
+    const t = setTimeout(() => finish({ pass: false, notes: [`a layout pass never reported back within ${ms / 1000} s`] }), ms);
+    const finish = (r) => { clearTimeout(t); done = null; settle(r); };
+    done = finish;
+  });
+}
+
 const server = createServer((req, res) => {
+  if (layout.handle(req, res)) return;
   if (req.method === "POST" && req.url === "/__result") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -138,6 +159,11 @@ const server = createServer((req, res) => {
   if (path === DRIVER) {
     res.writeHead(200, { ...ISOLATION, "Content-Type": TYPES[".js"] });
     createReadStream(join(ROOT, "bindings/web/tests/xr_driver.js")).pipe(res);
+    return;
+  }
+  if (path === PROBE) {
+    res.writeHead(200, { ...ISOLATION, "Content-Type": TYPES[".js"] });
+    createReadStream(join(ROOT, "bindings/web/tests/layout_probe.mjs")).pipe(res);
     return;
   }
 
@@ -194,10 +220,20 @@ server.listen(PORT, async () => {
   const notes = [];
   let pass = true;
   let noise = "";
-  for (const [query, label, ms] of [["__xr=0", "no-WebXR", 120000], ["__xr=1", "fake-XR", 240000]]) {
+  /* --layout-only skips the two driver passes, for work on the pages' CSS. */
+  const passes = args.includes("--layout-only") ? []
+    : [["__xr=0", "no-WebXR", 120000], ["__xr=1", "fake-XR", 240000]];
+  for (const [query, label, ms] of passes) {
     const r = await runPass(query, label, ms);
     notes.push(`---- ${label} ----`, ...r.notes);
     if (!r.pass) { pass = false; noise += r.stderr; }
+  }
+  if (!args.includes("--no-layout")) {
+    const url = (vp) => `http://localhost:${PORT}${PAGE}?__drive=1&__xr=1&__layout=${vp.label}` +
+                        `&__mode=${vp.mode}&__vw=${vp.w}` + (vp.rotate ? `&__rotate=${vp.rotate}` : "");
+    const lr = await layout.run(url, nextVerdict);
+    notes.push("---- layout ----", ...lr.notes);
+    if (!lr.pass) pass = false;
   }
   server.close();
   for (const n of notes) console.log(n);

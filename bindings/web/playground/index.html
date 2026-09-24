@@ -25,6 +25,7 @@
     background: var(--bg); color: var(--ink);
     font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
     display: flex; flex-direction: column;
+    height: 100dvh;   /* the dynamic viewport, so a phone's URL bar cannot push the layout past it */
   }
   header {
     padding: .6rem 1rem; border-bottom: 1px solid var(--line);
@@ -35,14 +36,14 @@
   header a { color: var(--dim); }
   #layout { flex: 1; display: flex; min-height: 0; }
   #panel {
-    width: 22rem; min-width: 18rem; overflow-y: auto;
+    flex: none; width: clamp(16rem, 30vw, 22rem); overflow-y: auto;
     border-right: 1px solid var(--line); background: var(--panel); padding: .9rem 1rem 3rem;
   }
   #viewWrap { flex: 1; position: relative; min-width: 0; }
   canvas#view { width: 100%; height: 100%; display: block; }
   #startPanel {
     position: absolute; inset: 0; display: grid; place-content: center; gap: 1rem;
-    text-align: center; padding: 2rem;
+    text-align: center; padding: 2rem; overflow-y: auto; align-content: safe center;
   }
   /* The UA's `[hidden] { display: none }` is a TYPE-selector rule and loses to the id selector
      above, so `startPanel.hidden = true` left the start text sitting over the running scene. It
@@ -65,6 +66,7 @@
        color: var(--dim); margin: 1.4rem 0 .5rem; font-weight: 650; }
   h2:first-of-type { margin-top: 0; }
   select, input[type=range] { width: 100%; font: inherit; }
+  input[type=file] { max-width: 100%; }   /* its intrinsic width outgrows a 16rem sidebar */
   select { background: #1e2733; color: var(--ink); border: 1px solid var(--line);
            border-radius: .3rem; padding: .3rem; }
   .ctl { margin: 0 0 .75rem; }
@@ -80,15 +82,62 @@
   table { border-collapse: collapse; width: 100%; font-size: .82rem; }
   th, td { text-align: left; padding: .15rem .4rem .15rem 0; vertical-align: top; }
   th { font-weight: 400; color: var(--dim); width: 50%; }
-  td { font-variant-numeric: tabular-nums; }
+  td { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
   .meterRow { display: flex; align-items: center; gap: .4rem; margin: .25rem 0; }
   .meterRow > span { width: 3.2rem; font-size: .74rem; color: var(--dim); }
   #meter, .meter { flex: 1; height: .6rem; background: #1e2733; border-radius: .3rem; overflow: hidden; }
   #meterFill, .meter > div { height: 100%; width: 0; background: linear-gradient(90deg, #3d8f5a, var(--accent)); }
   #meterText { font-size: .76rem; color: var(--dim); }
-  #log { margin-top: 1rem; font-size: .78rem; color: var(--dim); white-space: pre-wrap; }
+  #log { margin-top: 1rem; font-size: .78rem; color: var(--dim); white-space: pre-wrap;
+         overflow-wrap: anywhere; }
   .bad { color: var(--bad); }
   #sceneBlurb { color: var(--dim); font-size: .85rem; margin: .4rem 0 .8rem; }
+  /* ---- the responsive layout. The SAME block is in playground/index.html and xr/index.html;
+     change both. Both page runners check it at phone, headset window and desktop sizes
+     (tests/layout_cdp.mjs sets the size, tests/layout_probe.mjs asserts).
+
+     Side by side is the default, with the sidebar at clamp(16rem, 30vw, 22rem): a small window
+     (the headset's 2D browser) gets a narrower sidebar before it gets a narrower view.
+
+     STACKED below 48rem (768 px) of width. The breakpoint comes from the sidebar: at 16rem it is
+     a third of 768 px, and anything narrower leaves the view under two thirds of the width while
+     the controls sit in a column too narrow for a slider and its readout. Stacked, the view is a
+     fixed 42% of the height on top and the controls scroll under it, so a slider stays in sight
+     of what it moves.
+
+     A LANDSCAPE PHONE (short and wide) goes back to side by side even under 48rem, because 42% of
+     375 px is not a view. The rule after the stacked one wins by source order. ---- */
+  @media (max-width: 48rem) {
+    #layout { flex-direction: column; }
+    #viewWrap { order: -1; flex: none; height: 42vh; height: 42dvh; }
+    #panel {
+      flex: 1; width: auto; min-height: 0;
+      border-right: 0; border-top: 1px solid var(--line);
+    }
+    header { padding: .45rem .75rem; gap: 0 .75rem; }
+  }
+  @media (orientation: landscape) and (max-height: 30rem) {
+    #layout { flex-direction: row; }
+    #viewWrap { order: 0; flex: 1; height: auto; }
+    #panel { flex: none; width: 16rem; border-top: 0; border-right: 1px solid var(--line); }
+    header { padding: .3rem .75rem; }
+    header .tagline { display: none; }
+  }
+  /* Wherever the start panel may not fit (narrow, or short), its buttons come FIRST, so they are
+     on screen without scrolling. In the headset's window the XR page's Enter VR button is the
+     whole point of the page. The text scrolls inside the panel. */
+  @media (max-width: 48rem), (max-height: 40rem) {
+    #startPanel { align-content: start; gap: .5rem; padding: .75rem 1rem; }
+    #startPanel .startButtons { order: -1; margin: 0; }
+    #startPanel p { margin: 0; }
+  }
+  /* A finger, not a mouse: 44 px targets (WCAG 2.5.5, Apple HIG). */
+  @media (pointer: coarse) {
+    button, select, input[type=file] { min-height: 44px; }
+    input[type=range] { height: 44px; }
+    .toggle { min-height: 44px; }
+    .toggle input { width: 1.25rem; height: 1.25rem; }
+  }
 </style>
 </head>
 <body>
@@ -102,7 +151,7 @@
 
 <header>
   <h1>bw_audio playground</h1>
-  <p>The CAVE engine's demo scenes, in a browser. Headphones, please.</p>
+  <p class="tagline">The CAVE engine's demo scenes, in a browser. Headphones, please.</p>
   <p><a href="../">back to the landing page</a></p>
 </header>
 
@@ -137,7 +186,7 @@
     <div id="startPanel">
       <p>A browser resumes an AudioContext only from a user gesture, so nothing can make a sound
          until you click. Put headphones on first: every scene is rendered for two ears.</p>
-      <p><button id="go">Start</button></p>
+      <p class="startButtons"><button id="go">Start</button></p>
       <p style="color:var(--dim);font-size:.85rem">
          Drag in the view to orbit, the wheel to zoom, and drag the red marker to move the source.
       </p>

@@ -34,6 +34,24 @@ async function main() {
   ok("cross-origin isolated");
 
   const pg = await waitFor(() => globalThis.__bwaPlayground, 15000, "window.__bwaPlayground");
+
+  /* The runner's layout pass (tests/layout_cdp.mjs) loads the page once per viewport with
+   * `__layout` set. Only the layout is checked there; everything below ran in the main pass. */
+  if (new URLSearchParams(location.search).has("__layout")) {
+    const { layoutPass } = await import("/__bwa_layout_probe.mjs");
+    await layoutPass({
+      ok, fail,
+      startButtons: ["go"],
+      runButtons: [],
+      start: async () => {
+        document.getElementById("go").click();
+        const started = await Promise.race([pg.ready, sleep(40000).then(() => "timeout")]);
+        if (started !== true) throw new Error(`the page did not start (${started}); page log: ${pageLog()}`);
+      },
+    });
+    return;
+  }
+
   /* --autoplay-policy=no-user-gesture-required lets the resume inside the click handler work with
    * nobody to click. A real visitor supplies the gesture; index.html says so. */
   document.getElementById("go").click();

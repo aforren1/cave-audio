@@ -551,7 +551,9 @@ builder are one copy. Three things are duplicated, and each is marked in the fil
 - `xr/probe.js` is `playground/probe.js` with a head ORIENTATION argument added. The playground's
   version hard-codes an identity listener quaternion, which is right for a page whose head never
   turns and useless here.
-- the page's CSS, because neither page has an external stylesheet.
+- the page's CSS, because neither page has an external stylesheet. That includes the responsive
+  block at the end of each `<style>` (stacked under 48rem, side by side with a 16rem sidebar on a
+  landscape phone, 44 px targets on a coarse pointer), which says so where it starts.
 
 ### Tests
 
@@ -565,6 +567,15 @@ It loads the page twice, because two of the three states are decided before any 
 could change them. The first pass deletes `navigator.xr` and checks the no-WebXR state. The second
 installs a minimal fake one, so an `immersive-vr` session opens against a synthetic `XRFrame` whose
 viewer pose the check chooses.
+
+Both page runners then run a LAYOUT pass, one load per viewport: 390x844, 320x568, 844x390, 667x375,
+1024x600, 800x500 and 1440x900. `tests/layout_cdp.mjs` sets each size and a touch pointer over the
+DevTools protocol (no Puppeteer; Node 22 or later), and `tests/layout_probe.mjs`, loaded by the
+driver, asserts no horizontal overflow, the view's share of the width, the controls below the view
+when stacked, the start buttons on screen and unobstructed, 44 px touch targets, and a canvas buffer
+that follows a portrait-to-landscape turn. `--no-layout` skips it, `--layout-only` runs nothing
+else, and `--shots <dir>` saves a screenshot of each state. Look at them: the numbers only say what
+they measure.
 
 What the fake proves: the seam, in both signs, on every axis; that the pose reaches the engine,
 read back through `bwa_get_listener_pose`; that a source the listener looks at renders centered

@@ -939,6 +939,19 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   the panel has move buttons (left, right, up, down, ahead, back, 0.25 m each, relative to where
   you look). Hand joints are not drawn. The playground's head gizmo is hidden in session, because
   it sits at the tracked pose and its nose cone floated 22 cm in front of the eyes.
+
+  Both pages share one responsive layout, in CSS only. Side by side, the sidebar is
+  `clamp(16rem, 30vw, 22rem)`, so a small window gives up sidebar before it gives up view. Under
+  48rem (768 px) of width the pages stack: the view on top at 42 percent of the dynamic viewport
+  height, the controls scrolling under it. A landscape phone (under 30rem tall) stays side by side
+  with a 16rem sidebar. Wherever the start panel may not fit, its buttons come first, so Start and
+  Enter VR are on screen without scrolling; once the engine runs, the XR page keeps only Enter VR at
+  the top of the view (the start text used to stay over the scene, because `hidden` loses to the
+  panel's id selector). On a coarse pointer, buttons, selects and sliders are 44 px tall. Both page
+  runners check it at 390x844, 320x568, 844x390, 667x375, 1024x600, 800x500 and 1440x900, with a
+  touch pointer on the phone sizes (`tests/layout_cdp.mjs`). The Galaxy XR's 2D window size is not
+  measured, so the two middle sizes are guesses. Nobody has checked the layout on a real phone or in
+  the headset.
 - `bindings/web/src/host.js`, `client.js`: `invokeBuf`, which reaches the raw calls whose arguments
   are pointers. A page cannot allocate wasm heap of its own, so the alloc, the copy and the free
   happen around the one call on the control thread. Plus `writeFile` and `create({ files })` for
