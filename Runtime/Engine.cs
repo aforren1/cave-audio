@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/integration.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -718,7 +718,7 @@ namespace BwAudio
         public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
 
         // ---- readback (per-frame-safe: no locks, no allocation in the engine) -------------------------
-        /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..26), NOT a constant.
+        /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..64), NOT a constant.
         /// Size any meter / speaker-gizmo / channel-test array with this; never hard-code 26.</summary>
         public uint ChannelCount => _channels;
         uint _channels;

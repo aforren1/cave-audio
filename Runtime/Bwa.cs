@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md + https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md + https://github.com/aforren1/cave-audio/blob/80401223065e/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -40,7 +40,7 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
     /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
-    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md, "What each preset rests on".</summary>
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md, "What each preset rests on".</summary>
     public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -67,7 +67,7 @@ namespace BwAudio
     public enum BwaSinkType : int
     {
         Auto = 0, Asio = 1, Null = 2, Manual = 3,
-        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8
+        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8, Worklet = 9
     }
 
     /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. None of them reaches the
@@ -80,7 +80,7 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
-    /// https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    /// https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
     public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 
@@ -158,7 +158,7 @@ namespace BwAudio
         public ulong driverResyncs;   // the driver reporting a discontinuity itself
         public ulong lateBlocks;      // our render overran the block period
         public ulong streamStarves;   // a streamed voice's ring ran dry without the asset ending
-        public float peakLoad;        // worst block's render time / block period; 1.0 = at budget
+        public float peakLoad;        // worst block's render time / block period, last 4-5 s; 1.0 = at budget
         // Nonzero: the device went away (unplugged, a driver reset, the session torn down). The
         // engine keeps rendering from the host clock, so clocks and playheads stay live, and the
         // audio is SILENT. Nothing reopens on its own — Stop() then Start(), or leave it.
@@ -524,7 +524,7 @@ namespace BwAudio
 
         // ---- channel test / diagnostics (drives a raw output channel; speaker-check tool) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_test_signal(IntPtr e, uint channel, BwaTestKind kind, float gain);
-        // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
+        // The engine's active channel count = the layout's speaker count (4..64, BWA_MAX_CHANNELS). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
         // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against

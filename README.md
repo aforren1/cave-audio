@@ -2,7 +2,7 @@
 
 Unity **control client** for the bw_audio spatial-audio engine. Unity is a *thin* client: it sends
 control (source positions, triggers, listener pose) over the engine's C ABI. **No audio crosses the
-boundary.** The engine renders the 26-speaker CAVE array over ASIO/Dante and a binaural monitor.
+boundary.** The engine renders the CAVE's speaker array (24 to start) over ASIO/Dante and a binaural monitor.
 
 This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours - a scene manager
 (`Engine`) and a positional emitter (`Emitter`) - and the coordinate seam (`Room`).
@@ -32,7 +32,7 @@ This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours
 | Audio Reverb Zone | the shared reverb bed: **Steam Audio reflections**, or the **FDN reverb** (no SDK needed) |
 | occlusion (3rd-party) | `Emitter.occlusion`, ray-traced against the acoustic geometry - or `SetOcclusionManual` from game logic (no SDK needed) |
 | Doppler / rolloff curves | `Emitter.doppler`, `airAbsorption`, `loudnessComp` (all physically derived from distance) |
-| output device / AudioMixer | the engine (ASIO/Dante 26-ch + binaural monitor); Unity's audio output is disabled |
+| output device / AudioMixer | the engine (ASIO/Dante speaker array + binaural monitor); Unity's audio output is disabled |
 
 The big difference: **audio files are raw files in `StreamingAssets`, not imported `AudioClip`s**. The
 engine owns decoding, which also avoids Unity's 8-channel output cap entirely.
@@ -70,7 +70,7 @@ Install package from tarball…**. That's the whole install.
 
 Either route pins by hand rather than resolving, so neither notifies you of upgrades. Take the newer
 one and install it again. (This package isn't on a registry: it exists to drive one specific
-26-speaker CAVE, and the audience is people who already have the repo.)
+CAVE, and the audience is people who already have the repo.)
 
 ### From source (developing the engine itself)
 
@@ -89,19 +89,19 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is skipped, because Unity is
 not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
 ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -124,7 +124,7 @@ A release carries four assets. **Two matter here**: this package
 (`com.brainworks.bw_audio-<ver>.tgz`) and the engine on its own (`bw_audio-win64-<tag>.zip` -
 dll/lib/header/tools, for C/C++ consumers and the CAVE machine). The other two are the Godot addon
 and the ASIO SDK corresponding source. See
-[docs/build.md](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md#continuous-integration) for the full breakdown.
+[docs/build.md](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/build.md#continuous-integration) for the full breakdown.
 
 Locally:
 
@@ -146,7 +146,7 @@ Two things that will bite if forgotten:
   that could ever serve this speaks the npm protocol, and keys on a single publishable tarball. One
   `.tgz` per release keeps that door open at zero cost.
 
-Not on a registry, and deliberately so: this drives one specific 26-speaker CAVE, so the audience is
+Not on a registry, and deliberately so: this drives one specific CAVE, so the audience is
 people who already have the repo. A tarball costs them one click. The tarball *is* the artifact a
 registry would serve, so listing it later is a config change, not a rebuild.
 
@@ -227,6 +227,12 @@ Audio**). The package's editor check warns on load if it's still enabled. Unity 
 startup, so you can't flip it from a runtime script. It's a one-time project setting.
 
 ## Use
+
+Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit -> Import**. The
+sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
+`Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
+Every other binding of this engine ships the same demo, which makes them comparable by ear (see
+`https://github.com/aforren1/cave-audio/blob/80401223065e/docs/integration.md`, "The minimal example").
 
 1. Add **`Engine`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,
    the `listener` transform (your OptiTrack head rigid body or XR camera), and - optionally -
@@ -371,7 +377,7 @@ share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD), the room 
 acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
-speaker count - **size meter arrays with it, never hard-code 26**), `BusLevels()` (per-channel output
+speaker count - **size meter arrays with it, never hard-code a speaker count**), `BusLevels()` (per-channel output
 peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
 checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
