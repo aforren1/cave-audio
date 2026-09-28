@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.17.0]
+
 ### Changed: the speaker-array capacity is 64, and it is no longer the default grid
 
 The engine now drives up to 64 speaker channels (`BWA_MAX_CHANNELS`), the bound of an ASIO, MADI
