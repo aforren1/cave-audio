@@ -1,6 +1,6 @@
 # Third-party notices
 
-Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md` has the
+Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/build.md` has the
 full dependency and licensing discussion; this file is what ships next to the
 binaries.
 
@@ -50,7 +50,21 @@ Everything else is in every platform's build of the library.
 `bwa_calibrate` and `bwa_zylia_probe` are console tools; they add nothing beyond
 the `bw_audio.dll` list.
 
-## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON)
+## In the web demo (GitHub Pages artifact)
+
+- **coi-serviceworker** — MIT (text below). Copyright (c) 2021 Guido Zuidhof. Vendored at
+  `bindings/web/deploy/coi-serviceworker.js`; it adds the COOP/COEP headers GitHub Pages cannot.
+  https://github.com/gzuidhof/coi-serviceworker
+
+- **three.js** — MIT (text below). Copyright (c) 2010-2026 three.js authors. Version **0.186.0**,
+  pinned. NOT committed: `tools/wasm/fetch-web-vendor.sh` fetches `build/three.module.js`,
+  `build/three.core.js` and `LICENSE` into `bindings/web/dist/vendor/three/` at build time, checks
+  each against a sha256 recorded in that script, and `bindings/web/deploy/stage.sh` copies them
+  into the Pages artifact. The upstream `LICENSE` text travels with the files. The playground page
+  imports it from there because the site is served under COEP require-corp, where a CDN script is
+  blocked. https://github.com/mrdoob/three.js
+
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in

@@ -47,7 +47,7 @@ class Base extends RefCounted:
 
 
 ## ============================ 1. Localization (pure DBAP) ============================
-## Move a source around a 26-speaker array and hear where it lands. SPACE auto-sweeps on
+## Move a source around the speaker array and hear where it lands. SPACE auto-sweeps on
 ## three incommensurate periods so the source covers the whole space rather than repeating a
 ## short loop; X is a fast straight flyby, which with Doppler on is the race-car pitch sweep.
 class Localization extends Base:
@@ -949,7 +949,7 @@ class ReverbBed extends Base:
 
 
 ## ============================ 8. Underwater (medium boundary) ============================
-## The https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
+## The https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
 ## the surface gets the interface loss + the water's transmission EQ (manual occlusion) and
 ## goes diffuse (spread), the FDN retunes LIVE (the tail keeps ringing, only its slope
 ## changes) and the speed of sound glides to the medium's — Doppler is what makes that

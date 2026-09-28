@@ -32,7 +32,7 @@ the APK.
 
 What differs on a headset:
 
-- Output is **stereo through AAudio**. There is no 26-channel transport on Android, so use the
+- Output is **stereo through AAudio**. There is no multichannel array transport on Android, so use the
   binaural profile. A wider request falls to the silent offline sink.
 - The head pose comes from the **XR rig**, through the same listener push `BwaEngine` already does.
 - Steam Audio is **inside the library**, statically linked, so binaural is the real HRTF decode and
@@ -83,12 +83,12 @@ Budget time to verify with a known-position test source before trusting anything
 
 ## Channel count
 
-The engine's channel count is **the layout's speaker count** (4..26), not a constant. Read
-it with `BwaEngine.get_channel_count()` and size any meter or speaker-gizmo array from it.
-Never hard-code 26.
+The engine's channel count is **the layout's speaker count** (4 to 64, `BWA_MAX_CHANNELS`),
+not a constant. Read it with `BwaEngine.get_channel_count()` and size any meter or
+speaker-gizmo array from it. Never hard-code a speaker count.
 
 The trap: a failed layout load is **not** fatal at create. The core falls back to the
-26-speaker default grid and only records the reason. `BwaEngine` surfaces that as a
+default grid (26 speakers, `BWA_DEFAULT_GRID`) and only records the reason. `BwaEngine` surfaces that as a
 warning, and `bwa_start` refuses the fallback when a path was given, so a bad layout fails
 loudly instead of quietly changing the channel count.
 
@@ -197,7 +197,7 @@ core. It starts, it renders, it just sounds wrong:
 - `feed_listener` on with no listener node, so the listener never leaves the origin;
 - a `layout_path` that does not exist, or a `res://` one that will not survive export;
 - ray-traced occlusion or pathing switched on without the SDK or without geometry;
-- `profile` set to Cave on a machine with no ASIO driver, which renders the 26-channel array
+- `profile` set to Cave on a machine with no ASIO driver, which renders the speaker array
   into nothing and is silent by design.
 
 The split into three source classes is deliberate. The core genuinely *refuses*
@@ -329,7 +329,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -345,8 +345,8 @@ what the engine is rendering.
 `profile` is the highest-stakes property on the node, so the inspector spells out what each
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
-26-speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md)
+speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
@@ -430,6 +430,14 @@ noise without removing a decision.
 `addons/bw_audio/playground/` is the by-ear harness, and it ships **inside the addon**.
 However you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
 Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
+
+The array is `dome_24.json` from the same folder: a generated 24-speaker dome, 2 m around a
+listening point 1.5 m up, spread evenly over the sphere above the floor. To audition a
+surveyed array, pass its path as a user argument (`godot ... -- my_layout.json`) or put a
+`cave_layout.json` beside the executable or in the project root. The order is: the argument,
+`cave_layout.json`, the dome, then the engine's built-in 26-speaker grid. The playground copies
+the dome to `user://` before it loads it, because the engine opens files by OS path and an
+exported `.pck` has none.
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
 blind A/B/X, ambisonic bed, reverb bed, underwater. WASD/RF move the source, Q/E turn the
