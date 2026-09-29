@@ -1329,6 +1329,7 @@ GEN_E_F(set_limiter_ceiling)
 GEN_E_B(set_headphone_eq)
 GEN_E_U32(set_bed_renderer, bwa_bed_renderer)
 GEN_E_B(set_tracked_room_eq)
+GEN_E_B(set_tracked_directivity)
 GEN_E_B(set_tracked_align)
 GEN_E_FF(set_tracked_align_guards)
 
@@ -1366,9 +1367,9 @@ static const char* TUNING_FIELDS[] = {
     "struct_size", "panner", "spcap_focus", "spcap_density", "dual_band", "dual_band_cap",
     "spread_mode", "decorrelation", "near_spread", "hole_spread", "max_re", "max_re_split",
     "bed_renderer", "tracked_room_eq", "tracked_align", "align_dead_zone_m",
-    "align_slew_frames_per_s"
+    "align_slew_frames_per_s", "tracked_directivity"
 };
-#define TUNING_NFIELDS 17
+#define TUNING_NFIELDS 18
 
 static mxArray* tuning_to_mx(const bwa_tuning* t)
 {
@@ -1390,6 +1391,7 @@ static mxArray* tuning_to_mx(const bwa_tuning* t)
     sf_bool(s, "tracked_align", t->tracked_align);
     sf_dbl(s, "align_dead_zone_m", t->align_dead_zone_m);
     sf_dbl(s, "align_slew_frames_per_s", t->align_slew_frames_per_s);
+    sf_bool(s, "tracked_directivity", t->tracked_directivity);
     return s;
 }
 
@@ -1428,6 +1430,7 @@ CMD(apply_tuning)
         t.tracked_align           = gf(prhs[1], "tracked_align", 0, cmd) != 0.0;
         t.align_dead_zone_m       = (float)gf(prhs[1], "align_dead_zone_m", 0, cmd);
         t.align_slew_frames_per_s = (float)gf(prhs[1], "align_slew_frames_per_s", 0, cmd);
+        t.tracked_directivity     = gf(prhs[1], "tracked_directivity", 1, cmd) != 0.0;   /* absent = on (the engine default) */
         plhs[0] = ret_bool(bwa_apply_tuning(e, &t));
     }
 }
@@ -1771,7 +1774,7 @@ static const bwa_cmd_entry g_cmds[] = {
     ENT(set_dual_band), ENT(set_dual_band_cap), ENT(set_max_re), ENT(set_max_re_split),
     ENT(set_spread_mode), ENT(set_decorrelation), ENT(set_near_spread), ENT(set_hole_spread),
     ENT(set_limiter), ENT(set_limiter_ceiling), ENT(load_headphone_eq), ENT(set_headphone_eq),
-    ENT(set_bed_renderer), ENT(set_tracked_room_eq), ENT(set_tracked_align),
+    ENT(set_bed_renderer), ENT(set_tracked_room_eq), ENT(set_tracked_directivity), ENT(set_tracked_align),
     ENT(set_tracked_align_guards), ENT(tuning_preset), ENT(apply_tuning), ENT(get_tuning),
     ENT(panner_gains_batch), ENT(bed_gains_batch),
     /* listener and tracking */

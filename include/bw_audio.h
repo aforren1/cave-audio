@@ -1466,6 +1466,20 @@ BWA_API void     bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer renderer);
  * for layouts without a grid. Control thread, per-frame-safe. See docs/calibration.md. */
 BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
 
+/* Tracked directivity compensation (layouts carrying a `directivity` model, written by
+ * tools/directivity/clf_to_json.py from the speaker vendor's CLF simulation file, plus each
+ * speaker's `aim`). A speaker's output falls off its acoustic axis, more so with frequency, and a
+ * tracked listener walks across every speaker's beam; the trims and the gain solve both assume the
+ * listening point's view of each speaker. Each block the engine takes each speaker's angle to the live
+ * listener against its angle to the listening point, looks both up in the model, and hands the align
+ * stage the difference as a broadband gain plus a high shelf at the model's split frequency (glided at
+ * 24 dB/s; clamped to +/-6 dB and +/-10 dB, because past that a speaker is not reaching the listener
+ * and boosting it only raises the room). Identity at the listening point, so a calibrated layout is
+ * unchanged there. Pure gain, no resampling, which is why it defaults ON where tracked alignment does
+ * not. This is the live kill switch (off glides to identity, a click-free A/B). A no-op for layouts
+ * without a model. Control thread, per-frame-safe. See docs/spatialization.md. */
+BWA_API void     bwa_set_tracked_directivity(bwa_engine* e, bool on);
+
 /* Tracked listener alignment (OFF by default). The layout's per-speaker delay and gain trims align
  * the array's arrival times at ONE point, the array centroid, so the array is time-coherent there and
  * progressively less so as the listener walks away. Turn this on and the output stage re-references
@@ -1556,7 +1570,11 @@ typedef struct {
                                       * know whether you surveyed. Turn it on after bwa_calibrate. */
     float            align_dead_zone_m;      /* 0 = the 5 cm default. */
     float            align_slew_frames_per_s;/* 0 = the ~63 at 48 kHz default. */
-    uint32_t         reserved[4];    /* zero; reserved so the struct can grow without an ABI break */
+    bool             tracked_directivity;    /* on both; a no-op without a directivity model in the layout.
+                                              * Took one reserved slot (0.18), so struct_size is unchanged;
+                                              * a client built against an older header that zeroes
+                                              * reserved[] after bwa_tuning_preset turns this OFF. */
+    uint32_t         reserved[3];    /* zero; reserved so the struct can grow without an ABI break */
 } bwa_tuning;
 
 /* Fill `out` with the complete tuning for `setup`. Pure: no engine, no allocation, deterministic.

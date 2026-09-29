@@ -139,6 +139,29 @@ static int write_layout_grid(const char* path, int mode) {
     return k == 26;
 }
 
+/* a grid layout carrying a directivity model (two bands, five angles) with speaker 0's aim given
+ * explicitly (non-unit, along +z). mode 0 = valid; 1 = a zero aim on speaker 1; 2 = a loss row of
+ * the wrong length; 3 = bands not ascending; 4 = a loss entry past +12 dB. */
+static int write_layout_dir(const char* path, int mode) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const float ax[3] = { -1.5f, 0.f, 1.5f };
+    fprintf(f, "{ \"speakers\": [\n");
+    int k = 0;
+    for (int yi = 0; yi < 3; ++yi) for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) {
+        if (ax[xi] == 0 && ax[yi] == 0 && ax[zi] == 0) continue;
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]%s}%s\n", k, ax[xi], ax[yi], ax[zi],
+                (k == 0) ? ",\"aim\":[0,0,2]" : (mode == 1 && k == 1) ? ",\"aim\":[0,0,0]" : "",
+                (k == 25) ? "" : ",");
+        ++k;
+    }
+    fprintf(f, "],\n\"directivity\": { \"bands_hz\": [250, %d], \"angles_deg\": [0, 30, 60, 90, 180],\n"
+               "  \"split_hz\": 1000, \"loss_db\": [[0, -1, -2, -3, -6], [0, -3, -9, -15, %s]] } }\n",
+            mode == 3 ? 100 : 4000, mode == 2 ? "-25, 0" : mode == 4 ? "50" : "-25");
+    fclose(f);
+    return k == 26;
+}
+
 /* an N-speaker layout: the first N positions of the default grid, indices 0..N-1 (bad_index >= 0
  * replaces speaker 0's index — a gap/out-of-range case for the loader to reject) */
 static int write_layout_n(const char* path, int n, int bad_index) {
@@ -636,6 +659,97 @@ int main(void) {
         }
     }
 
+    /* 7a3b. tracked directivity compensation (align_dir_targets): a slewed broadband gain plus a
+     * high shelf at the model's split, per channel. The broadband half must move a 100 Hz tone and
+     * an 8 kHz tone alike, the shelf half only the 8 kHz one, off must glide back and then be
+     * bit-identical to an aligner that never had the stage, and an aligner built from a layout with
+     * no model must ignore the call entirely. */
+    {
+        static Layout D; layout_default(&D);
+        D.dir.nband = 2; D.dir.nang = 2;
+        D.dir.band_hz[0] = 250.f; D.dir.band_hz[1] = 4000.f;
+        D.dir.ang_deg[0] = 0.f;   D.dir.ang_deg[1] = 90.f;
+        D.dir.split_hz = 1000.f;
+        directivity_derive(&D.dir);
+        static Layout P; layout_default(&P);                /* no model: the stage must not exist */
+        Aligner* a  = align_create(CH, &D, RATE);
+        Aligner* rf = align_create(CH, &P, RATE);
+        Aligner* np = align_create(CH, &P, RATE);
+        CHECK(a != NULL && rf != NULL && np != NULL, "align_create (directivity)");
+        if (a && rf && np) {
+            enum { BL = 256, WIN = 47 };
+            static float blk[CH * BL], blk2[CH * BL];
+            float g[BWA_CHANNELS], sh[BWA_CHANNELS];
+            memset(g, 0, sizeof g); memset(sh, 0, sizeof sh);
+            int ph = 0;
+            #define DIR_WIN_DB(al, hz, out) do {                                                    \
+                double r_ = 0;                                                                     \
+                for (int b_ = 0; b_ < WIN; ++b_) {                                                 \
+                    memset(blk, 0, sizeof blk);                                                    \
+                    for (int i_ = 0; i_ < BL; ++i_, ++ph)                                          \
+                        blk[4*(size_t)BL + i_] = sinf(2.f*3.14159265f*(float)(hz)*(float)ph/(float)RATE); \
+                    align_process((al), blk, BL);                                                  \
+                    for (int i_ = 0; i_ < BL; ++i_) r_ += (double)blk[4*(size_t)BL+i_]*blk[4*(size_t)BL+i_]; \
+                }                                                                                  \
+                (out) = 10.0 * log10(r_ / (0.5 * WIN * BL));                                       \
+            } while (0)
+            double lo, hi;
+            /* (a) broadband +6 dB on channel 4: both tones rise 6 dB once landed (~0.25 s + settle) */
+            g[4] = 6.f;
+            align_dir_targets(a, g, sh);
+            for (int wn = 0; wn < 6; ++wn) DIR_WIN_DB(a, 100.0, lo);
+            DIR_WIN_DB(a, 100.0, lo);
+            DIR_WIN_DB(a, 8000.0, hi);
+            printf("directivity comp: +6 dB broadband -> 100 Hz %+.2f dB, 8 kHz %+.2f dB\n", lo, hi);
+            CHECK(fabs(lo - 6.0) < 0.3 && fabs(hi - 6.0) < 0.3, "directivity comp: the broadband gain lands on both tones");
+            /* (b) shelf only: +6 dB above 1 kHz leaves 100 Hz alone and lifts 8 kHz */
+            g[4] = 0.f; sh[4] = 6.f;
+            align_dir_targets(a, g, sh);
+            for (int wn = 0; wn < 6; ++wn) DIR_WIN_DB(a, 100.0, lo);
+            DIR_WIN_DB(a, 100.0, lo);
+            DIR_WIN_DB(a, 8000.0, hi);
+            printf("directivity comp: +6 dB shelf -> 100 Hz %+.2f dB, 8 kHz %+.2f dB\n", lo, hi);
+            CHECK(fabs(lo) < 0.3, "directivity comp: the shelf leaves the low band alone");
+            CHECK(fabs(hi - 6.0) < 0.5, "directivity comp: the shelf lifts the high band by its gain");
+            /* (c) clamps: a NaN target reads 0 and an absurd one saturates */
+            g[4] = NAN; sh[4] = 100.f;
+            align_dir_targets(a, g, sh);
+            for (int wn = 0; wn < 8; ++wn) DIR_WIN_DB(a, 8000.0, hi);
+            DIR_WIN_DB(a, 100.0, lo);
+            DIR_WIN_DB(a, 8000.0, hi);
+            CHECK(fabs(lo) < 0.3 && hi > 9.0 && hi < 10.6, "directivity comp: NaN reads as 0 and the shelf saturates at +10 dB");
+            /* (d) off: identity is reached by gliding, after which the output is bit-identical to an
+             * aligner that never had the stage (dir_live cleared, fast path resumed) */
+            align_dir_targets(a, NULL, NULL);
+            for (int wn = 0; wn < 8; ++wn) DIR_WIN_DB(a, 100.0, lo);
+            float gs[BWA_CHANNELS], ss[BWA_CHANNELS];
+            align_dir_state(a, gs, ss);
+            CHECK(gs[4] == 0.f && ss[4] == 0.f, "directivity comp: off lands exactly on identity");
+            uint32_t rs = 777;
+            int bitsame = 1;
+            for (int b = 0; b < 8; ++b) {
+                for (int i = 0; i < CH * BL; ++i) { blk[i] = 0.25f * lcg_noise(&rs); blk2[i] = blk[i]; }
+                align_process(a, blk, BL);
+                align_process(rf, blk2, BL);
+                if (memcmp(blk, blk2, sizeof blk) != 0) bitsame = 0;
+            }
+            CHECK(bitsame, "directivity comp: after off, the output is bit-identical to an aligner without the stage");
+            /* (e) no model in the layout: the call is a no-op and the output stays bit-identical */
+            g[4] = 6.f; sh[4] = 6.f;
+            align_dir_targets(np, g, sh);
+            bitsame = 1;
+            for (int b = 0; b < 8; ++b) {
+                for (int i = 0; i < CH * BL; ++i) { blk[i] = 0.25f * lcg_noise(&rs); blk2[i] = blk[i]; }
+                align_process(np, blk, BL);
+                align_process(rf, blk2, BL);
+                if (memcmp(blk, blk2, sizeof blk) != 0) bitsame = 0;
+            }
+            CHECK(bitsame, "directivity comp: a layout without a model ignores the targets");
+            #undef DIR_WIN_DB
+            align_destroy(a); align_destroy(rf); align_destroy(np);
+        }
+    }
+
     /* 7a4. tracked listener alignment (align_tracked_targets / align_tracked_slew): an EXTRA
      * fractional delay + gain per channel on top of the layout trims. Checked here at the DSP level:
      * OFF is bit-identical to an aligner that was never told about the feature, an engaged target
@@ -778,6 +892,45 @@ int main(void) {
         write_layout_with(BJ, 0.7, 0.0, 1.0e7);   CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "huge delay_ms is rejected");
         write_layout_with(BJ, 0.7, 0.0, 0.0);     CHECK( layout_load(BJ, RATE, &B, err, sizeof err), "valid layout still loads");
         remove(BJ);
+    }
+
+    /* 7b1b. directivity schema + speaker aim: the block parses into the model with its two half-band
+     * curves derived, an explicit aim is normalized, a missing one points at the listening point, the
+     * lookups interpolate and clamp, and every malformed variant is rejected. */
+    {
+        const char* DJ = "bwa_layout_dir.json";
+        static Layout B;
+        write_layout_dir(DJ, 0);
+        CHECK(layout_load(DJ, RATE, &B, err, sizeof err), err[0] ? err : "directivity layout loads");
+        CHECK(B.dir.nband == 2 && B.dir.nang == 5 && B.dir.split_hz == 1000.f, "directivity: bands, angles, split parsed");
+        CHECK(B.dir.lo_db[2] == -2.f && B.dir.hi_db[2] == -9.f, "directivity: lo = the band below the split, hi = the band above");
+        CHECK(fabs(B.speakers[0].aim[2] - 1.f) < 1e-6 && B.speakers[0].aim[0] == 0.f, "directivity: an explicit aim is normalized");
+        {
+            float want[3]; unit_dir(B.speakers[5].pos, B.ref, want);
+            CHECK(fabs(dot3(want, B.speakers[5].aim) - 1.0) < 1e-6, "directivity: a missing aim points at the listening point");
+            CHECK(fabs(layout_speaker_off_axis_deg(&B, 5, B.ref)) < 1e-3, "directivity: the listening point is on such a speaker's axis");
+            float behind[3] = { B.speakers[5].pos[0] - want[0], B.speakers[5].pos[1] - want[1], B.speakers[5].pos[2] - want[2] };
+            CHECK(fabs(layout_speaker_off_axis_deg(&B, 5, behind) - 180.f) < 1e-3, "directivity: directly behind reads 180 deg");
+        }
+        {
+            float lo, hi;
+            directivity_lookup(&B.dir, 45.f, &lo, &hi);
+            CHECK(fabs(lo + 1.5) < 1e-5 && fabs(hi + 6.0) < 1e-5, "directivity: the lookup interpolates between angles");
+            directivity_lookup(&B.dir, 400.f, &lo, &hi);
+            CHECK(lo == -6.f && hi == -25.f, "directivity: past the table clamps to its last angle");
+            directivity_lookup(&B.dir, NAN, &lo, &hi);
+            CHECK(lo == 0.f && hi == 0.f, "directivity: a NaN angle reads on-axis");
+            float l0 = directivity_loss_lin(&B.dir, 0.f, 40.f, 10000.f);
+            float l30 = directivity_loss_lin(&B.dir, 30.f, 40.f, 10000.f);
+            float l90 = directivity_loss_lin(&B.dir, 90.f, 40.f, 10000.f);
+            CHECK(fabs(l0 - 1.f) < 1e-5 && l30 < l0 && l90 < l30 && l90 > 0.1f,
+                  "directivity: the band-averaged amplitude loss is 1 on axis and falls monotonically");
+        }
+        write_layout_dir(DJ, 1); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "a zero aim is rejected");
+        write_layout_dir(DJ, 2); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "a loss row of the wrong length is rejected");
+        write_layout_dir(DJ, 3); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "non-ascending bands are rejected");
+        write_layout_dir(DJ, 4); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "a loss entry past +12 dB is rejected");
+        remove(DJ);
     }
 
     /* 7b2. room_eq_grid schema: parses into the shared ladder + per-position depths; positions must

@@ -43,7 +43,15 @@ struct SteamMonitor {
     IPLAmbisonicsDecodeEffect  decode;
     uint32_t                   channels;      /* the layout's speaker count (<= BWA_CHANNELS) */
     uint32_t                   frame_size;    /* phonon frameSize == the per-block n (fixed at create) */
-    float                      encode[BWA_CHANNELS][BWA_AMBI_CH];  /* fixed channels→16 SH matrix */
+    float                      encode[BWA_CHANNELS][BWA_AMBI_CH];  /* fixed channels→16 SH matrix (from ref) */
+    /* parallax mode (the array audition): the encode follows the live listener position. enc_cur is
+     * the matrix the last block landed on, enc_tgt this block's; the block ramps between them. */
+    int                        parallax;
+    int                        par_primed;
+    float                      spk[BWA_CHANNELS][3];
+    float                      par_p[3];      /* the position enc_tgt was solved for */
+    float                      enc_cur[BWA_CHANNELS][BWA_AMBI_CH];
+    float                      enc_tgt[BWA_CHANNELS][BWA_AMBI_CH];
     float*                     ambi;          /* 16 * frame_size, planar scratch */
     /* per-voice fleet (BWA_PROFILE_BINAURAL mode 2): one binaural effect per rt voice slot. The
      * effect carries overlap state, so a slot RECYCLE (generation change / inactive gap) resets it
@@ -85,7 +93,7 @@ static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
 }
 
 SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t block_size,
-                                   const char* hrtf_path, uint32_t max_voices) {
+                                   const char* hrtf_path, uint32_t max_voices, int parallax) {
     if (!L || block_size == 0) return NULL;
     SteamMonitor* m = (SteamMonitor*)calloc(1, sizeof *m);
     if (!m) return NULL;
@@ -126,7 +134,9 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
         float dir[3] = { 0, 0, -1 };
         if (len > 1e-6f) { dir[0] = pos[0] / len; dir[1] = pos[1] / len; dir[2] = pos[2] / len; }
         sh_encode(dir, m->encode[k]);
+        memcpy(m->spk[k], L->speakers[k].pos, sizeof m->spk[k]);
     }
+    m->parallax = parallax ? 1 : 0;
 
     m->ambi = (float*)calloc((size_t)BWA_AMBI_CH * block_size, sizeof(float));
     if (!m->ambi) { steam_monitor_destroy(m); return NULL; }
@@ -165,22 +175,60 @@ int steam_monitor_pervoice(const SteamMonitor* m) { return m && m->pv_cap > 0; }
 void steam_monitor_process(SteamMonitor* m, const float* bus26, const float* direct16,
                            const RtDirectVoice* voices, uint32_t nvoices,
                            const float p[3], const float q[4], float* out, uint32_t n) {
-    (void)p;
     if (!m || n == 0) return;
     /* phonon's effect was created for exactly frame_size samples — an off-spec device block
      * (a renegotiating ASIO device != cfg.block_size) renders silence rather than crash. */
     if (n != m->frame_size) { memset(out, 0, sizeof(float) * (size_t)n * 2); return; }
 
-    /* encode: ambi[k][i] = sum over speakers of encode[spk][k] * bus[spk][i] (planar, stride n) */
     memset(m->ambi, 0, sizeof(float) * (size_t)BWA_AMBI_CH * n);
-    for (uint32_t s = 0; s < m->channels; ++s) {
-        const float* src = bus26 + (size_t)s * n;
-        const float* g = m->encode[s];
-        for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
-            if (g[k] == 0.0f) continue;
-            float* a = m->ambi + (size_t)k * n;
-            float gk = g[k];
-            for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
+    if (!m->parallax) {
+        /* fixed encode: ambi[k][i] = sum over speakers of encode[spk][k] * bus[spk][i] (planar, stride n) */
+        for (uint32_t s = 0; s < m->channels; ++s) {
+            const float* src = bus26 + (size_t)s * n;
+            const float* g = m->encode[s];
+            for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
+                if (g[k] == 0.0f) continue;
+                float* a = m->ambi + (size_t)k * n;
+                float gk = g[k];
+                for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
+            }
+        }
+    } else {
+        /* parallax encode: each speaker's direction from the LIVE listener. Re-solved only when p
+         * moved more than 1 cm (or on the first block, which lands on it with nothing to ramp from);
+         * the NaN-safe compare also re-solves on a NaN p, whose directions then fall back below. */
+        const float dx = p[0] - m->par_p[0], dy = p[1] - m->par_p[1], dz = p[2] - m->par_p[2];
+        if (!m->par_primed || !(dx*dx + dy*dy + dz*dz < 1e-4f)) {
+            for (uint32_t s = 0; s < m->channels; ++s) {
+                const float v[3] = { m->spk[s][0] - p[0], m->spk[s][1] - p[1], m->spk[s][2] - p[2] };
+                const float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                /* a listener standing on a speaker (or a NaN p) has no direction to it: keep the
+                 * one from ref rather than invent one */
+                if (!(len > 1e-6f)) { memcpy(m->enc_tgt[s], m->encode[s], sizeof m->enc_tgt[s]); continue; }
+                const float dir[3] = { v[0] / len, v[1] / len, v[2] / len };
+                sh_encode(dir, m->enc_tgt[s]);
+            }
+            memcpy(m->par_p, p, sizeof m->par_p);
+            if (!m->par_primed) { memcpy(m->enc_cur, m->enc_tgt, sizeof m->enc_cur); m->par_primed = 1; }
+        }
+        const float inv_n = 1.0f / (float)n;
+        for (uint32_t s = 0; s < m->channels; ++s) {
+            const float* src = bus26 + (size_t)s * n;
+            float* g0 = m->enc_cur[s];
+            const float* g1 = m->enc_tgt[s];
+            for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
+                float* a = m->ambi + (size_t)k * n;
+                if (g0[k] == g1[k]) {                     /* settled: the fixed path's arithmetic */
+                    if (g0[k] == 0.0f) continue;
+                    const float gk = g0[k];
+                    for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
+                } else {                                  /* moved: ramp the coefficient across the block */
+                    float gk = g0[k];
+                    const float dg = (g1[k] - gk) * inv_n;
+                    for (uint32_t i = 0; i < n; ++i) { a[i] += gk * src[i]; gk += dg; }
+                    g0[k] = g1[k];                        /* land exactly */
+                }
+            }
         }
     }
     /* direct-binaural field (BWA_PROFILE_BINAURAL): already in this basis (rt.c encodes with the

@@ -92,6 +92,59 @@ int main(void) {
         CHECK(fabs(rec - 137.4) < 0.2, "sub-sample estimate well inside the 0.4-sample integer error");
         free(capf);
     }
+    /* --- the direct-sound gate (level_direct / band_direct / direct_frac): a direct sound plus ONE
+     *     reflection 3 ms later with a different spectrum, a one-pole HIGH-pass (~0.9 kHz) at 0.8 of
+     *     the direct, so it adds to the mid and high bands and barely to the low one. The gate must
+     *     close before the reflection, the gated means must match a reflection-free capture's, the
+     *     whole-response means must NOT, and the direct share of the energy must land well inside
+     *     (0, 1). A test that cannot fail is the default outcome: with the gate forced open to the
+     *     whole IR, the gated-means checks and the direct_frac check went red, as they must. --- */
+    {
+        const int Dd = 300, R = 144;                            /* reflection 3 ms after the direct */
+        const int ncap3 = nref + Dd + R + 9600;
+        float* dry = (float*)calloc((size_t)ncap3, sizeof(float));
+        float* wet = (float*)calloc((size_t)ncap3, sizeof(float));
+        CHECK(dry && wet, "alloc gate captures");
+        if (dry && wet) {
+            float lp = 0.f;
+            for (int i = 0; i < nref; ++i) {
+                dry[Dd + i]  = 0.5f * sweep[i];
+                wet[Dd + i] += 0.5f * sweep[i];                  /* += : the reflection is already there */
+                lp += 0.12f * (sweep[i] - lp);                  /* one-pole LP; sweep - LP = the HP */
+                wet[Dd + R + i] += 0.4f * (sweep[i] - lp);
+            }
+            MeasureResult rd, rw;
+            CHECK(measure_response(dry, ncap3, sweep, nref, f1, f2, fs, band_hz, &rd), "measure_response (dry)");
+            CHECK(measure_response(wet, ncap3, sweep, nref, f1, f2, fs, band_hz, &rw), "measure_response (wet)");
+            #define DB(a, b) (20.0 * log10((double)(a) / (double)(b)))
+            printf("gate: dry gate=%d frac=%.3f | wet gate=%d frac=%.3f\n",
+                   rd.gate_samples, rd.direct_frac, rw.gate_samples, rw.direct_frac);
+            printf("gate: wet vs dry, whole  level %+.2f  bands [%+.2f %+.2f %+.2f] dB\n",
+                   DB(rw.level, rd.level), DB(rw.band[0], rd.band[0]), DB(rw.band[1], rd.band[1]), DB(rw.band[2], rd.band[2]));
+            printf("gate: wet vs dry, gated  level %+.2f  bands [%+.2f %+.2f %+.2f] dB\n",
+                   DB(rw.level_direct, rd.level), DB(rw.band_direct[0], rd.band[0]),
+                   DB(rw.band_direct[1], rd.band[1]), DB(rw.band_direct[2], rd.band[2]));
+            CHECK(rw.gate_samples > 48 && rw.gate_samples < R, "gate: closes after 1 ms and before the reflection");
+            CHECK(rd.gate_samples == (int)(0.004 * fs), "gate: no reflection -> the 4 ms default");
+            /* whole response: the reflection is in it, and it is in the treble more than the bass */
+            CHECK(DB(rw.band[2], rd.band[2]) > 0.8, "whole-response high band includes the reflection");
+            CHECK(DB(rw.band[1], rd.band[1]) > 0.5, "whole-response mid band includes the reflection");
+            CHECK(DB(rw.band[2], rd.band[2]) > DB(rw.band[0], rd.band[0]) + 0.5,
+                  "the reflection's own spectrum shows: the high band rises more than the low band");
+            /* gated: the reflection is out (mid, high and the level band; the low band is 1/gate-smeared) */
+            CHECK(fabs(DB(rw.band_direct[1], rd.band[1])) < 0.25, "gated mid band excludes the reflection");
+            CHECK(fabs(DB(rw.band_direct[2], rd.band[2])) < 0.25, "gated high band excludes the reflection");
+            CHECK(fabs(DB(rw.level_direct, rd.level)) < 0.25, "gated level excludes the reflection");
+            CHECK(fabs(DB(rd.band_direct[2], rd.band[2])) < 0.25 && fabs(DB(rd.level_direct, rd.level)) < 0.25,
+                  "an anechoic capture gates to its own whole response");
+            /* the energy share: ~1 dry; about 1 / (1 + 0.64 x the HP's in-band power) wet */
+            CHECK(rd.direct_frac > 0.97f, "direct_frac ~ 1 with no room");
+            CHECK(rw.direct_frac > 0.45f && rw.direct_frac < 0.85f, "direct_frac sees the reflection's share");
+            CHECK(rw.level > rd.level && rw.level_direct < rw.level, "the whole level is diluted, the gated one is not");
+            #undef DB
+        }
+        free(dry); free(wet);
+    }
 
     free(sweep);
 
@@ -211,6 +264,6 @@ int main(void) {
     }
 
     if (fails) { printf("measure_test: %d FAILURES\n", fails); return 1; }
-    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections, speaker EQ, room EQ verified)\n");
+    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, direct-sound gate, RT60, early reflections, speaker EQ, room EQ verified)\n");
     return 0;
 }

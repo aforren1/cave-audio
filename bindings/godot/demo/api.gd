@@ -113,6 +113,7 @@ func _test_engine_knobs() -> void:
 	engine.max_re_split = true
 	engine.bed_renderer = BwaEngine.BED_PARAMETRIC
 	engine.tracked_room_eq = false
+	engine.tracked_directivity = false
 	engine.tracked_align_dead_zone = 0.08
 	engine.tracked_align_slew_frames_per_s = 128.0
 	engine.tracked_align = true
@@ -122,6 +123,7 @@ func _test_engine_knobs() -> void:
 	_check(is_equal_approx(engine.hole_spread, 1.0), "hole_spread did not round-trip")
 	_check(engine.dual_band_cap, "dual_band_cap did not round-trip")
 	_check(engine.tracked_align, "tracked_align did not round-trip")
+	_check(not engine.tracked_directivity, "tracked_directivity did not round-trip")
 	_check(is_equal_approx(engine.tracked_align_dead_zone, 0.08), "tracked_align_dead_zone did not round-trip")
 	_check(is_equal_approx(engine.tracked_align_slew_frames_per_s, 128.0), "tracked_align_slew_frames_per_s did not round-trip")
 
@@ -148,6 +150,7 @@ func _test_engine_knobs() -> void:
 	engine.max_re_split = false
 	engine.bed_renderer = BwaEngine.BED_MATRIX
 	engine.tracked_room_eq = true
+	engine.tracked_directivity = true
 	engine.tracked_align = false
 	engine.tracked_align_dead_zone = 0.0
 	engine.tracked_align_slew_frames_per_s = 0.0

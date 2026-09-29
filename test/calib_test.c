@@ -51,6 +51,157 @@ int main(void) {
     CHECK(gdb[1] == 0.f, "dead speaker left at 0 dB");
     CHECK(gdb[0] < -1.f, "live louder speaker still cut (dead one didn't poison the reference)");
 
+    /* directivity re-aim (calib_solve_corr): speaker 0 measured 6 dB down because the mic sat off
+     * its axis, equal sensitivity otherwise. Without the correction the other two get cut to match
+     * it (cut-only normalization); with corr[0] = 2 (D(ref)/D(mic)) every trim returns to 0 dB. A
+     * NaN factor reads as 1 rather than poisoning the file. */
+    {
+        MeasureResult m3[3] = { m[0], m[1], m[2] };
+        m3[0].level = (float)(0.5 / 1.0);                /* 1/r x an off-axis loss of 0.5 */
+        calib_solve_corr(m3, pos, mic, 3, fs, NULL, gdb, dms);
+        CHECK(fabs(gdb[0]) < 0.3 && fabs(gdb[1] + 6.02) < 0.3 && fabs(gdb[2] + 6.02) < 0.3,
+              "off-axis mic, no model: the others are cut to the quiet one");
+        float corr[3] = { 2.f, 1.f, 1.f };
+        calib_solve_corr(m3, pos, mic, 3, fs, corr, gdb, dms);
+        for (int i = 0; i < 3; ++i) CHECK(fabs(gdb[i]) < 0.3, "off-axis mic, model correction: trims back to ~0 dB");
+        float bad[3] = { NAN, 1.f, 1.f };
+        calib_solve_corr(m3, pos, mic, 3, fs, bad, gdb, dms);
+        CHECK(gdb[0] == gdb[0] && fabs(gdb[1] + 6.02) < 0.3, "a NaN correction factor reads as 1");
+        CHECK(fabs(dms[0] - 2.0/c*1000.0) < 0.05, "the correction never touches the delay trims");
+    }
+
+    /* aim check (calib_check_aim): tilts synthesized from a strongly directional model with the
+     * TRUE aim rotated 20 deg off the layout's, plus a per-speaker tilt constant and deterministic
+     * noise. The fit must recover the rotation to a few degrees and beat the layout aim's residual;
+     * an unrotated set must fit back to the layout aim; too few positions or a colinear set must be
+     * refused rather than answered. */
+    {
+        static Layout T; layout_default(&T);
+        T.dir.nband = 2; T.dir.nang = 5; T.dir.split_hz = 1000.f;
+        T.dir.band_hz[0] = 250.f; T.dir.band_hz[1] = 4000.f;
+        const float ang[5] = { 0, 30, 60, 90, 180 };
+        for (int a = 0; a < 5; ++a) {
+            T.dir.ang_deg[a] = ang[a];
+            T.dir.loss_db[0][a] = -0.03f * ang[a];
+            T.dir.loss_db[1][a] = -0.25f * ang[a];       /* -7.5 dB at 30 deg: a waveguide's treble */
+        }
+        directivity_derive(&T.dir);
+        const double band_hz[2] = { 300.0, 3000.0 }, f2 = 20000.0;
+        const int S = 3;
+        const float* sp = T.speakers[S].pos;
+        /* the true aim: the layout's, rotated 20 deg about a perpendicular */
+        float aim_true[3], u[3], up[3] = { 0, 1, 0 };
+        if (fabsf(T.speakers[S].aim[1]) > 0.9f) { up[0] = 1; up[1] = 0; }
+        const float* a0 = T.speakers[S].aim;
+        u[0] = a0[1]*up[2] - a0[2]*up[1]; u[1] = a0[2]*up[0] - a0[0]*up[2]; u[2] = a0[0]*up[1] - a0[1]*up[0];
+        { float l = sqrtf(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]); u[0]/=l; u[1]/=l; u[2]/=l; }
+        { float ca = cosf(20.f*3.14159265f/180.f), sa = sinf(20.f*3.14159265f/180.f);
+          for (int j = 0; j < 3; ++j) aim_true[j] = ca * a0[j] + sa * u[j]; }
+        /* seven mic positions spread over the working area around ref */
+        float micp[7][3]; float tilt[7], tilt0[7];
+        const float off[7][3] = { {0,0,0}, {0.9f,0,0}, {-0.9f,0,0}, {0,0,0.9f}, {0,0,-0.9f}, {0,0.6f,0.5f}, {0.5f,-0.5f,0} };
+        for (int k = 0; k < 7; ++k) {
+            for (int j = 0; j < 3; ++j) micp[k][j] = T.ref[j] + off[k][j];
+            float b[3]; unit_dir(sp, micp[k], b);
+            float ct = b[0]*aim_true[0] + b[1]*aim_true[1] + b[2]*aim_true[2];
+            float c0 = b[0]*a0[0] + b[1]*a0[1] + b[2]*a0[2];
+            float th_true = acosf(ct > 1 ? 1 : ct) * 180.f / 3.14159265f;
+            float th_0    = acosf(c0 > 1 ? 1 : c0) * 180.f / 3.14159265f;
+            float noise = 0.1f * sinf(3.7f * k);                     /* +/- 0.1 dB, deterministic */
+            tilt[k]  = calib_aim_tilt_db(&T.dir, th_true, band_hz, f2) - 2.0f + noise;   /* -2 dB: the box's own tilt */
+            tilt0[k] = calib_aim_tilt_db(&T.dir, th_0,    band_hz, f2) - 2.0f + noise;
+        }
+        CalibAimResult ar;
+        calib_check_aim(&T, S, micp, tilt, 7, band_hz, f2, &ar);
+        float cfit = ar.aim_fit[0]*aim_true[0] + ar.aim_fit[1]*aim_true[1] + ar.aim_fit[2]*aim_true[2];
+        float miss = acosf(cfit > 1 ? 1 : cfit) * 180.f / 3.14159265f;
+        printf("check-aim: spread %.1f deg, rms %.2f -> %.2f dB, layout-vs-fit %.1f deg (true 20), fit-vs-true %.1f deg\n",
+               ar.spread_deg, ar.rms_layout_db, ar.rms_fit_db, ar.aim_err_deg, miss);
+        CHECK(ar.ok, "check-aim: seven spread positions are enough to fit");
+        CHECK(fabs(ar.aim_err_deg - 20.f) < 4.f, "check-aim: recovers a 20 deg aim error to within 4 deg");
+        CHECK(miss < 4.f, "check-aim: the fitted axis lands on the true one");
+        CHECK(ar.rms_fit_db < 0.5f * ar.rms_layout_db && ar.rms_fit_db < 0.3f,
+              "check-aim: the fit explains the tilts far better than the layout aim");
+        calib_check_aim(&T, S, micp, tilt0, 7, band_hz, f2, &ar);
+        CHECK(ar.ok && ar.aim_err_deg < 3.f, "check-aim: a correctly aimed speaker fits back to its layout aim");
+        calib_check_aim(&T, S, micp, tilt, 2, band_hz, f2, &ar);
+        CHECK(!ar.ok && ar.npos == 2, "check-aim: two positions are refused");
+        float lin[5][3];                                    /* positions along the speaker's own axis: no spread */
+        for (int k = 0; k < 5; ++k) for (int j = 0; j < 3; ++j) lin[k][j] = sp[j] + (0.5f + 0.3f * k) * a0[j];
+        calib_check_aim(&T, S, lin, tilt, 5, band_hz, f2, &ar);
+        CHECK(!ar.ok && ar.spread_deg < 1.f, "check-aim: colinear positions are refused, not answered");
+        static Layout NM; layout_default(&NM);
+        calib_check_aim(&NM, S, micp, tilt, 7, band_hz, f2, &ar);
+        CHECK(!ar.ok, "check-aim: no model, no fit");
+    }
+
+    /* directivity re-aim under DILUTION (calib_directivity_corr with measured direct_frac): the model
+     * ratio r = D(ref)/D(mic) describes the DIRECT sound, and a live room's reverberant share does not
+     * follow the axis. A synthesized capture (a direct sound plus a high-passed reflection 3 ms
+     * later) gives a real direct_frac f in (0, 1); the factor must then land strictly between 1 and r,
+     * equal sqrt(f r^2 + 1 - f), and stay r with no measurement (f = 1). A mic at the listening
+     * point is exactly 1 whatever f is. With measure.c's gate forced open to the whole IR (f = 1, so
+     * the factor collapses to plain r), the partial-share and "between" checks went red. */
+    {
+        const double f1 = 20.0, f2 = 20000.0, bh[2] = { 300.0, 3000.0 };
+        const int nref = 48000, Dd = 300, R = 144, ncap = nref + Dd + R + 9600;
+        float* sw  = (float*)malloc((size_t)nref * sizeof(float));
+        float* cap = (float*)calloc((size_t)ncap, sizeof(float));
+        CHECK(sw && cap, "alloc (dilution)");
+        if (sw && cap) {
+            measure_sweep(sw, nref, f1, f2, fs);
+            float lp = 0.f;
+            for (int i = 0; i < nref; ++i) {
+                cap[Dd + i] += 0.5f * sw[i];
+                lp += 0.12f * (sw[i] - lp);
+                cap[Dd + R + i] += 0.4f * (sw[i] - lp);
+            }
+            MeasureResult mr;
+            CHECK(measure_response(cap, ncap, sw, nref, f1, f2, fs, bh, &mr), "measure_response (dilution)");
+            static Layout D; layout_default(&D);
+            D.dir.nband = 2; D.dir.nang = 5; D.dir.split_hz = 1000.f;
+            D.dir.band_hz[0] = 250.f; D.dir.band_hz[1] = 4000.f;
+            const float ang[5] = { 0, 30, 60, 90, 180 };
+            for (int a = 0; a < 5; ++a) {
+                D.dir.ang_deg[a] = ang[a];
+                D.dir.loss_db[0][a] = -0.03f * ang[a];
+                D.dir.loss_db[1][a] = -0.25f * ang[a];
+            }
+            directivity_derive(&D.dir);
+            static MeasureResult mm[BWA_MAX_CHANNELS];
+            for (uint32_t i = 0; i < D.count; ++i) mm[i] = mr;
+            const float micoff[3] = { D.ref[0] + 0.9f, D.ref[1], D.ref[2] };
+            float r[BWA_MAX_CHANNELS], cf[BWA_MAX_CHANNELS];
+            CHECK(calib_directivity_corr(&D, micoff, 2.0 * f1, 0.5 * f2, NULL, r), "corr (free field)");
+            CHECK(calib_directivity_corr(&D, micoff, 2.0 * f1, 0.5 * f2, mm, cf), "corr (diluted)");
+            const double f = mr.direct_frac;
+            int nlev = 0, between = 1, formula = 1; double maxr = 1.0; int imax = 0;
+            for (uint32_t i = 0; i < D.count; ++i) {
+                if (fabs(r[i] - 1.0) < 0.05) continue;       /* bearing barely moved: nothing to dilute */
+                ++nlev;
+                double lo = r[i] < 1.f ? r[i] : 1.0, hi = r[i] < 1.f ? 1.0 : r[i];
+                if (!(cf[i] > lo + 1e-3 && cf[i] < hi - 1e-3)) between = 0;
+                if (fabs(cf[i] - sqrt(f * r[i] * r[i] + 1.0 - f)) > 1e-5) formula = 0;
+                if (fabs(log(r[i])) > fabs(log(maxr))) { maxr = r[i]; imax = (int)i; }
+            }
+            printf("dilution: f=%.3f; e.g. spk %d r=%+.2f dB -> corr %+.2f dB (%d speakers moved)\n",
+                   f, imax, 20.0 * log10(maxr), 20.0 * log10(cf[imax]), nlev);
+            CHECK(f > 0.3 && f < 0.9, "dilution: the synthesized room gives a partial direct share");
+            CHECK(nlev >= 4, "dilution: the off-reference mic moves several speakers' bearings");
+            CHECK(between, "dilution: every diluted factor lies strictly between 1 and the free-field ratio");
+            CHECK(formula, "dilution: the factor is sqrt(f r^2 + 1 - f)");
+            float cref[BWA_MAX_CHANNELS];
+            calib_directivity_corr(&D, D.ref, 2.0 * f1, 0.5 * f2, mm, cref);
+            int unity = 1;
+            for (uint32_t i = 0; i < D.count; ++i) if (cref[i] != 1.f) unity = 0;
+            CHECK(unity, "dilution: a mic AT the listening point gives exactly 1 for any direct share");
+            mm[0].direct_frac = NAN;
+            calib_directivity_corr(&D, micoff, 2.0 * f1, 0.5 * f2, mm, cf);
+            CHECK(cf[0] == r[0], "dilution: a NaN direct share reads as 1 (the free-field factor)");
+        }
+        free(sw); free(cap);
+    }
+
     /* writeback round-trip: write a layout, apply trims, reload, confirm fields updated + dbap kept */
     const char* IN = "bwa_calib_in.json", *OUT = "bwa_calib_out.json";
     FILE* f = fopen(IN, "wb");

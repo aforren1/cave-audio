@@ -23,6 +23,8 @@ typedef struct { float fc, gain_db, q; } RoomEqSection;
 
 typedef struct {
     float    pos[3];        /* room space, right-handed, meters */
+    float    aim[3];        /* unit vector along the acoustic axis (the `aim` field, else toward ref).
+                             * Only the directivity model reads it (layout_speaker_off_axis_deg). */
     float    gain_lin;      /* per-speaker level trim (linear) */
     uint32_t delay_samples; /* per-speaker delay for arrival-time alignment */
     uint16_t eq_len;        /* per-speaker correction-FIR length (0 = none) */
@@ -45,6 +47,30 @@ typedef struct {
     float    q [BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode Qs */
     float    gain_db[BWA_RQ_GRID_MAX][BWA_CHANNELS][BWA_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
 } RoomEqGrid;
+
+/* Speaker directivity model (docs/layout-schema.md `directivity`, written by
+ * tools/directivity/clf_to_json.py from the vendor's CLF simulation file): the off-axis loss of ONE
+ * speaker model, in dB relative to on-axis, per third-octave band and per degree off the acoustic
+ * axis, assumed the same for every speaker in the layout and axisymmetric about its aim. Three
+ * consumers: bwa_calibrate corrects a trim measured off a speaker's axis back to what the listening
+ * point hears (calib_solve_corr); rt.c's tracked directivity compensation re-references the loss
+ * from the listening point onto the live listener each block (directivity_track), as a broadband
+ * gain plus a high shelf at split_hz; and the array-sim audition (arraysim.c) plays each virtual
+ * speaker's loss toward the listener through a graphic EQ fitted to the full table. lo_db/hi_db
+ * are the two half-band curves the comp uses, derived at load (directivity_derive) so the comp
+ * never touches the table on the audio thread. */
+#define BWA_DIR_MAX_BANDS  32
+#define BWA_DIR_MAX_ANGLES 37
+typedef struct {
+    uint8_t nband;                            /* 0 = no model (every consumer bypasses) */
+    uint8_t nang;                             /* 2..37, ang_deg ascending from 0 */
+    float   band_hz[BWA_DIR_MAX_BANDS];       /* ascending band centers */
+    float   ang_deg[BWA_DIR_MAX_ANGLES];      /* [0] = 0 (on axis) .. last <= 180 */
+    float   loss_db[BWA_DIR_MAX_BANDS][BWA_DIR_MAX_ANGLES];   /* <= 0 in practice; [band][angle] */
+    float   split_hz;                         /* the two-band split the runtime comp shelves at */
+    float   lo_db[BWA_DIR_MAX_ANGLES];        /* derived: power-mean loss over bands BELOW split_hz */
+    float   hi_db[BWA_DIR_MAX_ANGLES];        /* derived: power-mean loss over bands AT/ABOVE it */
+} Directivity;
 
 /* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~176 KB, almost all
  * of it the 512-tap FIR each Speaker embeds, and a binding may call in from a 512 KB thread. Keep it
@@ -75,6 +101,7 @@ typedef struct {
     float    atten_min_lin;
     uint32_t max_delay_samples;     /* max over speakers; sizes the alignment delay lines */
     RoomEqGrid rq_grid;             /* tracked room EQ grid (npos = 0 when the layout has none) */
+    Directivity dir;                /* speaker directivity model (nband = 0 when the layout has none) */
 } Layout;
 
 /* A sane default: a 3 m-cube 3x3x3 boundary grid (minus center), FLOOR-origin — x/z at
@@ -89,6 +116,33 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 
 /* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
 void layout_compute_ref(Layout* L);
+
+/* Point every speaker's aim at `ref` (the schema's default when a record has no `aim`). Needs
+ * `count` + `ref` set. A speaker sitting exactly on ref keeps (0,0,1). For hand-built layouts. */
+void layout_default_aims(Layout* L);
+
+/* Degrees between speaker k's acoustic axis and the direction from it to `p` (0 = p is on axis,
+ * 180 = directly behind). Pure, alloc-free, audio-thread safe; 0 when p sits on the speaker. */
+float layout_speaker_off_axis_deg(const Layout* L, uint32_t k, const float p[3]);
+/* The same angle from a bare position + unit aim, for a consumer that copied them out of the
+ * Layout (the array-sim room stage, arraysim.c). The one implementation both go through. */
+float directivity_off_axis_deg(const float pos[3], const float aim[3], const float p[3]);
+
+/* Directivity model helpers (see the struct). All pure and alloc-free. */
+/* Fill lo_db/hi_db from band_hz/loss_db/split_hz. Call after building a Directivity by hand;
+ * layout_load does it. No bands below the split reads as omni there (lo = 0); none above it makes
+ * the shelf 0 (hi = lo). */
+void  directivity_derive(Directivity* d);
+/* The two half-band losses (dB) at `angle_deg` off axis, linear in angle over the table and
+ * clamped at its ends. Both 0 when the model is empty. Audio thread OK (rt.c calls it per block). */
+void  directivity_lookup(const Directivity* d, float angle_deg, float* lo_db, float* hi_db);
+/* The AMPLITUDE loss (linear, <= 1 typically) averaged the way measure.c's level is: uniformly in
+ * frequency over [f_lo, f_hi] Hz (log-interpolated between band centers, clamped outside them).
+ * Control thread (bwa_calibrate). 1 when the model is empty. */
+float directivity_loss_lin(const Directivity* d, float angle_deg, float f_lo, float f_hi);
+/* The loss (dB) at one angle and one frequency: linear in angle over the table, linear in log f
+ * between band centers, clamped at the table's ends. 0 when the model is empty. Pure. */
+float directivity_loss_db_at(const Directivity* d, float angle_deg, float f_hz);
 
 /* The array's angular scale: the mean nearest-neighbor angular separation (RADIANS) of the speaker
  * directions seen from `ref`. 37.5 deg on the default 26-speaker cube grid. Returns 0 on a

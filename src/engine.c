@@ -19,6 +19,7 @@
 #include "spatial/allrad.h"
 #include "spatial/epad.h"
 #include "binaural/binaural.h"
+#include "binaural/arraysim.h"      /* the array sim's room: distance, delay, directivity */
 #include "tracking/natnet.h"
 #include "binaural/steam_decode.h"   /* phonon-free interfaces; impls linked only when BWA_HAVE_STEAMAUDIO */
 #include "core/profile.h"
@@ -98,6 +99,8 @@ struct bwa_engine {
     AssetCache* assets;           /* refcounted by-path cache over the same loaders (assets.c);
                                    * owns the handles it hands out, so bwa_unload_sound refuses them */
     Monitor*    monitor;          /* headphone profiles: 26->stereo decode (+ direct field in binaural) */
+    ArraySim*   asim;             /* cave_sim/cave_both: the array sim's room (arraysim.h), applied to a copy
+                                   * of the bus before either decoder reads it; NULL in cave and binaural */
     Layout      layout;           /* effective speaker geometry (for the Steam decoder at start) */
     int         layout_failed;    /* an EXPLICIT layout_path failed to load at create — engine is on
                                    * the 26-grid fallback and bwa_start refuses with BWA_ERR_LAYOUT */
@@ -294,16 +297,20 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const bwa_times
     const float* direct = rt_direct_ambi(e->rt);            /* non-NULL only in BWA_PROFILE_BINAURAL */
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
+    /* cave_sim: the array sim's room (each virtual speaker's distance gain, propagation delay and
+     * off-axis loss toward the listener), on a copy. asim is NULL in binaural, so bus26 IS scratch26
+     * there and that profile's decode reads exactly what it always read. */
+    const float* bus26 = arraysim_apply(e->asim, e->scratch26, p, rt_speed_of_sound(e->rt), n);
     BWA_ZONE_BEGIN(zbin, "binaural decode");                /* virtual speakers (+ direct field) -> HRTF -> 2 ch */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (e->steam) {
         const RtDirectVoice* dvs = NULL;                    /* mode 2: the per-voice point taps */
         uint32_t ndv = rt_direct_voices(e->rt, &dvs);
-        steam_monitor_process(e->steam, e->scratch26, direct, dvs, ndv, p, q, dev2, n);
+        steam_monitor_process(e->steam, bus26, direct, dvs, ndv, p, q, dev2, n);
     }
     else
 #endif
-    monitor_process(e->monitor, e->scratch26, direct, p, q, dev2, n);
+    monitor_process(e->monitor, bus26, direct, p, q, dev2, n);
     engine_hpeq(e, dev2, n);                                /* headphone correction (post-decode) */
     engine_clamp2(dev2, n);                                 /* protection clamp (see engine_clamp2) */
     if (bwa_null_sink_tap) bwa_null_sink_tap(dev2, 2, n);   /* test hook: observe the device-bound
@@ -327,16 +334,19 @@ static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_ti
     /* Seqlock on the back buffer. The BUFFER itself stays plain float (an audio block is not
      * something to make atomic); the counter carries the ordering, and the fence below is what
      * keeps the buffer writes from sinking above the odd store. */
+    /* the array sim's room (cave_sim's, above) reads dev26 and writes its OWN scratch: dev26 is the
+     * array's device buffer, and the array must never hear the monitor's room */
+    const float* mon26 = arraysim_apply(e->asim, dev26, p, rt_speed_of_sound(e->rt), n);
     const uint32_t sq = atomic_load_explicit(&e->mon_seq[bk], memory_order_relaxed);
     atomic_store_explicit(&e->mon_seq[bk], sq + 1u, memory_order_relaxed);
     atomic_thread_fence(memory_order_seq_cst);          /* odd: rewrite in progress — a reader still on
                                                          * this buffer (drifted a full period behind on
                                                          * its own device clock) falls back to last-good */
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e->steam) steam_monitor_process(e->steam, dev26, NULL, NULL, 0, p, q, e->mon_buf[bk], n);
+    if (e->steam) steam_monitor_process(e->steam, mon26, NULL, NULL, 0, p, q, e->mon_buf[bk], n);
     else
 #endif
-    monitor_process(e->monitor, dev26, NULL, p, q, e->mon_buf[bk], n);
+    monitor_process(e->monitor, mon26, NULL, p, q, e->mon_buf[bk], n);
     engine_hpeq(e, e->mon_buf[bk], n);                  /* headphone correction on the monitor tap */
     engine_clamp2(e->mon_buf[bk], n);                   /* protection clamp (see engine_clamp2) */
     atomic_store_explicit(&e->mon_seq[bk], sq + 2u, memory_order_release);  /* even: stable */
@@ -456,6 +466,15 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
         e->monitor = monitor_create(&e->layout, e->cfg.sample_rate);   /* count-driven virtual speakers */
         if (!e->monitor) { assets_destroy(e->assets); rt_destroy(e->rt); free(e); return NULL; }
     }
+    /* the array sim's room (arraysim.h): only where the bus channels ARE physical speakers being
+     * auditioned, and always there, model or no model (distance and arrival time are the room's too).
+     * NULL is an allocation failure, fatal like the monitor's own. */
+    if (e->profile == BWA_PROFILE_CAVE_SIM || e->profile == BWA_PROFILE_CAVE_BOTH) {
+        e->asim = arraysim_create(&e->layout, e->cfg.sample_rate, BWA_MAX_BLOCK);
+        if (!e->asim) {
+            monitor_destroy(e->monitor); assets_destroy(e->assets); rt_destroy(e->rt); free(e); return NULL;
+        }
+    }
     /* BINAURAL routes point voices onto the direct SH bus for the engine's whole life (a create-
      * time topology, like the profile itself — never toggled once the audio thread exists). */
     rt_set_direct_ambi(e->rt, e->profile == BWA_PROFILE_BINAURAL);
@@ -536,6 +555,7 @@ bwa_result bwa_start(bwa_engine* e) {
 
     const uint32_t sr = e->cfg.sample_rate, bs = e->cfg.block_size;
     e->cap = bs;
+    arraysim_reset(e->asim);          /* no audio thread yet: a restart must not replay the last run's rings */
 
     /* exact_rate is the ARRAY's rule and only the array's: a resampled array shifts every
      * per-speaker delay, which is the whole point of the alignment stage. A headphone sink may
@@ -619,12 +639,15 @@ bwa_result bwa_start(bwa_engine* e) {
      * in general) — so build it now that the sink is open and its real block size is known.
      * Non-fatal: render falls back to the simple-pan monitor if NULL. Torn down in
      * engine_close_devices. BINAURAL asks for the per-voice fleet (one IPLBinauralEffect per
-     * voice slot — the mode-2 point taps); the sim profiles decode the bus only. */
+     * voice slot — the mode-2 point taps); the sim profiles decode the bus only, and re-encode each
+     * virtual speaker from the LIVE listener position (parallax: those speakers are physical), while
+     * BINAURAL keeps the fixed-from-ref encode its synthesized-diffuse bus is decoded through. */
     if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM ||
         e->profile == BWA_PROFILE_CAVE_BOTH)
         e->steam = steam_monitor_create(&e->layout, e->cfg.sample_rate,
                                         bwa_sink_block_size(e->sink), e->cfg.hrtf_path,
-                                        e->profile == BWA_PROFILE_BINAURAL ? BWA_VOICE_SLOTS : 0);
+                                        e->profile == BWA_PROFILE_BINAURAL ? BWA_VOICE_SLOTS : 0,
+                                        e->profile != BWA_PROFILE_BINAURAL);
 
     /* reflection bed: a separate reflections sim + the audio-thread convolution registered as the rt
      * bus tap. Same frameSize-fixed-at-create reason as the monitor — build it now. Non-fatal: if it
@@ -767,6 +790,7 @@ void bwa_destroy(bwa_engine* e) {
     steam_scene_destroy(e->scene);                      /* join the occlusion sim thread before rt is freed */
 #endif
     monitor_destroy(e->monitor);
+    arraysim_destroy(e->asim);
     assets_destroy(e->assets);                          /* joins the loader thread before rt's tables go */
     rt_destroy(e->rt);
     free((void*)e->cfg.layout_path);                    /* owned copies from bwa_create */
@@ -1272,6 +1296,7 @@ void bwa_set_max_re(bwa_engine* e, bool on) {
 void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) { e->cur.max_re_split = on; rt_set_max_re_split(e->rt, on); } }
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) { e->cur.spread_mode = mode; rt_set_spread_mode(e->rt, (int)mode); } }
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) { e->cur.tracked_room_eq = on; rt_set_room_eq_dyn(e->rt, on); } }
+void bwa_set_tracked_directivity(bwa_engine* e, bool on) { if (e) { e->cur.tracked_directivity = on; rt_set_tracked_directivity(e->rt, on); } }
 void bwa_set_tracked_align(bwa_engine* e, bool on) {
     if (e) { e->cur.tracked_align = on; rt_set_tracked_align(e->rt, on); }
 }
@@ -1308,6 +1333,7 @@ void bwa_tuning_preset(bwa_setup setup, bwa_tuning* out) {
     out->max_re_split    = false;            /* no evidence either way */
     out->bed_renderer    = BWA_BED_MATRIX;   /* parametric's claim needs a walking listener */
     out->tracked_room_eq = true;             /* no-op without a room_eq_grid; harmless when absent */
+    out->tracked_directivity = true;         /* no-op without a directivity model; harmless when absent */
     out->tracked_align   = false;            /* needs a CALIBRATED layout; measures worse without one */
     out->align_dead_zone_m       = 0.f;      /* 0 = the built-in guards */
     out->align_slew_frames_per_s = 0.f;
@@ -1377,6 +1403,7 @@ bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t) {
     bwa_set_max_re_split(e, t->max_re_split);
     bwa_set_bed_renderer(e, t->bed_renderer);
     bwa_set_tracked_room_eq(e, t->tracked_room_eq);
+    bwa_set_tracked_directivity(e, t->tracked_directivity);
     /* guards before the enable, so turning it on never runs a block at stale guards */
     bwa_set_tracked_align_guards(e, t->align_dead_zone_m, t->align_slew_frames_per_s);
     bwa_set_tracked_align(e, t->tracked_align);

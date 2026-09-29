@@ -98,6 +98,15 @@ self-consistent at any temperature and recovers the geometry it started from. Th
 generate at one `c` and solve at another, and every solved position inflates by their ratio,
 silently. Then `--localize` writes the result back.
 
+**Projectors.** The CAVE's projectors warm the room by about 3 F (1.7 C) over a long session,
+which is 1 m/s of `c`, 12 mm of range at 4 m and 35 microseconds of arrival time. That is under
+the survey's other error terms and far under the 1 ms scale where alignment reads, so it needs
+no second calibration. What the projectors do change is the noise floor: their fans sit under the
+direct-sound gate and the RT60 decay fit. So warm the room up with them on, calibrate in that
+state with `--temp` set to the air temperature you read then, and leave them on for every pass.
+That is the state the listener is in. If the first sweep's IR is dirty, you have a noise problem,
+not a temperature one; treat it as one.
+
 **This does not change what you hear.** 4 cm of speaker position error at 3 m is under half a degree
 of direction error, against the 4 to 6 degrees the array carries anyway. Set the temperature so the
 survey is honest as a measurement, and so it agrees with the install drawings when you cross-check
@@ -138,6 +147,46 @@ it. Do not expect it to be audible.
   physically**: you cannot DSP reverb away for a moving listener (it is non-invertible and
   position-dependent). The binaural monitor (headphones, room-free) is the clean reference.
   Comparing array-vs-monitor measures how much the room is adding.
+- **`--check-aim`** (with `--localize`, and a layout carrying a `directivity` model): fit each
+  speaker's acoustic axis from the captures `--localize` already took. Each mic position sees
+  each speaker at a known bearing, and the deconvolved response's high-to-mid band tilt changes
+  with that bearing the way the model says, while the speaker's own response cancels out as a
+  per-speaker constant. The tilt is the DIRECT sound's: `measure_response` gates the impulse
+  response from 1 ms before its peak to just before the first reflection (the `--eq` gate
+  policy, 4 ms when no reflection shows). The reverberant part does not follow the axis, and
+  left in, it dilutes the bearing dependence so the fit reads smaller errors than are there.
+  The tilt bands are 1 to 3 kHz against 3 kHz up, not the 300 Hz and 3 kHz level bands: a gate
+  of a few ms smears the spectrum over about 1/gate (250 Hz at 4 ms), and the gate changes with
+  the mic position, so a band edge at 300 Hz would carry a position-dependent window error into
+  exactly what the fit compares. That costs contrast: on the 4410A the tilt at 45 degrees is
+  2.8 dB instead of 3.8. The report fits the whole-response tilt too, in its own column and in
+  a summary line beside the gated median, so the dilution is visible on every run.
+  `calib_check_aim` grid-searches the direction that explains the tilts
+  best and reports it against the layout's `aim`, with the residual before and after. A speaker
+  over 15 degrees out with a clearly better fit is flagged: the mount is aimed wrong, or the
+  layout's `aim` is. Resolution is set by the bearing spread the positions give it, roughly
+  10 degrees over a 3 m working area, so it refuses under 8 degrees of spread rather than
+  guess, and it never fits the balloon itself. The run also prints the residual every speaker
+  shares as a function of bearing: a slope there is a loss the model does not carry, the screens
+  being the obvious one, and not an aim error. Diagnostic only, nothing is written back.
+  `--simulate --sim-aim-error 20` rotates every simulated speaker's true axis by 20 degrees, so
+  the check has a known error to recover; that is how you know it is measuring anything. Add
+  `--sim-room` and the capture has a room to dilute it: on the 26-speaker example with the
+  4410A model and 7 positions, the gated fit still reads a median 21.0 degrees while the
+  whole-response fit reads 13.6. The `calibrate_sim_room_aim` ctest pins both.
+- **`--simulate --sim-room [absorption]`**: the simulator's room. Without it a simulated capture
+  is anechoic, so the direct-sound gate and everything built on it (`--check-aim`'s tilt, the
+  trims' directivity correction) have nothing to act on. With it, the array sits in a shoebox
+  0.5 m larger than the speakers on every side. Each speaker adds image sources of orders 1
+  and 2 (24 of them), each leaving at its own departure angle off the speaker's axis and so
+  carrying the directivity model's loss at that angle, plus 1/r and `sqrt(1 - absorption)` per
+  bounce, generated as the same analytic delayed sweep the direct sound is. Past order 2 a
+  deterministic noise tail stands in: Sabine RT60 for the box, the room equation's diffuse
+  level for what orders 1 and 2 did not already deliver, shaped by the model's power response,
+  starting two mean free paths after the direct sound. Absorption defaults to 0.3 (RT60
+  0.36 s on the 26-speaker example). The whole `--localize --check-aim` run above, 182
+  captures, takes 18 s instead of 11 s anechoic. It is a test fixture, not a room model: no
+  frequency-dependent absorption, no scattering, no air absorption.
 - **`--check`**: drift detector. One fast pass from the mic position. `calib_check_drift` compares
   each speaker's measured distance to its stored position (it removes the common latency as the
   median residual, so it's robust to a few moved speakers) and flags anything beyond ~20 mm. Catches a
@@ -223,6 +272,85 @@ it. Do not expect it to be audible.
   the direct-sound speaker correction for moving installs. `room_eq` and `room_eq_grid` are mutually
   exclusive in one layout file (the loader rejects both together; the grid writeback removes a stale
   static `room_eq` for you).
+
+## Speaker directivity from the vendor's simulation file
+
+Speaker makers publish measured directivity balloons for room simulators. Genelec's page
+for the 4410A ([genelec.com/4410a](https://www.genelec.com/4410a), Downloads) has one in the
+Common Loudspeaker Format, `Genelec_Oy-4410A.CF2`: 27 third-octave bands from 40 Hz to
+16 kHz, each a full sphere at 5 degree resolution, in dB relative to on-axis. The 4010A's
+EASE and GLL files on the same page are proprietary binaries the tooling does not read.
+
+Convert it once and the layout carries the result:
+
+```
+uv run tools/directivity/clf_to_json.py Genelec_Oy-4410A.CF2 --into cave_layout.json
+```
+
+That writes a top-level `directivity` block (format in
+[layout-schema.md](./layout-schema.md)). The converter decodes the binary itself and
+checks its decode against the file's own coverage-angle lists before it writes anything.
+`examples/genelec_4410a_directivity.json` is the standalone result for the 4410A. The
+model is one per layout, so a mixed array takes its dominant model, and it is
+axisymmetric about each speaker's axis: the balloon's planes are averaged, because the
+layout does not know how a speaker is rolled on its mount. On the 4410A that costs up to
+3 dB around 2 to 2.5 kHz for a box rolled 90 degrees, and under 1 dB elsewhere.
+
+Then tell the layout where each speaker points. A speaker record's `aim` is a direction
+vector along its acoustic axis. Leave it out and the loader aims the speaker at the
+listening point, which is the CAVE's case and the dome's.
+
+**What it changes in `bwa_calibrate`.** The default trim run prints a directivity report:
+each speaker's bearing off its axis as seen from the mic and from the listening point, the
+model's loss at each, and the correction it applies. The correction re-aims the measured
+sensitivity from the mic's bearing to the listening point's, the way the 1/r term is
+already divided out, so a mic that could not sit at the listening point still produces the
+trims that point hears. With the mic at the listening point every correction is 0 dB by
+construction and the trims are exactly what they were. `--ignore-directivity` skips it.
+
+The model describes the direct sound, but the trims are built on the whole response, and in a
+live room part of that is reverberant energy that does not follow the axis. Applying the
+model's ratio `r = D(ref) / D(mic)` to all of it over-corrects. So the correction acts on the
+direct share only. Each capture's `direct_frac` is `f`, the gated share of its energy over the
+level band, and the amplitude factor is:
+
+```
+corr = sqrt(f * r^2 + (1 - f))
+```
+
+An anechoic capture gets `r`, a fully diffuse one gets 1, and a mic at the listening point
+still gets exactly 1 whatever `f` is. The report prints `f` per speaker as `direct`, after the
+sweeps, and a one-line min, median and max. An anechoic simulated capture reads 1.00 on every
+speaker. `--simulate --sim-room --mic 0.6 1.2 0.4` on the 26-speaker example reads 0.29 to
+0.74, median 0.42, so there the correction applies well under half of the model's ratio (the
+`calibrate_sim_room_trim` ctest pins shares below 1). `calib_directivity_corr` is the one
+implementation, so `bwa_calibrate` and `calib_view` write the same trims from the same captures.
+
+**The correction needs the mic's real position.** `bwa_calibrate` applies it only when you pass
+`--mic`: the default mic, `(0, 0, 0)`, is the floor origin, and its bearing off every speaker
+would put several dB of fictitious correction into the trims. Without `--mic` it says so and
+leaves the trims as measured. `calib_view`'s Capture tab follows the same rule. Its mic field
+starts at the loaded layout's listening point, the correction stays off until you edit the
+field, and a one-line note under the field says which is in effect. "use listening point" puts
+the field back and turns the correction off again.
+
+The report is also a first aim check. A speaker whose bearing from the listening point is
+over 30 degrees is flagged: either the mount is aimed wrong or the layout's `aim` is, and the
+difference is audible treble at the sweet spot. That only catches an `aim` that disagrees with
+the geometry, though. Whether the box is physically pointed where the layout says is what
+`--check-aim` measures (see "Modes"), from the captures `--localize` already takes.
+
+**What it changes at runtime.** With the model loaded, the engine follows each speaker's
+off-axis loss onto the tracked listener (`bwa_set_tracked_directivity`, on by default,
+identity at the listening point). The headphone audition of the array (`cave_sim`, and the
+`cave_both` monitor) plays each virtual speaker's physical off-axis loss toward the listener at
+the model's full resolution, with its distance and arrival time, so a walk on headphones hears
+the comp's two-band residual against the loss it is fighting. What that can and cannot buy you:
+[spatialization.md](./spatialization.md#compensating-speaker-directivity-for-the-tracked-listener-bwa_set_tracked_directivity-on-by-default).
+
+Not yet: the `--eq` correction FIR is still designed from the mic's bearing. Measured
+off-axis, it flattens the off-axis response, which is right for a mic at the listening
+point and wrong elsewhere. Dividing the model's off-axis curve out of it is a follow-on.
 
 ## Zylia ZM-1: full 3D from one placement
 
@@ -466,7 +594,8 @@ a bad mic placement, or a bogus `--localize` solve is one glance, not an evening
 It is the **calibration station**: one window for the rig session. The **Capture tab** runs the
 calibration itself (sweep, solve, write, on a worker thread, through the same capture backends
 and measure/solve DSP as the CLI; simulate hardware-free, ASIO full-duplex at the rig). One
-button loads the result into Diff for review before you accept it. The **Zylia tab** (live
+button loads the result into Diff for review before you accept it. Its directivity correction
+follows the CLI's `--mic` rule (see "Speaker directivity" above): off until you set the mic. The **Zylia tab** (live
 clap-DOA, see "Bring-up" above) covers the ZM-1.
 
 `bwa_calibrate` remains the headless CLI over the same code: scriptable, and the only place for
@@ -477,5 +606,6 @@ the multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
 ## What feeds the engine
 
 `cave_layout.json` carries per-speaker `position`, `gain_db`, `delay_ms` (consumed by `dbap.c` +
-`align.c`). Model the room itself, if you want simulated reverb, in Steam Audio as geometry +
+`align.c`), and optionally each speaker's `aim` plus one `directivity` model (consumed by the
+tracked directivity compensation in `rt.c` + `align.c`). Model the room itself, if you want simulated reverb, in Steam Audio as geometry +
 material absorption (`steam_reflect.c`) tuned to creative intent, **not** to the measured RT60.

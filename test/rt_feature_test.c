@@ -66,6 +66,18 @@ static void lc_settle(RtCore* c, int nb) {              /* silence: let the comp
     for (int b = 0; b < nb; ++b) rt_render(c, bus, N, &ts);
 }
 
+/* A bus tap that plants an 8 kHz tone on one channel, the way the FDN or the reflection bed puts its
+ * tail on the bus: the directivity section uses it to put signal on the bus in direct-binaural mode,
+ * where point voices never reach it. ud = a per-core phase counter. */
+static int dir_tap_ch = 0;
+static void dir_tone_tap(void* ud, float* b, uint32_t n, const float* lp, const float* lq, const float* aux) {
+    uint64_t* ph = (uint64_t*)ud;
+    (void)lp; (void)lq; (void)aux;
+    for (uint32_t i = 0; i < n; ++i)
+        b[(size_t)dir_tap_ch * n + i] += 0.1f * sinf(6.2831853f * 8000.f * (float)((*ph + i) % RATE) / (float)RATE);
+    *ph += n;
+}
+
 /* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape,
  * open at both poles. 24 speakers, so its RtCore is 24 channels wide, not 26. */
 static void make_barrel(Layout* L) {
@@ -575,6 +587,144 @@ int main(void) {
             }
             remove(IMP);
         } else CHECK(0, "write impulse wav (tracked align)");
+    }
+
+    /* tracked directivity compensation (rt_set_tracked_directivity): with a directivity model in the
+     * layout, a listener who walks off speaker K's axis gets channel K boosted by the model's loss at
+     * that angle, re-referenced from the listening point: a 100 Hz tone by the low half-band loss, an
+     * 8 kHz tone by the high one (the shelf carries the difference). Measured as the level ratio of
+     * two cores at the SAME listener position, one with the comp on and one off, so the panner's own
+     * response to the move cancels. At the listening point the comp is exact identity, bit for bit. */
+    {
+        const char* T1 = "bwa_rt_dir_100.wav", *T2 = "bwa_rt_dir_8k.wav";
+        if (write_sine_wav(T1, 100.0, 4 * N) && write_sine_wav(T2, 8000.0, 4 * N)) {
+            static Layout DL;
+            DL = LD;                                      /* aims toward ref (layout_default set them) */
+            DL.dir.nband = 2; DL.dir.nang = 5; DL.dir.split_hz = 1000.f;
+            DL.dir.band_hz[0] = 250.f; DL.dir.band_hz[1] = 4000.f;
+            const float ang[5] = { 0, 30, 60, 90, 180 };
+            for (int a = 0; a < 5; ++a) {                 /* lo: -0.1 dB/deg, hi: -0.3 dB/deg */
+                DL.dir.ang_deg[a] = ang[a];
+                DL.dir.loss_db[0][a] = -0.1f * ang[a];
+                DL.dir.loss_db[1][a] = -0.3f * ang[a];
+            }
+            directivity_derive(&DL.dir);
+            const int K = 7;
+            const float qid[4] = { 0, 0, 0, 1 };
+            /* a listener 30 deg off speaker K's axis: ref + d*tan(30) along a direction
+             * perpendicular to the axis, where d = |ref - pos_K| */
+            float axis[3], perp[3], lp[3];
+            unit_dir(DL.speakers[K].pos, DL.ref, axis);
+            { float up[3] = { 0, 1, 0 };
+              if (fabsf(axis[1]) > 0.9f) { up[0] = 1; up[1] = 0; }
+              perp[0] = axis[1]*up[2] - axis[2]*up[1]; perp[1] = axis[2]*up[0] - axis[0]*up[2]; perp[2] = axis[0]*up[1] - axis[1]*up[0];
+              float l = sqrtf(perp[0]*perp[0] + perp[1]*perp[1] + perp[2]*perp[2]);
+              perp[0] /= l; perp[1] /= l; perp[2] /= l; }
+            float dx = DL.ref[0]-DL.speakers[K].pos[0], dy = DL.ref[1]-DL.speakers[K].pos[1], dz = DL.ref[2]-DL.speakers[K].pos[2];
+            float d = sqrtf(dx*dx + dy*dy + dz*dz), t = d * tanf(30.f * 3.14159265f / 180.f);
+            for (int j = 0; j < 3; ++j) lp[j] = DL.ref[j] + t * perp[j];
+            float th = layout_speaker_off_axis_deg(&DL, (uint32_t)K, lp);
+            printf("tracked directivity: listener placed %.1f deg off speaker %d's axis\n", th, K);
+            CHECK(fabs(th - 30.f) < 0.5, "tracked directivity: the test geometry puts the listener 30 deg off axis");
+
+            /* one measurement: the level of channel K over 16 blocks with tone `snd` looping at K */
+            #define DIR_LEVEL(core, snd, out) do {                                                  \
+                uint32_t h_ = rt_source_create(core);                                              \
+                rt_source_play(core, h_, snd, true); rt_source_set_gain(core, h_, 0.05f);          \
+                set_pos_spk(core, h_, K); rt_commit(core);                                         \
+                bwa_timestamp ts_ = { 0, 0 }; double e_ = 0;                                       \
+                for (int b_ = 0; b_ < 8; ++b_) rt_render(core, bus, N, &ts_);                      \
+                for (int b_ = 0; b_ < 16; ++b_) { rt_render(core, bus, N, &ts_);                    \
+                    for (int i_ = 0; i_ < N; ++i_) e_ += (double)bus[(size_t)K*N+i_]*bus[(size_t)K*N+i_]; } \
+                rt_source_destroy(core, h_); rt_commit(core);                                      \
+                for (int b_ = 0; b_ < 4; ++b_) rt_render(core, bus, N, &ts_);                      \
+                (out) = 10.0 * log10(e_ + 1e-30);                                                  \
+            } while (0)
+            RtCore* ca = rt_create(8, 4, RATE, CH);       /* comp on (the default) */
+            RtCore* cb = rt_create(8, 4, RATE, CH);       /* comp off */
+            CHECK(ca && cb, "rt_create (tracked directivity)");
+            if (ca && cb) {
+                CHECK(rt_set_layout(ca, &DL) && rt_set_layout(cb, &DL), "rt_set_layout (directivity model)");
+                rt_set_tracked_directivity(cb, 0);
+                uint32_t a1 = rt_load_sound(ca, T1, err, sizeof err), a2 = rt_load_sound(ca, T2, err, sizeof err);
+                uint32_t b1 = rt_load_sound(cb, T1, err, sizeof err), b2 = rt_load_sound(cb, T2, err, sizeof err);
+                /* (1) at the listening point: bit-identical, the stage never engages */
+                {
+                    static float tmp[CH * N];
+                    uint32_t ha = rt_source_create(ca), hb = rt_source_create(cb);
+                    rt_source_play(ca, ha, a2, true); rt_source_play(cb, hb, b2, true);
+                    set_pos_spk(ca, ha, K); set_pos_spk(cb, hb, K);
+                    rt_commit(ca); rt_commit(cb);
+                    int same = 1; bwa_timestamp ts = { 0, 0 };
+                    for (int b = 0; b < 12; ++b) {
+                        rt_render(ca, bus, N, &ts); memcpy(tmp, bus, sizeof tmp);
+                        rt_render(cb, bus, N, &ts);
+                        if (memcmp(tmp, bus, sizeof tmp) != 0) same = 0;
+                    }
+                    CHECK(same, "tracked directivity: at the listening point the comp is bit-exact identity");
+                    rt_source_destroy(ca, ha); rt_source_destroy(cb, hb); rt_commit(ca); rt_commit(cb);
+                    lc_settle(ca, 4); lc_settle(cb, 4);
+                }
+                /* (2) 30 deg off axis: +3 dB at 100 Hz (lo), +9 dB at 8 kHz (hi), after the glide */
+                rt_set_listener(ca, lp, qid); rt_set_listener(cb, lp, qid);
+                rt_commit(ca); rt_commit(cb);
+                lc_settle(ca, 120); lc_settle(cb, 120);   /* 9 dB at 24 dB/s = 0.4 s; 120 blocks = 0.64 s */
+                double on_lo, off_lo, on_hi, off_hi;
+                DIR_LEVEL(ca, a1, on_lo); DIR_LEVEL(cb, b1, off_lo);
+                DIR_LEVEL(ca, a2, on_hi); DIR_LEVEL(cb, b2, off_hi);
+                printf("tracked directivity: 30 deg off axis -> channel %d +%.2f dB at 100 Hz (want 3), +%.2f dB at 8 kHz (want 9)\n",
+                       K, on_lo - off_lo, on_hi - off_hi);
+                CHECK(fabs((on_lo - off_lo) - 3.0) < 0.5, "tracked directivity: the low band is boosted by the model's low-band loss");
+                CHECK(fabs((on_hi - off_hi) - 9.0) < 0.8, "tracked directivity: the high band is boosted by the model's high-band loss");
+                /* (3) toggled off: glides back to identity */
+                rt_set_tracked_directivity(ca, 0);
+                lc_settle(ca, 120);
+                DIR_LEVEL(ca, a1, on_lo); DIR_LEVEL(cb, b1, off_lo);
+                CHECK(fabs(on_lo - off_lo) < 0.1, "tracked directivity: off glides back to the layout's own trims");
+                rt_destroy(ca); rt_destroy(cb);
+            }
+            /* (4) direct-binaural mode (BWA_PROFILE_BINAURAL) forces the comp inert: that bus carries
+             * only synthesized-diffuse taps decoded through VIRTUAL directions, so no physical speaker
+             * has an axis to compensate. A bus tap plants a tone on channel K, the listener stands 30
+             * deg off its axis: a direct-mode core with the comp ON (the default, untouched) renders
+             * bit-identically to one with it OFF, while a speaker-mode pair does not (so the tap does
+             * reach the stage and the check can fail). Without the direct_on gate (then inside
+             * directivity_track, now around rt_render's whole align stage) the first check went red. */
+            {
+                RtCore* d_on  = rt_create(8, 4, RATE, CH), *d_off = rt_create(8, 4, RATE, CH);
+                RtCore* s_on  = rt_create(8, 4, RATE, CH), *s_off = rt_create(8, 4, RATE, CH);
+                CHECK(d_on && d_off && s_on && s_off, "rt_create (directivity, direct mode)");
+                if (d_on && d_off && s_on && s_off) {
+                    static uint64_t ph[4];
+                    RtCore* cs[4] = { d_on, d_off, s_on, s_off };
+                    dir_tap_ch = K;
+                    for (int i = 0; i < 4; ++i) {
+                        ph[i] = 0;
+                        rt_set_layout(cs[i], &DL);
+                        rt_set_bus_tap(cs[i], dir_tone_tap, &ph[i]);
+                        rt_set_listener(cs[i], lp, qid);
+                        rt_commit(cs[i]);
+                    }
+                    rt_set_direct_ambi(d_on, 1); rt_set_direct_ambi(d_off, 1);
+                    rt_set_tracked_directivity(d_off, 0); rt_set_tracked_directivity(s_off, 0);
+                    static float tmp[CH * N];
+                    bwa_timestamp ts = { 0, 0 };
+                    int dsame = 1, sdiff = 0;
+                    for (int b = 0; b < 160; ++b) {                  /* past the 0.4 s glide */
+                        rt_render(d_on, bus, N, &ts);  memcpy(tmp, bus, sizeof tmp);
+                        rt_render(d_off, bus, N, &ts); if (memcmp(tmp, bus, sizeof tmp) != 0) dsame = 0;
+                        rt_render(s_on, bus, N, &ts);  memcpy(tmp, bus, sizeof tmp);
+                        rt_render(s_off, bus, N, &ts); if (memcmp(tmp, bus, sizeof tmp) != 0) sdiff = 1;
+                    }
+                    CHECK(dsame, "tracked directivity: inert in direct-binaural mode, bit for bit, with the toggle left ON");
+                    CHECK(sdiff, "tracked directivity: the same tap and pose DO move the speaker-mode bus (the check can fail)");
+                    for (int i = 0; i < 4; ++i) rt_set_bus_tap(cs[i], NULL, NULL);
+                }
+                rt_destroy(d_on); rt_destroy(d_off); rt_destroy(s_on); rt_destroy(s_off);
+            }
+            #undef DIR_LEVEL
+            remove(T1); remove(T2);
+        } else CHECK(0, "write tone wavs (tracked directivity)");
     }
 
     /* decorrelation (bwa_set_decorrelation): a fully-spread noise source's speaker feeds are IDENTICAL

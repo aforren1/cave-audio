@@ -151,6 +151,12 @@ monitor. Use `layout_tool` for the physical array.
 The capture path (full-duplex ASIO sweep→record) is the one calibration piece with no
 off-hardware test. First contact:
 
+- [ ] **Projectors on, room warm.** Run the projectors for as long as a session would before
+      the first sweep, read the air temperature, and pass it as `--temp` on every run. Their
+      3 F of warming is 12 mm of range at 4 m, which nothing here can hear, but their fans are
+      the noise floor under every gate and decay fit, so calibrate in the state the listener
+      will be in and do not switch them off between passes ([calibration.md](./calibration.md),
+      "Air temperature").
 - [ ] One sweep works: run `bwa_calibrate --layout cave_layout.json --mic x y z --input <ch>`
       and watch the first speaker's capture. A garbage IR (no clear peak, an absurd delay)
       means a routing or clocking problem. Fix that before sweeping the whole array.
@@ -167,6 +173,19 @@ Then the real sequence:
       residual (DAC/ADC + analog) must be a *small positive* number: negative is
       physically impossible (wrong device / rate mismatch), tens of ms means an unexpected
       buffer (check the Dante latency setting). The solved value stays authoritative.
+- [ ] **Directivity model** (if the speakers have a vendor CLF file, as the 4410A does):
+      `uv run tools/directivity/clf_to_json.py <file>.cf2 --into cave_layout.json` once, then
+      read the `directivity:` report the trim run prints. A speaker flagged more than
+      30 degrees off the listening point is aimed wrong, on the mount or in the layout's
+      `aim`. Then add `--check-aim` to the `--localize` run: it fits each box's real axis
+      from those same captures and flags one more than 15 degrees off the layout's aim, and
+      prints whether the screens add a loss the model does not know. Fix the mounts before
+      trusting the trims. It also prints the whole-response fit beside the gated one: in a
+      live room the whole-response median should read SMALLER (the reverberant share dilutes
+      the tilt; `--simulate --sim-room` shows about 21 against 14 degrees). If the two agree,
+      the gate is not separating the direct sound from the room: look at the IRs
+      (`--save-irs`) before believing either. The trim run's `direct` column is the same story
+      per speaker, and needs `--mic` with the mic's real position before it re-aims anything.
 - [ ] **Trims**: a default run writes `delay_ms`/`gain_db`. Optionally `--eq` (per-speaker
       correction FIRs), `--save-irs prefix` (keep the kernels), `--room` (RT60 report: a
       treatment diagnostic, never numbers to copy into the reverb).
@@ -269,7 +288,9 @@ tracker connected.
       measured lead in **seconds** (0.02–0.04).
       Start at the measured value: too much lead overshoots on direction changes.
 - [ ] **`cave_both` profile**: array + headphone monitor concurrently, same build, and the
-      monitor's image agrees with the array's.
+      monitor's image agrees with the array's. The monitor simulates the room's distance,
+      arrival time and speaker directivity for your tracked position, so walk while you
+      compare: the nearer speakers should pull the same way on the headphones as in the room.
 - [ ] **Soak**: leave a busy scene running (looping sources, moving listener) for 30+
       minutes. On any dropout, widen the ASIO buffer / Dante latency and soak again. Keep
       a tighter setting only after it survives a full clean soak.
@@ -461,6 +482,10 @@ The checks with no assertion: bring ears you trust.
 - [ ] **Tracked alignment by ear** (after the sweep above): walk while it is on. The measured win is
       coherence off-center. The risk it trades against is warble from the delay lines gliding. If you
       hear pitch movement while walking, the rate limit is too high for this room.
+- [ ] **Tracked directivity by ear** (layouts with a model): pan a bright source to one wall,
+      walk to the opposite wall, and A/B `bwa_set_tracked_directivity`. On, the far wall should
+      keep its treble; off, it dulls as you walk away. If on sounds harsher near a wall than
+      off, the shelf cap is too generous for this room.
 - [ ] **Tracked room EQ** (if the install wants it): one `bwa_calibrate --room-eq-grid
       --mic x y z` run per mic placement, ~0.5–1 m spacing over the working area at ear
       height. Then walk the room and A/B `bwa_set_tracked_room_eq`. LF evenness should

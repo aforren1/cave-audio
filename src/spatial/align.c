@@ -3,13 +3,16 @@
  * channel, a single shared write index. Trivial DSP, but not optional for a real array
  * (docs/spatialization.md). In-place on the planar 26-ch bus.
  * Optionally also applies the per-speaker correction FIR and the LF room_eq modal cuts
- * (static-listener room correction; docs/calibration.md) before the gain+delay, and the
+ * (static-listener room correction; docs/calibration.md) before the gain+delay, the tracked
+ * directivity compensation (align_dir_targets: a slewed broadband gain + high shelf per channel
+ * that re-references each speaker's off-axis loss onto the tracked head), and the
  * opt-in tracked-listener alignment (align_tracked_targets), which adds a slewed FRACTIONAL
  * delay + gain per channel so the array's time coherence follows the tracked head instead of
  * the layout's fixed reference. The ring carries headroom for that whether or not it is used.
  */
 #include "spatial/align.h"
 #include "dsp/biquad.h"       /* shared RBJ cookbook (also used by rt.c's transmission/pathing EQ) */
+#include "spatial/dirstage.h" /* the directivity comp's gain + shelf (shared with the monitor) */
 #include "core/bits.h"         /* bwa_pow2_ge */
 
 #include <math.h>
@@ -65,7 +68,19 @@ struct Aligner {
     double   lc_dcur[BWA_CHANNELS];
     float    lc_dtgt[BWA_CHANNELS];                   /* extra delay, frames (>= 0) */
     float    lc_gcur[BWA_CHANNELS], lc_gtgt[BWA_CHANNELS];   /* extra gain, linear */
+    /* Tracked directivity compensation (align_dir_targets; layouts with a directivity model): a
+     * per-channel broadband gain + high shelf at the model's split, both dB, slewed at the room-EQ
+     * rate (dirstage.h, shared with the array-sim monitor's simulated loss). dir.have = the layout
+     * carried a model; while dir.live is 0 the stage is skipped, so the default path is bit-identical. */
+    DirStage dir;
 };
+
+/* Directivity comp clamps (BWA_DIR_*_MAX_DB, align.h): a boost past these is a speaker that is
+ * not reaching the listener, and raising it only raises the room's reverberant field. rt.c clamps
+ * the two band totals before it splits the shelf off; these re-apply the same bounds as a backstop
+ * for any other caller. */
+#define DIR_GAIN_MAX_DB  BWA_DIR_GAIN_MAX_DB
+#define DIR_SHELF_MAX_DB BWA_DIR_SHELF_MAX_DB
 
 #define RQ_SLEW_DB_S 24.0f   /* tracked-room-EQ gain slew: a full 12 dB cut lands in ~0.5 s — fast
                               * enough to track a walking listener, far too slow to zipper (the cuts
@@ -145,6 +160,10 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
             a->rq_n[k] = m;
         }
     }
+    /* directivity comp: precompute the shelf prototype. dirstage_init pulls a split at or above
+     * Nyquist (a 20 kHz split at a 32 kHz rate) under it rather than dropping the stage, since that
+     * would lose the broadband half too, silently. */
+    if (L->dir.nband) dirstage_init(&a->dir, channels, L->dir.split_hz, sample_rate, RQ_SLEW_DB_S);
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
     if (a->any_eq) {                               /* only pay the memory + DSP if a filter exists */
@@ -176,6 +195,16 @@ void align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]) 
             else if (g < -24.f) g = -24.f;
             a->rq_gtgt[k][s] = g;
         }
+}
+
+void align_dir_targets(Aligner* a, const float* gain_db, const float* shelf_db) {
+    if (!a) return;
+    dirstage_targets(&a->dir, gain_db, shelf_db, DIR_GAIN_MAX_DB, DIR_SHELF_MAX_DB);
+}
+
+void align_dir_state(const Aligner* a, float* gain_db, float* shelf_db) {
+    if (!a) return;
+    dirstage_state(&a->dir, gain_db, shelf_db);
 }
 
 void align_tracked_targets(Aligner* a, const float* delay_frames, const float* gain_lin) {
@@ -272,6 +301,7 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
             }
         }
     }
+    dirstage_process(&a->dir, bus, n);             /* tracked directivity comp (no-op at identity) */
     const uint32_t len = a->len, mask = a->mask, C = a->channels;
     const uint32_t w = a->w;
     if (!a->lc_live) {                                 /* the default path: integer taps, untouched */

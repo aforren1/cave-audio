@@ -7,6 +7,8 @@
  *   - delay_samples : the IR peak position = system latency + speaker->mic time of flight.
  *   - level         : the in-band average |H(f)| = the speaker's broadband sensitivity at the mic.
  *   - band[3]       : low / mid / high average |H(f)| (a coarse response shape; diagnostic only).
+ *   - the same two, *_direct, from the IR GATED to the direct sound (measure_direct_gate), plus the
+ *     direct-energy fraction: what the speaker's axis governs, with the room's reverberant part out.
  *
  * The calibration tool (examples/calibrate.c) runs this per speaker, then turns the 26 results into
  * per-speaker delay trims (align all arrivals to the farthest) and gain trims (equalize sensitivity,
@@ -30,6 +32,17 @@ typedef struct {
     float delay_frac;      /* sub-sample refinement of the peak [-0.5,0.5]; true delay = delay_samples + delay_frac */
     float level;           /* in-band mean |H(f)| — broadband sensitivity (linear, ref-normalized) */
     float band[3];         /* low / mid / high mean |H(f)| (diagnostic; not written to the layout) */
+    /* The same means over the DIRECT sound only: the IR windowed from 1 ms before its peak to
+     * gate_samples after it (raised-cosine rise over that 1 ms, fall over the gate's last quarter),
+     * the gate end per measure_direct_gate from the first reflection this IR shows. level and band
+     * above keep their whole-response meaning (the trims are built on them). RESOLUTION: a gate of
+     * T seconds smears the spectrum over about 1/T Hz (250 Hz at the 4 ms default), so
+     * band_direct[0] and the bottom of the mid band describe a truncated response, not the speaker. */
+    float level_direct;
+    float band_direct[3];
+    float direct_frac;     /* gated / whole-response ENERGY over the level band, in [0, 1]: how much of
+                            * `level` is direct sound (1 in an anechoic capture; lower in a live room) */
+    int   gate_samples;    /* the gate end, samples after the peak */
 } MeasureResult;
 
 /* Room characterization from the captured impulse response — a treatment diagnostic, NOT a model to
@@ -47,6 +60,12 @@ typedef struct {
  * at both ends (no click). This is the signal to play out a speaker; the SAME array is the reference
  * passed to measure_response. n is arbitrary (a power of two is not required). */
 void measure_sweep(float* out, int n, double f1, double f2, double fs);
+
+/* The calibration's direct-sound gate policy, ONE implementation (calib_eq, calib_room_eq and
+ * measure_response's direct fields all use it): end the gate 4 samples before the first reflection
+ * when one is known (`first_refl` > 8 samples after the direct peak), else a 4 ms default (long
+ * enough to hold a speaker's own response, short enough to exclude most rooms). Returns samples. */
+int measure_direct_gate(int first_refl, double fs);
 
 /* Recover one speaker's response: deconvolve `capture` (the mic recording, ncap samples) against
  * `ref` (the played sweep, nref samples) and analyze the IR. `band_hz[2]` are the low|mid and mid|high

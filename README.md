@@ -57,10 +57,12 @@ that day. The Unreal binding is planned and not written.
   near-listener widening for fly-throughs; a **multi-listener compromise** mode
   (energy-mean over up to 4 occupants); per-speaker gain/delay/correction-EQ
   output stage, master gain, and a linked protection limiter as the final stage.
-  Two modifiers follow the head rather than the layout: **CAP** matches the rendered
+  Three modifiers follow the head rather than the layout: **CAP** matches the rendered
   interaural time difference to a real source for the head's current orientation
-  (`bwa_set_dual_band_cap`), and **tracked alignment** re-aims the per-speaker trims
-  and delays onto the live head (`bwa_set_tracked_align`).
+  (`bwa_set_dual_band_cap`), **tracked alignment** re-aims the per-speaker trims
+  and delays onto the live head (`bwa_set_tracked_align`), and **tracked directivity**
+  puts each speaker's off-axis loss back as the head crosses its beam, from the
+  vendor's measured balloon (`bwa_set_tracked_directivity`).
 - **Acoustics**: ray-traced occlusion with per-band transmission EQ, source
   directivity, a directional reflection bed (real-time, or baked over a probe
   grid), and sound pathing with bending-loss EQ via Steam Audio, **plus a

@@ -9,7 +9,7 @@ tcheck('commands returns a cell of names', iscell(cmds) && ischar(cmds{1}));
 % Every subcommand maps to a bw_audio.h entry point, except `constants`, which has no C twin.
 % The count is the pin: an entry point added to the header and not bound here shows up as a
 % number that stopped matching, which is the only way a binding gap is noticed at all.
-tcheck('the gateway binds 169 subcommands', numel(cmds) == 169, sprintf('%d', numel(cmds)));
+tcheck('the gateway binds 170 subcommands', numel(cmds) == 170, sprintf('%d', numel(cmds)));
 tcheck('constants is one of them', any(strcmp(cmds, 'constants')));
 tcheck('set_output_capture is listed even though it refuses', ...
        any(strcmp(cmds, 'set_output_capture')));

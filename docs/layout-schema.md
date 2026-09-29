@@ -10,8 +10,11 @@ thread. Three consumers read the result:
   distance-attenuation curve. See [`spatialization.md`](./spatialization.md).
 - **the align stage** (`align_process`): per-speaker `gain_db` trim and `delay_ms`
   align the unequal speaker distances to a common reference (output stage, after the mix).
+  The `binaural` profile skips it: its bus drives no physical speaker.
 - **the binaural monitor**: the same positions become the virtual-speaker directions
-  for the bus→ambisonics→binaural decode.
+  for the bus→ambisonics→binaural decode. In `cave_sim` and on the `cave_both` tap they
+  also set each virtual speaker's distance gain and arrival time to the live listener
+  (the array sim's room, [`spatialization.md`](./spatialization.md#the-array-sims-room)).
 
 **The speaker count in this file IS the engine's channel count.** Any N in **4..64** works
 (64 = `BWA_MAX_CHANNELS`, the compile-time capacity, which is the transport's bound). The count is
@@ -43,7 +46,17 @@ you can hear gaps/smoothness and walk the room to judge off-center coverage. The
 rebuilds the engine with the edited positions, since the layout is load-time.
 
 The tool exports this schema with `delay_ms` auto-derived from the positions
-(max-distance alignment). A headless `bwa_layout_tool --export <file>`
+(max-distance alignment). A `directivity` block and any per-speaker `aim` in the loaded
+file survive the export verbatim; the tool never edits them.
+
+**The selected speaker's beam.** In edit mode the selected speaker shows its acoustic axis and,
+with a `directivity` model in the file, two rings at the distance of the ears: the -3 dB
+half-angle at 2 kHz (yellow) and at the top band (orange), so the ring's radius is the lateral
+extent at the listener before that band drops 3 dB. Only the selected speaker, so the scene
+stays readable. Without a model the ring is a 20 degree guide, which on the Genelec 4410A is
+about the 2 dB region above 2 kHz. The HUD line under the speaker prints the two angles and the
+loss at 20 degrees. The axis is the file's `aim` when the record has one, else the line to the
+ears, which is what the engine's loader assumes too. A headless `bwa_layout_tool --export <file>`
 writes/normalizes a layout without the GUI. To audition a saved layout in the full
 binaural playground: `bwa_playground cave_layout.json`.
 
@@ -388,6 +401,7 @@ cannot see the problem it most needs to.
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0; the loader floors it at 0.001 m (1 mm), below any audible blur. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean listening-point→speaker distance, the centroid unless `listening_point_m` is set (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored - the inverse curve is the only one implemented. |
 | `pin_slab_m` | float (optional) | authoring only, engine-ignored: half-height of the ear-plane slab that `"pin": "plane"` speakers are confined to. Written by `bwa_layout_tool` when any speaker is pinned. |
+| `directivity` | object (optional) | one speaker model's off-axis loss table, written by `tools/directivity/clf_to_json.py` from the vendor's CLF simulation file. Read by `bwa_calibrate` (trims measured off a speaker's axis are re-aimed to the listening point), by the engine's tracked directivity compensation (`bwa_set_tracked_directivity`), and by the array-sim headphone monitor (`cave_sim` and the `cave_both` tap play each speaker's off-axis loss toward the listener, at the table's full resolution). Format below. |
 | `speakers[]` | array | **4..64** speaker records (64 = the compile-time `BWA_MAX_CHANNELS` capacity). **The speaker count IS the engine's channel count** - a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 
 ### Per-speaker record
@@ -401,6 +415,7 @@ cannot see the problem it most needs to.
 | `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bwa_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
 | `pin` | string (optional) | authoring only, engine-ignored: `"plane"` holds this speaker to the ear-plane slab (`pin_slab_m`) during optimization and snap. The allocation constraint from the authoring section above. |
 | `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bwa_calibrate --room-eq`. **Static-listener room correction** - see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
+| `aim` | `[x, y, z]` float (optional) | the speaker's acoustic axis as a direction vector in room space (any length; normalized on load). Omit it and the speaker is aimed at the listening point, which is the CAVE's case. A zero or non-finite vector rejects the file. Only the `directivity` model reads it. |
 
 ### Tracked room EQ: top-level `room_eq_grid` (optional)
 
@@ -428,6 +443,30 @@ the runtime interpolates depths by ladder index; the loader rejects a mismatch.
 `room_eq` and `room_eq_grid` in one file are rejected too (one correction scheme at
 a time). The calibration writeback maintains both invariants for you.
 
+### Speaker directivity: top-level `directivity` (optional)
+
+One speaker model's measured off-axis loss, written by `tools/directivity/clf_to_json.py`
+from the vendor's CLF file (see [calibration.md](./calibration.md) -> "Speaker directivity
+from the vendor's simulation file"). One model per layout, axisymmetric about each
+speaker's `aim`.
+
+```jsonc
+"directivity": {
+  "model":      "Genelec 4410A",
+  "source":     "Genelec_Oy-4410A.CF2 (CLF v2 balloon ...)",   // provenance, engine-ignored
+  "bands_hz":   [40, 50, 63, /* ... */ 16000],                  // 1..32 band centers, ascending
+  "angles_deg": [0, 5, 10, /* ... */ 180],                      // 2..37, ascending from 0 (on axis), <= 180
+  "split_hz":   1000,                                           // optional; the runtime's two-band split (default 1000)
+  "loss_db":    [[0, -0.02, /* ... */], /* one row per band */],  // dB relative to on-axis, in [-80, 12]
+  "planes":     { /* the two principal polars, same shape */ }  // informational, engine-ignored
+}
+```
+
+At load the engine derives two curves from the table: the power mean of `loss_db` over the
+bands below `split_hz` and over the bands at or above it. Those two are what the tracked
+compensation applies, as a broadband gain and a high shelf per speaker. `bwa_calibrate`
+reads the full table.
+
 ## Validation (loader contract)
 
 `layout_load` rejects a malformed file (the reason surfaces through `bwa_last_error`)
@@ -443,7 +482,12 @@ if any of:
 - a `room_eq_grid` is malformed: 0 or >16 positions, an entry without
   `position[3]` + one `speakers` array per speaker (N), a section out of range,
   positions disagreeing on a speaker's `fc`/`q` ladder, or the file carrying both
-  `room_eq` and `room_eq_grid`.
+  `room_eq` and `room_eq_grid`;
+- a speaker's `aim` is present but not three finite numbers, or is the zero vector;
+- a `directivity` block is malformed: not an object, `bands_hz` outside 1..32 entries or
+  not ascending, `angles_deg` outside 2..37 entries, not starting at 0, not ascending, or
+  past 180, a `loss_db` row count or length that does not match, an entry outside
+  `[-80, 12]`, or a `split_hz` outside `[20, 20000]`.
 
 `schema_version` is not checked: the loader never reads it.
 

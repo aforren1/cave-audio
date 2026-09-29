@@ -128,6 +128,7 @@ void BwaEngine::_ready() {
 	bwa_set_max_re_split(eng, max_re_split);
 	bwa_set_bed_renderer(eng, (bwa_bed_renderer)bed_renderer);
 	bwa_set_tracked_room_eq(eng, tracked_room_eq);
+	bwa_set_tracked_directivity(eng, tracked_directivity);
 	bwa_set_tracked_align_guards(eng, tracked_align_dead_zone, tracked_align_slew_frames_per_s);
 	bwa_set_tracked_align(eng, tracked_align);
 	bwa_set_limiter(eng, limiter);
@@ -736,6 +737,7 @@ static godot::Dictionary tuning_to_dict(const bwa_tuning& t) {
 	d["max_re_split"] = t.max_re_split;
 	d["bed_renderer"] = (int)t.bed_renderer;
 	d["tracked_room_eq"] = t.tracked_room_eq;
+	d["tracked_directivity"] = t.tracked_directivity;
 	d["tracked_align"] = t.tracked_align;
 	d["align_dead_zone_m"] = t.align_dead_zone_m;
 	d["align_slew_frames_per_s"] = t.align_slew_frames_per_s;
@@ -769,6 +771,7 @@ bool BwaEngine::apply_setup(Setup setup) {
 	max_re = t.max_re; max_re_split = t.max_re_split;
 	bed_renderer = (BedRenderer)t.bed_renderer;
 	tracked_room_eq = t.tracked_room_eq;
+	tracked_directivity = t.tracked_directivity;
 	tracked_align = t.tracked_align;
 	tracked_align_dead_zone = t.align_dead_zone_m;
 	tracked_align_slew_frames_per_s = t.align_slew_frames_per_s;
@@ -786,6 +789,7 @@ BWA_LIVE_SETTER(max_re, bool, bwa_set_max_re(eng, v))
 BWA_LIVE_SETTER(max_re_split, bool, bwa_set_max_re_split(eng, v))
 BWA_LIVE_SETTER(bed_renderer, BedRenderer, bwa_set_bed_renderer(eng, (bwa_bed_renderer)v))
 BWA_LIVE_SETTER(tracked_room_eq, bool, bwa_set_tracked_room_eq(eng, v))
+BWA_LIVE_SETTER(tracked_directivity, bool, bwa_set_tracked_directivity(eng, v))
 /* one C call carries the toggle and both knobs, so each property setter re-sends the trio */
 BWA_LIVE_SETTER(tracked_align, bool, bwa_set_tracked_align(eng, v))
 BWA_LIVE_SETTER(tracked_align_dead_zone, float, bwa_set_tracked_align_guards(eng, tracked_align_dead_zone, tracked_align_slew_frames_per_s))
@@ -1445,6 +1449,7 @@ void BwaEngine::_bind_methods() {
 	M(set_max_re_split, "on"); M0(get_max_re_split);
 	M(set_bed_renderer, "renderer"); M0(get_bed_renderer);
 	M(set_tracked_room_eq, "on"); M0(get_tracked_room_eq);
+	M(set_tracked_directivity, "on"); M0(get_tracked_directivity);
 	M(set_tracked_align, "on"); M0(get_tracked_align);
 	M(set_tracked_align_dead_zone, "dead_zone_m"); M0(get_tracked_align_dead_zone);
 	M(set_tracked_align_slew_frames_per_s, "frames_per_s"); M0(get_tracked_align_slew_frames_per_s);
@@ -1581,6 +1586,8 @@ void BwaEngine::_bind_methods() {
 			"get_max_re_split");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tracked_room_eq"), "set_tracked_room_eq",
 			"get_tracked_room_eq");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tracked_directivity"), "set_tracked_directivity",
+			"get_tracked_directivity");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tracked_align"), "set_tracked_align",
 			"get_tracked_align");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tracked_align_dead_zone", PROPERTY_HINT_RANGE,

@@ -33,11 +33,36 @@ extern "C" {
 #define CAL_MAX_INPUTS 19                /* input ceiling per capture — sized for the ZM-1's capsules */
 
 /* simulate backend: synthesize what an ideal rig would capture for speaker `ch` (fractional
- * time-of-flight + 1/r + a deterministic +/-~1.4 dB sensitivity wobble). cap = CAL_CAPLEN floats.
+ * time-of-flight + 1/r + a deterministic +/-~1.4 dB sensitivity wobble, the layout's directivity
+ * model when it has one, and the simulated room when calib_sim_set_room turned one on).
+ * cap = CAL_CAPLEN floats.
  * `sos` is the speed of sound the time of flight is generated at: pass the SAME value the caller's
  * analyzer will divide back out, or the survey inflates every position by their ratio. Out-of-range
  * falls back to BWA_SOS_REF_MPS (sos.h). */
 void calib_sim_capture(int ch, const Layout* L, const float mic[3], double sos, const float* sweep, float* cap);
+/* Simulate only: rotate every speaker's TRUE aim `deg` away from the layout's before synthesizing
+ * its capture, so --check-aim has a known error to recover (the self-check of the check). 0 = off. */
+void calib_sim_set_aim_error(float deg);
+
+/* Simulate only: a ROOM around the array (bwa_calibrate --sim-room), so the direct-sound gate and
+ * the reverberant dilution it exists for have something to act on. `absorption` is every wall's
+ * energy absorption coefficient in (0, 1]; 0 = off, the anechoic capture (the default).
+ *
+ * The room is a shoebox enclosing every speaker with CALIB_SIM_ROOM_MARGIN_M to spare (the mic has to
+ * sit inside it, which any sane mic position does). Its image sources, orders 1 and 2 (6 + 18),
+ * each leave the speaker at their own DEPARTURE angle off its axis, so each carries the directivity
+ * model's loss at that angle (a first reflection off the wall behind a speaker is its rear lobe, and
+ * dull), plus 1/r and sqrt(1 - absorption) per bounce. Each is the same analytic delayed sweep the
+ * direct sound is. Past the second order a deterministic noise tail stands in for the rest: Sabine
+ * RT60 for the box, the diffuse-field level of the room equation (16 pi (1 - a) / (S a)) times the
+ * (1 - a)^2 share orders 1 and 2 have not already delivered, spectrally shaped by the model's POWER
+ * response (a directive speaker feeds the reverberant field less treble than its axis gets), and
+ * starting two mean free paths after the direct sound. Deterministic, so every run is the same. */
+#define CALIB_SIM_ROOM_MARGIN_M 0.5f
+void calib_sim_set_room(float absorption);
+/* One line describing the room the next capture uses for this layout (dimensions, RT60, the image
+ * count), or "anechoic". Control thread. */
+void calib_sim_room_describe(const Layout* L, char* buf, size_t cap);
 
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);

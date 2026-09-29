@@ -120,6 +120,10 @@ namespace BwAudio
         [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
+        [Tooltip("For layouts carrying a directivity model (tools/directivity/clf_to_json.py from the speaker " +
+                 "vendor's CLF file): follow each speaker's off-axis loss onto the tracked head as a gain + HF " +
+                 "shelf per speaker. No-op without a model; this is the kill switch.")]
+        public bool trackedDirectivity = true;
         [Tooltip("Re-align the array's arrival times on the TRACKED listener instead of the fixed array " +
                  "centroid, so time coherence follows the head. OFF by default: every delay change resamples, " +
                  "so a walking listener Doppler-shifts the whole array. Try it, listen for warble.")]
@@ -383,6 +387,7 @@ namespace BwAudio
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_max_re_split(_eng, maxReSplit);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
+            Bwa.bwa_set_tracked_directivity(_eng, trackedDirectivity);
             Bwa.bwa_set_tracked_align_guards(_eng, trackedAlignDeadZone, trackedAlignSlewFramesPerSecond);
             Bwa.bwa_set_tracked_align(_eng, trackedAlign);
             Bwa.bwa_set_master_gain(_eng, masterGain);
@@ -441,6 +446,7 @@ namespace BwAudio
             maxReSplit    = t.maxReSplit;
             bedRenderer   = t.bedRenderer;
             trackedRoomEq = t.trackedRoomEq;
+            trackedDirectivity = t.trackedDirectivity;
             trackedAlign  = t.trackedAlign;
             trackedAlignDeadZone            = t.alignDeadZoneM;
             trackedAlignSlewFramesPerSecond = t.alignSlewFramesPerSecond;
@@ -699,6 +705,9 @@ namespace BwAudio
         /// <summary>Band-split max-rE (needs max-rE on): taper only above ~700 Hz, plain decode below. Live A/B.</summary>
         public void SetMaxReSplit(bool on)       { maxReSplit = on;   if (Ready) Bwa.bwa_set_max_re_split(_eng, on); }
         public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
+        /// <summary>Follow each speaker's off-axis loss onto the tracked head (layouts with a directivity
+        /// model). On by default; off glides back to the layout's own trims. No-op without a model.</summary>
+        public void SetTrackedDirectivity(bool on) { trackedDirectivity = on; if (Ready) Bwa.bwa_set_tracked_directivity(_eng, on); }
         /// <summary>Re-align the array's arrival times on the TRACKED listener instead of the fixed array
         /// centroid. OFF by default: every delay change is a resampling event, so a walking listener glides
         /// all 26 delays at once. `deadZoneM` is how far the head must move before anything is recomputed

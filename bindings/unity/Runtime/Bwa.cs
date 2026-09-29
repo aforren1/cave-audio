@@ -609,6 +609,12 @@ namespace BwAudio
         // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Tracked directivity compensation (layouts carrying a `directivity` model from the speaker vendor's
+        // CLF balloon, plus each speaker's `aim`): each speaker's off-axis loss is re-referenced from the
+        // listening point onto the TRACKED listener each block, as a slewed broadband gain plus an HF shelf
+        // (clamped +/-6 and +/-10 dB). Identity at the listening point. ON by default; this is the live kill
+        // switch. No-op without a model.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_directivity(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Tracked listener alignment (OFF by default). The layout's per-speaker delay/gain trims align the
         // array at ONE point (the array centroid); this re-references them onto the TRACKED listener, adding
         // each speaker's extra propagation delay and 1/r level for |speaker - listener| vs |speaker - centroid|.
@@ -642,7 +648,8 @@ namespace BwAudio
             [MarshalAs(UnmanagedType.I1)] public bool trackedRoomEq;
             [MarshalAs(UnmanagedType.I1)] public bool trackedAlign;
             public float alignDeadZoneM, alignSlewFramesPerSecond;
-            public uint r0, r1, r2, r3;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedDirectivity;   // took reserved slot 0 (0.18); same size
+            public uint r1, r2, r3;
         }
 
         // Source configuration. Same fill-then-apply shape as the engine tuning above, for a SOURCE:

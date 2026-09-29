@@ -481,6 +481,96 @@ you use this in a session that also cares about AV sync.
 Untested on hardware. The by-ear question is whether the improvement in coherence is worth
 any warble the rate limit still lets through, and that is a rig call, not a theory call.
 
+### Compensating speaker directivity for the tracked listener (`bwa_set_tracked_directivity`, on by default)
+
+A speaker is loudest on its acoustic axis and falls off to the sides, more so with
+frequency. The Genelec 4410A is within 2 dB of on-axis out to 60 degrees at 250 Hz, about
+7 dB down there at 4 kHz and 17 dB at 16 kHz. The trims align the array at one point, and the gain solve
+assumes every speaker reaches the listener the way it reaches that point. A tracked
+listener does not stay there. Walk toward one wall and you move onto those speakers' axes
+and off the far wall's, so the far wall loses treble, and the phantom images that depend on
+a level balance across speakers pull toward the near wall.
+
+The engine can put the loss back. The layout carries a `directivity` model (the vendor's
+measured balloon, converted by `tools/directivity/clf_to_json.py`; see
+[layout-schema.md](./layout-schema.md) and [calibration.md](./calibration.md)) and each
+speaker's `aim`. Each block, per speaker:
+
+```
+theta_ref = angle(aim, ref - speaker)          the listening point's bearing off the axis
+theta_lis = angle(aim, listener - speaker)     the live listener's
+broadband (dB) = lo(theta_ref) - lo(theta_lis)
+shelf     (dB) = [hi(theta_ref) - hi(theta_lis)] - broadband
+```
+
+`lo` and `hi` are the model's power-mean loss below and above its split frequency (1 kHz
+by default). The align stage applies the pair as a broadband gain plus a high shelf at the
+split, per channel, glided at 24 dB/s. So the comp is identity at the listening point, a
+boost with extra treble as the listener moves off a speaker's axis, and a cut as they move
+onto one. It rides on top of the trims, touches no gain solve, and works with every panner:
+the same shape as tracked alignment, one stage over.
+
+Why it is on by default where tracked alignment is off: it is pure gain. No delay moves, so
+nothing resamples and there is no warble to guard against. A layout without a model is a
+no-op, and off glides back to the layout's own trims.
+
+#### What it can and cannot do
+
+Given a speaker's loss versus angle off its axis, can you compensate the drop dynamically
+from the tracked position? Yes, within four limits that decide how far to push it:
+
+- **The loss is frequency dependent, so one gain is the wrong shape.** Below about 500 Hz a
+  small box is close to omnidirectional and needs nothing; at 10 kHz the 4410A is 7 dB
+  down at 45 degrees and 12 dB at 60. A broadband gain fitted to the treble over-boosts the bass by that
+  much, and one fitted to the bass does nothing where it matters. Two bands is the smallest
+  honest shape. It leaves a residual of a few dB against the true 27-band curve at the band
+  edges: 45 degrees off a 4410A's axis, the comp overshoots by 2 dB around 5 kHz and falls
+  6 dB short at 16 kHz. The full correction is a per-speaker graphic EQ that follows the head,
+  which the headphone audition already runs (next bullet) and the array does not.
+- **Boosting a speaker the listener is far off-axis of raises the room, not the listener.**
+  The model describes the direct sound. The reverberant field is set by the speaker's
+  total radiated power, which the boost raises uniformly, so past the -6 dB angle you buy a
+  little direct level and a lot of reverberant treble, and the direct-to-reverberant ratio
+  that localization rides on gets worse. That is why the comp clamps at +6 dB broadband and
+  +10 dB on the shelf instead of chasing the curve.
+- **It compensates the level, not the beam.** Off-axis, a two-way speaker also has a
+  crossover lobe and, with a waveguide, a different horizontal and vertical width. The
+  model is the power mean over rotation about the axis, because the mounting roll is not in
+  the layout, so a speaker mounted on its side gets the average of its two planes. On the
+  4410A the two agree within 2 dB over most of the range but differ by up to 6 dB around
+  2 to 2.5 kHz, where the woofer beams just under the crossover, so in that band a box
+  rolled 90 degrees is up to 3 dB off the mean.
+- **The headphone audition simulates the loss at the model's full resolution, so it shows the
+  two-band residual.** With a model loaded, `cave_sim` and the `cave_both` headphone tap give
+  each virtual speaker its physical off-axis loss toward the live listener: the model's whole
+  curve at `angle(aim, listener - speaker)`, absolute, not relative to the listening point,
+  because the real array has that loss. It runs as a graphic EQ with one section per model
+  band (see "The array sim's room" below), within 1 dB of the table out to 90 degrees. The
+  comp (relative, two bands) and the simulated loss (absolute, full curve) combine the way the
+  real room would, so what you hear on a walk is the comp's residual, its clamps and its glide
+  lag (the simulated loss glides at 96 dB/s, four times the comp's rate), not a cancellation of
+  two matching approximations. The `monitor` test pins it: at 45 degrees off a 4410A's axis
+  with the comp on, the audition equals the comp plus the model's loss to within 0.4 dB, and
+  that residual peaks at 6.4 dB. The array's own output never sees the simulated loss: the
+  `cave_both` monitor works on a copy of the array's buffer.
+- **The direct binaural render has no speakers to compensate.** `BWA_PROFILE_BINAURAL`'s bus
+  carries only synthesized-diffuse taps decoded through virtual directions, so that profile
+  skips the whole align stage (the trims, the correction FIR, the room EQ cuts, tracked room EQ,
+  tracked alignment and this comp) and builds no simulated room. `bwa_set_tracked_directivity`
+  keeps its value and has nothing to act on in that profile.
+- **It is single-listener.** The correction changes what every other occupant hears. That
+  is the trade every tracked feature makes, and `bwa_set_extra_listeners` does not reach
+  into it.
+
+One more loss follows the listener the same way and is not in the model: an acoustically
+transparent screen's transmission loss rises with incidence angle. Nothing measures it
+yet. Calibrate through the screens and the trims carry it at the listening point; the comp
+only sees the speaker.
+
+A/B it on the rig: pan a bright source to one wall, walk to the opposite wall, toggle. The
+measurable claim is a flatter speaker-to-speaker treble balance off-center; the audible one
+is that the far wall keeps its brightness as you walk away from it. Untested on hardware.
+
 ## Propagation effects (opt-in, per source)
 
 Physically-motivated per-voice effects, toggled per emitter (default off,
@@ -589,7 +679,8 @@ Two headphone profiles share one decode; they answer different questions.
 **`BWA_PROFILE_CAVE_SIM`** is the array audition: a **bus→stereo** transform. It
 consumes the same speaker bus the array render does, so it auditions the actual
 render: panner spread, alignment, gain staging, everything. Each bus channel is a
-virtual speaker at its surveyed room direction. Head orientation rotates the
+virtual speaker at its surveyed room position, heard from the live listener
+position through the array sim's room (below). Head orientation rotates the
 virtual array. `BWA_PROFILE_CAVE_BOTH` runs this same transform as the rig's
 headphone tap.
 
@@ -621,6 +712,50 @@ voice slot resets its effect (generation-gated), so no overlap tail bleeds acros
 voices. Without the SDK (or if the fleet fails to build) the render stays on the
 shared SH field: mode 1, the same 3rd-order path the tests pin.
 
+### The array sim's room
+
+The bus the audition plays already carries the layout's gain and delay trims, and the tracked
+compensations when they are on. All of them exist to fight a room: distance, arrival time,
+off-axis loss. A decode that models only direction plays the fixes without the problems, so a
+walk on headphones hears the trims instead of the array. `arraysim.c` puts the room back, on a
+copy of the bus, before either decoder reads it. It runs in `cave_sim` and on the `cave_both`
+tap, always, with or without a directivity model. Per channel `k`, listener at `p`:
+
+1. **Directivity, full resolution** (only with a model): a cascade graphic EQ, one peaking
+   biquad per model band, fitted to the model's loss at `angle(aim_k, p - pos_k)`. The section
+   gains come from an interaction matrix (Liski and Valimaki 2017, the accurate cascade graphic
+   EQ), built and inverted once at create; each retarget is one mat-vec. Bandwidth is set in
+   octaves, so the sections near Nyquist keep their width. On the 4410A the fit is within
+   0.8 dB of the table at and between the band centers out to 90 degrees, 1.5 dB at 180.
+   Section gains saturate at 36 dB and glide at 96 dB/s.
+2. **Distance gain** `r0 / d_k`: `d_k = |p - pos_k|` floored at 0.3 m, `r0` the mean
+   `|ref - pos_k|`, so the overall level at the listening point stays where it was. Clamped to
+   -24..+18 dB, ramped per sample. Absolute on purpose: the calibration trims divide 1/r out and
+   equalize sensitivity only, so a real listener at `ref` hears the nearer speakers louder, and
+   the audition does too.
+3. **Propagation delay** `(d_k - C) / c * rate` frames: `c` the engine's live speed of sound,
+   `C` the smallest `|ref - pos_k|`, so the nearest speaker at `ref` adds no latency beyond
+   the interpolator's own 8 frames (0.17 ms at 48 kHz). A fractional delay line read with a
+   16-tap windowed sinc, flat within 0.03 dB to 16 kHz at any fraction. A linear tap, which
+   the engine's other delay lines use, would cost 6 dB at 16 kHz half a sample off, and a
+   walking listener sweeps that fraction, so the audition would play the interpolator instead
+   of the room. The tap creeps at a physical closing
+   speed of 3 m/s, and the Doppler that produces is the real one, so there is no dead zone. The
+   ring is sized at create for a listener up to 4 m from `ref`; further out the delay clamps and
+   never wraps. On the 26-speaker grid at 48 kHz that is 26 rings of 1024 samples, 104 KB.
+
+With the SDK, the HRTF monitor then re-encodes each virtual speaker from the live position:
+walk past a speaker and its image moves. It re-solves the encode when you move more than
+1 cm and ramps the matrix across the block. `BWA_PROFILE_BINAURAL` keeps the fixed encode from
+`ref`, because its bus holds only the synthesized-diffuse taps. The no-SDK pan already reads
+the live position.
+
+What it costs: 150 us per 256-frame block for 26 channels with all 27 sections of the 4410A
+model engaged (x64, SSE across four channels at a time), 3% of the block. In `cave_both` that
+runs on the array's audio thread, after the array's own output is written.
+
+What it cannot show: the room's own reflections and a real speaker's crossover lobes.
+
 Either way, the chain ends at real headphones, which are not acoustically flat:
 `bwa_load_headphone_eq` runs an AutoEq correction on the final stereo of every
 headphone profile (the headphone-side align stage; docs/api.md "Headphone
@@ -643,8 +778,9 @@ channel (24 of them on the CAVE array):
 1. Treat each bus channel as a virtual speaker at its surveyed room **direction**
    relative to the listener. This is where head **orientation** enters: rotate the
    speaker directions with the head.
-2. Encode those feeds into ambisonics: a fixed gain matrix from the speaker
-   directions. Cheap.
+2. Encode those feeds into ambisonics: a gain matrix from the speaker directions,
+   fixed from `ref` in `BINAURAL`, re-solved from the live position in the sim
+   profiles (see "The array sim's room"). Cheap.
 3. Sum the direct field (`BINAURAL` only; it is already in this basis).
 4. Do a single **ambisonics → binaural** decode (Steam Audio's ambisonics-binaural
    effect with the configured HRTF).

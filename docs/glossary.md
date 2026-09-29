@@ -48,7 +48,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Air absorption](#air-absorption), [Air temperature](#air-temperature), [AllRAD](#allrad),
 [AmbiX and FuMa](#ambix-and-fuma), [Ambisonic order](#ambisonic-order),
 [Angular miss](#angular-miss), [Anisotropic decay](#anisotropic-decay),
-[Array-sim monitor](#array-sim-monitor), [Azimuth reference](#azimuth-reference)
+[Array-sim monitor](#array-sim-monitor), [Array-sim room](#array-sim-room),
+[Azimuth reference](#azimuth-reference)
 
 **B** [Badness map](#badness-map), [Baked reflections](#baked-reflections), [Bed](#bed),
 [Bed metric](#bed-metric), [Bending loss](#bending-loss), [Blur](#blur),
@@ -62,7 +63,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 **D** [DBAP](#dbap), [Deconvolution](#deconvolution), [Decorrelation](#decorrelation),
 [Delay trim](#delay-trim), [Density](#density), [Diffuseness](#diffuseness), [DirAC](#dirac),
 [Direct binaural field](#direct-binaural-field), [Direct channel route](#direct-channel-route),
-[Directivity](#directivity),
+[Direct share](#direct-share), [Directivity](#directivity),
 [Distance attenuation](#distance-attenuation), [Doppler](#doppler), [Drift check](#drift-check),
 [Dual-band panning](#dual-band-panning)
 
@@ -112,6 +113,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Sweet spot](#sweet-spot)
 
 **T** [Tracked listener alignment](#tracked-listener-alignment),
+[Tracked directivity compensation](#tracked-directivity-compensation),
 [Tracked room EQ](#tracked-room-eq), [Tracked versus fixed solve](#tracked-versus-fixed-solve),
 [Transmission](#transmission), [Transported frame](#transported-frame),
 [Trilateration](#trilateration)
@@ -767,10 +769,25 @@ Two headphone profiles share one decode and answer different questions. Full tre
 ### Array-sim monitor
 
 `BWA_PROFILE_CAVE_SIM` (and `CAVE_BOTH`'s tap): a **bus to stereo** transform that treats each
-speaker-bus channel as a virtual speaker at its surveyed room direction and HRTFs the lot to stereo.
+speaker-bus channel as a virtual speaker at its surveyed room position and HRTFs the lot to stereo,
+heard from the live listener position through the [array-sim room](#array-sim-room).
 It auditions the **actual array render**, panner spread and alignment and gain staging included,
-which is exactly what it is for. Head orientation rotates the virtual array. The ambisonic order
-fixes its cost, and the source count does not change it.
+which is exactly what it is for. Head orientation rotates the virtual array, and walking moves it
+(the HRTF encode follows the live position). The ambisonic order fixes the decode's cost, and the
+source count does not change it.
+
+### Array-sim room
+
+The physics the [array-sim monitor](#array-sim-monitor) puts back before its decode, per channel,
+on a copy of the bus (`src/binaural/arraysim.c`): the speaker's [directivity](#directivity) loss
+at its angle to the listener, as a graphic EQ with one section per model band (gains from a
+precomputed interaction matrix, Liski and Valimaki 2017); a distance gain `r0 / d` (absolute, `r0`
+the mean speaker distance from the listening point); and a propagation delay `(d - C) / c` (`C`
+the nearest speaker's distance from the listening point) on a fractional delay line that creeps at
+3 m/s. Without it the audition plays the layout's trims and the tracked compensations with none
+of the distance, arrival time or off-axis loss they exist to fight. Never under
+`BWA_PROFILE_BINAURAL`. See
+[spatialization.md](./spatialization.md#the-array-sims-room).
 
 ### Direct binaural field
 
@@ -928,6 +945,17 @@ compose. Note that it is computed for one reference ear height. That is part of 
 displacement is a calibration problem rather than a tracking one. See
 [spatialization.md](./spatialization.md#per-speaker-alignment).
 
+### Direct share
+
+`direct_frac` in `measure_response`'s result: the share of a capture's energy over the level band
+that arrives inside the direct-sound gate (the IR windowed from 1 ms before its peak to just before
+the first reflection). 1.00 is an anechoic capture; a live room reads lower. The trims' directivity
+correction acts on that share only, because the reverberant rest does not follow the speaker's
+axis, and `--check-aim` fits its tilts from the gated response for the same reason: the whole
+response DILUTES the bearing dependence and reads a smaller aim error than is there.
+`bwa_calibrate --simulate --sim-room` shows both without the rig. See
+[calibration.md](./calibration.md#modes).
+
 ### Drift check
 
 `bwa_calibrate --check`: one fast pass from a mic position comparing each speaker's measured distance
@@ -991,6 +1019,22 @@ vertical and the capsule **heights** unrecoverable. Below 0.05 the solver refuse
 handing back a flattened array and a confident wrong answer. **Clap high and low, not just around.**
 Unrelated to source [spread](#spread), which is a width. See
 [calibration.md](./calibration.md#the-capsule-self-survey-zylia_survey).
+
+### Tracked directivity compensation
+
+`bwa_set_tracked_directivity`, on by default: each speaker's off-axis loss, from the layout's
+`directivity` model (the vendor's CLF balloon, converted by `tools/directivity/clf_to_json.py`)
+and its `aim`, re-referenced from the listening point onto the **tracked** listener as a slewed
+broadband gain plus a high shelf per channel (`src/core/rt.c`, `directivity_track`;
+`src/spatial/align.c`, `align_dir_targets`). Pure gain, so unlike
+[tracked listener alignment](#tracked-listener-alignment) it resamples nothing and can default on.
+Clamped at +6 dB and +10 dB, because a boost past a speaker's beam raises the room, not the
+listener. The gain + shelf DSP is `src/spatial/dirstage.c`. `BWA_PROFILE_BINAURAL` has no
+physical speakers and skips the whole align stage, this included. The
+[array-sim room](#array-sim-room) applies the same model at full resolution as each virtual
+speaker's ABSOLUTE loss toward the listener, so the audition hears the comp's two-band residual
+against the loss it corrects. See
+[spatialization.md](./spatialization.md#compensating-speaker-directivity-for-the-tracked-listener-bwa_set_tracked_directivity-on-by-default).
 
 ### Tracked listener alignment
 

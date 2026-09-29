@@ -27,7 +27,9 @@ Terms used here without definition are in [glossary.md](./glossary.md).
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage. Its LF room correction and,
   opt-in, its whole time alignment can follow the tracked listener instead of one fixed
-  point (`bwa_set_tracked_room_eq`, `bwa_set_tracked_align`).
+  point (`bwa_set_tracked_room_eq`, `bwa_set_tracked_align`), and with the speaker vendor's
+  directivity balloon in the layout, each speaker's off-axis loss follows the head too
+  (`bwa_set_tracked_directivity`).
 - Acoustics, **any build**: image-source early reflections (each wall bounce panned
   as a point source, so it has parallax as the listener walks; a shoebox or a bare
   ground plane, with pressure-release faces for water surfaces), a directional FDN
@@ -141,8 +143,8 @@ render):
 | profile                 | what renders |
 |-------------------------|--------------|
 | `BWA_PROFILE_CAVE`      | bus → ASIO → Dante (production). Listener **position** only - real speakers, real ears. |
-| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-channel output device (a WASAPI endpoint on Windows, or an ASIO driver). Point sources (and their ISM reflections) skip the speaker panner: with the SDK each point voice gets its **own true HRTF convolution**, without it each SH-encodes at its **true** listener-relative direction into a shared field. Beds pass SH→SH, pathing sums in directly; only the FDN/reflection-bed tails ride the bus as virtual speakers. None of the array's phantom-source spread. Full **pose**. Render details: [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim). |
-| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-channel output device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included; full **pose** - head orientation turns the virtual array around you. |
+| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-channel output device (a WASAPI endpoint on Windows, or an ASIO driver). Point sources (and their ISM reflections) skip the speaker panner: with the SDK each point voice gets its **own true HRTF convolution**, without it each SH-encodes at its **true** listener-relative direction into a shared field. Beds pass SH→SH, pathing sums in directly; only the FDN/reflection-bed tails ride the bus as virtual speakers. None of the array's phantom-source spread, and none of the layout's per-speaker corrections: the align stage (trims, correction FIR, room EQ, tracked alignment, directivity comp) is skipped, since no physical speaker exists. Full **pose**. Render details: [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim). |
+| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-channel output device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included, heard from the live listener position through a simulated room: each speaker's distance gain, propagation delay and (with a `directivity` model) off-axis loss toward you. Full **pose** - head orientation turns the virtual array around you, and walking moves you through it. Details: [spatialization.md](./spatialization.md#the-array-sims-room). |
 | `BWA_PROFILE_CAVE_BOTH` | array to Dante + the `CAVE_SIM` monitor tap, concurrently. Two devices: `device` names the array, the monitor takes the platform default. |
 
 Pick by question, not habit: *"what will the room do?"* is `CAVE_SIM`; it hears
@@ -2489,7 +2491,37 @@ interpolate safely. Mid/HF room correction stays out of the tracked path: it is 
 at the centimeter scale ([`calibration.md`](./calibration.md)).
 
 The switch is the live kill switch (off glides every cut to flat, a clean A/B). It's a no-op for
-layouts without a grid.
+layouts without a grid, and under `BWA_PROFILE_BINAURAL`, which skips the whole align stage.
+
+## Tracked directivity compensation (control thread; live, ON by default)
+
+```c
+void bwa_set_tracked_directivity(bwa_engine* e, bool on);   // default ON when the layout carries a model
+```
+
+Layouts carrying a `directivity` model (the speaker vendor's CLF balloon, converted by
+`tools/directivity/clf_to_json.py`; see [layout-schema.md](./layout-schema.md)) plus each
+speaker's `aim` get **listener-tracked directivity compensation**: each block the engine
+takes each speaker's angle off its axis toward the live listener against its angle toward
+the listening point, looks both up in the model, and hands the align stage the difference
+as a broadband gain plus a high shelf at the model's split frequency, glided at 24 dB/s.
+Identity at the listening point, so a calibrated layout is unchanged there; a boost with
+extra treble as the listener walks off a speaker's axis, a cut as they walk onto one.
+Clamped at +/-6 dB broadband and +/-10 dB on the shelf, because past a speaker's beam a
+boost raises the room more than the listener.
+
+It is pure gain (no delay moves), which is why it can default on where tracked alignment
+cannot. This is the live kill switch (off glides to identity, a clean A/B). A no-op for
+layouts without a model, and under `BWA_PROFILE_BINAURAL`, which has no physical speakers:
+that profile skips the whole align stage, and the call still stores its value.
+
+The headphone audition of the array (`BWA_PROFILE_CAVE_SIM`, and the `BWA_PROFILE_CAVE_BOTH`
+monitor) applies the model too, at its full resolution, as each virtual speaker's physical
+loss toward the listener before the decode, so the audition hears the comp's two-band residual
+against the loss it corrects. That part has no switch: it is the simulated room, not a
+correction. The array output never sees it. What it can and cannot do, and why two bands:
+[spatialization.md](./spatialization.md#compensating-speaker-directivity-for-the-tracked-listener-bwa_set_tracked_directivity-on-by-default).
+Untested on hardware.
 
 ## Tracked listener alignment (control thread; live, OFF by default)
 
@@ -2520,7 +2552,8 @@ array, the trade the default takes on purpose. Off is exact, not approximate: wh
 displaced the align stage runs its original integer delay tap, bit-identical to a build without
 the feature; toggling either way glides. It reads the same active listener position everything
 else does (committed pose or internal tracker), touches no gain solve, and re-solves no sources.
-Saturation limits, the level-clamp caveat, the unreported added latency, and why the defaults are
+No effect in `BWA_PROFILE_BINAURAL`, which skips the whole align stage (no physical speakers to
+align); the call still stores its value. Saturation limits, the level-clamp caveat, the unreported added latency, and why the defaults are
 what they are: [spatialization.md](./spatialization.md#re-aligning-to-the-tracked-listener-bwa_set_tracked_align-off-by-default).
 Untested on hardware.
 
@@ -2577,6 +2610,7 @@ at the engine default rather than a guess.
 | `max_re_split` | off | off | No evidence either way |
 | `bed_renderer` | MATRIX | MATRIX | Parametric's claim needs a walking listener, which nothing has measured |
 | `tracked_room_eq` | on | on | Engine default, and a no-op without a `room_eq_grid` |
+| `tracked_directivity` | on | on | Engine default, and a no-op without a `directivity` model. Pure gain, identity at the listening point; unmeasured on hardware |
 | `spcap_focus` / `_density` | 0 | 0 | 0 means the array-derived default |
 | `align_*` guards | 0 | 0 | 0 means the built-in guards |
 

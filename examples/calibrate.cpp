@@ -44,6 +44,9 @@ extern "C" {
 static const double FS         = CAL_FS;
 static const double F1         = CAL_F1, F2 = CAL_F2;
 static const double BAND_HZ[2] = { CAL_BAND_LO, CAL_BAND_HI };
+/* --check-aim's tilt bands (calib.h says why they are not BAND_HZ): passed to measure_response in the
+ * --localize loop AND to calib_check_aim / calib_aim_tilt_db, so both sides of the tilt use them */
+static const double AIM_BAND_HZ[2] = { CALIB_AIM_MID_HZ, CALIB_AIM_HIGH_HZ };
 static const int    NSWEEP     = CAL_NSWEEP;
 static const int    CAPLEN     = CAL_CAPLEN;
 static const int    IR_LEN     = CAL_IRLEN;
@@ -70,7 +73,12 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = NULL;                       /* --driver; NULL = auto-pick */
     float mic[3] = { 0.f, 0.f, 0.f };
+    int   mic_set = 0;                                    /* --mic given: the directivity re-aim needs a real bearing */
     int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, rq_grid = 0, zylia = 0;
+    int   no_dir = 0;                                     /* --ignore-directivity: trims as measured, no model re-aim */
+    int   check_aim = 0;                                  /* --check-aim: fit each speaker's aim from the --localize tilts */
+    double sim_aim_err = 0.0;                             /* --sim-aim-error: simulate only, a known aim error to recover */
+    double sim_room = 0.0;                                /* --sim-room [absorption]: simulate only, a room around the array */
     double known_latency = -1.0;
     int    ref_spk = -1; double ref_dist = 0.0;               /* --ref: one tape-measured distance -> latency */
     const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
@@ -102,7 +110,21 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--room-eq"))            eq = room_eq = 1;  /* + room correction AT THE MIC POINT (static listener only) */
         else if (!strcmp(argv[i],"--room-eq-grid"))       rq_grid     = 1;   /* accumulate LF modal cuts at THIS mic position into room_eq_grid (tracked room EQ) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
-        else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
+        else if (!strcmp(argv[i],"--ignore-directivity")) no_dir      = 1;   /* trims: skip the layout's directivity re-aim */
+        else if (!strcmp(argv[i],"--check-aim"))          check_aim   = 1;   /* with --localize: fit each speaker's aim from its off-axis tilt */
+        else if (!strcmp(argv[i],"--sim-aim-error") && i+1<argc) sim_aim_err = atof(argv[++i]);   /* --simulate: rotate the true aims by this */
+        else if (!strcmp(argv[i],"--sim-room")) {         /* --simulate: a shoebox room; optional absorption */
+            sim_room = 0.3;                               /* a moderately damped room: RT60 ~0.35 s on the 26-grid */
+            if (i+1 < argc) {
+                char* end = NULL;
+                double v = strtod(argv[i+1], &end);
+                if (end != argv[i+1] && *end == 0) {
+                    if (!(v > 0.0 && v <= 1.0)) { fprintf(stderr, "calibrate: --sim-room absorption must be in (0, 1] (got %s)\n", argv[i+1]); return 2; }
+                    sim_room = v; ++i;
+                }
+            }
+        }
+        else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); mic_set = 1; }
         else if (!strcmp(argv[i],"--temp") && i+1<argc) {   /* "22.8", "22.8C", "73F" */
             if (!sos_parse_temp(argv[++i], &sos)) {
                 fprintf(stderr, "calibrate: --temp '%s' is not a plausible room temperature "
@@ -118,18 +140,34 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]]\n"
                                "  --zylia: ZM-1 single-placement localization; --input is the FIRST of its 19 consecutive\n"
                                "  capture channels, --mic is the array center. Distances need --latency (loopback, m at c)\n"
                                "  or --ref <spk> <m> (one tape-measured center->speaker distance).\n"
                                "  --temp: room air temperature; every surveyed range scales with it (2%% of c = 8 cm at\n"
-                               "  4 m). Recorded into the layout's reference.speed_of_sound_mps, so set it once per rig.\n"); return 2; }
+                               "  4 m). Recorded into the layout's reference.speed_of_sound_mps, so set it once per rig.\n"
+                               "  --ignore-directivity: with a layout that carries a directivity model, the trims are\n"
+                               "  re-aimed from the mic's bearing off each speaker to the listening point's; this skips it.\n"
+                               "  --check-aim: with --localize and a directivity model, fit each speaker's acoustic axis from\n"
+                               "  how its high/mid tilt changes across the mic positions, and report it against the layout's\n"
+                               "  aim. Diagnostic only. --sim-aim-error <deg> gives --simulate a known error to recover.\n"
+                               "  --sim-room [absorption]: --simulate inside a shoebox room around the array (image sources\n"
+                               "  to order 2, each carrying the directivity model at its own departure angle, plus a late\n"
+                               "  tail); absorption 0.3 by default. Exercises the direct-sound gate and its dilution.\n"); return 2; }
     }
     if (n_temp && n_c) {
         fprintf(stderr, "calibrate: --temp and --c set the same thing; pass one\n"); return 2; }
     if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
     if (zylia && (localize_file || check || live_speaker >= 0)) {
         fprintf(stderr, "calibrate: --zylia is its own mode (19-input capture); drop --localize/--check/--live\n"); return 2; }
+    if (check_aim && !localize_file) {
+        fprintf(stderr, "calibrate: --check-aim rides the --localize captures; pass --localize positions.txt\n"); return 2; }
+    if (sim_aim_err != 0.0 && !simulate) {
+        fprintf(stderr, "calibrate: --sim-aim-error is a --simulate knob (a real rig has its own aim errors)\n"); return 2; }
+    if (sim_aim_err != 0.0) calib_sim_set_aim_error((float)sim_aim_err);
+    if (sim_room != 0.0 && !simulate) {
+        fprintf(stderr, "calibrate: --sim-room is a --simulate knob (a real rig brings its own room)\n"); return 2; }
+    if (sim_room != 0.0) calib_sim_set_room((float)sim_room);
     if (room_eq)
         printf("calibrate: --room-eq corrects the ROOM at the mic position - valid only for a STATIC\n"
                "           listener seated there (SPCAP/VBAP deployments); a roaming listener wants plain --eq.\n"
@@ -156,6 +194,32 @@ int main(int argc, char** argv) {
     printf("calibrate: %d speakers from %s; mic at (%.2f %.2f %.2f)%s\n",
            n, layout_path, mic[0], mic[1], mic[2], simulate ? "  [SIMULATE]" : "");
     printf("           speed of sound %.1f m/s (%s)\n", sos, sos_src);
+    if (simulate) {
+        char rd[256];
+        calib_sim_room_describe(&L, rd, sizeof rd);
+        printf("           simulated room: %s\n", rd);
+    }
+    /* Speaker directivity model (layout `directivity` + per-speaker `aim`; docs/calibration.md).
+     * The measured level of each speaker carries its off-axis loss toward the MIC; the trims should
+     * describe what the LISTENING POINT hears, which is the loss toward ref. The factor is
+     * calib_directivity_corr's: D(ref)/D(mic) averaged the way measure.c's level is, diluted by each
+     * capture's reverberant share, so it is computed AFTER the sweeps (it needs direct_frac). A mic at
+     * the listening point leaves every trim exactly as measured. The report is the rig-day check that
+     * the speakers are aimed where the layout says. */
+    int want_corr = 0;
+    if (L.dir.nband && !no_dir && !mic_set) {
+        /* the default mic (0,0,0) is the floor origin: a 1/r term nobody minds much, but a bearing
+         * off every speaker's axis that would put several dB of fictitious correction in the trims */
+        printf("directivity: model present but no --mic given, so the mic's bearing off each speaker is\n"
+               "             unknown; the trims stay as measured. Pass --mic x y z (the listening point is\n"
+               "             (%.2f %.2f %.2f)) to re-aim them.\n", L.ref[0], L.ref[1], L.ref[2]);
+    } else if (L.dir.nband && !no_dir) {
+        want_corr = 1;
+        printf("directivity: %d-band model, split %.0f Hz; the trims are re-aimed to the listening point\n"
+               "             after the sweeps (the per-speaker table follows them)\n", (int)L.dir.nband, L.dir.split_hz);
+    } else if (L.dir.nband) {
+        printf("directivity: model present, --ignore-directivity given: trims stay as measured at the mic\n");
+    }
     if (ref_spk >= 0 && (ref_spk >= n || ref_dist < 0.2)) {
         fprintf(stderr, "calibrate: --ref wants a speaker 0..%d and a distance >= 0.2 m (got %d, %.3f)\n",
                 n - 1, ref_spk, ref_dist); return 2;
@@ -209,6 +273,11 @@ int main(int argc, char** argv) {
         }
         printf("localize: %d mic positions, %d speakers each\n", K, n);
         double* range = (double*)malloc((size_t)n * K * sizeof(double));
+        float*  tilt  = (float*)calloc((size_t)n * K, sizeof(float));   /* --check-aim: high/mid tilt per capture */
+        float*  tiltw = (float*)calloc((size_t)n * K, sizeof(float));   /* ... the same from the WHOLE response (dilution) */
+        if (check_aim && !L.dir.nband)
+            printf("check-aim: the layout carries no directivity model, so there is nothing to check the tilts against\n"
+                   "           (tools/directivity/clf_to_json.py --into %s)\n", layout_path);
         for (int k = 0; k < K; ++k) {
             if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
             for (int s = 0; s < n; ++s) {
@@ -216,8 +285,14 @@ int main(int argc, char** argv) {
 #ifdef BWA_HAVE_ASIO
                 else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); calib_asio_close(); return 1; }
 #endif
-                MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
+                /* AIM_BAND_HZ, not BAND_HZ: only the delay and the tilt are read here, and the tilt is
+                 * the DIRECT sound's, over the bands calib_check_aim predicts it on */
+                MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, AIM_BAND_HZ, &r);
                 range[(size_t)s * K + k] = ((double)r.delay_samples + r.delay_frac) * sos / FS; /* c*delay, meters (sub-sample) */
+                tilt[(size_t)s * K + k] = (r.band_direct[1] > 1e-9f && r.band_direct[2] > 1e-9f)
+                                        ? (float)(20.0 * log10((double)r.band_direct[2] / (double)r.band_direct[1])) : 0.f;
+                tiltw[(size_t)s * K + k] = (r.band[1] > 1e-9f && r.band[2] > 1e-9f)
+                                         ? (float)(20.0 * log10((double)r.band[2] / (double)r.band[1])) : 0.f;
             }
         }
 #ifdef BWA_HAVE_ASIO
@@ -264,6 +339,77 @@ int main(int argc, char** argv) {
               }
           } }
 #endif
+        if (check_aim && L.dir.nband) {
+            /* The aim check (calib_check_aim): each speaker's measured high/mid tilt across the mic
+             * positions against the model's prediction for its aim, mean removed; a grid search
+             * around the layout aim finds the direction that explains the tilts best. Bearings use
+             * the SOLVED positions where the solve succeeded. Then the residual every speaker shares
+             * as a function of bearing: a slope there is a loss the model does not know (the screens)
+             * or a model that does not fit these boxes, and it is not an aim error. */
+            static Layout LA;                                /* never a stack local (layout.h) */
+            LA = L;
+            for (int s = 0; s < n; ++s) if (latv[s] >= 0.0) memcpy(LA.speakers[s].pos, pos[s], sizeof pos[s]);
+            printf("check-aim: fitted acoustic axis per speaker (tilt = direct-sound high/mid level, %.0f-%.0f Hz\n"
+                   "           against %.0f Hz up, dB; %d positions)\n", AIM_BAND_HZ[0], AIM_BAND_HZ[1], AIM_BAND_HZ[1], K);
+            printf("           spk  spread  rms@layout  rms@fit   aim error  fitted aim                whole-resp\n");
+            double sxx = 0, sxy = 0, sx = 0, sy = 0; int nn = 0;
+            int flagged = 0;
+            /* the gated fit's error and the whole-response fit's, per fitted speaker: the gap is the
+             * reverberant dilution the gate removes (docs/calibration.md) */
+            float err_g[BWA_MAX_CHANNELS], err_w[BWA_MAX_CHANNELS]; int nerr = 0;
+            for (int s = 0; s < n; ++s) {
+                CalibAimResult ar;
+                calib_check_aim(&LA, s, micpos, &tilt[(size_t)s * K], K, AIM_BAND_HZ, F2, &ar);
+                if (!ar.ok) {
+                    printf("           %3d  %5.1f    %5.2f       -         -        (refused: %s)\n", s, ar.spread_deg, ar.rms_layout_db,
+                           K < 3 ? "fewer than 3 positions" : "under 8 deg of bearing spread");
+                    continue;
+                }
+                int flag = ar.aim_err_deg > 15.f && ar.rms_layout_db - ar.rms_fit_db > 0.5f;
+                flagged += flag;
+                CalibAimResult aw;
+                calib_check_aim(&LA, s, micpos, &tiltw[(size_t)s * K], K, AIM_BAND_HZ, F2, &aw);
+                printf("           %3d  %5.1f    %5.2f     %5.2f     %5.1f deg  (%+.3f %+.3f %+.3f)  %5.1f deg%s\n", s, ar.spread_deg,
+                       ar.rms_layout_db, ar.rms_fit_db, ar.aim_err_deg, ar.aim_fit[0], ar.aim_fit[1], ar.aim_fit[2],
+                       aw.ok ? aw.aim_err_deg : 0.f, flag ? "   <- AIM: check the mount, or the layout's aim" : "");
+                if (aw.ok) { err_g[nerr] = ar.aim_err_deg; err_w[nerr] = aw.aim_err_deg; ++nerr; }
+                /* the shared residual: layout-aim tilt residual (mean removed) against bearing */
+                double m = 0; float rk[64];
+                for (int k = 0; k < K; ++k) {
+                    float th = layout_speaker_off_axis_deg(&LA, (uint32_t)s, micpos[k]);
+                    rk[k] = tilt[(size_t)s * K + k] - calib_aim_tilt_db(&L.dir, th, AIM_BAND_HZ, F2);
+                    m += rk[k];
+                }
+                m /= K;
+                for (int k = 0; k < K; ++k) {
+                    double x = layout_speaker_off_axis_deg(&LA, (uint32_t)s, micpos[k]), y = rk[k] - m;
+                    sx += x; sy += y; sxx += x * x; sxy += x * y; ++nn;
+                }
+            }
+            if (nn > 2) {
+                double den = nn * sxx - sx * sx;
+                double slope = den > 1e-9 ? (nn * sxy - sx * sy) / den : 0.0;
+                printf("check-aim: shared residual vs bearing: %+.2f dB per 10 deg over %d captures", slope * 10.0, nn);
+                printf(fabs(slope * 10.0) > 0.5 ? "  <- a loss the model does not carry (screens?), not an aim error\n" : "  (model fits)\n");
+            }
+            if (nerr > 0) {
+                /* medians (insertion sort; nerr <= the speaker count) */
+                for (int a = 1; a < nerr; ++a) {
+                    float vg = err_g[a], vw = err_w[a]; int b = a;
+                    while (b > 0 && err_g[b-1] > vg) { err_g[b] = err_g[b-1]; --b; } err_g[b] = vg;
+                    b = a;
+                    while (b > 0 && err_w[b-1] > vw) { err_w[b] = err_w[b-1]; --b; } err_w[b] = vw;
+                }
+                const float mg = (nerr & 1) ? err_g[nerr/2] : 0.5f * (err_g[nerr/2 - 1] + err_g[nerr/2]);
+                const float mw = (nerr & 1) ? err_w[nerr/2] : 0.5f * (err_w[nerr/2 - 1] + err_w[nerr/2]);
+                printf("check-aim: median aim error: gated %.1f deg, whole-response %.1f deg%s\n", mg, mw,
+                       mw < mg - 1.f ? ": the whole response under-reads it (its reverberant share dilutes the tilt)"
+                                     : " (no dilution to speak of: an anechoic capture, or a dead room)");
+            }
+            printf("check-aim: %d speaker(s) flagged. Diagnostic only: nothing is written back.\n", flagged);
+        }
+        free(tilt);
+        free(tiltw);
         free(latv);
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         record_sos(out_path, sos);
@@ -532,8 +678,38 @@ int main(int argc, char** argv) {
      * not a float[n][3] — calib_solve needs a packed [3]-stride array. */
     float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
     for (int i = 0; i < n; ++i) { pos[i][0]=L.speakers[i].pos[0]; pos[i][1]=L.speakers[i].pos[1]; pos[i][2]=L.speakers[i].pos[2]; }
-    calib_solve(res, pos, mic, n, FS, gdb, dms);
-    free(pos);
+    float* corr = NULL;
+    if (want_corr) {
+        corr = (float*)calloc((size_t)n, sizeof(float));
+        calib_directivity_corr(&L, mic, 2.0 * F1, 0.5 * F2, res, corr);   /* the one implementation (calib.c) */
+        printf("directivity: per-speaker bearing off the acoustic axis, and the trim re-aim\n"
+               "             (direct = the gated share of each capture's energy; the model ratio acts on it only)\n");
+        printf("             spk  at-mic   at-ref   loss@mic(lo/hi dB)  loss@ref(lo/hi dB)  direct  trim corr\n");
+        for (int i = 0; i < n; ++i) {
+            float th_mic = layout_speaker_off_axis_deg(&L, (uint32_t)i, mic);
+            float th_ref = layout_speaker_off_axis_deg(&L, (uint32_t)i, L.ref);
+            float lm, hm, lr, hr;
+            directivity_lookup(&L.dir, th_mic, &lm, &hm);
+            directivity_lookup(&L.dir, th_ref, &lr, &hr);
+            printf("             %3d  %5.1f    %5.1f    %+5.1f / %+5.1f        %+5.1f / %+5.1f        %4.2f   %+.2f dB%s\n",
+                   i, th_mic, th_ref, lm, hm, lr, hr, res[i].direct_frac, 20.0 * log10(corr[i]),
+                   th_ref > 30.f ? "   <- aimed > 30 deg off the listening point" : "");
+        }
+        if (fabsf(mic[0] - L.ref[0]) < 1e-3f && fabsf(mic[1] - L.ref[1]) < 1e-3f && fabsf(mic[2] - L.ref[2]) < 1e-3f)
+            printf("             mic is at the listening point: every correction is 0 dB by construction\n");
+        {   /* the direct shares in one line: 1.00 everywhere is an anechoic capture, and the model's
+             * ratio then acts on the whole level */
+            float fs_[BWA_MAX_CHANNELS];
+            for (int i = 0; i < n; ++i) {
+                float v = res[i].direct_frac; int b = i;
+                while (b > 0 && fs_[b-1] > v) { fs_[b] = fs_[b-1]; --b; } fs_[b] = v;
+            }
+            printf("directivity: direct share of the level band: min %.2f  median %.2f  max %.2f\n",
+                   fs_[0], (n & 1) ? fs_[n/2] : 0.5f * (fs_[n/2 - 1] + fs_[n/2]), fs_[n - 1]);
+        }
+    }
+    calib_solve_corr(res, pos, mic, n, FS, corr, gdb, dms);   /* corr NULL = the plain solve */
+    free(pos); free(corr);
 
     /* report the spread + write back */
     float gmin=1e9f, gmax=-1e9f, dmax=0.f;

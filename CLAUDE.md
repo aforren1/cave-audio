@@ -29,7 +29,10 @@ Sources → per-voice **listener-relative DBAP** panning → an in-memory
 - **ASIO device** (production): writes the speaker bus straight to the Digiface.
 - **Array-sim monitor** (`cave_sim`, and `cave_both`'s tap): treats each bus channel
   as a virtual speaker at its room position, HRTFs to stereo, writes to a normal
-  output device.
+  output device. Before the decode, `arraysim.c` puts the ROOM back on a copy of the
+  bus (each speaker's distance gain, propagation delay and full-resolution directivity
+  toward the live listener), and the phonon encode follows the live position
+  (parallax), because the bus carries trims that only make sense against that room.
 
 Adding the sim path did not complicate the core — it is just a second consumer of
 the same bus. Protect that property. The one deliberate extension is the
@@ -40,7 +43,9 @@ field otherwise — beds pass SH->SH into that field (one diagonal,
 ambi_canon_to_phonon) and pathing sums in raw; ONE HRTF decode + the per-voice
 convolutions produce stereo. The bus keeps the synthesized-diffuse taps
 (FDN/reflection bed). These are profile-gated render targets, not a parallel
-engine — anything synthesized-diffuse still belongs on the bus.
+engine — anything synthesized-diffuse still belongs on the bus. That bus drives no
+physical speaker, so BINAURAL skips rt.c's whole align stage (trims, correction FIR,
+room EQ, tracked room EQ, tracked alignment, directivity comp) and builds no sim room.
 
 ## Hard invariants (do not violate)
 
@@ -228,6 +233,9 @@ src/
     hole.h / hole.c      hole-aware spread floor: a source aimed where the array has NO speaker (the
                          barrel's open poles) is floored WIDE instead of split across the hull triangle
                          that closes the hole. Cached per listener like spcap/vbap; bwa_set_hole_spread. [spatialization]
+    dirstage.h/.c        per-channel slewed broadband gain + RBJ high shelf, state in a caller-owned
+                         struct: the DSP of align.c's tracked directivity comp (the model's two-band
+                         approximation). The array-sim room deliberately does NOT share it. [directivity]
     align.h / align.c    per-speaker gain trim + delay-line output stage. [M4] Also the tracked-listener
                          re-reference (bwa_set_tracked_align): re-aims the trims from the layout's fixed
                          ref onto the live head, slewed + dead-zoned because every delay change is a
@@ -243,10 +251,23 @@ src/
   binaural/
     binaural.h/binaural.c  head-oriented array->stereo monitor + the no-SDK cardioid decode of the
                          direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
+    arraysim.h/.c        the array sim's ROOM (cave_sim + cave_both's tap, always; never BINAURAL), on a
+                         copy of the bus before either decoder: per channel a graphic EQ fitted to the
+                         directivity model at the speaker's angle to the listener (one peaking section per
+                         model band, bandwidth in octaves, gains = a precomputed interaction-matrix
+                         inverse x the table, one mat-vec per retarget; Liski/Valimaki 2017; SSE/NEON four
+                         channels per vector, 150 us per 256-block at 26 ch x 27 bands), a distance gain
+                         r0/d (ABSOLUTE: the trims divide 1/r out, the room does not) and a propagation
+                         delay (d - C)/c on a fractional line creeping at 3 m/s (the Doppler is physical;
+                         ring sized for 4 m of excursion, clamps past it). Never writes the bus it reads:
+                         cave_both's is the array's device buffer. [directivity]
     hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on
                          the headphone profiles' final stereo (bwa_load_headphone_eq). [binaural]
     steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK); sums the
-                         direct field into the virtual-speaker encode pre-decode. [M5]
+                         direct field into the virtual-speaker encode pre-decode. [M5] `parallax` at create:
+                         the sim profiles re-encode each virtual speaker from the LIVE listener position
+                         (>1 cm move, matrix ramped across the block); BINAURAL keeps the fixed encode from
+                         ref, bit-identical to before.
   dsp/
     biquad.h             RBJ "Audio EQ Cookbook" coefficients, a0-normalized, Direct Form I.
                          Shared by the transmission/pathing EQ, the room EQ and the headphone EQ.
@@ -322,6 +343,38 @@ tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 buil
                        into bindings/web/dist/, three.js fetched by fetch-web-vendor.sh with sha256
                        pins) and gen-abi.mjs (the web binding's raw layer + export list, from the
                        header). docs/web.md. [wasm]
+tools/directivity/     clf_to_json.py: the speaker vendor's CLF simulation file (.cf2; the Genelec 4410A's
+                       is on its product page) -> the layout's `directivity` block (27 bands x 37 angles of
+                       off-axis loss, axisymmetric). The CLF binary is UNDOCUMENTED: the layout was decoded
+                       from that one file (30 bands, 72 x 37 balloons, on-axis at polar 0, a placeholder
+                       37th entry) and the script REFUSES to write unless the decoded -6 dB half-angles
+                       agree with the file's own coverage lists in 12 of the 15 bands that have one and
+                       the measured-band count matches those lists (a zero region ahead of the balloon
+                       matches the structural test too). Stdlib only. examples/genelec_4410a_directivity.json
+                       is its output. Three consumers: bwa_calibrate's trim re-aim (calib_directivity_corr
+                       -> calib_solve_corr, the mic's bearing -> the listening point's, applied to the
+                       DIRECT share only: sqrt(f r^2 + 1 - f), f = measure.c's gated direct_frac); rt.c's
+                       directivity_track -> align.c's slewed gain + HF shelf (bwa_set_tracked_directivity,
+                       ON by default, identity at ref, clamped +6/+10 dB, skipped with the rest of the
+                       align stage in BWA_PROFILE_BINAURAL); and the array-sim room's SIMULATED loss
+                       (arraysim.c: each virtual speaker's ABSOLUTE loss toward the listener at the model's
+                       FULL resolution, a per-band graphic EQ, on a COPY because cave_both's monitor reads
+                       the array's device buffer). The comp is two bands and the audition is not, so the
+                       audition plays the comp's two-band residual (monitor test: 6.4 dB at 16 kHz, 45 deg
+                       off a 4410A). The trim re-aim needs the mic's REAL position: the CLI applies it only
+                       with --mic, and calib_view's Capture tab only once the user edits the mic field
+                       (which defaults to the layout's listening point). Speakers carry an `aim`; absent = toward ref. The
+                       aim is the one input nothing else verifies, so `bwa_calibrate --localize
+                       --check-aim` fits each box's real axis from the localize captures' DIRECT-sound
+                       tilt (band_direct, 1-3 kHz vs 3 kHz up: CALIB_AIM_*_HZ, on both the measurement and
+                       the model side; calib_check_aim refuses under 8 deg of bearing spread;
+                       `--simulate --sim-aim-error N` is its self-check; it prints the whole-response fit
+                       beside the gated one, so the dilution shows). `--simulate --sim-room [absorption]`
+                       (calib_capture.cpp) puts a shoebox around the array: 24 image sources, each carrying
+                       the model at its own departure angle, plus a deterministic diffuse tail, so the gate
+                       and the direct share have something to act on; the calibrate_sim_room_aim and
+                       _trim ctests pin a gated fit of about 20 deg with a smaller whole-response one (21 vs 14 measured), and direct shares below 1.
+                       [directivity]
 tools/layout/          gen_dome.py: the playgrounds' default array, a 24-speaker dome evenly spread over
                        the sphere ABOVE the floor. Writes examples/dome_24.json and the Godot addon's
                        copy (playground/dome_24.json) - regenerate, never hand-edit either. Stdlib only.
@@ -478,17 +531,18 @@ engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manyl
 release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
 phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
 everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
-tree registers 45 on Windows at full options and 38 off it, and each job's bindings tree registers
+tree registers 47 on Windows at full options and 38 off it, and each job's bindings tree registers
 the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 45 tests with the Steam Audio SDK, 40 without (the 5 SDK-gated ones are `reflect`,
+suite — 47 tests with the Steam Audio SDK, 42 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
+(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, the two
+`calibrate_sim_room_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
 under their build flags. On Linux, macOS or Android at the DEFAULT options it is 33: `calib_view`
 and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
-`validate_*` runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
+`validate_*` and `calibrate_sim_room_*` runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
 `BWA_BUILD_PLAYGROUND`, which defaults OFF. Those two are NOT Windows-bound (raylib + rlImGui +
 imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
 back, for 40 with phonon and 35 without, MEASURED on Ubuntu 22.04 / gcc 11.4. They need a DISPLAY:
@@ -504,7 +558,7 @@ sleep-lateness bound, which a no-SDK library of the same commit misses identical
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
-`python_example_live_onset`), so the full-options Windows tree is 49 and the default Windows tree
+`python_example_live_onset`), so the full-options Windows tree is 51 and the default Windows tree
 42; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
@@ -521,7 +575,7 @@ after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
-55 (45 + 10) and 59 at full options; a Linux or macOS box with Octave alone reaches 43 (38 + 5) and
+57 (47 + 10) and 61 at full options; a Linux or macOS box with Octave alone reaches 43 (38 + 5) and
 with both 48 (38 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
@@ -531,7 +585,7 @@ into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's
 engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
-that is the 42 the linux and macos jobs report, and on Windows 49 registered with 46 run (the three
+that is the 42 the linux and macos jobs report, and on Windows 51 registered with 48 run (the three
 GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is

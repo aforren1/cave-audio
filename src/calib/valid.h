@@ -87,6 +87,11 @@
  *                       dual_band: it touches nothing else.
  *   hole_spread         the hole-aware spread floor's strength. Inert on an array with no holes.
  *   tracked_align       re-reference the output stage's delays/trims onto the solve listener.
+ *   tracked_directivity re-reference each speaker's off-axis loss (the layout's directivity
+ *                       model) onto the solve listener. OFF here although the engine defaults it
+ *                       on: the simulate arm and the physical reference model omni speakers, so a
+ *                       phantom rendered with the comp would be scored against a mic model that
+ *                       never saw the loss it corrects. Turn it on only to sweep it.
  *   spread_mode         how width renders: 0 lobe, 1 MDAP, 2 spectral.
  *   decorrelation       velvet-noise decorrelation of the wide part.
  *   near_spread         near-listener widening radius, meters (0 = off).
@@ -104,6 +109,7 @@ typedef struct {
     int   decorrelation;    /* bwa_set_decorrelation */
     float near_spread;      /* bwa_set_near_spread radius, meters; 0 = off */
     float spread;           /* the source's own width, 0..1 (bwa_source_set_spread) */
+    int   tracked_directivity;   /* bwa_set_tracked_directivity (see above; default OFF here) */
 } ValidRender;
 
 /* All-defaults (the same thing as passing NULL anywhere a `const ValidRender*` is taken). */

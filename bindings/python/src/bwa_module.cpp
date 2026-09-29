@@ -317,6 +317,7 @@ NB_MODULE(_bwa, m) {
         .def_rw("max_re_split", &bwa_tuning::max_re_split)
         .def_rw("bed_renderer", &bwa_tuning::bed_renderer)
         .def_rw("tracked_room_eq", &bwa_tuning::tracked_room_eq)
+        .def_rw("tracked_directivity", &bwa_tuning::tracked_directivity)
         .def_rw("tracked_align", &bwa_tuning::tracked_align)
         .def_rw("align_dead_zone_m", &bwa_tuning::align_dead_zone_m)
         .def_rw("align_slew_frames_per_s", &bwa_tuning::align_slew_frames_per_s);
@@ -844,6 +845,7 @@ NB_MODULE(_bwa, m) {
     m.def("set_bed_renderer", [](Engine& e, bwa_bed_renderer r) { bwa_set_bed_renderer(live(e), r); },
           "e"_a, "renderer"_a);
     m.def("set_tracked_room_eq", [](Engine& e, bool on) { bwa_set_tracked_room_eq(live(e), on); }, "e"_a, "on"_a);
+    m.def("set_tracked_directivity", [](Engine& e, bool on) { bwa_set_tracked_directivity(live(e), on); }, "e"_a, "on"_a);
     m.def("set_tracked_align", [](Engine& e, bool on) { bwa_set_tracked_align(live(e), on); }, "e"_a, "on"_a);
     m.def("set_tracked_align_guards", [](Engine& e, float dz, float slew) {
         bwa_set_tracked_align_guards(live(e), dz, slew);

@@ -36,4 +36,8 @@ void     monitor_destroy(Monitor* m);
 void monitor_process(Monitor* m, const float* bus, const float* direct16,
                      const float p[3], const float q[4], float* out_stereo, uint32_t nframes);
 
+/* The array sim's room (distance gain, propagation delay and the speakers' directivity) is NOT this
+ * decode's job: arraysim.h applies it to a copy of the bus before either decoder reads it, in
+ * cave_sim and cave_both only. */
+
 #endif /* BWA_BINAURAL_H */

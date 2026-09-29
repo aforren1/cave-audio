@@ -242,6 +242,10 @@ void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq
  * ratio, hence the pitch shift); either <= 0 reverts that one to its default. Live A/B. */
 void    rt_set_tracked_align(RtCore* c, int on);
 void    rt_set_tracked_align_guards(RtCore* c, float dead_zone_m, float slew_frames_per_s);
+/* Tracked directivity compensation (align.h, layout.h Directivity): re-reference each speaker's
+ * off-axis loss from Layout.ref onto the live listener, as a slewed broadband gain + HF shelf per
+ * channel. Default ON; inert for a layout with no directivity model. Live A/B. */
+void    rt_set_tracked_directivity(RtCore* c, int on);
 void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
 void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */
@@ -429,6 +433,9 @@ void rt_source_set_directivity_manual(RtCore* c, uint32_t h, const float fwd[3],
  * from it next block (both glide, so a change bends, never steps). Delays saturate at each ring's
  * capacity, so a c far below air's mostly shows up as pitch/glide behavior, not unbounded delay. */
 void rt_set_speed_of_sound(RtCore* c, float mps);
+/* The live value, for a consumer outside the core that must follow it (the array-sim room stage's
+ * propagation delays, arraysim.h). One relaxed atomic load: audio-thread safe. */
+float rt_speed_of_sound(const RtCore* c);
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
 void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt);/* anisotropic width/height extent (room-referenced) */
 void rt_source_set_attenuation(RtCore* c, uint32_t h, float ref_m, float rolloff, float min_lin);  /* per-source curve;

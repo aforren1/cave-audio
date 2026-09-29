@@ -240,6 +240,7 @@ static void null_engine_sweep(void) {
     bwa_set_limiter(NULL, false);           bwa_set_limiter_ceiling(NULL, 0.5f);
     bwa_set_headphone_eq(NULL, true);       bwa_set_bed_renderer(NULL, BWA_BED_PARAMETRIC);
     bwa_set_tracked_room_eq(NULL, false);   bwa_set_tracked_align(NULL, true);
+    bwa_set_tracked_directivity(NULL, false);
     bwa_set_tracked_align_guards(NULL, 0.1f, 100.f); bwa_set_pose_prediction(NULL, 0.05f);
     bwa_set_extra_listeners(NULL, f3, 1);
     bwa_set_listener_pose(NULL, 0, 0, 0, 0, 0, 0, 1);

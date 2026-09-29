@@ -251,7 +251,8 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   `bwa_set_spcap_focus`, `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
   `bwa_set_decorrelation`, `bwa_set_near_spread`, `bwa_set_hole_spread`,
   `bwa_set_bed_renderer`, `bwa_set_tracked_align` + `bwa_set_tracked_align_guards`,
-  `bwa_set_tracked_room_eq` (the bed *decoder* is create-time: `bwa_desc.bed_decoder`).
+  `bwa_set_tracked_room_eq`, `bwa_set_tracked_directivity` (the bed *decoder* is
+  create-time: `bwa_desc.bed_decoder`).
   Semantics: [api.md](./api.md). `Engine` re-pushes these from `OnValidate`, so the
   inspector A/Bs them by ear in Play mode, which is what the engine makes them atomic for.
 - **Listener**: `bwa_set_pose_prediction` (internal tracking only) and

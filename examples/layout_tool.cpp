@@ -91,13 +91,86 @@
 static float speed_of_sound = (float)BWA_SOS_REF_MPS;
 #define PANEL_W        300.0f     /* control panel width (right side), in unscaled UI px */
 
-typedef struct { Vector3 pos; float gain_db; int pin; } Spk;   /* pin: 1 = held to the ear-plane slab */
+typedef struct {
+    Vector3 pos; float gain_db; int pin;   /* pin: 1 = held to the ear-plane slab */
+    int has_aim; Vector3 aim;              /* the file's `aim` (unit), kept across a save; else aimed at the ears */
+} Spk;
 static Spk spk[NSPK];
 static int g_nspk = BWA_DEFAULT_GRID;  /* speakers in the edited layout (4..NSPK) — the engine's channel count */
 
 /* dbap knobs (round-tripped through the file; defaults match layout_default) */
 static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min_db = -40.0f;
 static const char* dist_model = "inverse";
+
+/* Speaker directivity (the layout's `directivity` block, docs/layout-schema.md). The tool never
+ * edits it: it keeps the block verbatim across a save (save_json rewrites the file from scratch,
+ * so without this an authored layout would lose its model), and reads the table to draw the
+ * SELECTED speaker's -3 dB rings, one at 2 kHz and one at the top band. Only the selected speaker,
+ * on purpose: 24 cones is a hedge, one is a check. */
+#define DIR_MAX_B 32
+#define DIR_MAX_A 37
+static int   g_dir_nb = 0, g_dir_na = 0;
+static float g_dir_hz[DIR_MAX_B], g_dir_ang[DIR_MAX_A], g_dir_loss[DIR_MAX_B][DIR_MAX_A];
+static char  g_dir_model[64];
+static char* g_dir_json = NULL;            /* cJSON_PrintUnformatted of the block; re-emitted by save_json */
+
+static void dir_reset(void) {
+    g_dir_nb = g_dir_na = 0; g_dir_model[0] = 0;
+    free(g_dir_json); g_dir_json = NULL;
+    for (int i = 0; i < NSPK; ++i) spk[i].has_aim = 0;
+}
+
+/* the off-axis angle where band `b` first drops to `level_db` (linear between the table's angles);
+ * 180 when it never does. The table is the converter's axisymmetric mean. */
+static float dir_half_angle(int b, float level_db) {
+    if (b < 0 || b >= g_dir_nb || g_dir_na < 2) return 180.0f;
+    for (int a = 1; a < g_dir_na; ++a) {
+        float v0 = g_dir_loss[b][a - 1], v1 = g_dir_loss[b][a];
+        if (v1 <= level_db) {
+            float t = (v1 != v0) ? (level_db - v0) / (v1 - v0) : 0.0f;
+            return g_dir_ang[a - 1] + (g_dir_ang[a] - g_dir_ang[a - 1]) * t;
+        }
+    }
+    return 180.0f;
+}
+static float dir_loss_at(int b, float ang) {         /* the table at one angle, clamped at its ends */
+    if (b < 0 || b >= g_dir_nb || g_dir_na < 2) return 0.0f;
+    if (ang <= g_dir_ang[0]) return g_dir_loss[b][0];
+    for (int a = 1; a < g_dir_na; ++a)
+        if (ang <= g_dir_ang[a]) {
+            float t = (ang - g_dir_ang[a - 1]) / (g_dir_ang[a] - g_dir_ang[a - 1]);
+            return g_dir_loss[b][a - 1] + (g_dir_loss[b][a] - g_dir_loss[b][a - 1]) * t;
+        }
+    return g_dir_loss[b][g_dir_na - 1];
+}
+static int dir_band_at_or_above(float hz) {          /* first band >= hz, else the last */
+    for (int b = 0; b < g_dir_nb; ++b) if (g_dir_hz[b] >= hz) return b;
+    return g_dir_nb - 1;
+}
+
+/* parse the block out of a loaded layout (root) into the table + the verbatim copy; a malformed
+ * block is kept verbatim (the engine's loader is the judge) but not drawn */
+static void dir_load(cJSON* root) {
+    cJSON* dj = cJSON_GetObjectItemCaseSensitive(root, "directivity");
+    if (!cJSON_IsObject(dj)) return;
+    g_dir_json = cJSON_PrintUnformatted(dj);
+    cJSON* bands = cJSON_GetObjectItemCaseSensitive(dj, "bands_hz");
+    cJSON* angs  = cJSON_GetObjectItemCaseSensitive(dj, "angles_deg");
+    cJSON* loss  = cJSON_GetObjectItemCaseSensitive(dj, "loss_db");
+    cJSON* mdl   = cJSON_GetObjectItemCaseSensitive(dj, "model");
+    if (cJSON_IsString(mdl)) snprintf(g_dir_model, sizeof g_dir_model, "%s", mdl->valuestring);
+    if (!cJSON_IsArray(bands) || !cJSON_IsArray(angs) || !cJSON_IsArray(loss)) return;
+    int nb = cJSON_GetArraySize(bands), na = cJSON_GetArraySize(angs);
+    if (nb < 1 || nb > DIR_MAX_B || na < 2 || na > DIR_MAX_A || cJSON_GetArraySize(loss) != nb) return;
+    for (int b = 0; b < nb; ++b) { cJSON* v = cJSON_GetArrayItem(bands, b); if (!cJSON_IsNumber(v)) return; g_dir_hz[b] = (float)v->valuedouble; }
+    for (int a = 0; a < na; ++a) { cJSON* v = cJSON_GetArrayItem(angs, a);  if (!cJSON_IsNumber(v)) return; g_dir_ang[a] = (float)v->valuedouble; }
+    for (int b = 0; b < nb; ++b) {
+        cJSON* row = cJSON_GetArrayItem(loss, b);
+        if (!cJSON_IsArray(row) || cJSON_GetArraySize(row) != na) return;
+        for (int a = 0; a < na; ++a) { cJSON* v = cJSON_GetArrayItem(row, a); if (!cJSON_IsNumber(v)) return; g_dir_loss[b][a] = (float)v->valuedouble; }
+    }
+    g_dir_nb = nb; g_dir_na = na;
+}
 static float       obs_height = 1.4f;      /* observer EAR height above the floor origin (m; ~4.6 ft) — the
                                               listener/scoring point + the line-of-sight source sit here, not at y=0 */
 /* Speaker ALLOCATION as a constraint: a pinned speaker is confined to a slab about the ear plane
@@ -161,6 +234,7 @@ static int load_json(const char* path) {
     size_t rd = fread(buf, 1, (size_t)n, f); buf[rd] = 0; fclose(f);
     cJSON* root = cJSON_Parse(buf); free(buf);
     if (!root) return 0;
+    dir_reset();
 
     int loaded = 0;
     float lp_y_pending = 0.0f;
@@ -187,6 +261,16 @@ static int load_json(const char* path) {
             spk[idx].gain_db = cJSON_IsNumber(g) ? (float)g->valuedouble : 0.0f;
             cJSON* pj = cJSON_GetObjectItemCaseSensitive(sp, "pin");
             spk[idx].pin = (cJSON_IsString(pj) && strcmp(pj->valuestring, "plane") == 0) ? 1 : 0;
+            spk[idx].has_aim = 0;                     /* optional acoustic axis (the directivity model reads it) */
+            cJSON* aj = cJSON_GetObjectItemCaseSensitive(sp, "aim");
+            if (cJSON_IsArray(aj) && cJSON_GetArraySize(aj) == 3) {
+                cJSON* ax = cJSON_GetArrayItem(aj, 0); cJSON* ay = cJSON_GetArrayItem(aj, 1); cJSON* az = cJSON_GetArrayItem(aj, 2);
+                if (cJSON_IsNumber(ax) && cJSON_IsNumber(ay) && cJSON_IsNumber(az)) {
+                    Vector3 a = { (float)ax->valuedouble, (float)ay->valuedouble, (float)az->valuedouble };
+                    float L = Vector3Length(a);
+                    if (L > 1e-6f) { spk[idx].aim = Vector3Scale(a, 1.0f / L); spk[idx].has_aim = 1; }
+                }
+            }
             ++loaded;
         }
     }
@@ -237,6 +321,7 @@ static int load_json(const char* path) {
         }
     }
     if (lp_y_pending > 0.0f) obs_height = lp_y_pending;   /* the declared point wins over ears_m */
+    dir_load(root);                                  /* the directivity model, for the cone + the save */
     cJSON_Delete(root);
     return loaded;
 }
@@ -262,13 +347,16 @@ static int save_json(const char* path) {
     for (int i = 0; i < g_nspk; ++i) npin += spk[i].pin;
     if (npin) fprintf(f, "  \"pin_slab_m\": %g,\n", pin_slab_m);   /* authoring-only, like \"pin\"; the engine ignores it */
     if (g_lp_set) fprintf(f, "  \"listening_point_m\": [%.4f, %.4f, %.4f],\n", g_lp_x, obs_height, g_lp_z);
+    if (g_dir_json) fprintf(f, "  \"directivity\": %s,\n", g_dir_json);   /* verbatim: the tool never edits it */
     fprintf(f, "  \"speakers\": [\n");
     for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
         float delay_ms = (dmax - d) / speed_of_sound * 1000.0f;
-        fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f%s }%s\n",
+        char aim[96] = "";
+        if (spk[i].has_aim) snprintf(aim, sizeof aim, ", \"aim\": [%.4f, %.4f, %.4f]", spk[i].aim.x, spk[i].aim.y, spk[i].aim.z);
+        fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f%s%s }%s\n",
                 i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms,
-                spk[i].pin ? ", \"pin\": \"plane\"" : "", (i < g_nspk - 1) ? "," : "");
+                spk[i].pin ? ", \"pin\": \"plane\"" : "", aim, (i < g_nspk - 1) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
     fclose(f);
@@ -1222,6 +1310,53 @@ static void update_camera(Camera3D* cam, bool ms) {
     }
 }
 
+static Vector3 spk_axis(int i) {                     /* the file's aim, else toward the ears */
+    if (spk[i].has_aim) return spk[i].aim;
+    Vector3 d = Vector3Subtract(Vector3{ 0, obs_height, 0 }, spk[i].pos);
+    float L = Vector3Length(d);
+    return L > 1e-6f ? Vector3Scale(d, 1.0f / L) : Vector3{ 0, 0, 1 };
+}
+
+/* One ring of the selected speaker's cone: radius r at distance R along its axis, plus four
+ * spokes from the speaker so it reads as a cone and not a hoop. */
+static void draw_dir_ring(Vector3 pos, Vector3 a, float R, float half_deg, Color col) {
+    Vector3 up = fabsf(a.y) > 0.9f ? Vector3{ 1, 0, 0 } : Vector3{ 0, 1, 0 };
+    Vector3 u = Vector3Normalize(Vector3CrossProduct(a, up));
+    Vector3 v = Vector3CrossProduct(a, u);
+    Vector3 c = Vector3Add(pos, Vector3Scale(a, R));
+    float   r = R * tanf(half_deg * DEG2RAD);
+    Vector3 prev = Vector3Add(c, Vector3Scale(u, r));
+    for (int k = 1; k <= 48; ++k) {
+        float t = (float)k / 48.0f * 2.0f * PI;
+        Vector3 p = Vector3Add(c, Vector3Add(Vector3Scale(u, r * cosf(t)), Vector3Scale(v, r * sinf(t))));
+        DrawLine3D(prev, p, col);
+        prev = p;
+    }
+    Color spoke = col; spoke.a = (unsigned char)(col.a / 2);
+    for (int k = 0; k < 4; ++k) {
+        float t = (float)k * 0.5f * PI;
+        DrawLine3D(pos, Vector3Add(c, Vector3Add(Vector3Scale(u, r * cosf(t)), Vector3Scale(v, r * sinf(t)))), spoke);
+    }
+}
+
+/* The selected speaker's directivity cone, at the distance of the ears so the ring's radius is
+ * the lateral extent AT the listener. With a model: the -3 dB half-angle at 2 kHz (yellow) and at
+ * the top band (orange), from the table. Without one: a 20 deg guide (gray), which on the Genelec
+ * 4410A is about the 2 dB region above 2 kHz. The axis is the file's `aim` when it has one, else
+ * the line to the ears, which is what the loader assumes. */
+static void draw_dir_cone(void) {
+    Vector3 pos = spk[sel].pos, a = spk_axis(sel);
+    float   R   = Vector3Distance(pos, Vector3{ 0, obs_height, 0 });
+    if (R < 0.2f) R = 0.2f;
+    DrawLine3D(pos, Vector3Add(pos, Vector3Scale(a, R * 1.15f)), Color{ 245, 220, 90, 120 });   /* the axis */
+    if (g_dir_nb) {
+        draw_dir_ring(pos, a, R, dir_half_angle(dir_band_at_or_above(2000.0f), -3.0f), Color{ 245, 220, 90, 200 });
+        draw_dir_ring(pos, a, R, dir_half_angle(g_dir_nb - 1, -3.0f),                  Color{ 245, 165, 70, 200 });
+    } else {
+        draw_dir_ring(pos, a, R, 20.0f, Color{ 170, 170, 190, 150 });
+    }
+}
+
 /* the raylib 3D scene: grid, constraints, speakers, preview source, coverage shell.
  * Fills the coverage summary (worst/mean, deg) for the HUD line. */
 static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mean_out) {
@@ -1247,6 +1382,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
         else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
             DrawSphereWires(spk[i].pos, is_sel ? 0.22f : 0.18f, 6, 6, Color{ 245, 165, 70, 255 });
     }
+    if (!preview) draw_dir_cone();                   /* the selected speaker's beam, at the ears' distance */
     if (preview) {                                   /* the moving DBAP source */
         DrawLine3D(Vector3{ 0, 0, 0 }, src_pos, Color{ 90, 220, 90, 200 });
         DrawSphere(src_pos, 0.16f, Color{ 240, 120, 90, 255 });
@@ -1366,6 +1502,17 @@ static void draw_hud(float cov_worst, float cov_mean) {
             : "[H] head view   right-drag/wheel: camera   click: pick   arrows/R/F: move (SHIFT fine)   F11 fullscreen");
         ImGui::TextColored(ImVec4(0.96f, 0.86f, 0.35f, 1), "spk %d -> ch %d   pos (%.3f, %.3f, %.3f)   delay %.3f ms   dist %.2f m",
                            sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld);
+        if (g_dir_nb) {
+            int b1 = dir_band_at_or_above(2000.0f), b2 = g_dir_nb - 1;
+            ImGui::TextColored(ImVec4(0.96f, 0.76f, 0.40f, 1),
+                               "%s: -3 dB half-angle %.0f deg @%.0f Hz (yellow)  %.0f deg @%.0f Hz (orange)   at 20 deg: %+.1f / %+.1f dB   aim: %s",
+                               g_dir_model[0] ? g_dir_model : "directivity model",
+                               dir_half_angle(b1, -3.0f), g_dir_hz[b1], dir_half_angle(b2, -3.0f), g_dir_hz[b2],
+                               dir_loss_at(b1, 20.0f), dir_loss_at(b2, 20.0f),
+                               spk[sel].has_aim ? "file" : "at the ears");
+        } else {
+            ImGui::TextDisabled("no directivity model in this layout: the gray ring is a 20 deg guide (tools/directivity/clf_to_json.py --into <layout>)");
+        }
     }
     if (audio) ImGui::TextColored(ImVec4(0.43f, 0.92f, 0.51f, 1), "audio: %s  (tone drives the selected channel)", backend);
     else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (the audition demands the array's ASIO device, one output per speaker)");
@@ -1800,6 +1947,7 @@ static void register_tests(ImGuiTestEngine* te) {
         g_lp_set = 1; g_lp_x = 0.2f; g_lp_z = -0.1f; obs_height = 1.3f;
         IM_CHECK(save_json(TEST_OUT));
         g_lp_set = 0; g_lp_x = g_lp_z = 0.0f; obs_height = 1.4f;
+        dir_reset();
         IM_CHECK(load_json(TEST_OUT) > 0);
         IM_CHECK_EQ(g_lp_set, 1);
         IM_CHECK_LT(fabsf(g_lp_x - 0.2f), 1e-4f);

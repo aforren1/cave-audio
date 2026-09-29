@@ -48,7 +48,12 @@ one channel per speaker. *Consumers* read that bus:
   as a virtual speaker at that speaker's surveyed room position, HRTFs them to
   stereo, and writes to an ordinary output device (a headphone DAC). It sits
   *after* the panner, so it auditions the real array render (DBAP behavior and
-  all), not an idealized version.
+  all), not an idealized version. Before the decode it puts the room back, on a
+  copy of the bus (`arraysim.c`): each virtual speaker's distance gain and
+  propagation delay to the live listener and, with a speaker `directivity` model
+  in the layout, its off-axis loss at the model's full resolution. The array
+  output never sees any of it. See
+  [spatialization.md](./spatialization.md#the-array-sims-room).
 
 A *device sink* is one file behind one small vtable (`src/sink/sink.h`), so which OS API carries the
 bus is a detail the core never sees. Windows has two: ASIO for the array, and WASAPI
@@ -83,8 +88,15 @@ Full render description:
       │  N-ch master bus  │   │ 16-ch direct field (SH)  │  (BINAURAL only)
       └───────────────────┘   └──────────────────────────┘
         │                  │            │
-   per-ch gain/delay   bus→ambisonics ──┴─→ HRTF
-   align               (one binaural decode for both)
+   per-ch gain/delay       │            │
+   align (skipped in       │            │
+   BINAURAL)               │            │
+        │            array-sim room     │
+        │            (cave_sim · the    │
+        │            cave_both tap)     │
+        │                  │            │
+        │            bus→ambisonics ────┴─→ HRTF
+        │            (one binaural decode for both)
         │                  │
      ASIO ► Digiface         stereo device
    (cave, cave_both)    (binaural · cave_sim · cave_both's tap)
@@ -160,8 +172,11 @@ that implement and configure it. This ASCII version is canonical for structure.)
  ─────────────────────────────────────────────────────────────────────────────
  × master gain (ramped)
  align: per-speaker correction FIR · room-EQ biquads (re-aimed at the tracked pose) ·
+        directivity comp (gain + HF shelf per speaker, the vendor's balloon re-aimed at the
+        tracked pose: bwa_set_tracked_directivity) ·
         gain trim · delay (re-referenced onto the tracked head: bwa_set_tracked_align,
         slewed + dead-zoned; off = the exact integer tap)
+        BINAURAL profile: skipped whole (its bus drives no physical speaker)
  + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │
@@ -171,7 +186,11 @@ that implement and configure it. This ASCII version is canonical for structure.)
       │            per-voice point taps each through their OWN IPLBinauralEffect,
       │            summed (cardioid+pan fallback, field-only) → 2 ch
       ├ cave_sim   each bus channel = a virtual speaker at its room position →
-      │            3rd-order SH encode → phonon HRTF decode (simple-pan fallback) → 2 ch
+      │            the array-sim room, on a copy (arraysim.c): directivity graphic EQ at
+      │            that speaker's angle to the listener (with a model) · distance gain
+      │            r0/d · propagation delay (d - C)/c, 3 m/s creep →
+      │            3rd-order SH encode from the LIVE position → phonon HRTF decode
+      │            (simple-pan fallback) → 2 ch
       ├ cave_both  the array sink + the cave_sim monitor on a second device (double-buffered)
       └ null       no device: keeps rendering in real time, silent (tools' visual mode)
 ```
@@ -221,12 +240,13 @@ identical across all four:
 |-------------|-----------------------------------------------------------|-----------------|----------|
 | `cave`      | bus → ASIO/Digiface                                       | position only   | yes      |
 | `binaural`  | direct field + diffuse bus → one HRTF decode → stereo     | full head pose  | no       |
-| `cave_sim`  | bus → virtual-speaker monitor → stereo                    | full head pose  | no       |
+| `cave_sim`  | bus → array-sim room → virtual-speaker monitor → stereo   | full head pose  | no       |
 | `cave_both` | bus → ASIO/Digiface + the `cave_sim` monitor → stereo     | full head pose  | yes      |
 
 `binaural` is the first-class headphone render: point sources at their true
 directions, no array simulation in the direct path. `cave_sim` auditions the
-ARRAY render: same bus, DBAP artifacts included, the desk-verification profile.
+ARRAY render: same bus, DBAP artifacts included, heard through a simulated room
+(distance, arrival time, the speakers' directivity), the desk-verification profile.
 Both run the array render into memory. Only the stereo device opens, so neither
 needs Dante hardware.
 

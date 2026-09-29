@@ -11,8 +11,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* the directivity correction factor for speaker i: 1 when absent, non-finite or non-positive (a
+ * NaN factor would otherwise write gain_db = NaN, the same failure the level guard below prevents) */
+static double cfac(const float* corr, int i) {
+    if (!corr) return 1.0;
+    double f = corr[i];
+    return (f > 0.0 && f < 1e6) ? f : 1.0;
+}
+
 void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[3], int n, double fs,
                  float* gain_db, float* delay_ms) {
+    calib_solve_corr(m, pos, mic, n, fs, NULL, gain_db, delay_ms);
+}
+
+void calib_solve_corr(const MeasureResult* m, const float (*pos)[3], const float mic[3], int n, double fs,
+                      const float* corr, float* gain_db, float* delay_ms) {
     if (!m || !pos || !mic || !gain_db || !delay_ms || n <= 0 || !(fs > 0.0)) return;
 
     /* delays: align every arrival to the farthest (largest measured delay). Latency cancels. */
@@ -30,7 +47,7 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
     for (int i = 0; i < n; ++i) {
         double dx = pos[i][0]-mic[0], dy = pos[i][1]-mic[1], dz = pos[i][2]-mic[2];
         double dist = sqrt(dx*dx + dy*dy + dz*dz); if (dist < 0.05) dist = 0.05;
-        double s = (double)m[i].level * dist;
+        double s = (double)m[i].level * dist * cfac(corr, i);
         if (m[i].level > 1e-3 && s < sref) sref = s;
     }
     if (sref >= 1e30) sref = 1.0;                 /* every speaker silent: leave trims at unity */
@@ -41,11 +58,120 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
         if (!(m[i].level > 1e-3)) { gain_db[i] = 0.f; continue; }
         double dx = pos[i][0]-mic[0], dy = pos[i][1]-mic[1], dz = pos[i][2]-mic[2];
         double dist = sqrt(dx*dx + dy*dy + dz*dz); if (dist < 0.05) dist = 0.05;
-        double s  = (double)m[i].level * dist;
+        double s  = (double)m[i].level * dist * cfac(corr, i);
         double db = 20.0 * log10(sref / s);       /* sref <= s, so db <= 0 (cut-only) */
         if (!(db < 0.0)) db = 0.0; else if (db < -40.0) db = -40.0;   /* NaN-safe */
         gain_db[i] = (float)(round(db * 100.0) / 100.0);
     }
+}
+
+float calib_aim_tilt_db(const Directivity* d, float angle_deg, const double band_hz[2], double f2) {
+    if (!d || !d->nband) return 0.f;
+    float mid = directivity_loss_lin(d, angle_deg, (float)band_hz[0], (float)band_hz[1]);
+    float hi  = directivity_loss_lin(d, angle_deg, (float)band_hz[1], (float)f2);
+    if (!(mid > 1e-9f) || !(hi > 1e-9f)) return 0.f;
+    return (float)(20.0 * log10((double)hi / (double)mid));
+}
+
+int calib_directivity_corr(const Layout* L, const float mic[3], double f_lo, double f_hi,
+                           const MeasureResult* m, float* corr) {
+    if (!L || !mic || !corr || !L->dir.nband) return 0;
+    for (uint32_t i = 0; i < L->count; ++i) {
+        float th_mic = layout_speaker_off_axis_deg(L, i, mic);
+        float th_ref = layout_speaker_off_axis_deg(L, i, L->ref);
+        float dmic = directivity_loss_lin(&L->dir, th_mic, (float)f_lo, (float)f_hi);
+        float dref = directivity_loss_lin(&L->dir, th_ref, (float)f_lo, (float)f_hi);
+        double r = (dmic > 1e-4f) ? (double)dref / (double)dmic : 1.0;
+        /* the direct share of the measured level (the rest is reverberant and does not follow the
+         * axis); NaN or out of range reads as 1, the free-field factor */
+        double f = m ? (double)m[i].direct_frac : 1.0;
+        if (!(f >= 0.0 && f <= 1.0)) f = 1.0;
+        corr[i] = (float)sqrt(1.0 + f * (r * r - 1.0));     /* r == 1 gives exactly 1 for any f */
+    }
+    return 1;
+}
+
+static float aim_angle_deg(const float a[3], const float b[3]) {
+    double c = (double)a[0]*b[0] + (double)a[1]*b[1] + (double)a[2]*b[2];
+    if (c > 1.0) c = 1.0; else if (c < -1.0) c = -1.0;
+    return (float)(acos(c) * 180.0 / M_PI);
+}
+
+/* the predicted tilt tabulated over 0..180 deg in 0.25 deg steps: the search evaluates ~1100
+ * candidates x K bearings, and each direct evaluation is two 256-point band integrals */
+#define AIM_TT_N 721
+static float aim_tilt_tab(const float* tt, float th) {
+    float x = th * 4.f;
+    if (!(x > 0.f)) return tt[0];
+    if (x >= AIM_TT_N - 1) return tt[AIM_TT_N - 1];
+    int i = (int)x; float f = x - (float)i;
+    return tt[i] + (tt[i + 1] - tt[i]) * f;
+}
+
+/* tilt residual RMS (mean removed) for a candidate aim: the score the search minimizes */
+static double aim_score(const float* tt, const float aim[3], const float (*bear)[3], const float* tilt_db, int K,
+                        float* resid) {
+    double r[64], mean = 0.0;
+    for (int k = 0; k < K; ++k) {
+        float th = aim_angle_deg(aim, bear[k]);
+        r[k] = (double)tilt_db[k] - aim_tilt_tab(tt, th);
+        mean += r[k];
+    }
+    mean /= K;
+    double ss = 0.0;
+    for (int k = 0; k < K; ++k) { r[k] -= mean; ss += r[k] * r[k]; if (resid) resid[k] = (float)r[k]; }
+    return sqrt(ss / K);
+}
+
+int calib_check_aim(const Layout* L, int s, const float (*mic)[3], const float* tilt_db, int K,
+                    const double band_hz[2], double f2, CalibAimResult* out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!L || s < 0 || (uint32_t)s >= L->count || !mic || !tilt_db || K <= 0 || K > 64) return 0;
+    const Speaker* sp = &L->speakers[s];
+    memcpy(out->aim_fit, sp->aim, sizeof out->aim_fit);
+    out->npos = K;
+    if (!L->dir.nband) return 0;
+    /* bearings from the speaker to each mic, and their spread (the fit's leverage) */
+    float bear[64][3];
+    for (int k = 0; k < K; ++k) unit_dir(sp->pos, mic[k], bear[k]);
+    float spread = 0.f;
+    for (int a = 0; a < K; ++a)
+        for (int b = a + 1; b < K; ++b) { float d = aim_angle_deg(bear[a], bear[b]); if (d > spread) spread = d; }
+    out->spread_deg = spread;
+    static float tt[AIM_TT_N];                     /* control thread, one call at a time */
+    for (int i = 0; i < AIM_TT_N; ++i) tt[i] = calib_aim_tilt_db(&L->dir, 0.25f * (float)i, band_hz, f2);
+    out->rms_layout_db = (float)aim_score(tt, sp->aim, bear, tilt_db, K, NULL);
+    out->rms_fit_db = out->rms_layout_db;
+    if (K < 3 || spread < 8.f) return 0;           /* refuse: nothing to lever the fit with */
+    /* local tangent basis around the layout aim, then a coarse disc search out to 45 deg and a fine
+     * one around the best cell; every candidate is a unit vector by construction */
+    float u[3], v[3];
+    { float up[3] = { 0, 1, 0 };
+      if (fabsf(sp->aim[1]) > 0.9f) { up[0] = 1; up[1] = 0; }
+      u[0] = sp->aim[1]*up[2] - sp->aim[2]*up[1]; u[1] = sp->aim[2]*up[0] - sp->aim[0]*up[2]; u[2] = sp->aim[0]*up[1] - sp->aim[1]*up[0];
+      float l = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]); if (l < 1e-6f) return 0;
+      u[0] /= l; u[1] /= l; u[2] /= l;
+      v[0] = sp->aim[1]*u[2] - sp->aim[2]*u[1]; v[1] = sp->aim[2]*u[0] - sp->aim[0]*u[2]; v[2] = sp->aim[0]*u[1] - sp->aim[1]*u[0]; }
+    double best = out->rms_layout_db; float bx = 0.f, by = 0.f;   /* tangent-plane offsets, degrees */
+    for (int pass = 0; pass < 2; ++pass) {
+        const float step = pass ? 0.5f : 3.f, reach = pass ? 3.f : 45.f;
+        const float cx = bx, cy = by;
+        for (float dx = -reach; dx <= reach + 1e-3f; dx += step)
+            for (float dy = -reach; dy <= reach + 1e-3f; dy += step) {
+                float ox = cx + dx, oy = cy + dy, rad = sqrtf(ox*ox + oy*oy);
+                if (rad > 45.f) continue;
+                float ang = rad * (float)(M_PI / 180.0), ca = cosf(ang), sa = rad > 1e-6f ? sinf(ang) / rad : 0.f;
+                float cand[3];
+                for (int j = 0; j < 3; ++j) cand[j] = ca * sp->aim[j] + sa * (ox * u[j] + oy * v[j]);
+                double sc = aim_score(tt, cand, bear, tilt_db, K, NULL);
+                if (sc < best - 1e-9) { best = sc; bx = ox; by = oy; memcpy(out->aim_fit, cand, sizeof out->aim_fit); }
+            }
+    }
+    out->rms_fit_db  = (float)best;
+    out->aim_err_deg = aim_angle_deg(sp->aim, out->aim_fit);
+    out->ok = 1;
+    return 1;
 }
 
 /* Gaussian elimination with partial pivoting on a 4x4 system A*x = b. Returns 0 if singular. */
@@ -228,7 +354,7 @@ int calib_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, flo
     if (!ir || !taps) return 0;
     /* gate to just before the first reflection so we invert the SPEAKER, not the room; if unknown, a
      * 4 ms window (long enough to resolve the speaker's response, short enough to exclude most rooms). */
-    int gate = (first_refl > 8) ? first_refl - 4 : (int)(0.004 * fs);
+    int gate = measure_direct_gate(first_refl, fs);
     if (gate > nir) gate = nir;
     if (gate < 16) return 0;
     return measure_correction(ir, nir, 0, gate, 30.0, 18000.0, fs, 6.0, 18.0, ntaps, taps);
@@ -275,7 +401,7 @@ int calib_room_eq(const float* ir, int nir, int first_refl, double fs, int ntaps
                   MeasureEqSection* cuts, int max_cuts) {
     if (!ir || !taps || !cuts) return -1;
     /* same HF gate policy as calib_eq: at high frequencies the FD window shrinks to the direct sound */
-    int gate = (first_refl > 8) ? first_refl - 4 : (int)(0.004 * fs);
+    int gate = measure_direct_gate(first_refl, fs);
     if (gate > nir) gate = nir;
     if (gate < 16) return -1;
     /* 6 cycles/f window (~1/6-octave resolution — the broad-stroke smoothing that survives head sway),

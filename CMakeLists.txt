@@ -286,7 +286,9 @@ add_library(bwa_core OBJECT
   src/spatial/hole.c
   src/spatial/hull.c
   src/spatial/align.c
+  src/spatial/dirstage.c
   src/binaural/binaural.c
+  src/binaural/arraysim.c
   src/binaural/hpeq.c
   src/spatial/ambisonics.c
   src/spatial/allrad.c
@@ -1026,7 +1028,7 @@ if(BWA_BUILD_TESTS)
 
   add_executable(test_monitor test/monitor_test.c)
   target_link_libraries(test_monitor PRIVATE bwa_core)
-  add_test(NAME monitor COMMAND test_monitor)
+  add_test(NAME monitor COMMAND test_monitor "${CMAKE_SOURCE_DIR}/examples/genelec_4410a_directivity.json")
 
   add_executable(test_natnet test/natnet_test.c)
   target_link_libraries(test_natnet PRIVATE bwa_core)
@@ -1063,6 +1065,12 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_cave_both PRIVATE bw_audio)
   bwa_link_os(test_cave_both PRIVATE)
   add_test(NAME cave_both COMMAND test_cave_both)
+  # audio_sink and cave_both both open the machine's REAL output devices (WASAPI shared/exclusive,
+  # ASIO when present). Run side by side under `ctest -j`, one holds the endpoint while the other
+  # asserts on what it resolved to or on a matching block size, and the loser fails for a reason
+  # that has nothing to do with the code. One named lock serializes the two without serializing
+  # the rest of the suite.
+  set_tests_properties(audio_sink cave_both PROPERTIES RESOURCE_LOCK bwa_audio_device)
   bwa_copy_runtime_dll(test_cave_both)
 
   # The two background threads that used to sleep-poll: idle wakeup counts + async-acquire latency.
@@ -1413,6 +1421,37 @@ if(BWA_BUILD_CALIBRATE)
     add_test(NAME validate_focus
              COMMAND bwa_validate --simulate --focus 4,32 --azimuths 4 --no-prompt
                      --position 0.5,1.5,-0.3)
+
+    # The simulated room (bwa_calibrate --sim-room): the direct-sound gate and the reverberant
+    # dilution it removes, end to end without the rig. The layout is the 26-speaker example plus the
+    # Genelec 4410A model, assembled HERE in the build tree (never under examples/), and every file the
+    # runs write lands in the build tree too. Both assert on the printed report, so a regression that
+    # still exits 0 fails them.
+    file(READ "${CMAKE_SOURCE_DIR}/examples/cave_layout.json" _bwa_simroom_lay)
+    file(READ "${CMAKE_SOURCE_DIR}/examples/genelec_4410a_directivity.json" _bwa_simroom_dir)
+    string(JSON _bwa_simroom_lay SET "${_bwa_simroom_lay}" directivity "${_bwa_simroom_dir}")
+    file(WRITE "${CMAKE_BINARY_DIR}/calib_sim_room_layout.json" "${_bwa_simroom_lay}")
+    file(WRITE "${CMAKE_BINARY_DIR}/calib_sim_room_positions.txt"
+         "0 1.5 0\n0.8 1.2 0.6\n-0.8 1.7 0.5\n0.6 1.8 -0.7\n-0.7 1.1 -0.6\n0.2 0.9 0.1\n-0.1 2.1 -0.2\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_SOURCE_DIR}/examples/cave_layout.json"
+                 "${CMAKE_SOURCE_DIR}/examples/genelec_4410a_directivity.json")
+    # ...the aim check: every simulated axis is off by 20 deg. The GATED tilt must still recover about
+    # that, and the whole-response tilt (reflections and tail left in) must read less: the dilution.
+    add_test(NAME calibrate_sim_room_aim
+             COMMAND bwa_calibrate --layout calib_sim_room_layout.json --out calib_sim_room_aim_out.json
+                     --simulate --sim-room --localize calib_sim_room_positions.txt --check-aim --sim-aim-error 20
+             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_tests_properties(calibrate_sim_room_aim PROPERTIES
+      PASS_REGULAR_EXPRESSION "median aim error: gated (1[7-9]|2[0-3])\\.[0-9] deg, whole-response [0-9.]+ deg: the whole response under-reads it")
+    # ...and a trim run from an off-axis mic: in a room, part of every capture's level is
+    # reverberant, so the directivity re-aim must see direct shares below 1 (1.00 is the anechoic value).
+    add_test(NAME calibrate_sim_room_trim
+             COMMAND bwa_calibrate --layout calib_sim_room_layout.json --out calib_sim_room_trim_out.json
+                     --simulate --sim-room --mic 0.6 1.2 0.4
+             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_tests_properties(calibrate_sim_room_trim PROPERTIES
+      PASS_REGULAR_EXPRESSION "direct share of the level band: min 0\\.[0-9][0-9]  median 0\\.[0-9][0-9]  max 0\\.[0-9][0-9]")
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

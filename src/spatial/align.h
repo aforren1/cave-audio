@@ -50,4 +50,23 @@ uint32_t align_tracked_max_frames(const Aligner* a);
  * be NULL; both are `channels` long. */
 void     align_tracked_state(const Aligner* a, float* delay_frames, float* gain_lin);
 
+/* ---- tracked directivity compensation (layouts with a directivity model; ON by default) ----------
+ * Per channel an EXTRA broadband gain and a high-shelf gain at the model's split_hz, both in dB and
+ * both SLEWED (24 dB/s, the tracked-room-EQ rate), on top of the layout trims: rt.c derives them each
+ * block from the listener's angle off each speaker's axis against the reference point's
+ * (directivity_track), so what the listening point hears of each speaker's directivity follows the
+ * head. The stage exists only when the layout carried a model (align_create precomputes the shelf
+ * prototype); without one both calls are no-ops. While every channel sits at identity the stage is
+ * skipped outright, so the default path is bit-identical to a build without it. AUDIO thread.
+ *
+ * Targets clamp to +/-6 dB broadband and +/-10 dB on the shelf (the constants below; rt.c applies
+ * them to the low- and high-band TOTALS before splitting off the shelf, so the treble never exceeds
+ * the shelf clamp): past that a speaker is not reaching the listener and boosting it only raises
+ * the room. NaN targets read as 0. */
+#define BWA_DIR_GAIN_MAX_DB   6.0f
+#define BWA_DIR_SHELF_MAX_DB 10.0f
+void     align_dir_targets(Aligner* a, const float* gain_db, const float* shelf_db);   /* NULL, NULL = identity */
+/* Readback of the current (slewed) directivity comp; either pointer may be NULL. */
+void     align_dir_state(const Aligner* a, float* gain_db, float* shelf_db);
+
 #endif /* BWA_ALIGN_H */

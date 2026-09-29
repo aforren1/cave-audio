@@ -982,7 +982,8 @@ static int do_op(Fz* z) {
             case 8:  bwa_set_near_spread(e, hfin(z, 0.f, 2.f)); break;
             case 9:  bwa_set_hole_spread(e, hfin(z, -0.5f, 2.5f)); break;
             case 10: bwa_set_bed_renderer(e, chance(z, 1, 6) ? (bwa_bed_renderer)5 : (bwa_bed_renderer)rnd(z, 2)); break;
-            case 11: bwa_set_tracked_room_eq(e, chance(z, 1, 2)); break;
+            case 11: bwa_set_tracked_room_eq(e, chance(z, 1, 2));
+                     bwa_set_tracked_directivity(e, chance(z, 1, 2)); break;
             case 12: {
                 bwa_set_tracked_align(e, chance(z, 1, 2));
                 float dz = hfin(z, -0.1f, 0.5f), sl = hfin(z, -10.f, 5000.f);

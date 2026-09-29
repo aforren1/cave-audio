@@ -50,7 +50,7 @@ int main(void) {
     out = (float*)calloc((size_t)2 * N, sizeof(float));
     if (!bus || !out) { printf("FAIL: alloc\n"); return 1; }
 
-    SteamMonitor* m = steam_monitor_create(&L, 48000, N, NULL, 8);   /* built-in HRTF + a small
+    SteamMonitor* m = steam_monitor_create(&L, 48000, N, NULL, 8, 0);   /* built-in HRTF + a small
                                                                       * per-voice fleet (mode 2) */
     CHECK(m != NULL, "steam_monitor_create (built-in HRTF)");
     if (!m) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
@@ -253,9 +253,62 @@ int main(void) {
         }
     }
 
+    /* 7. PARALLAX (the array audition: cave_sim, cave_both). A tone on the median FRONT speaker,
+     * through two monitors on the same layout, one encoding every virtual speaker from the live
+     * listener position (parallax, the sim profiles) and one from ref (BWA_PROFILE_BINAURAL). At ref
+     * the two are the same matrix, bit for bit. Then the listener steps 1 m to their RIGHT (-x): the
+     * real speaker is now ahead-LEFT of them, so the parallax monitor must favor the left ear, while
+     * the fixed monitor must not notice the step at all (same input, same head, bit-identical output
+     * to a run that never moved). With the parallax branch reading the fixed matrix, the "image
+     * moves" check went red. */
+    {
+        SteamMonitor* mp = steam_monitor_create(&L, 48000, N, NULL, 0, 1);
+        SteamMonitor* mf = steam_monitor_create(&L, 48000, N, NULL, 0, 0);
+        SteamMonitor* mr = steam_monitor_create(&L, 48000, N, NULL, 0, 0);   /* the fixed one, never moved */
+        CHECK(mp && mf && mr, "parallax: steam_monitor_create (parallax on / off)");
+        int front = -1;
+        for (int k = 0; k < (int)BWA_DEFAULT_GRID; ++k)
+            if (fabsf(L.speakers[k].pos[0]) < 0.01f && fabsf(L.speakers[k].pos[1] - 1.5f) < 0.01f &&
+                L.speakers[k].pos[2] > 1.0f) front = k;
+        CHECK(front >= 0, "parallax: the default layout has a median front speaker");
+        if (mp && mf && mr && front >= 0) {
+            static float o_par[2 * N], o_fix[2 * N], o_ref[2 * N];
+            const float q[4] = { 0, 0, 0, 1 };
+            const float at_ref[3] = { L.ref[0], L.ref[1], L.ref[2] };
+            const float moved[3]  = { L.ref[0] - 1.0f, L.ref[1], L.ref[2] };   /* 1 m to the listener's right */
+            memset(bus, 0, sizeof(float) * (size_t)BWA_DEFAULT_GRID * N);
+            for (uint32_t i = 0; i < N; ++i)                  /* a tone, never DC (decode_channel says why) */
+                bus[(size_t)front * N + i] = sinf(6.2831853f * 660.0f * (float)i / 48000.0f);
+            for (int b = 0; b < 3; ++b) {
+                steam_monitor_process(mp, bus, NULL, NULL, 0, at_ref, q, o_par, N);
+                steam_monitor_process(mf, bus, NULL, NULL, 0, at_ref, q, o_fix, N);
+                steam_monitor_process(mr, bus, NULL, NULL, 0, at_ref, q, o_ref, N);
+            }
+            CHECK(!memcmp(o_par, o_fix, sizeof o_par), "parallax: at ref the parallax encode IS the fixed one, bit for bit");
+            double l0 = 0, r0 = 0;
+            for (uint32_t i = 0; i < N; ++i) { l0 += fabs(o_par[i]); r0 += fabs(o_par[N + i]); }
+            for (int b = 0; b < 3; ++b) {                     /* one block ramps the encode, phonon settles */
+                steam_monitor_process(mp, bus, NULL, NULL, 0, moved, q, o_par, N);
+                steam_monitor_process(mf, bus, NULL, NULL, 0, moved, q, o_fix, N);
+                steam_monitor_process(mr, bus, NULL, NULL, 0, at_ref, q, o_ref, N);
+            }
+            double l1 = 0, r1 = 0;
+            for (uint32_t i = 0; i < N; ++i) { l1 += fabs(o_par[i]); r1 += fabs(o_par[N + i]); }
+            printf("parallax front speaker: at ref L=%.4g R=%.4g; stepped 1 m right L=%.4g R=%.4g\n", l0, r0, l1, r1);
+            CHECK(fabs(l0 - r0) < 0.1 * (l0 + r0), "parallax: at ref the front speaker is centered");
+            /* 34 deg left at 660 Hz is about a 2 dB ILD on the default HRTF: demand the image MOVED
+             * (the L/R ratio grew by 1.15 over its value at ref), not just that it leans */
+            CHECK(l1 > r1 * 1.15 && (l1 / r1) > 1.15 * (l0 / r0),
+                  "parallax: after a step to the right the front speaker's image moves LEFT (cave_sim)");
+            CHECK(!memcmp(o_fix, o_ref, sizeof o_fix), "parallax: the fixed encode (binaural) ignores the step, bit for bit");
+        }
+        steam_monitor_destroy(mp); steam_monitor_destroy(mf); steam_monitor_destroy(mr);
+    }
+
     steam_monitor_destroy(m);
     free(bus); free(out);
     if (fails) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
-    printf("steam_decode_test OK (HRTF decode runs + preserves laterality: virtual-speaker, direct field, per-voice)\n");
+    printf("steam_decode_test OK (HRTF decode runs + preserves laterality: virtual-speaker, direct field, per-voice; "
+           "parallax follows the listener in the sim profiles only)\n");
     return 0;
 }

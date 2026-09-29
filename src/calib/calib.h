@@ -8,6 +8,7 @@
 #define BWA_CALIB_H
 
 #include "calib/measure.h"
+#include "core/layout.h"
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -24,6 +25,85 @@ extern "C" {
  * 0 dB and is excluded from the reference. fs is the sample rate. */
 void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[3], int n, double fs,
                  float* gain_db, float* delay_ms);
+
+/* calib_solve with a per-speaker sensitivity correction: `corr[i]` (linear amplitude, > 0) multiplies
+ * speaker i's measured level before the equalization; NULL = calib_solve. The calibration tool derives
+ * it from the layout's directivity model (calib_directivity_corr: loss(listening-point bearing) /
+ * loss(mic bearing), acting on the capture's direct share only), so a trim measured off a speaker's
+ * axis is re-aimed to what the listening point hears of that speaker,
+ * the way the 1/r term is already divided out. With the mic AT the listening point every factor is 1
+ * and the two solves agree exactly. A non-finite or non-positive factor reads as 1. */
+void calib_solve_corr(const MeasureResult* m, const float (*pos)[3], const float mic[3], int n, double fs,
+                      const float* corr, float* gain_db, float* delay_ms);
+
+/* The `corr` for calib_solve_corr from the layout's directivity model. Per speaker, the model's
+ * free-field ratio r = D(ref) / D(mic): the amplitude loss toward the listening point over the loss
+ * toward the mic, each averaged uniformly over [f_lo, f_hi] the way measure.c's level is (pass 2*f1
+ * and f2/2 of the sweep). But `level` is the WHOLE response, and in a live room part of it is
+ * reverberant energy that does not follow the speaker's axis, so applying r to all of it would
+ * over-correct. With f = m[i].direct_frac (the gated share of the level band's energy):
+ *
+ *     corr = sqrt(f * r^2 + (1 - f)),   computed as sqrt(1 + f * (r^2 - 1))
+ *
+ * which is r in an anechoic capture (f = 1), 1 in a purely diffuse one (f = 0), and in between
+ * otherwise; the second spelling makes a mic AT the listening point (r == 1 exactly, same bearing)
+ * give exactly 1 whatever f is. `m` may be NULL: every f reads as 1 (the free-field factor). A
+ * non-finite f also reads as 1. Fills corr[count] and returns 1 when the layout carries a model;
+ * returns 0 and leaves corr alone when it does not. The ONE implementation of this factor, so the
+ * CLI and the GUI cannot write different trims. */
+int calib_directivity_corr(const Layout* L, const float mic[3], double f_lo, double f_hi,
+                           const MeasureResult* m, float* corr);
+
+/* ---- aim check (bwa_calibrate --check-aim; docs/calibration.md) --------------------------------
+ * The directivity model multiplies each speaker's AIM, and the aim is the one input nothing else
+ * verifies: a mount pointed at the floor, or a layout `aim` typed wrong, is 2 to 4 dB of treble at
+ * the listening point on a waveguide monitor. The --localize captures already hold what is needed:
+ * every speaker swept from K known mic positions, each yielding a mid and high band level of the
+ * DIRECT sound (measure.c's band_direct[1]/[2]: the IR gated before the first reflection, because
+ * the reverberant part does not follow the axis, and left in, it dilutes the bearing dependence and
+ * the fit reads errors too small). Their ratio, the TILT, changes with the bearing off the axis the
+ * way the model says, and the speaker's own response and the mic cancel out of it as a per-speaker
+ * constant. So: predict the tilt at each position for a candidate aim, remove the mean, and the
+ * residual RMS scores the aim. A grid search around the layout's aim finds the best one.
+ *
+ * The bands are CALIB_AIM_MID_HZ..CALIB_AIM_HIGH_HZ (mid) and CALIB_AIM_HIGH_HZ..f2 (high), not the
+ * level bands' 300 Hz / 3 kHz: a gate of a few ms smears the spectrum over 1/gate (250 Hz at 4 ms,
+ * 500 Hz behind a 2 ms floor bounce), and the gate length changes with the mic position, so a mid
+ * band starting at 300 Hz would carry a position-dependent window error into exactly the quantity
+ * the fit compares across positions. From 1 kHz the band sits at least two resolution cells above
+ * that. The cost is contrast: on the Genelec 4410A model the 45 deg tilt is 2.8 dB instead of 3.8.
+ * The measurement (the band_hz passed to measure_response) and the model (calib_aim_tilt_db's
+ * band_hz) MUST use the same bands; the CLI passes these constants to both.
+ *
+ * What it can resolve: an aim error of the order of the bearing SPREAD the positions give it, so
+ * with positions spanning 20 to 30 deg of bearing, roughly 10 deg. What it cannot: the balloon
+ * shape (far too little coverage, and gated HF in a live room is noisy at the dB level), which is
+ * why it fits ONE direction and refuses below a minimum spread rather than reporting a confident
+ * wrong answer. Diagnostic only; nothing writes the fitted aim back. */
+#define CALIB_AIM_MID_HZ  1000.0
+#define CALIB_AIM_HIGH_HZ 3000.0
+typedef struct {
+    int   ok;              /* 1 = fitted; 0 = refused (no model, < 3 positions, or < 8 deg of bearing
+                            * spread); the layout-aim fields below are still filled when a model exists */
+    int   npos;
+    float spread_deg;      /* max bearing difference between any two positions: the fit's leverage */
+    float rms_layout_db;   /* tilt residual RMS (mean removed) with the layout's aim */
+    float rms_fit_db;      /* ... with the fitted aim */
+    float aim_fit[3];      /* unit vector; = the layout aim when refused */
+    float aim_err_deg;     /* angle between the layout aim and the fit (0 when refused) */
+} CalibAimResult;
+
+/* The model's predicted TILT (dB) at `angle_deg` off axis: the high band's mean amplitude loss over
+ * [band_hz[1], f2] against the mid band's over [band_hz[0], band_hz[1]], each averaged the way
+ * measure.c's band means are. 0 without a model. */
+float calib_aim_tilt_db(const Directivity* d, float angle_deg, const double band_hz[2], double f2);
+
+/* Fit speaker `s`'s aim from measured tilts: `tilt_db[k]` = 20 log10(band_direct[2]/band_direct[1])
+ * of its capture at `mic[k]`, K positions, `band_hz`/`f2` as passed to measure_response. Uses L->speakers[s].pos
+ * (pass a layout carrying the SOLVED positions) and .aim as the starting point. Pure. Returns
+ * out->ok. */
+int calib_check_aim(const Layout* L, int s, const float (*mic)[3], const float* tilt_db, int K,
+                    const double band_hz[2], double f2, CalibAimResult* out);
 
 /* Read the layout JSON at `in_path`, set each speaker's `gain_db` + `delay_ms` (preserving index,
  * position, the dbap block, everything else), and write to `out_path` (may equal in_path). The file's

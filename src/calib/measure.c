@@ -39,11 +39,21 @@ static float band_mean(const double* hre, const double* him, int L, double fs, d
     return (float)(acc / (khi - klo + 1));
 }
 
+/* sum |H(k)|^2 over the same bins band_mean averages */
+static double band_energy(const double* hre, const double* him, int L, double fs, double flo, double fhi) {
+    int klo = (int)(flo * L / fs); if (klo < 1) klo = 1;
+    int khi = (int)(fhi * L / fs); if (khi > L / 2) khi = L / 2;
+    double acc = 0.0;
+    for (int k = klo; k <= khi; ++k) acc += hre[k]*hre[k] + him[k]*him[k];
+    return acc;
+}
+
 /* Deconvolve capture vs ref -> the real impulse response (caller frees *ir_out) + the in-band level +
- * 3-band tilt from the spectrum. Returns the FFT length L, or 0 on allocation failure. */
+ * 3-band tilt from the spectrum (+ the level band's energy, when e_level is non-NULL). Returns the
+ * FFT length L, or 0 on allocation failure. */
 static int deconvolve(const float* capture, int ncap, const float* ref, int nref,
                       double f1, double f2, double fs, const double band_hz[2],
-                      float* level, float band[3], float** ir_out) {
+                      float* level, float band[3], double* e_level, float** ir_out) {
     const int L = (int)bwa_pow2_ge((uint32_t)(ncap + nref));
     double* cre = (double*)calloc((size_t)L, sizeof(double));   /* Capture -> H -> h (reused) */
     double* cim = (double*)calloc((size_t)L, sizeof(double));
@@ -75,6 +85,7 @@ static int deconvolve(const float* capture, int ncap, const float* ref, int nref
     /* level + bands: mean |H| over frequency ranges (before the IFFT). Broadband over [2*f1, f2/2]
      * to dodge the sweep's faded extremes. */
     if (level) *level  = band_mean(cre, cim, L, fs, 2.0 * f1, 0.5 * f2);
+    if (e_level) *e_level = band_energy(cre, cim, L, fs, 2.0 * f1, 0.5 * f2);
     if (band) { band[0] = band_mean(cre, cim, L, fs, f1,         band_hz[0]);
                 band[1] = band_mean(cre, cim, L, fs, band_hz[0], band_hz[1]);
                 band[2] = band_mean(cre, cim, L, fs, band_hz[1], f2); }
@@ -84,6 +95,67 @@ static int deconvolve(const float* capture, int ncap, const float* ref, int nref
     *ir_out = ir;
     free(cre); free(cim); free(rre); free(rim);
     return L;
+}
+
+int measure_direct_gate(int first_refl, double fs) {
+    return (first_refl > 8) ? first_refl - 4 : (int)(0.004 * fs);
+}
+
+#define ER_THRESH   0.06f      /* early reflections at least this fraction of the direct (~ -24 dB) */
+#define ER_WINDOW_S 0.08       /* search for reflections within this many seconds after the direct */
+#define DG_MIN_S    0.001      /* the direct gate's floor: nothing earlier than this counts as a reflection */
+#define DG_PRE_S    0.001      /* the direct gate opens this long before the peak */
+
+/* The first reflection after the direct peak p, as samples after it (0 = none): measure_rt60's
+ * early-reflection rule, searched from DG_MIN_S on. The floor keeps the speaker's OWN ringing (a
+ * band-limited peak's sidelobes, a crossover's group delay) from reading as a room surface, which
+ * would collapse the gate to a few samples; no real surface returns within 34 cm of extra path. */
+static int first_reflection(const float* ir, int nir, int p, double fs) {
+    const float direct = fabsf(ir[p]);
+    if (!(direct > 0.f)) return 0;
+    int from = p + (int)(DG_MIN_S * fs), to = p + 1 + (int)(ER_WINDOW_S * fs);
+    if (to > nir - 1) to = nir - 1;
+    for (int i = from; i < to; ++i) {
+        float a = fabsf(ir[i]);
+        if (a > ER_THRESH * direct && a >= fabsf(ir[i-1]) && a > fabsf(ir[i+1])) return i - p;
+    }
+    return 0;
+}
+
+/* The direct-sound fields of a MeasureResult: window the IR around its peak p (a raised-cosine rise
+ * over the DG_PRE_S before it, flat to the gate's last quarter, a raised-cosine fall to the gate
+ * end), FFT at the deconvolution's own length L so bin k means the same frequency as H's, and take
+ * the same band means. Nothing arrives before the direct sound, so the pre-window costs only noise;
+ * it is there for the deconvolution's own pre-ringing and a non-minimum-phase speaker's. Returns 0 on
+ * allocation failure. */
+static int direct_fields(const float* ir, int L, int p, double f1, double f2, double fs,
+                         const double band_hz[2], double e_full, MeasureResult* out) {
+    int gate = measure_direct_gate(first_reflection(ir, L, p, fs), fs);
+    if (gate > L - 1 - p) gate = L - 1 - p;
+    if (gate < 1) gate = 1;
+    out->gate_samples = gate;
+    double* re = (double*)calloc((size_t)L, sizeof(double));
+    double* im = (double*)calloc((size_t)L, sizeof(double));
+    if (!re || !im) { free(re); free(im); return 0; }
+    int pre = (int)(DG_PRE_S * fs); if (pre > p) pre = p;   /* never wrap to the IR's circular end */
+    int fall = gate / 4; if (fall < 1) fall = 1;
+    for (int i = p - pre; i < p + gate; ++i) {
+        double w = 1.0;
+        if (i < p)                     w = 0.5 - 0.5 * cos(M_PI * (double)(i - (p - pre) + 1) / (double)(pre + 1));
+        else if (i >= p + gate - fall) w = 0.5 + 0.5 * cos(M_PI * (double)(i - (p + gate - fall) + 1) / (double)fall);
+        re[i] = (double)ir[i] * w;
+    }
+    fft(re, im, L, +1);
+    out->level_direct   = band_mean(re, im, L, fs, 2.0 * f1, 0.5 * f2);
+    out->band_direct[0] = band_mean(re, im, L, fs, f1,         band_hz[0]);
+    out->band_direct[1] = band_mean(re, im, L, fs, band_hz[0], band_hz[1]);
+    out->band_direct[2] = band_mean(re, im, L, fs, band_hz[1], f2);
+    const double e_dir = band_energy(re, im, L, fs, 2.0 * f1, 0.5 * f2);
+    double f = (e_full > 0.0) ? e_dir / e_full : 1.0;
+    if (!(f >= 0.0)) f = 1.0; else if (f > 1.0) f = 1.0;     /* NaN-safe; the window can nudge past 1 */
+    out->direct_frac = (float)f;
+    free(re); free(im);
+    return 1;
 }
 
 static int ir_peak(const float* ir, int from, int to) {        /* strongest |tap| in [from, to) */
@@ -98,7 +170,9 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
     /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
     if ((int64_t)ncap + nref > (1 << 30)) return 0;
     float* ir = NULL;
-    int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &ir);
+    double e_full = 0.0;
+    memset(out, 0, sizeof *out);
+    int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &e_full, &ir);
     if (!L) return 0;
     int p = ir_peak(ir, 0, ncap < L ? ncap : L);                /* physical arrival = strongest tap */
     out->delay_samples = p;
@@ -110,12 +184,10 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
         float den = a - 2.f*b + c;
         if (den < 0.f) { float d = 0.5f * (a - c) / den; if (d > -0.5f && d < 0.5f) out->delay_frac = d; }
     }
+    int ok = direct_fields(ir, L, p, f1, f2, fs, band_hz, e_full, out);
     free(ir);
-    return 1;
+    return ok;
 }
-
-#define ER_THRESH   0.06f      /* early reflections at least this fraction of the direct (~ -24 dB) */
-#define ER_WINDOW_S 0.08       /* search for reflections within this many seconds after the direct */
 
 void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out) {
     if (!out) return;                    /* the memset dereferenced out BEFORE any guard */
@@ -375,7 +447,7 @@ int measure_room(const float* capture, int ncap, const float* ref, int nref,
     if ((int64_t)ncap + nref > (1 << 30)) return 0;   /* bwa_pow2_ge spins forever above 2^31 */
     const double band_hz[2] = { 300.0, 3000.0 };
     float* ir = NULL;
-    int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, NULL, NULL, &ir);
+    int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, NULL, NULL, NULL, &ir);
     if (!L) return 0;
     int direct = ir_peak(ir, 0, ncap < L ? ncap : L);
     measure_rt60(ir, L, direct, fs, out);

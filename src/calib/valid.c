@@ -36,7 +36,7 @@ void valid_render_init(ValidRender* r) { if (r) memset(r, 0, sizeof *r); }
 
 /* The all-defaults render, so every call below can take NULL and mean "the shape this harness had
  * before the knobs became sweepable". */
-static const ValidRender VALID_RENDER_OFF = { 0.f, 0.f, 0, 0, 0.f, 0, 0, 0, 0.f, 0.f };
+static const ValidRender VALID_RENDER_OFF = { 0.f, 0.f, 0, 0, 0.f, 0, 0, 0, 0.f, 0.f, 0 };
 static const ValidRender* rr(const ValidRender* R) { return R ? R : &VALID_RENDER_OFF; }
 
 /* `R` with the focus/density sentinel applied against THIS layout — what a cell records, and what a
@@ -54,7 +54,8 @@ int valid_render_equal(const ValidRender* pa, const ValidRender* pb) {
            a->dual_band == b->dual_band && a->cap == b->cap &&
            a->hole_spread == b->hole_spread && a->tracked_align == b->tracked_align &&
            a->spread_mode == b->spread_mode && a->decorrelation == b->decorrelation &&
-           a->near_spread == b->near_spread && a->spread == b->spread;
+           a->near_spread == b->near_spread && a->spread == b->spread &&
+           a->tracked_directivity == b->tracked_directivity;
 }
 
 /* The engine's OWN panner solves, so this scores what will actually ship rather than a copy. Called
@@ -207,6 +208,7 @@ typedef struct {
     int      lc_dirty;                   /* the PREVIOUS cell left the tracked aligner displaced, so
                                           * this one must wait for it to glide home even if it does
                                           * not use the feature itself (see ve_settle) */
+    int      dir_dirty;                  /* same for the directivity comp's gain + shelf glide */
 } ValidEngine;
 
 static ValidEngine g_ve;
@@ -266,6 +268,10 @@ static uint32_t ve_settle(const Layout* L, const ValidRender* R, uint32_t rate) 
      * first cell after it opening its capture window on gains up to ~3 dB wrong and decaying, which
      * is a measurement corrupted by whatever ran before it. Wait when either end is displaced. */
     if (rr(R)->tracked_align || g_ve.lc_dirty) s += rate / 2u;
+    /* The directivity comp glides at 24 dB/s and its high band can move 10 dB either way plus the
+     * broadband 6, so a full excursion or the trip home is up to ~0.7 s: wait a second when either
+     * end is displaced, for the same reason as above. */
+    if (rr(R)->tracked_directivity || g_ve.dir_dirty) s += rate;
     return (s + VE_BLOCK - 1u) / VE_BLOCK * VE_BLOCK;
 }
 
@@ -290,6 +296,7 @@ static int ve_render(const Layout* L, int panner, const ValidRender* Rin, const 
     rt_set_near_spread(co, R->near_spread);
     rt_set_hole_spread(co, R->hole_spread);
     rt_set_tracked_align(co, R->tracked_align ? 1 : 0);
+    rt_set_tracked_directivity(co, R->tracked_directivity ? 1 : 0);   /* the core defaults it ON */
     rt_set_speed_of_sound(co, (float)c);
     rt_source_set_spread(co, g_ve.src, R->spread);
     /* The panner solves at the listener, so the harness's SOLVE position IS the engine's listener:
@@ -303,7 +310,8 @@ static int ve_render(const Layout* L, int panner, const ValidRender* Rin, const 
     const uint32_t settle = ve_settle(L, R, g_ve.rate);
     /* Record what this cell leaves behind BEFORE rendering, so an early return still marks the core
      * displaced rather than letting the next cell trust a stale clean flag. */
-    g_ve.lc_dirty = rr(R)->tracked_align ? 1 : 0;
+    g_ve.lc_dirty  = rr(R)->tracked_align ? 1 : 0;
+    g_ve.dir_dirty = rr(R)->tracked_directivity ? 1 : 0;
     const uint32_t total  = settle + row;
     for (uint32_t f = 0; f < total; f += VE_BLOCK) {
         const uint32_t bn = (total - f < VE_BLOCK) ? (total - f) : VE_BLOCK;

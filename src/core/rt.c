@@ -440,6 +440,15 @@ struct RtCore {
     _Atomic float lc_slew;       /* rate limit (frames/s; <= 0 = derived from LC_SLEW_SPEED_MS) */
     float     lc_lis[3];
     int       lc_state;
+    /* tracked directivity compensation (rt_set_tracked_directivity; ON by default, inert without a
+     * model in the layout): per block the audio thread re-references each speaker's off-axis loss
+     * from Layout.ref onto the LIVE listener (directivity_track) and hands the aligner a broadband
+     * gain + high-shelf pair to slew toward. dir_state mirrors rq_state. dir_ref_* cache the loss at
+     * the reference point per speaker (a layout constant, seeded by dir_seed_ref). */
+    _Atomic int dir_on;
+    float     dir_lis[3];
+    int       dir_state;
+    float     dir_ref_lo[BWA_CHANNELS], dir_ref_hi[BWA_CHANNELS];
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
     _Atomic int dual_band;   /* 0 = single (power) panning; 1 = dual-band (amplitude LF / power HF); atomic for A/B */
     _Atomic int cap_on;      /* compensated amplitude panning on the LF band (cap.c). INERT unless dual_band
@@ -3084,6 +3093,65 @@ static void listener_align_track(RtCore* c) {
     c->lc_state = 1;
 }
 
+/* Tracked directivity compensation (rt_set_tracked_directivity; ON by default). The layout's trims
+ * and the gain solve both assume each speaker reaches the listener as it reaches the listening point,
+ * but a speaker's output falls off its acoustic axis, and a tracked listener walks across every
+ * speaker's beam. The model (Layout.dir, from the vendor's CLF balloon) says by how much, per band,
+ * per degree; this re-references that loss from Layout.ref onto the live listener, per speaker:
+ *
+ *     theta_ref = angle(aim_k, ref - pos_k),  theta_lis = angle(aim_k, listener - pos_k)
+ *     broadband (dB) = lo(theta_ref) - lo(theta_lis)        > 0 when the listener is further off axis
+ *     shelf     (dB) = [hi(theta_ref) - hi(theta_lis)] - broadband
+ *
+ * where lo/hi are the model's power-mean losses below and above its split frequency. So the comp is
+ * identity at the reference point (the trims already describe that), a broadband boost plus an HF
+ * shelf as the listener moves off a speaker's axis, and a cut when they move onto one. The broadband
+ * total is clamped to +/-6 dB and the high-band TOTAL to +/-10 dB (align.h), so the shelf carries
+ * the remainder rather than its own budget. Same dead-zone shape as room_eq_track (1 cm), and
+ * align.c slews it. Pure gain, no resampling, which is why it can default ON where tracked
+ * alignment cannot. */
+static void dir_seed_ref(RtCore* c) {
+    const Layout* L = &c->layout;
+    for (uint32_t k = 0; k < c->channels; ++k) {
+        if (!L->dir.nband) { c->dir_ref_lo[k] = c->dir_ref_hi[k] = 0.f; continue; }
+        float th = layout_speaker_off_axis_deg(L, k, L->ref);
+        directivity_lookup(&L->dir, th, &c->dir_ref_lo[k], &c->dir_ref_hi[k]);
+    }
+}
+static void directivity_track(RtCore* c) {
+    const Layout* L = &c->layout;
+    if (!L->dir.nband || !c->aligner) return;
+    /* (not called at all in direct-binaural mode: rt_render skips the whole align stage there) */
+    if (!atomic_load_explicit(&c->dir_on, memory_order_acquire)) {
+        if (c->dir_state != 2) {                      /* toggled off: slew to identity, once */
+            align_dir_targets(c->aligner, NULL, NULL);
+            c->dir_state = 2;
+        }
+        return;
+    }
+    const float* lp = c->lis.p_active;
+    if (c->dir_state == 1) {
+        float dx = lp[0]-c->dir_lis[0], dy = lp[1]-c->dir_lis[1], dz = lp[2]-c->dir_lis[2];
+        if (dx*dx + dy*dy + dz*dz < 1e-4f) return;    /* < 1 cm: the standing targets hold */
+    }
+    float gn[BWA_CHANNELS], sh[BWA_CHANNELS];
+    for (uint32_t k = 0; k < c->channels; ++k) {
+        float lo, hi;
+        directivity_lookup(&L->dir, layout_speaker_off_axis_deg(L, k, lp), &lo, &hi);
+        /* the clamps are on the TOTAL of each band, not on the two stages: the shelf is what is
+         * left of the clamped high-band comp after the clamped broadband part, so the treble never
+         * exceeds +/-10 dB however the two halves split (align.c re-clamps as a backstop) */
+        float g = c->dir_ref_lo[k] - lo, h = c->dir_ref_hi[k] - hi;
+        if (g >  BWA_DIR_GAIN_MAX_DB)  g =  BWA_DIR_GAIN_MAX_DB;  if (g < -BWA_DIR_GAIN_MAX_DB)  g = -BWA_DIR_GAIN_MAX_DB;
+        if (h >  BWA_DIR_SHELF_MAX_DB) h =  BWA_DIR_SHELF_MAX_DB; if (h < -BWA_DIR_SHELF_MAX_DB) h = -BWA_DIR_SHELF_MAX_DB;
+        gn[k] = g;
+        sh[k] = h - g;
+    }
+    align_dir_targets(c->aligner, gn, sh);
+    memcpy(c->dir_lis, lp, sizeof c->dir_lis);
+    c->dir_state = 1;
+}
+
 /* A seqlock's payload is ordinary data, but this core keeps every published field in an _Atomic
  * slot; bit-cast doubles through uint64 so they ride the same relaxed load/store. */
 static inline void   pub_d(_Atomic uint64_t* slot, double v) {
@@ -3473,11 +3541,24 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
             c->master_g_cur = mg_tgt;                  /* land exactly */
         }
     }
-    room_eq_track(c);                          /* tracked room EQ: re-aim the align biquads at the pose */
-    listener_align_track(c);                   /* tracked alignment: re-aim the align delays at the pose */
-    BWA_ZONE_BEGIN(za, "align");
-    align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
-    BWA_ZONE_END(za);
+    /* The align stage belongs to PHYSICAL speakers: the static gain_db / delay_ms trims, the correction
+     * FIR and the room_eq cuts, the tracked room EQ, tracked alignment and the directivity comp all
+     * describe a real speaker at a real distance in a real room. In direct-binaural mode
+     * (BWA_PROFILE_BINAURAL) this bus carries only the synthesized-diffuse taps, decoded on headphones
+     * through VIRTUAL directions, so none of it means anything there and the whole stage is skipped:
+     * the trackers too, so none of them keeps state for a stage that never runs. direct_on is
+     * create/start-time state (set while the audio thread is stopped), and the public toggles keep
+     * their values and readbacks; they simply have nothing to act on in this profile. A layout with
+     * no trims ran align as exact identity (x * 1.0f, delay 0), so that case is bit-identical to
+     * before the skip. */
+    if (!c->direct_on) {
+        room_eq_track(c);                      /* tracked room EQ: re-aim the align biquads at the pose */
+        listener_align_track(c);               /* tracked alignment: re-aim the align delays at the pose */
+        directivity_track(c);                  /* tracked directivity: re-aim each speaker's off-axis loss */
+        BWA_ZONE_BEGIN(za, "align");
+        align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
+        BWA_ZONE_END(za);
+    }
 
     /* debug channel test (bwa_set_test_signal): inject a built-in signal onto a raw output channel AFTER
      * align, so it is independent of the per-speaker trim/delay — a clean speaker-check / wiring tool. */
@@ -4763,6 +4844,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lis.q_pending[3] = 1.0f;
     atomic_store_explicit(&c->room_eq_dyn, 1, memory_order_relaxed);   /* tracked room EQ: on when a grid is present */
     atomic_store_explicit(&c->lc_on, 0, memory_order_relaxed);         /* tracked alignment: OFF (opt-in) */
+    atomic_store_explicit(&c->dir_on, 1, memory_order_relaxed);        /* tracked directivity: on when a model is present */
     atomic_store_explicit(&c->lc_dead_m, 0.f, memory_order_relaxed);   /* 0 = the built-in defaults */
     atomic_store_explicit(&c->lc_slew,   0.f, memory_order_relaxed);
     atomic_store_explicit(&c->master_gain, 1.f, memory_order_relaxed);
@@ -4802,6 +4884,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
      * which a memcpy is not the right access for. */
     c->aligner = align_create(channels, &c->layout, sample_rate);
     if (!c->aligner) { rt_destroy(c); return NULL; }
+    dir_seed_ref(c);                            /* (all zero: the default grid carries no model) */
     build_bed_decode(c);                        /* ambisonic bed decode from the default layout */
     /* push indices so the first alloc hands out slot 0, then 1, ... */
     for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++]   = voice_cap - 1 - i;
@@ -4827,6 +4910,8 @@ bool rt_set_layout(RtCore* c, const Layout* L) {
     build_bed_decode(c);                         /* re-derive the bed decode for the new geometry */
     c->rq_state = 0;                             /* new aligner starts flat: re-send the room-EQ targets */
     c->lc_state = 0;                             /* ... and the tracked-alignment targets */
+    c->dir_state = 0;                            /* ... and the directivity targets, against the new ref */
+    dir_seed_ref(c);
     c->layout_gen++;                             /* the SPCAP cache self-invalidates on the next gains call */
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
@@ -4933,6 +5018,13 @@ void rt_set_max_re_split(RtCore* c, int on) {
 void rt_set_room_eq_dyn(RtCore* c, int on) {
     if (!c) return;
     atomic_store_explicit(&c->room_eq_dyn, on ? 1 : 0, memory_order_release);
+}
+
+/* Tracked directivity compensation (directivity_track): default ON; off slews every channel's comp
+ * to identity, so the toggle is a click-free live A/B. A no-op for layouts without a model. */
+void rt_set_tracked_directivity(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->dir_on, on ? 1 : 0, memory_order_release);
 }
 
 /* Tracked listener alignment (listener_align_track): default OFF; off slews every channel back to the
@@ -5100,6 +5192,10 @@ void rt_source_set_directivity_manual(RtCore* c, uint32_t h, const float fwd[3],
 void rt_set_speed_of_sound(RtCore* c, float mps) {
     if (!c || !bwa_finite_clamp(&mps, BWA_SOS_MIN, BWA_SOS_MAX)) return;
     atomic_store_explicit(&c->sos, mps, memory_order_relaxed);
+}
+
+float rt_speed_of_sound(const RtCore* c) {
+    return c ? atomic_load_explicit(&((RtCore*)c)->sos, memory_order_relaxed) : BWA_SPEED_OF_SOUND;
 }
 
 /* Extra (compromise) listener positions — multi-listener panning. Latest-wins, commit-gated like

@@ -345,6 +345,11 @@ public:
 	BedRenderer get_bed_renderer() const { return bed_renderer; }
 	void set_tracked_room_eq(bool on);
 	bool get_tracked_room_eq() const { return tracked_room_eq; }
+	/* Tracked directivity compensation: each speaker's off-axis loss (the layout's `directivity`
+	 * model, from the vendor's CLF balloon) re-referenced from the listening point onto the tracked
+	 * head. ON by default; a no-op without a model in the layout. The live kill switch. */
+	void set_tracked_directivity(bool on);
+	bool get_tracked_directivity() const { return tracked_directivity; }
 	/* Tracked listener alignment: re-reference the per-speaker delay/gain trims from the fixed array
 	 * centroid onto the TRACKED listener. OFF by default (every delay change resamples). One C call
 	 * carries all three, so each setter re-sends the trio, like the SPCAP pair. */
@@ -589,6 +594,7 @@ private:
 	bool max_re_split = false;
 	BedRenderer bed_renderer = BED_MATRIX;
 	bool tracked_room_eq = true;
+	bool tracked_directivity = true;        /* no-op without a directivity model in the layout */
 	bool tracked_align = false;             /* opt-in: a moving delay line resamples the whole array */
 	float tracked_align_dead_zone = 0.0f;   /* 0 = the 5 cm default */
 	float tracked_align_slew_frames_per_s = 0.0f;        /* 0 = the default (~63 audio frames/s at 48 kHz) */

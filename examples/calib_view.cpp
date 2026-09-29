@@ -346,6 +346,18 @@ struct CapJob {
     int   mic_in;
     bool  simulate, do_room, do_eq, do_irs;
     char  driver[128];
+    /* The directivity re-aim needs the mic's REAL position, the bwa_calibrate --mic rule: until the
+     * user sets the field it follows the loaded layout's listening point, and the correction stays
+     * off (a guessed bearing puts fictitious dB into the trims). mic_for is the layout path the
+     * default was taken from; dir_note says which case the UI line shows. */
+    bool  mic_set;                                   /* the user edited the mic field */
+    bool  ran_mic_set;                               /* ... snapshotted at Run, for the worker */
+    char  mic_for[512];
+    bool  have_ref, have_model;                      /* what the layout at mic_for carries */
+    float mic_ref[3];
+    int   dir_note;                                  /* 0 no model, 1 model + mic unset (off), 2 model + mic set (on) */
+    bool  corr_applied;                              /* the last run re-aimed the trims (valid when state == 2) */
+    unsigned mic_scope_id;                           /* ImGui ID scope of the mic field (the test drives it) */
 
     std::atomic<int>  state;                         /* 0 idle / 1 running / 2 done / 3 failed */
     std::atomic<int>  done_count;
@@ -446,7 +458,14 @@ static void cap_worker(void) {
     float gdb[BWA_MAX_CHANNELS], dms[BWA_MAX_CHANNELS];
     static float pos[BWA_MAX_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
     for (int i = 0; i < n; ++i) { pos[i][0] = L.speakers[i].pos[0]; pos[i][1] = L.speakers[i].pos[1]; pos[i][2] = L.speakers[i].pos[2]; }
-    calib_solve(res, pos, J.mic, n, CAL_FS, gdb, dms);
+    /* the directivity re-aim, when the layout carries a model AND the user set the mic: the same
+     * factor and the same rule as the CLI (calib_directivity_corr, only with --mic), so the two tools
+     * cannot write different trims from one capture */
+    static float corr[BWA_MAX_CHANNELS];
+    const float* cp = (J.ran_mic_set && calib_directivity_corr(&L, J.mic, 2.0 * CAL_F1, 0.5 * CAL_F2, res, corr))
+                    ? corr : NULL;
+    J.corr_applied = cp != NULL;
+    calib_solve_corr(res, pos, J.mic, n, CAL_FS, cp, gdb, dms);
     memcpy(J.gain_db, gdb, sizeof gdb);
     memcpy(J.trim_ms, dms, sizeof dms);
     if (!calib_write_layout(J.ran_layout, J.ran_out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
@@ -472,9 +491,27 @@ static void tab_capture(void) {
     ImGui::InputText("##co", J.out, sizeof J.out);
     bwTip("where the calibrated layout is written (trims + optional eq) - becomes the B side of the diff");
     ImGui::SameLine(); ImGui::TextUnformatted("layout out (trims written here)");
+    /* the mic default follows the layout's listening point until the user sets the field. The
+     * layout is re-read only when the path changes (a failed read of a half-typed path is fine). */
+    if (strcmp(J.mic_for, J.layout) != 0) {
+        snprintf(J.mic_for, sizeof J.mic_for, "%s", J.layout);
+        static Layout ML;                            /* never a stack local (layout.h); UI thread */
+        char merr[256];
+        J.have_ref = layout_load(J.layout, (uint32_t)CAL_FS, &ML, merr, sizeof merr);
+        J.have_model = J.have_ref && ML.dir.nband > 0;
+        if (J.have_ref) memcpy(J.mic_ref, ML.ref, sizeof J.mic_ref);
+        if (J.have_ref && !J.mic_set) memcpy(J.mic, ML.ref, sizeof J.mic);
+    }
     ImGui::SetNextItemWidth(uiScaled(220));
-    ImGui::InputFloat3("mic (m)", J.mic, "%.2f");
-    bwTip("omni mic position in room space - the solve time-aligns and level-matches arrivals at this point");
+    J.mic_scope_id = ImGui::GetID("mic (m)");        /* InputFloat3 pushes its label as an ID scope */
+    if (ImGui::InputFloat3("mic (m)", J.mic, "%.2f")) J.mic_set = true;
+    bwTip("omni mic position in room space - the solve time-aligns and level-matches arrivals at this point. "
+          "Defaults to the layout's listening point; set it to where the mic really is");
+    if (J.mic_set && J.have_ref) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("use listening point")) { memcpy(J.mic, J.mic_ref, sizeof J.mic); J.mic_set = false; }
+        bwTip("put the mic field back on the layout's listening point (the directivity re-aim turns off again)");
+    }
     ImGui::SameLine(0, uiScaled(16)); ImGui::Checkbox("simulate", &J.simulate);
     bwTip("no hardware: synthesize each sweep capture (1/r + a per-speaker sensitivity wobble) and "
           "run the identical measure->solve->writeback pipeline");
@@ -491,6 +528,15 @@ static void tab_capture(void) {
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(140));
         ImGui::InputTextWithHint("##cirp", "ir prefix", J.irprefix, sizeof J.irprefix);
     }
+    J.dir_note = !J.have_model ? 0 : (J.mic_set ? 2 : 1);
+    if (J.dir_note == 0)
+        ImGui::TextDisabled("directivity: the layout carries no model; the trims are as measured");
+    else if (J.dir_note == 1)
+        ImGui::TextDisabled("directivity: mic not set, so it sits at the listening point (%.2f %.2f %.2f) and the "
+                            "re-aim is OFF; set the mic to turn it on", J.mic_ref[0], J.mic_ref[1], J.mic_ref[2]);
+    else
+        ImGui::TextUnformatted("directivity: mic set, the re-aim is ON (trims corrected from the mic's bearing "
+                               "to the listening point's)");
 #ifdef BWA_HAVE_ASIO
     if (!J.simulate) {
         ImGui::SetNextItemWidth(uiScaled(160));
@@ -512,6 +558,7 @@ static void tab_capture(void) {
             if (J.th_live) { J.th.join(); J.th_live = false; }   /* reap the previous run */
             snprintf(J.ran_layout, sizeof J.ran_layout, "%s", J.layout);   /* snapshot: this run's paths */
             snprintf(J.ran_out,    sizeof J.ran_out,    "%s", J.out);
+            J.ran_mic_set = J.mic_set;
             J.cancel.store(false); J.done_count.store(0); J.n.store(0); J.msg[0] = 0;
             J.state.store(1, std::memory_order_release);
             J.th = std::thread(cap_worker); J.th_live = true;
@@ -1060,6 +1107,7 @@ static void draw_ui(void) {
  * assert on through the REAL UI (typed paths, clicked buttons), not through a parallel code path. */
 static const char* FIX_A = "calibview_fix_a.json";
 static const char* FIX_B = "calibview_fix_b.json";
+static const char* FIX_D = "calibview_fix_d.json";   /* A plus a directivity model and a listening point */
 
 static int write_fixture(const char* path, int variant_b) {
     FILE* f = fopen(path, "wb");
@@ -1075,15 +1123,20 @@ static int write_fixture(const char* path, int variant_b) {
     for (int zi = -1; zi <= 1; ++zi) for (int yi = -1; yi <= 1; ++yi) for (int xi = -1; xi <= 1; ++xi) {
         if (!zi && !yi && !xi) continue;                          /* 27 - center = 26 */
         double x = 1.5 * xi, y = 1.5 * yi, z = 1.5 * zi, g = 0.0;
-        if (variant_b && idx == 7) { x += 0.10; g = -1.5; }       /* the known deltas */
+        if (variant_b == 1 && idx == 7) { x += 0.10; g = -1.5; }  /* the known deltas */
         fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f",
                 idx, x, y, z, g, 0.05 * idx);
-        if (variant_b && idx == 3)
+        if (variant_b == 1 && idx == 3)
             fprintf(f, ", \"eq\": [0.9, 0.2, -0.1, 0.05, 0.02, -0.01, 0.005, 0.0]");
         fprintf(f, " }%s\n", idx < 25 ? "," : "");
         ++idx;
     }
-    fprintf(f, "  ]\n}\n");
+    if (variant_b == 2)
+        fprintf(f, "  ],\n  \"listening_point_m\": [0.2, 0.3, -0.1],\n"
+                   "  \"directivity\": { \"bands_hz\": [250, 4000], \"angles_deg\": [0, 30, 60, 90, 180],\n"
+                   "    \"split_hz\": 1000, \"loss_db\": [[0, -1, -2, -3, -6], [0, -4, -10, -16, -25]] }\n}\n");
+    else
+        fprintf(f, "  ]\n}\n");
     fclose(f);
     return 1;
 }
@@ -1160,6 +1213,57 @@ static void register_tests(ImGuiTestEngine* e) {
         IM_CHECK_GT(trimmed, 5);
         ctx->ItemClick("**/Diff");
         ctx->Yield(2);
+        ctx->CaptureScreenshotWindow("//calib view");
+    };
+
+    /* the directivity re-aim follows bwa_calibrate's --mic rule. A layout with a model and a listening
+     * point off the array centroid: the mic field defaults to that point and the re-aim stays OFF
+     * through a whole run; typing a mic position turns it ON for the next run; a model-free layout
+     * shows the no-model note; "use listening point" puts the field back and turns it off. With the
+     * worker applying the correction whenever a model exists (the old rule), the first run's
+     * corr_applied check went red. */
+    t = IM_REGISTER_TEST(e, "capture", "mic_rule");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        J.mic_set = false;                                        /* earlier tests share J */
+        ctx->ItemClick("**/##cl");   ctx->KeyCharsReplaceEnter(FIX_D);
+        ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_cap_out_d.json");
+        ctx->ItemCheck("**/simulate");
+        ctx->Yield(2);
+        IM_CHECK(J.have_model);
+        IM_CHECK(!J.mic_set);
+        IM_CHECK_LT(fabsf(J.mic[0] - 0.2f), 1e-4f);               /* the layout's listening point, */
+        IM_CHECK_LT(fabsf(J.mic[1] - 0.3f), 1e-4f);               /* not (0, 0, 0)                 */
+        IM_CHECK_LT(fabsf(J.mic[2] + 0.1f), 1e-4f);
+        IM_CHECK_EQ(J.dir_note, 1);
+        ctx->ItemClick("**/Run calibration");
+        double t0 = ImGui::GetTime();
+        while (J.state.load() == 1 && ImGui::GetTime() - t0 < 60.0) ctx->Yield();
+        IM_CHECK_EQ(J.state.load(), 2);
+        IM_CHECK(!J.corr_applied);                                /* mic never set: trims as measured */
+
+        ctx->ItemInputValue(ctx->GetIDByInt(0, J.mic_scope_id), 1.0f);   /* the mic's x component */
+        ctx->Yield(2);
+        IM_CHECK(J.mic_set);
+        IM_CHECK_LT(fabsf(J.mic[0] - 1.0f), 1e-4f);
+        IM_CHECK_EQ(J.dir_note, 2);
+        ctx->ItemClick("**/Run calibration");
+        t0 = ImGui::GetTime();
+        while (J.state.load() == 1 && ImGui::GetTime() - t0 < 60.0) ctx->Yield();
+        IM_CHECK_EQ(J.state.load(), 2);
+        IM_CHECK(J.corr_applied);                                 /* mic set + a model: re-aimed */
+
+        ctx->ItemClick("**/##cl");   ctx->KeyCharsReplaceEnter(FIX_A);   /* no model in this one */
+        ctx->Yield(2);
+        IM_CHECK(!J.have_model);
+        IM_CHECK_EQ(J.dir_note, 0);
+        IM_CHECK_LT(fabsf(J.mic[0] - 1.0f), 1e-4f);               /* a set mic survives a layout change */
+        ctx->ItemClick("**/use listening point");
+        ctx->Yield(2);
+        IM_CHECK(!J.mic_set);
+        IM_CHECK_LT(fabsf(J.mic[0]), 1e-4f);                      /* FIX_A's listening point: its centroid */
         ctx->CaptureScreenshotWindow("//calib view");
     };
 
@@ -1339,7 +1443,8 @@ int main(int argc, char** argv) {
     for (int k = 0; k < EQ_PTS; ++k) V.eqfreq[k] = 20.0f * powf(1000.0f, (float)k / (EQ_PTS - 1));
     J.simulate = true;                                            /* hardware capture is the rig-day opt-out */
     if (selftest) {
-        if (!write_fixture(FIX_A, 0) || !write_fixture(FIX_B, 1)) { fprintf(stderr, "calib_view: cannot write fixtures in cwd\n"); return 1; }
+        if (!write_fixture(FIX_A, 0) || !write_fixture(FIX_B, 1) || !write_fixture(FIX_D, 2)) {
+            fprintf(stderr, "calib_view: cannot write fixtures in cwd\n"); return 1; }
     } else {
         if (!V.pathA[0]) snprintf(V.pathA, sizeof V.pathA, "cave_layout.json");
         if (V.pathA[0])  load_layout(0);                          /* best effort; status shows any error */
