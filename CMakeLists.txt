@@ -5,7 +5,7 @@
 #   - bw_audio.dll — the public C ABI (include/bw_audio.h) over the shared core (bwa_core) plus the
 #     null/manual sinks. Optional ASIO and Steam Audio backends auto-enable when their SDKs are
 #     vendored under third_party/ (see third_party/README.md).
-#   - console examples (minimal/ambisonic/streaming/track_monitor) — built every build so
+#   - console examples (minimal/ambisonic/streaming/track_monitor/speaker_survey) — built every build so
 #     they can't drift from the ABI.
 #   - profiling benches (profile_bench + bench_situations) — opt-in behind -DBWA_BUILD_BENCH=ON.
 #   - the ctest suite (BWA_BUILD_TESTS, ON by default).
@@ -296,6 +296,7 @@ add_library(bwa_core OBJECT
   src/acoustics/fdn.c
   src/acoustics/ism.c
   src/tracking/natnet.c
+  src/tracking/survey.c        # the optical speaker survey's math (bwa_speaker_survey); pure, no atomics
   ${BWA_OS_SRC}
   src/calib/measure.c
   src/calib/calib.c
@@ -836,6 +837,12 @@ target_link_libraries(bwa_track_monitor PRIVATE bw_audio)
 bwa_tool_icon(bwa_track_monitor)
 bwa_copy_runtime_dll(bwa_track_monitor)
 
+# ---- optical speaker survey (console; the visible speakers' rigid bodies -> aim, position and the
+# Motive-vs-room frame check). Links bwa_core like bwa_calibrate: it reads the layout the way the
+# engine does and parses NatNet with the engine's own parsers. No icon resource of its own. ----
+add_executable(bwa_speaker_survey examples/speaker_survey.c)
+target_link_libraries(bwa_speaker_survey PRIVATE bwa_core)
+
 # ---- profiling benches (opt-in; the default build stays lean) ----
 # Both are dev/profiling tools, not part of the ABI-drift guard, so they gate behind one flag:
 #   cmake -S . -B build -DBWA_BUILD_BENCH=ON     (pair with -DBWA_TRACY=ON for Tracy zones)
@@ -1035,6 +1042,42 @@ if(BWA_BUILD_TESTS)
   add_test(NAME natnet COMMAND test_natnet)
   if(MSVC)   # includes pose.h (the C11-atomics seqlock) directly
     set_source_files_properties(test/natnet_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endif()
+  # the optical speaker survey's math (pure; no atomics, so no MSVC flag)
+  add_executable(test_survey test/survey_test.c)
+  target_link_libraries(test_survey PRIVATE bwa_core)
+  add_test(NAME survey COMMAND test_survey)
+  # End to end with no Motive: bwa_speaker_survey --simulate synthesizes MODELDEF + frame packets
+  # from the layout and pushes them through the same NatNet parsers. The tool checks its answer
+  # against what it injected; test/speaker_survey_check.cmake asserts on the report and exit code.
+  # Host builds only: the wrapper is a HOST cmake that runs the tool itself, which neither the
+  # Android runner (tools/android/run-tests.ps1 pushes each test's executable to the device) nor a
+  # wasm runtime can serve. test_survey and test_natnet still run everywhere.
+  if(NOT CMAKE_CROSSCOMPILING)
+  function(bwa_survey_test name rc args expect)
+    add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:bwa_speaker_survey>
+             "-DARGS=${args}" "-DEXPECT=${expect}" -DEXPECT_RC=${rc}
+             -P ${CMAKE_SOURCE_DIR}/test/speaker_survey_check.cmake
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+  endfunction()
+  set(_dome "${CMAKE_SOURCE_DIR}/examples/dome_24.json")
+  set(_inj "@@--simulate@@--sim-yaw@@2@@--sim-offset@@0.05,0,0@@--sim-aim-error@@3@@--sim-noise-mm@@0.1@@--baffle-offset-m@@0.08")
+  bwa_survey_test(speaker_survey_sim 0 "${_dome}${_inj}@@--write@@speaker_survey_out.json@@--fields@@aim,position"
+    "summary: matched 4, accepted 4, aims 4, rotation (1\\.9[89]|2\\.0[0-2]) deg, translation (49|50)\\.[0-9] mm, rms 0\\.[0-9] mm, handedness OK, simulate PASS, wrote 4 aims, 4 positions \\(reload OK\\)@@speaker  0  position +[0-9.]+ mm  aim +(2\\.9[0-9]|3\\.0[0-9]) deg@@\"Speaker_6\" \\(id 102\\) -> speaker 6@@\"spkr0\" \\(id 8\\): ignored, not spk<N>@@frame is OFF the room frame by (1\\.9[89]|2\\.0[0-2]) deg")
+  set_tests_properties(speaker_survey_sim PROPERTIES FIXTURES_SETUP survey_out)
+  bwa_survey_test(speaker_survey_rerun 0 "speaker_survey_out.json@@--simulate"
+    "\\(layout aim explicit\\)@@frame agrees with the room frame@@handedness OK, simulate PASS")
+  set_tests_properties(speaker_survey_rerun PROPERTIES FIXTURES_REQUIRED survey_out)
+  bwa_survey_test(speaker_survey_mirror 3 "${_dome}${_inj}@@--sim-mirror@@--write@@speaker_survey_mirror_out.json"
+    "handedness   MIRRORED \\(decided by positions\\)@@handedness MIRRORED, simulate PASS, write refused")
+  bwa_survey_test(speaker_survey_three 0 "${_dome}${_inj}@@--sim-mirror@@--sim-speakers@@2,8,14"
+    "handedness   MIRRORED \\(decided by aims\\)@@matched 3, accepted 3, aims 3")
+  bwa_survey_test(speaker_survey_natnet31 0 "${_dome}${_inj}@@--sim-natnet@@3.1"
+    "\\(NatNet 3\\.1\\)@@model: 6 rigid bodies described, every description read@@handedness OK, simulate PASS")
+  bwa_survey_test(speaker_survey_map 0 "${_dome}${_inj}@@--sim-natnet@@4.2@@--map@@SPK00=0@@--map@@nobody=3"
+    "-> speaker 0 \\(--map\\)@@--map nobody=3: no rigid body has that name@@handedness OK, simulate PASS")
+  bwa_survey_test(speaker_survey_pair 0 "${_dome}${_inj}@@--sim-speakers@@3,9"
+    "two speakers: their optical distance differs from the layout's by -?0\\.[0-9] mm@@no frame fit, simulate PASS")
   endif()
 
   add_executable(test_ambi test/ambi_test.c)
@@ -1452,6 +1495,17 @@ if(BWA_BUILD_CALIBRATE)
              WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
     set_tests_properties(calibrate_sim_room_trim PROPERTIES
       PASS_REGULAR_EXPRESSION "direct share of the level band: min 0\\.[0-9][0-9]  median 0\\.[0-9][0-9]  max 0\\.[0-9][0-9]")
+    # --verify (trim, verify clean, corrupt two speakers, verify flags exactly them), the ZM-1 as the
+    # trim mic, --aim-sheet, and --live N --zylia (live aiming: a moved and a turned speaker, bounded
+    # by --sweeps / --sim-aim-steps). Multi-step, so each drives bwa_calibrate from a CMake script
+    # that checks exit codes and the report; scratch lands in calib_cli_<mode>/ in the build tree.
+    foreach(_bwa_cli verify_omni verify_zylia zylia_trims aim_sheet live_zylia)
+      add_test(NAME calibrate_${_bwa_cli}
+               COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DMODE=${_bwa_cli}
+                       -DLAYOUT=${CMAKE_BINARY_DIR}/calib_sim_room_layout.json
+                       -DWORK=${CMAKE_BINARY_DIR}/calib_cli_${_bwa_cli}
+                       -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
+    endforeach()
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

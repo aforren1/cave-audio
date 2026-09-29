@@ -27,7 +27,18 @@ below was established from the file's own consistency and is checked at run time
     is left out of the output;
   - in the numeric header, four 27-entry per-band lists (one per measured band, 40 Hz up):
     the -6 dB coverage half-angle in three planes, 180 where the band never drops 6 dB,
-    plus the maker's own directivity index (DI, dB).
+    plus the maker's own directivity index (DI, dB);
+  - just ahead of the balloon (byte 6456 of 14236 in the 4410A file, one zero float between
+    them), the ABSOLUTE on-axis sensitivity: one float32 dB SPL value per measured band and
+    meridian (27 x 72). Every meridian of a band agrees within 0.8 dB, since on-axis is one
+    point; the per-band power mean over the meridians is exported as `on_axis_db`.
+
+The on-axis block has its own checks, and the block is left out (with a note) rather than
+guessed when any fails: exactly one candidate of (measured bands x 72) float32 values, every
+one in [20, 160] dB SPL, each band's 72 meridians within 1.5 dB of each other, and ending
+within 64 bytes of the balloon. The relative balloon does not depend on it, so a file without
+one still converts. `bwa_calibrate --live N --zylia` reads its high-to-mid tilt as the tilt a
+speaker shows pointing at the mic (docs/calibration.md, "Live aiming").
 
 The coverage lists are the self-check: the script recomputes the -6 dB half-angle of the
 balloon it decoded, in two planes, and refuses to write unless it agrees with the file's
@@ -172,6 +183,37 @@ def decode(data):
     raise SystemExit("clf_to_json: no balloon block found (not a CF2 of the expected shape)")
 
 
+ON_AXIS_MIN_DB = 20.0       # plausible dB SPL on a speaker's axis, anything from a whisper ...
+ON_AXIS_MAX_DB = 160.0      # ... to a line array
+ON_AXIS_SPREAD_DB = 1.5     # one on-axis point: the meridians of a band must agree
+ON_AXIS_MAX_GAP = 64        # bytes between the block's end and the balloon
+
+
+def find_on_axis(data, balloon_off, nbands):
+    """The absolute on-axis response block ahead of the balloon: nbands x N_MERID float32 dB SPL
+    values, band-major. Returns (offset, per-band power mean over the meridians, worst per-band
+    spread, candidate count), or None with a reason string when the checks fail."""
+    n = nbands * N_MERID
+    hits = []
+    for off in range(0, balloon_off - 4 * n + 1, 4):
+        v = struct.unpack_from("<%df" % n, data, off)
+        if not (ON_AXIS_MIN_DB <= min(v) and max(v) <= ON_AXIS_MAX_DB):
+            continue
+        spread = max(max(v[b * N_MERID:(b + 1) * N_MERID]) - min(v[b * N_MERID:(b + 1) * N_MERID])
+                     for b in range(nbands))
+        if spread <= ON_AXIS_SPREAD_DB:
+            hits.append((off, v, spread))
+    if len(hits) != 1:
+        return None, "%d candidate blocks of %d x %d plausible dB SPL values (need exactly 1)" \
+                     % (len(hits), nbands, N_MERID)
+    off, v, spread = hits[0]
+    gap = balloon_off - (off + 4 * n)
+    if gap > ON_AXIS_MAX_GAP:
+        return None, "the only candidate ends %d bytes before the balloon (need <= %d)" % (gap, ON_AXIS_MAX_GAP)
+    means = [power_mean_db(v[b * N_MERID:(b + 1) * N_MERID]) for b in range(nbands)]
+    return (off, means, spread, gap), None
+
+
 def half_angle_6db(band, m):
     """Degrees off axis where meridian m of a band first drops to -6 dB (linear between the
     5 deg samples); 180 when it never does."""
@@ -211,7 +253,7 @@ def directivity_index_db(band):
     return 10.0 * math.log10(num / den)
 
 
-def build_block(bands, balloon, model, source, split_hz):
+def build_block(bands, balloon, model, source, split_hz, on_axis_db=None):
     angles = list(range(0, 181, POLAR_STEP_DEG))
     loss = []
     for band in balloon:
@@ -238,6 +280,7 @@ def build_block(bands, balloon, model, source, split_hz):
         "angles_deg": angles,
         "split_hz": split_hz,
         "loss_db": loss,
+        **({"on_axis_db": [round(v, 2) for v in on_axis_db]} if on_axis_db else {}),
         "planes": {
             "note": "the two principal polars of the balloon (meridians 0/180 and 90/270), same "
                     "shape as loss_db; informational, the engine reads loss_db only",
@@ -311,7 +354,17 @@ def main():
         print("  coverage self-check passed: %d of %d bands agree within %d deg"
               % (agree, with_list, COVERAGE_TOL_DEG))
 
-    block = build_block(bands, balloon, model, source, args.split_hz)
+    on_axis, why = find_on_axis(data, off, len(bands))
+    if on_axis:
+        oa_off, oa_means, oa_spread, oa_gap = on_axis
+        print("  on-axis response: block at byte %d (%d bands x %d meridians, %d bytes before the balloon), "
+              "meridians agree within %.2f dB" % (oa_off, len(bands), N_MERID, oa_gap, oa_spread))
+        for hz in (1000, 3150, 8000, 16000):
+            if hz in bands:
+                print("    %5d Hz: %.2f dB SPL" % (hz, oa_means[bands.index(hz)]))
+    else:
+        print("  on-axis response: not exported (%s); the balloon is unaffected" % why)
+    block = build_block(bands, balloon, model, source, args.split_hz, on_axis[1] if on_axis else None)
     print("  -6 dB half-angle (axisymmetric mean):")
     for hz in (500, 1000, 2000, 4000, 8000, 16000):
         if hz not in bands:

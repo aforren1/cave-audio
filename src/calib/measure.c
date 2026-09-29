@@ -174,6 +174,7 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
     memset(out, 0, sizeof *out);
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &e_full, &ir);
     if (!L) return 0;
+    out->energy = (float)e_full;
     int p = ir_peak(ir, 0, ncap < L ? ncap : L);                /* physical arrival = strongest tap */
     out->delay_samples = p;
     /* sub-sample refinement: fit a parabola to |IR| at the peak and its neighbors (true peak of a

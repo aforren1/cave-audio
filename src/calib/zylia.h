@@ -28,6 +28,7 @@
 #define BWA_ZYLIA_H
 
 #include <stdint.h>
+#include "calib/measure.h"     /* MeasureResult: the pressure proxy pools per-capsule results */
 
 #define ZYLIA_MICS 19
 #define ZYLIA_SURVEY_MAX 64    /* max clap observations zylia_survey will take (far more than it needs) */
@@ -335,5 +336,79 @@ int  zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int e
  * the DISTANCE inherits the latency's accuracy (see the header). */
 int  zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
                     double latency_s, double c, float pos_out[3], float* dist_out);
+
+/* ---- the ZM-1 as a PRESSURE mic (bwa_calibrate --zylia --trims / --verify) ----
+ *
+ * The trims want what an omni at the array center would measure: one delay, one level, one direct
+ * share per speaker. The ZM-1 has no capsule at its center, and every capsule sits on a rigid sphere,
+ * so above about 2 kHz (ka ~ 1.8 at R = 49 mm) a capsule facing the speaker reads up to +6 dB and one
+ * in the shadow reads well below the free field. No single capsule is a pressure mic there.
+ *
+ * The surface-averaged POWER of a plane wave on a sphere does not depend on where the wave comes
+ * from, though: rotating the source only rotates the pattern. So the mean over 19 capsules spread
+ * over the surface is close to direction-independent where any one capsule is not. What is left is
+ * the sampling error of 19 points (the capsules are a dodecahedron minus one vertex, not a design)
+ * and a direction-INDEPENDENT coloration (the sphere's surface-mean response against the free field),
+ * which is common to every speaker and cancels out of relative trims. zylia_test.c measures the
+ * leftover with an analytic rigid-sphere model.
+ *
+ * The CENTER arrival: the capsule arrivals' mean, corrected for the wavefront's tilt across the
+ * sphere (the capsule centroid is not the center: 2.6 mm above it for the built-in table), using
+ * zylia_doa's direction. Plane-wave model, so a near source leaves a curvature term of about
+ * R^2 / (2 d c): 1 us at 1 m. The ONE implementation: --ref's latency solve and the proxy share it.
+ * Reads the installed capsule table. `c` in m/s. Returns seconds; when the DOA solve fails it
+ * returns the plain mean (no tilt correction). */
+double zylia_center_arrival(const double arrival_s[ZYLIA_MICS], double c);
+
+/* Pool 19 per-capsule measure_response results (capsule i = cap[i], all against the same sweep)
+ * into one pressure-proxy MeasureResult:
+ *   level, band[3], level_direct, band_direct[3] -> the RMS across capsules (the power mean);
+ *   energy       -> the mean capsule energy;
+ *   direct_frac  -> energy-weighted: sum(direct_frac_i * energy_i) / sum(energy_i);
+ *   delay        -> zylia_center_arrival of the capsules' sub-sample arrivals, as delay_samples
+ *                   (nearest) + delay_frac;
+ *   gate_samples -> the shortest capsule gate.
+ * `fs` is the capture rate, `c` the speed of sound. Pure (reads the installed capsule table).
+ *
+ * A DEAD capsule is refused, not pooled: one whose level is non-finite or more than
+ * ZYLIA_PROXY_DEAD_DB below the capsules' median. Its level would only cost the power mean 0.2 dB,
+ * but its "arrival" is the peak of noise, anywhere in the capture, and one wild arrival in 19 moves
+ * the center arrival by milliseconds. The rigid sphere's own shadow stays far above the threshold (a
+ * shadowed capsule's broadband level is at most about 9 dB under a lit one's).
+ * Returns 1; 0 on NULL input or an out-of-range rate; -1 for a dead capsule, with its index in
+ * `*dead` (NULL ok). */
+#define ZYLIA_PROXY_DEAD_DB 20.0
+int  zylia_pressure_proxy(const MeasureResult cap[ZYLIA_MICS], double fs, double c, MeasureResult* out, int* dead);
+
+/* ---- live position check (bwa_calibrate --live N --zylia, calib_view's Aim tab) ----
+ *
+ * Where one speaker is, from one sweep, against where the layout says it is. Direction from the
+ * capsule arrivals (zylia_doa: latency-independent, sub-degree), distance from the arrival at the
+ * array center (zylia_center_arrival) minus the known system latency, so
+ *
+ *     pos = center + c * (t_center - latency_s) * dir
+ *
+ * The distance is exactly as good as the latency: 20 us of latency error is 6.9 mm of range at
+ * 343 m/s, so about a centimeter per 30 us, and the ZM-1 chain's ~60 ms must be MEASURED (--latency,
+ * or --ref's one taped distance), never guessed. zylia_doa is a far-field fit; at the 1.5 to 3 m of
+ * a CAVE its near-field bias stays under a degree. `layout_pos` is the target. Pure (reads the
+ * installed capsule table). Returns out->ok: 0 when the DOA solve fails or an input is non-finite.
+ * With latency_known = 0 only the direction fields are filled (dist_m and every position and
+ * distance delta read 0) and have_distance is 0. */
+typedef struct {
+    int   ok;
+    int   have_distance;   /* 1 = a latency was given, so dist_m / pos / the deltas mean something */
+    float dir[3];          /* unit, center -> speaker */
+    float dist_m;          /* c * (t_center - latency) */
+    float pos[3];          /* center + dist_m * dir, room meters */
+    float layout_dir[3];   /* unit, center -> layout_pos */
+    float layout_dist_m;
+    float dir_err_deg;     /* angle between dir and layout_dir */
+    float delta_mm[3];     /* pos - layout_pos */
+    float delta_norm_mm;
+    float dist_err_mm;     /* dist_m - layout_dist_m */
+} ZyliaLivePos;
+int zylia_live_position(const double arrival_s[ZYLIA_MICS], const float center[3], int latency_known,
+                        double latency_s, double c, const float layout_pos[3], ZyliaLivePos* out);
 
 #endif /* BWA_ZYLIA_H */

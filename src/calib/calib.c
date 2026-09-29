@@ -3,6 +3,7 @@
 #include "core/layout.h"        /* BWA_RQ_GRID_MAX / BWA_ROOM_EQ_MAX (the room_eq_grid schema caps) */
 #include "dsp/sos.h"           /* BWA_SOS_MIN_MPS / BWA_SOS_MAX_MPS (the plausible-room guard) */
 #include "os/os.h"        /* os_fopen: UTF-8 paths on Windows */
+#include "core/frame.h"     /* BWA_ROOM_AHEAD / _UP / _RIGHT: the aiming sheet's angle convention */
 
 #include <cJSON.h>
 
@@ -99,7 +100,7 @@ static float aim_angle_deg(const float a[3], const float b[3]) {
 
 /* the predicted tilt tabulated over 0..180 deg in 0.25 deg steps: the search evaluates ~1100
  * candidates x K bearings, and each direct evaluation is two 256-point band integrals */
-#define AIM_TT_N 721
+#define AIM_TT_N CALIB_AIM_CURVE_N
 static float aim_tilt_tab(const float* tt, float th) {
     float x = th * 4.f;
     if (!(x > 0.f)) return tt[0];
@@ -140,7 +141,7 @@ int calib_check_aim(const Layout* L, int s, const float (*mic)[3], const float* 
         for (int b = a + 1; b < K; ++b) { float d = aim_angle_deg(bear[a], bear[b]); if (d > spread) spread = d; }
     out->spread_deg = spread;
     static float tt[AIM_TT_N];                     /* control thread, one call at a time */
-    for (int i = 0; i < AIM_TT_N; ++i) tt[i] = calib_aim_tilt_db(&L->dir, 0.25f * (float)i, band_hz, f2);
+    calib_aim_curve(&L->dir, band_hz, f2, tt);
     out->rms_layout_db = (float)aim_score(tt, sp->aim, bear, tilt_db, K, NULL);
     out->rms_fit_db = out->rms_layout_db;
     if (K < 3 || spread < 8.f) return 0;           /* refuse: nothing to lever the fit with */
@@ -172,6 +173,82 @@ int calib_check_aim(const Layout* L, int s, const float (*mic)[3], const float* 
     out->aim_err_deg = aim_angle_deg(sp->aim, out->aim_fit);
     out->ok = 1;
     return 1;
+}
+
+void calib_aim_curve(const Directivity* d, const double band_hz[2], double f2, float curve[CALIB_AIM_CURVE_N]) {
+    if (!curve) return;
+    for (int i = 0; i < CALIB_AIM_CURVE_N; ++i) curve[i] = calib_aim_tilt_db(d, 0.25f * (float)i, band_hz, f2);
+}
+
+/* the smallest angle (deg) at which the monotone envelope env[] reaches `v`, linear between the two
+ * samples that straddle it; `imax` bounds the walk */
+static float aim_envelope_angle(const float* env, int imax, float v) {
+    if (v >= env[0]) return 0.f;
+    for (int i = 1; i <= imax; ++i)
+        if (env[i] <= v) {
+            const float span = env[i - 1] - env[i];
+            const float t = span > 0.f ? (env[i - 1] - v) / span : 1.f;
+            return 0.25f * ((float)(i - 1) + t);
+        }
+    return 0.25f * (float)imax;
+}
+
+int calib_aim_invert(const float curve[CALIB_AIM_CURVE_N], float rel_db, float tol_db, CalibAimAngle* out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    out->rel_db = rel_db;
+    if (!curve || !isfinite(rel_db)) return 0;
+    if (!(tol_db >= 0.f)) tol_db = 0.f;                    /* NaN reads as 0 too */
+    /* the running minimum from 0 deg, relative to the 0 deg value, and where it stops falling. A
+     * curve that never falls (no model: all zeros) cannot be inverted. */
+    float env[CALIB_AIM_CURVE_N];
+    env[0] = 0.f;
+    int imax = 0;
+    for (int i = 1; i < CALIB_AIM_CURVE_N; ++i) {
+        const float v = curve[i] - curve[0];
+        env[i] = v < env[i - 1] ? v : env[i - 1];
+        if (env[i] < env[imax] - 1e-6f) imax = i;
+    }
+    if (imax == 0) return 0;
+    out->max_deg   = 0.25f * (float)imax;
+    out->angle_deg = aim_envelope_angle(env, imax, rel_db);
+    out->lo_deg    = aim_envelope_angle(env, imax, rel_db + tol_db);
+    out->hi_deg    = aim_envelope_angle(env, imax, rel_db - tol_db);
+    out->beyond    = rel_db < env[imax];
+    out->on_axis   = out->lo_deg == 0.f;
+    out->ok = 1;
+    return 1;
+}
+
+int calib_direct_tilt_db(const MeasureResult* m, float* out) {
+    if (!m || !out) return 0;
+    const double mid = m->band_direct[1], hi = m->band_direct[2];
+    if (!(mid > 1e-12 && hi > 1e-12) || !isfinite(mid) || !isfinite(hi)) return 0;
+    *out = (float)(20.0 * log10(hi / mid));
+    return 1;
+}
+
+int calib_on_axis_tilt_db(const Directivity* d, const double band_hz[2], double f2, float* out) {
+    if (!d || !d->nband || !d->has_on_axis || !band_hz || !out) return 0;
+    const float mid = directivity_on_axis_lin(d, (float)band_hz[0], (float)band_hz[1]);
+    const float hi  = directivity_on_axis_lin(d, (float)band_hz[1], (float)f2);
+    if (!(mid > 1e-9f) || !(hi > 1e-9f)) return 0;
+    *out = (float)(20.0 * log10((double)hi / (double)mid));
+    return 1;
+}
+
+void calib_peak_reset(CalibPeakHold* p) {
+    if (!p) return;
+    p->n = 0; p->last_db = 0.f; p->peak_db = 0.f; p->peak_index = 0;
+}
+
+float calib_peak_update(CalibPeakHold* p, float value_db) {
+    if (!p) return 0.f;
+    if (!isfinite(value_db)) return p->peak_index ? p->peak_db - p->last_db : 0.f;
+    ++p->n;
+    p->last_db = value_db;
+    if (!p->peak_index || value_db > p->peak_db) { p->peak_db = value_db; p->peak_index = p->n; }
+    return p->peak_db - value_db;
 }
 
 /* Gaussian elimination with partial pivoting on a 4x4 system A*x = b. Returns 0 if singular. */
@@ -752,4 +829,164 @@ fail:
     free(outtext); cJSON_Delete(root); free(text);
     return ok;
     #undef FAIL
+}
+
+/* ---- the second pass: --verify (calib.h) ---- */
+
+int calib_verify_residuals(const MeasureResult* m, const float (*pos)[3], const float mic[3],
+                           const float align_pt[3], int n, double fs, double c, const float* corr,
+                           float* arrival_us, float* level_db, int* flags, CalibVerifySummary* sum) {
+    if (sum) memset(sum, 0, sizeof *sum);
+    if (!m || !pos || !mic || !align_pt || !arrival_us || !level_db || !flags || n <= 0 || !(fs > 0.0) || !(c > 1.0))
+        return -1;
+    double* ra  = (double*)malloc((size_t)n * sizeof(double));   /* raw arrival residual, s */
+    double* rl  = (double*)malloc((size_t)n * sizeof(double));   /* raw normalized level, dB */
+    float*  tmp = (float*)malloc((size_t)n * sizeof(float));
+    if (!ra || !rl || !tmp) { free(ra); free(rl); free(tmp); return -1; }
+    int nlive = 0;
+    for (int k = 0; k < n; ++k) {
+        flags[k] = 0;
+        const double lv = (double)m[k].level;
+        const double t  = ((double)m[k].delay_samples + (double)m[k].delay_frac) / fs;
+        if (!(lv > 0.0) || !isfinite(lv) || !isfinite(t)) { flags[k] = CALIB_VERIFY_FLAG_DEAD; continue; }
+        double dx = pos[k][0]-mic[0], dy = pos[k][1]-mic[1], dz = pos[k][2]-mic[2];
+        double dm = sqrt(dx*dx + dy*dy + dz*dz); if (dm < 0.05) dm = 0.05;   /* calib_solve's clamp */
+        dx = pos[k][0]-align_pt[0]; dy = pos[k][1]-align_pt[1]; dz = pos[k][2]-align_pt[2];
+        const double da = sqrt(dx*dx + dy*dy + dz*dz);
+        ra[k] = t - (dm - da) / c;
+        rl[k] = 20.0 * log10(lv * dm * cfac(corr, k));
+        ++nlive;
+    }
+    float ma = 0.f, ml = 0.f;
+    if (nlive) {
+        int j = 0;
+        for (int k = 0; k < n; ++k) if (!flags[k]) tmp[j++] = (float)(ra[k] * 1e6);
+        ma = fmedian(tmp, nlive);
+        j = 0;
+        for (int k = 0; k < n; ++k) if (!flags[k]) tmp[j++] = (float)rl[k];
+        ml = fmedian(tmp, nlive);
+    }
+    int nflag = 0, first = 1;
+    float amin = 0.f, amax = 0.f, lmin = 0.f, lmax = 0.f;
+    for (int k = 0; k < n; ++k) {
+        if (flags[k]) { arrival_us[k] = 0.f; level_db[k] = 0.f; ++nflag; continue; }
+        arrival_us[k] = (float)(ra[k] * 1e6) - ma;
+        level_db[k]   = (float)rl[k] - ml;
+        if (!(fabsf(arrival_us[k]) <= CALIB_VERIFY_ARRIVAL_US)) flags[k] |= CALIB_VERIFY_FLAG_ARRIVAL;
+        if (!(fabsf(level_db[k])   <= CALIB_VERIFY_LEVEL_DB))   flags[k] |= CALIB_VERIFY_FLAG_LEVEL;
+        if (flags[k]) ++nflag;
+        if (first || arrival_us[k] < amin) amin = arrival_us[k];
+        if (first || arrival_us[k] > amax) amax = arrival_us[k];
+        if (first || level_db[k] < lmin)   lmin = level_db[k];
+        if (first || level_db[k] > lmax)   lmax = level_db[k];
+        first = 0;
+    }
+    if (sum) {
+        sum->nlive = nlive;
+        sum->nflag = nflag;
+        sum->arrival_spread_us = amax - amin;
+        sum->level_spread_db   = lmax - lmin;
+    }
+    free(ra); free(rl); free(tmp);
+    return nflag;
+}
+
+/* ---- the aiming sheet: --aim-sheet (calib.h) ---- */
+
+void calib_aim_angles(const float v[3], float* bearing_deg, float* down_tilt_deg) {
+    /* projected on the room basis rather than read off x/y/z, so the sheet follows the frame
+     * convention from the one place that defines it */
+    const double ahead = (double)v[0]*BWA_ROOM_AHEAD[0] + (double)v[1]*BWA_ROOM_AHEAD[1] + (double)v[2]*BWA_ROOM_AHEAD[2];
+    const double right = (double)v[0]*BWA_ROOM_RIGHT[0] + (double)v[1]*BWA_ROOM_RIGHT[1] + (double)v[2]*BWA_ROOM_RIGHT[2];
+    const double up    = (double)v[0]*BWA_ROOM_UP[0]    + (double)v[1]*BWA_ROOM_UP[1]    + (double)v[2]*BWA_ROOM_UP[2];
+    const double h = sqrt(ahead * ahead + right * right);
+    double b = 0.0, t = 0.0;
+    if (h > 1e-6 * (fabs(up) > 1.0 ? fabs(up) : 1.0)) {   /* a vertical vector has no bearing */
+        b = atan2(right, ahead) * 180.0 / M_PI;           /* clockwise from above: ahead toward right */
+        if (b < 0.0) b += 360.0;
+        if (b >= 360.0) b -= 360.0;
+    }
+    if (h > 0.0 || up != 0.0) t = atan2(-up, h) * 180.0 / M_PI;   /* + = below the horizontal */
+    if (bearing_deg)   *bearing_deg   = (float)b;
+    if (down_tilt_deg) *down_tilt_deg = (float)t;
+}
+
+int calib_aim_row(const Layout* L, int s, CalibAimRow* out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!L || s < 0 || (uint32_t)s >= L->count) return 0;
+    const Speaker* sp = &L->speakers[s];
+    memcpy(out->pos, sp->pos, sizeof out->pos);
+    memcpy(out->target, L->ref, sizeof out->target);
+    const double dx = L->ref[0]-sp->pos[0], dy = L->ref[1]-sp->pos[1], dz = L->ref[2]-sp->pos[2];
+    out->dist_m = (float)sqrt(dx*dx + dy*dy + dz*dz);
+    unit_dir(sp->pos, L->ref, out->aim);                  /* the loader's own default-aim rule */
+    calib_aim_angles(out->aim, &out->bearing_deg, &out->down_tilt_deg);
+    memcpy(out->layout_aim, sp->aim, sizeof out->layout_aim);
+    calib_aim_angles(out->layout_aim, &out->layout_bearing_deg, &out->layout_down_tilt_deg);
+    out->off_deg = aim_angle_deg(out->layout_aim, out->aim);
+    if (L->dir.nband) {
+        out->have_loss   = 1;
+        out->loss_2k_db  = directivity_loss_db_at(&L->dir, out->off_deg, 2000.f);
+        out->loss_16k_db = directivity_loss_db_at(&L->dir, out->off_deg, 16000.f);
+    }
+    return 1;
+}
+
+int calib_layout_declared(const char* path, int n, int* has_listening_point, unsigned char* aim_explicit) {
+    if (has_listening_point) *has_listening_point = 0;
+    if (!path || n <= 0) return 0;
+    char* text = read_file(path, NULL);
+    if (!text) return 0;
+    cJSON* root = cJSON_Parse(text);
+    int ok = 0;
+    if (root) {
+        cJSON* spk = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+        if (cJSON_IsArray(spk) && cJSON_GetArraySize(spk) == n) {
+            if (has_listening_point)
+                *has_listening_point = cJSON_GetObjectItemCaseSensitive(root, "listening_point_m") != NULL;
+            if (aim_explicit)
+                for (int i = 0; i < n; ++i)
+                    aim_explicit[i] = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(spk, i), "aim") != NULL;
+            ok = 1;
+        }
+        cJSON_Delete(root);
+    }
+    free(text);
+    return ok;
+}
+
+int calib_write_aim_sheet(const char* csv_path, const Layout* L, const unsigned char* aim_explicit,
+                          float flag_deg, int* nflag, char* err, size_t errcap) {
+    if (nflag) *nflag = 0;
+    if (!csv_path || !L || L->count == 0) {
+        if (err && errcap) snprintf(err, errcap, "calib: aim sheet needs a path and a loaded layout");
+        return 0;
+    }
+    FILE* f = os_fopen(csv_path, "wb");
+    if (!f) { if (err && errcap) snprintf(err, errcap, "calib: cannot open %s for writing", csv_path); return 0; }
+    fprintf(f, "speaker,x_m,y_m,z_m,target_x_m,target_y_m,target_z_m,distance_m,"
+               "aim_x,aim_y,aim_z,bearing_deg,down_tilt_deg,"
+               "layout_aim_x,layout_aim_y,layout_aim_z,layout_aim_source,layout_bearing_deg,layout_down_tilt_deg,"
+               "layout_aim_off_deg,loss_2k_db,loss_16k_db,flag\n");
+    int nf = 0;
+    for (uint32_t s = 0; s < L->count; ++s) {
+        CalibAimRow r;
+        calib_aim_row(L, (int)s, &r);
+        const int flag = !(r.off_deg <= flag_deg);
+        nf += flag;
+        char loss[64] = ",";                              /* no model: two empty cells */
+        if (r.have_loss) snprintf(loss, sizeof loss, "%.1f,%.1f", r.loss_2k_db, r.loss_16k_db);
+        fprintf(f, "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%.1f,%.4f,%.4f,%.4f,%s,%.1f,%.1f,%.1f,%s,%s\n",
+                s, r.pos[0], r.pos[1], r.pos[2], r.target[0], r.target[1], r.target[2], r.dist_m,
+                r.aim[0], r.aim[1], r.aim[2], r.bearing_deg, r.down_tilt_deg,
+                r.layout_aim[0], r.layout_aim[1], r.layout_aim[2],
+                (aim_explicit && aim_explicit[s]) ? "explicit" : "default",
+                r.layout_bearing_deg, r.layout_down_tilt_deg, r.off_deg, loss, flag ? "OFF_AIM" : "");
+    }
+    const int bad = ferror(f);
+    fclose(f);
+    if (bad) { if (err && errcap) snprintf(err, errcap, "calib: write error on %s", csv_path); return 0; }
+    if (nflag) *nflag = nf;
+    return 1;
 }

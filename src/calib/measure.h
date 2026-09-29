@@ -43,6 +43,9 @@ typedef struct {
     float direct_frac;     /* gated / whole-response ENERGY over the level band, in [0, 1]: how much of
                             * `level` is direct sound (1 in an anechoic capture; lower in a live room) */
     int   gate_samples;    /* the gate end, samples after the peak */
+    float energy;          /* whole-response ENERGY over the level band (sum of |H|^2): what direct_frac is
+                            * a share of, so several captures' shares can be pooled energy-weighted
+                            * (zylia_pressure_proxy) */
 } MeasureResult;
 
 /* Room characterization from the captured impulse response — a treatment diagnostic, NOT a model to

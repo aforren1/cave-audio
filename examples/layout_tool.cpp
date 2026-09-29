@@ -1510,6 +1510,10 @@ static void draw_hud(float cov_worst, float cov_mean) {
                                dir_half_angle(b1, -3.0f), g_dir_hz[b1], dir_half_angle(b2, -3.0f), g_dir_hz[b2],
                                dir_loss_at(b1, 20.0f), dir_loss_at(b2, 20.0f),
                                spk[sel].has_aim ? "file" : "at the ears");
+            if (!g_lp_set)
+                ImGui::TextColored(ImVec4(0.96f, 0.51f, 0.51f, 1),
+                                   "no listening_point_m: the engine aims every speaker without an `aim` at the array centroid, "
+                                   "not at your ears - tick 'declare listening point'");
         } else {
             ImGui::TextDisabled("no directivity model in this layout: the gray ring is a 20 deg guide (tools/directivity/clf_to_json.py --into <layout>)");
         }
@@ -1810,8 +1814,20 @@ static void draw_panel(void) {
      * accepts (0, 3]. A slider that can reach exactly 0 writes an anchor the loader then drops, so a
      * reopen would silently re-derive every delay at the 1.4 default — the round trip this field
      * exists to close. Keep this range inside the loader's. */
-    if (ImGui::SliderFloat("obs ear y", &obs_height, 0.1f, 2.0f, "%.2f m")) mark_score();
+    if (ImGui::SliderFloat("obs ear y", &obs_height, 0.1f, 2.0f, "%.2f m")) {
+        mark_score();
+        if (g_lp_set) mark_edit();                   /* the declared point's y rides this slider */
+    }
     bwTip("listener EAR height above the floor - scoring, coverage, and the sightline checks all measure from here");
+    /* A file that never declared listening_point_m keeps it absent on save (the round trip is
+     * deliberate: a symmetric array wants the centroid). This is the one way to ADD it: the engine
+     * then uses (x, ear y, z) as its reference point, the default listener, and the point every
+     * speaker without an explicit `aim` is assumed to face. */
+    { bool lp = g_lp_set != 0;
+      if (ImGui::Checkbox("declare listening point", &lp)) { g_lp_set = lp ? 1 : 0; mark_edit(); mark_score(); } }
+    bwTip("write listening_point_m = (x, ear y, z) into the layout. Without it the engine's reference point is the "
+          "array CENTROID, which sits above your ears on a top-heavy array, and every speaker with no `aim` is "
+          "assumed to face that centroid. Tick it for any install with a directivity model");
     if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
     bwTip("weight azimuth error over elevation: human azimuth acuity is ~3.5x finer, so the "
           "optimizer trades vertical accuracy for horizontal");
@@ -2350,6 +2366,30 @@ static void register_tests(ImGuiTestEngine* te) {
         g_nspk = keep; seed_default(); sel = 0; layout_dirty = 1;
     };
 
+    /* the one way to ADD a listening point to a file that never had one: the checkbox sets it, the
+     * save writes it, and a reload reads it back; unticked, the save leaves it out again */
+    t = IM_REGISTER_TEST(te, "viewer", "declare_listening_point");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const float keep_h = obs_height;
+        ctx->SetRef("layout");
+        seed_default();
+        g_lp_set = 0; g_lp_x = g_lp_z = 0.0f; obs_height = 1.448f;   /* 4.75 ft */
+        ctx->ItemClick("**/declare listening point");
+        IM_CHECK_EQ(g_lp_set, 1);
+        IM_CHECK(save_json(TEST_OUT));
+        g_lp_set = 0; obs_height = 1.4f;
+        IM_CHECK(load_json(TEST_OUT) > 0);
+        IM_CHECK_EQ(g_lp_set, 1);
+        IM_CHECK_LT(fabsf(obs_height - 1.448f), 1e-3f);
+        ctx->ItemClick("**/declare listening point");
+        IM_CHECK_EQ(g_lp_set, 0);
+        IM_CHECK(save_json(TEST_OUT));
+        g_lp_set = 1;
+        IM_CHECK(load_json(TEST_OUT) > 0);
+        IM_CHECK_EQ(g_lp_set, 0);                                 /* unticked: absent again */
+        obs_height = keep_h; seed_default(); layout_dirty = 1;
+    };
+
     t = IM_REGISTER_TEST(te, "viewer", "save_reload");           /* Save writes the file; Reload restores from it */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("layout");
@@ -2555,7 +2595,9 @@ static void register_tests(ImGuiTestEngine* te) {
 
 int main(int argc, char** argv) {
     /* headless (no window/audio, scriptable):
-     *   --export   [file]            write the layout (default grid, or an existing file with delay_ms recomputed)
+     *   --export   [file] [ears=<m>] [listen]   write the layout (default grid, or an existing file with
+     *                                delay_ms recomputed); ears= sets the ear height, listen declares
+     *                                listening_point_m there (x/z kept from the file, else 0)
      *   --score    [file] [condition]   print each panner's rE-localization error for the layout,
      *                                under a named condition if given (default: the full sphere),
      *                                at an SPCAP tuning if given (focus=/density=; 0 = derived)
@@ -2571,7 +2613,8 @@ int main(int argc, char** argv) {
             printf("usage: bwa_layout_tool [cave_layout.json | mode]\n"
                    "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
                    "  ./constraints.json bounds the placement if present)\n"
-                   "  --export   [file]                    write the layout headless\n"
+                   "  --export   [file] [ears=<m>] [listen] write the layout headless; ears= sets the ear\n"
+                   "             height, listen declares listening_point_m there\n"
                    "  --score    [file] [condition] [fixed|moving] [ears=<m>] [focus=<n>]\n"
                    "             [density=<n>] [epad|allrad] [maxre]\n"
                    "             print each panner's rE-localization error, under a named condition\n"
@@ -2645,6 +2688,24 @@ int main(int argc, char** argv) {
           if (!(ax[xi] == 0 && ay[yi] == 0 && ax[zi] == 0)) cov_lis[li++] = Vector3{ ax[xi], ay[yi], ax[zi] }; }
 
     if (export_only) {
+        /* after the file's own values are loaded, so these override them: ears=<m> sets the ear
+         * height (the listening point's y and the delay-alignment height), `listen` declares
+         * listening_point_m at (x, ears, z), keeping the file's x/z when it had one */
+        for (int a = 3; a < argc; ++a) {
+            if (!strncmp(argv[a], "ears=", 5)) {
+                const char* v = argv[a] + 5; char* end = NULL;
+                const float h = strtof(v, &end);
+                if (end == v || *end || !(h > 0.0f && h <= 3.0f)) { printf("export: ears=%s is not a height in (0, 3] m\n", v); return 1; }
+                obs_height = h;
+            } else if (!strcmp(argv[a], "listen")) {
+                g_lp_set = 1;
+            } else {
+                printf("export: unknown option '%s' (have: ears=<m> listen)\n", argv[a]); return 1;
+            }
+        }
+        if (g_dir_nb && !g_lp_set)
+            printf("export: WARNING the layout has a directivity model but no listening_point_m, so the engine aims\n"
+                   "        every speaker without an `aim` at the array centroid. Add 'listen' to declare the point.\n");
         if (!save_json(g_path)) { printf("export failed: %s\n", g_path); return 1; }
         printf("exported layout -> %s (from %s)\n", g_path, loaded ? "existing file" : "default grid");
         return 0;

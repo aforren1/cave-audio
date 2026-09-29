@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
 
@@ -440,6 +444,252 @@ static void test_survey(void) {
     zylia_set_capsules(NULL);                            /* leave the global default installed */
 }
 
+/* ---- the ZM-1 as a pressure mic (zylia_pressure_proxy / zylia_center_arrival) ---- */
+
+/* |p| on the surface of a RIGID sphere under a unit plane wave, at the point `cosg` = cos of its
+ * angle from the direction the wave comes FROM (1 = the lit pole), for ka = x:
+ *
+ *   p = (i / x^2) sum_n i^n (2n+1) P_n(cosg) / h_n'(x)
+ *
+ * (the surface pressure after the Wronskian collapse, zylia.c's mode-strength note). h_n = j_n + i y_n
+ * by UPWARD recurrence, which is stable for h because it is dominated by y_n; only |h_n'| matters
+ * once n > x, and the j_n part it gets wrong there is negligible against it. This is the test's own
+ * physics and shares nothing with the proxy under test, which never models the sphere. hp[] is
+ * h_n'(x), precomputed per x by sphere_hp. */
+#define SPH_NMAX 48
+static int sphere_hp(double x, double hpr[SPH_NMAX], double hpi[SPH_NMAX]) {
+    int N = (int)x + 20; if (N > SPH_NMAX - 1) N = SPH_NMAX - 1;
+    double hr[SPH_NMAX + 1], hi[SPH_NMAX + 1];
+    hr[0] = sin(x) / x;                 hi[0] = -cos(x) / x;
+    hr[1] = sin(x) / (x*x) - cos(x) / x; hi[1] = -cos(x) / (x*x) - sin(x) / x;
+    for (int n = 1; n < N; ++n) {
+        hr[n+1] = (2.0*n + 1.0) / x * hr[n] - hr[n-1];
+        hi[n+1] = (2.0*n + 1.0) / x * hi[n] - hi[n-1];
+    }
+    hpr[0] = -hr[1]; hpi[0] = -hi[1];
+    for (int n = 1; n < N; ++n) {
+        hpr[n] = hr[n-1] - (n + 1.0) / x * hr[n];
+        hpi[n] = hi[n-1] - (n + 1.0) / x * hi[n];
+    }
+    return N;
+}
+static double sphere_p(double x, int N, const double* hpr, const double* hpi, double cosg) {
+    /* the series is in the angle from the PROPAGATION direction, which points away from the source:
+     * cos(theta) = -cosg. Getting this backwards puts the pressure doubling in the shadow. */
+    const double ct = -cosg;
+    double sr = 0.0, si = 0.0, P0 = 1.0, P1 = ct;
+    for (int n = 0; n < N; ++n) {
+        const double Pn = (n == 0) ? P0 : P1;
+        const double den = hpr[n]*hpr[n] + hpi[n]*hpi[n];
+        double tr = (2.0*n + 1.0) * Pn * hpr[n] / den, ti = -(2.0*n + 1.0) * Pn * hpi[n] / den;   /* (2n+1) P_n / h' */
+        for (int k = 0; k < (n & 3); ++k) { const double t = tr; tr = -ti; ti = t; }            /* x i^n */
+        sr += tr; si += ti;
+        if (n >= 1) { const double P2 = ((2.0*n + 1.0) * ct * P1 - n * P0) / (n + 1.0); P0 = P1; P1 = P2; }
+    }
+    return sqrt(sr*sr + si*si) / (x * x);          /* |i| = 1 */
+}
+
+static void test_pressure_proxy(void) {
+    /* (1) pooling arithmetic: power means, energy-weighted direct share, the shortest gate */
+    {
+        MeasureResult cap[ZYLIA_MICS];
+        memset(cap, 0, sizeof cap);
+        double s2 = 0.0, e = 0.0, ed = 0.0;
+        for (int j = 0; j < ZYLIA_MICS; ++j) {
+            cap[j].level = 0.5f + 0.05f * (float)j;
+            cap[j].band[1] = 2.f * cap[j].level;
+            cap[j].energy = 10.f + (float)j;
+            cap[j].direct_frac = 0.2f + 0.03f * (float)j;
+            cap[j].gate_samples = 300 - j;
+            cap[j].delay_samples = 1000;
+            s2 += (double)cap[j].level * cap[j].level;
+            e += cap[j].energy; ed += (double)cap[j].energy * cap[j].direct_frac;
+        }
+        MeasureResult out;
+        CHECK(zylia_pressure_proxy(cap, 48000.0, 343.0, &out, NULL) == 1, "proxy: pools 19 results");
+        CHECK(fabs(out.level - sqrt(s2 / ZYLIA_MICS)) < 1e-6, "proxy: level is the RMS across capsules");
+        CHECK(fabs(out.band[1] - 2.0 * sqrt(s2 / ZYLIA_MICS)) < 1e-5, "proxy: bands are power means too");
+        CHECK(fabs(out.direct_frac - ed / e) < 1e-6, "proxy: direct share is energy-weighted");
+        CHECK(fabs(out.direct_frac - 0.2 - 0.03 * 9.0) > 1e-3, "proxy: ... and not the plain mean (the weights matter here)");
+        CHECK(out.gate_samples == 300 - (ZYLIA_MICS - 1), "proxy: the shortest gate");
+        CHECK(!zylia_pressure_proxy(NULL, 48000.0, 343.0, &out, NULL) && !zylia_pressure_proxy(cap, 0.0, 343.0, &out, NULL),
+              "proxy: NULL input and a zero rate are refused");
+        /* a dead capsule is refused and named: 21 dB under the median, and a NaN; a capsule 19 dB
+         * down (deep shadow and then some) still pools */
+        int dead = -9;
+        MeasureResult keep = cap[7];
+        cap[7].level = cap[9].level * (float)pow(10.0, -21.0 / 20.0);
+        CHECK(zylia_pressure_proxy(cap, 48000.0, 343.0, &out, &dead) == -1 && dead == 7, "proxy: a capsule 21 dB down is dead, and named");
+        cap[7].level = cap[9].level * (float)pow(10.0, -19.0 / 20.0);
+        CHECK(zylia_pressure_proxy(cap, 48000.0, 343.0, &out, &dead) == 1 && dead == -1, "proxy: 19 dB down still pools");
+        cap[7].level = NAN;
+        CHECK(zylia_pressure_proxy(cap, 48000.0, 343.0, &out, &dead) == -1 && dead == 7, "proxy: a NaN capsule is dead");
+        cap[7] = keep;
+    }
+
+    /* (2) the center arrival: exact spherical-wavefront arrivals from sources in several directions.
+     * The plain capsule mean is biased by the centroid's offset (2.6 mm up on the built-in table:
+     * 7.6 us for a source straight overhead); the tilt-corrected value is not. Also through the
+     * proxy's own sample/fraction encoding. */
+    {
+        const double c = 343.0, fs = 48000.0, lat = 0.0600;          /* a Dante-Via-sized latency */
+        const float ctr[3] = { 0.2f, 1.45f, -0.1f };
+        const double dirs[5][3] = { {0,1,0}, {0,-0.6,0.8}, {1,0,0}, {-0.6,0.48,-0.64}, {0,0,-1} };
+        double worst = 0.0, worst_plain = 0.0;
+        for (int k = 0; k < 5; ++k) {
+            const double D = 2.2;
+            double src[3] = { ctr[0] + D*dirs[k][0], ctr[1] + D*dirs[k][1], ctr[2] + D*dirs[k][2] };
+            double arr[ZYLIA_MICS], mean = 0.0;
+            synth(ctr, src, lat, c, arr);
+            for (int j = 0; j < ZYLIA_MICS; ++j) mean += arr[j] / ZYLIA_MICS;
+            const double truth = lat + D / c;
+            const double got = zylia_center_arrival(arr, c);
+            if (fabs(got - truth) > worst) worst = fabs(got - truth);
+            if (fabs(mean - truth) > worst_plain) worst_plain = fabs(mean - truth);
+            MeasureResult cap[ZYLIA_MICS], out;
+            memset(cap, 0, sizeof cap);
+            for (int j = 0; j < ZYLIA_MICS; ++j) {
+                const double t = arr[j] * fs;
+                cap[j].delay_samples = (int)floor(t + 0.5);
+                cap[j].delay_frac = (float)(t - floor(t + 0.5));
+                cap[j].level = 1.f;
+            }
+            zylia_pressure_proxy(cap, fs, c, &out, NULL);
+            const double tp = ((double)out.delay_samples + out.delay_frac) / fs;
+            CHECK(fabs(tp - truth) < 2e-6, "proxy: the pooled delay is the center arrival (sample + fraction)");
+            CHECK(out.delay_frac >= -0.5f && out.delay_frac <= 0.5f, "proxy: the fraction stays within half a sample");
+        }
+        printf("  proxy center arrival: worst error %.2f us tilt-corrected, %.2f us as a plain capsule mean\n",
+               worst * 1e6, worst_plain * 1e6);
+        CHECK(worst < 1.5e-6, "center arrival: within 1.5 us at 2.2 m (the plane-wave curvature term)");
+        CHECK(worst_plain > 5e-6, "center arrival: the plain mean IS biased, so the correction is doing something");
+    }
+
+    /* (3) the proxy's leftover DIRECTION dependence on a rigid sphere, which the calibrate simulator
+     * does not model (its capsules are free-field omnis). For a plane wave from each of 400 directions,
+     * the power mean over the 19 capsule |p|^2 against a single capsule's |p|^2, per frequency and as
+     * measure.c's broadband level (the mean |H| over 40 Hz to 10 kHz on a linear bin grid, per
+     * capsule, then the RMS across capsules). The surface-averaged power of a sphere does not depend
+     * on direction; 19 points sample that average, and this measures how well. */
+    {
+        float cd[ZYLIA_MICS][3], R;
+        zylia_geometry(cd, &R);
+        const double c = 343.0;
+        enum { ND = 400, NF = 120 };
+        static double pbb[ND][ZYLIA_MICS];                /* broadband mean |p| per direction, capsule */
+        double dir[ND][3];
+        for (int d = 0; d < ND; ++d) {                    /* Fibonacci sphere */
+            const double y = 1.0 - 2.0 * (d + 0.5) / ND, r = sqrt(1.0 - y*y), ph = d * 2.399963229728653;
+            dir[d][0] = r * cos(ph); dir[d][1] = y; dir[d][2] = r * sin(ph);
+        }
+        memset(pbb, 0, sizeof pbb);
+        const double fq[6] = { 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0 };
+        double spread_proxy[6], spread_one[6], lit[6];
+        double hpr[SPH_NMAX], hpi[SPH_NMAX];
+        for (int q = 0; q < 6; ++q) {
+            const double x = 2.0 * M_PI * fq[q] * R / c;
+            const int N = sphere_hp(x, hpr, hpi);
+            double pmin = 1e30, pmax = 0.0, omin = 1e30, omax = 0.0;
+            for (int d = 0; d < ND; ++d) {
+                double pm = 0.0;
+                for (int j = 0; j < ZYLIA_MICS; ++j) {
+                    const double cg = cd[j][0]*dir[d][0] + cd[j][1]*dir[d][1] + cd[j][2]*dir[d][2];
+                    const double p = sphere_p(x, N, hpr, hpi, cg);
+                    pm += p * p / ZYLIA_MICS;
+                    if (j == 0) { if (p*p < omin) omin = p*p; if (p*p > omax) omax = p*p; }
+                }
+                if (pm < pmin) pmin = pm;
+                if (pm > pmax) pmax = pm;
+            }
+            spread_proxy[q] = 10.0 * log10(pmax / pmin);
+            spread_one[q]   = 10.0 * log10(omax / omin);
+            lit[q] = 20.0 * log10(sphere_p(x, N, hpr, hpi, 1.0));
+        }
+        for (int f = 0; f < NF; ++f) {                    /* the broadband level, measure.c's band */
+            const double hz = 40.0 + (10000.0 - 40.0) * (f + 0.5) / NF;
+            const double x = 2.0 * M_PI * hz * R / c;
+            const int N = sphere_hp(x, hpr, hpi);
+            for (int d = 0; d < ND; ++d)
+                for (int j = 0; j < ZYLIA_MICS; ++j) {
+                    const double cg = cd[j][0]*dir[d][0] + cd[j][1]*dir[d][1] + cd[j][2]*dir[d][2];
+                    pbb[d][j] += sphere_p(x, N, hpr, hpi, cg) / NF;
+                }
+        }
+        double bmin = 1e30, bmax = 0.0, b1min = 1e30, b1max = 0.0;
+        for (int d = 0; d < ND; ++d) {
+            /* through the proxy under test: each capsule's broadband level into its MeasureResult */
+            MeasureResult cap[ZYLIA_MICS], out;
+            memset(cap, 0, sizeof cap);
+            for (int j = 0; j < ZYLIA_MICS; ++j) { cap[j].level = (float)pbb[d][j]; cap[j].delay_samples = 100; }
+            zylia_pressure_proxy(cap, 48000.0, c, &out, NULL);
+            const double s = out.level;
+            if (s < bmin) bmin = s;
+            if (s > bmax) bmax = s;
+            if (pbb[d][0] < b1min) b1min = pbb[d][0];
+            if (pbb[d][0] > b1max) b1max = pbb[d][0];
+        }
+        const double bb_proxy = 20.0 * log10(bmax / bmin), bb_one = 20.0 * log10(b1max / b1min);
+        printf("  rigid-sphere direction dependence over %d directions (max/min, dB):\n", ND);
+        printf("    freq     19-capsule power mean   one capsule   lit-pole |p|\n");
+        for (int q = 0; q < 6; ++q)
+            printf("    %5.0f Hz      %5.2f                 %5.1f        %+5.1f dB\n", fq[q], spread_proxy[q], spread_one[q], lit[q]);
+        printf("    broadband level (40 Hz - 10 kHz): proxy %.2f dB, one capsule %.1f dB\n", bb_proxy, bb_one);
+        /* the model itself: pressure doubling on the lit pole at high ka, unity at low ka */
+        CHECK(fabs(lit[0]) < 1.0 && lit[1] < lit[3], "sphere model: a 500 Hz wave barely sees the 49 mm sphere, and the lit pole rises with frequency");
+        CHECK(lit[5] > 5.0 && lit[5] < 7.0, "sphere model: about +6 dB (pressure doubling) on the lit pole at 16 kHz");
+        CHECK(spread_one[4] > 10.0, "sphere model: a single capsule swings by more than 10 dB with direction at 8 kHz");
+        /* the claim: the power mean is nearly direction-independent where one capsule is not */
+        CHECK(spread_proxy[0] < 0.1 && spread_proxy[2] < 0.5, "proxy: under 0.1 dB of direction dependence at 500 Hz, 0.5 dB at 2 kHz");
+        CHECK(spread_proxy[3] < 0.8 && spread_proxy[5] < 0.8, "proxy: under 0.8 dB at 4 and 16 kHz");
+        CHECK(bb_proxy < 0.7, "proxy: the broadband level moves under 0.7 dB with direction");
+        CHECK(bb_one > 3.0 * bb_proxy, "proxy: ... several times less than one capsule's");
+    }
+}
+
+/* The live position check (zylia_live_position): a speaker 10 cm from where the layout puts it,
+ * exact arrivals through the ZM-1's own table, the rig's ~60 ms of latency. The estimate must land
+ * on the TRUE position, so the delta against the layout is the injected 10 cm; 20 us of latency error
+ * must move the distance by c x 20 us and nothing else; no latency must give the direction alone. */
+static void test_live_position(void) {
+    const double C = 343.0, LAT = 0.0607;                   /* the ZM-1 chain's measured ~60 ms */
+    const float center[3] = { 0.f, 1.448f, 0.f };           /* the 4.75 ft listening point */
+    const float layout[3] = { 1.5f, 0.f, 0.f };
+    const double truth[3] = { 1.6, 0.0, 0.0 };              /* 10 cm off in x */
+    double arr[ZYLIA_MICS];
+    synth(center, truth, LAT, C, arr);
+    ZyliaLivePos lp;
+    CHECK(zylia_live_position(arr, center, 1, LAT, C, layout, &lp) && lp.have_distance, "live: position estimate");
+    const double ex = lp.delta_mm[0] - 100.0, ey = lp.delta_mm[1], ez = lp.delta_mm[2];
+    const double miss = sqrt(ex * ex + ey * ey + ez * ez);
+    double tx = truth[0] - center[0], ty = truth[1] - center[1], tz = truth[2] - center[2];
+    const double tdist = sqrt(tx * tx + ty * ty + tz * tz);
+    tx /= tdist; ty /= tdist; tz /= tdist;
+    const double want_deg = acos(fmin(1.0, tx * lp.layout_dir[0] + ty * lp.layout_dir[1] + tz * lp.layout_dir[2])) * 180.0 / M_PI;
+    printf("live position: delta (%+.2f %+.2f %+.2f) mm for an injected (+100 0 0), dir error %.3f deg (true %.3f), dist %+.2f mm\n",
+           lp.delta_mm[0], lp.delta_mm[1], lp.delta_mm[2], lp.dir_err_deg, want_deg, lp.dist_err_mm);
+    CHECK(miss < 2.0, "live: the injected 10 cm offset comes back within 2 mm on exact arrivals");
+    CHECK(fabs(lp.dir_err_deg - want_deg) < 0.05, "live: the direction error is the true bearing change");
+    CHECK(fabs(lp.dist_err_mm - (tdist - lp.layout_dist_m) * 1000.0) < 1.0, "live: the distance error is the true range change");
+    /* a latency 20 us too long reads the speaker c x 20 us = 6.86 mm closer, same direction */
+    ZyliaLivePos l2;
+    zylia_live_position(arr, center, 1, LAT + 20e-6, C, layout, &l2);
+    printf("live position: +20 us of latency moves the distance by %.2f mm\n", (l2.dist_m - lp.dist_m) * 1000.0);
+    CHECK(fabs((lp.dist_m - l2.dist_m) * 1000.0 - C * 20e-6 * 1000.0) < 0.05, "live: 20 us of latency is 6.86 mm of range");
+    CHECK(fabs(l2.dir_err_deg - lp.dir_err_deg) < 1e-4, "live: the latency never moves the direction");
+    /* no latency: the direction only */
+    ZyliaLivePos l3;
+    CHECK(zylia_live_position(arr, center, 0, 0.0, C, layout, &l3) && !l3.have_distance, "live: direction without a latency");
+    CHECK(l3.dist_m == 0.f && l3.delta_norm_mm == 0.f && fabs(l3.dir_err_deg - lp.dir_err_deg) < 1e-6,
+          "live: no latency, no distance, the same direction");
+    /* the box exactly where the layout says: a zero delta */
+    const double at_layout[3] = { layout[0], layout[1], layout[2] };
+    synth(center, at_layout, LAT, C, arr);
+    zylia_live_position(arr, center, 1, LAT, C, layout, &lp);
+    CHECK(lp.ok && lp.delta_norm_mm < 1.0 && lp.dir_err_deg < 0.03, "live: a box at its layout position reads a zero delta");
+    arr[4] = NAN;
+    CHECK(!zylia_live_position(arr, center, 1, LAT, C, layout, &lp) && !lp.ok, "live: a NaN arrival is refused");
+}
+
 int main(void) {
     const double C = 343.0, LAT = 0.0047;       /* arbitrary nonzero system latency */
     const float center[3] = { 0.1f, 1.2f, -0.3f };   /* array placed off-origin in the room */
@@ -447,6 +697,8 @@ int main(void) {
     test_geometry();
     test_survey();
     test_comb();
+    test_pressure_proxy();
+    test_live_position();
 
     struct { double pos[3]; const char* name; } cases[] = {
         {{  2.0,  1.2, -0.3 }, "right  (+X)"},

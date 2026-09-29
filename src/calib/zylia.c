@@ -1211,3 +1211,108 @@ int zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
     }
     return 1;
 }
+
+/* ---- the ZM-1 as a pressure mic (zylia.h) ---- */
+
+double zylia_center_arrival(const double arrival_s[ZYLIA_MICS], double c) {
+    if (!arrival_s) return 0.0;
+    if (!(c > 1.0)) c = 343.0;                          /* a caller's bad c must not divide by zero */
+    float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
+    float d[3] = { 0, 0, 0 };                           /* a failed solve leaves the plain mean */
+    zylia_doa(arrival_s, d);
+    /* tau_i = t_center - (m_i . d) / c, so mean(tau) = t_center - (mean(m) . d) / c: add the
+     * centroid's projection back. The built-in table's centroid sits R/19 above the center. */
+    double mean_t = 0.0, mdotd = 0.0;
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        mean_t += arrival_s[j] / ZYLIA_MICS;
+        mdotd  += ((double)caps[j][0]*d[0] + (double)caps[j][1]*d[1] + (double)caps[j][2]*d[2]) / ZYLIA_MICS;
+    }
+    return mean_t + mdotd / c;
+}
+
+static int zy_cmp_float(const void* a, const void* b) {
+    const float x = *(const float*)a, y = *(const float*)b; return x < y ? -1 : x > y ? 1 : 0;
+}
+
+int zylia_pressure_proxy(const MeasureResult cap[ZYLIA_MICS], double fs, double c, MeasureResult* out, int* dead) {
+    if (dead) *dead = -1;
+    if (!cap || !out || !(fs > 0.0) || !(fs < 1e7)) return 0;
+    memset(out, 0, sizeof *out);
+    {   /* dead-capsule guard (zylia.h): against the median, so one bad capsule cannot move the bar */
+        float lv[ZYLIA_MICS];
+        for (int i = 0; i < ZYLIA_MICS; ++i) lv[i] = isfinite(cap[i].level) ? cap[i].level : 0.f;
+        qsort(lv, ZYLIA_MICS, sizeof lv[0], zy_cmp_float);
+        const double floor_lv = (double)lv[ZYLIA_MICS / 2] * pow(10.0, -ZYLIA_PROXY_DEAD_DB / 20.0);
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            if (!isfinite(cap[i].level) || !((double)cap[i].level > floor_lv) ||
+                !isfinite(cap[i].delay_frac)) {
+                if (dead) *dead = i;
+                return -1;
+            }
+    }
+    double lv = 0.0, ld = 0.0, b[3] = { 0, 0, 0 }, bd[3] = { 0, 0, 0 }, e = 0.0, ed = 0.0;
+    double arr[ZYLIA_MICS];
+    int gate = 0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        const MeasureResult* m = &cap[i];
+        lv += (double)m->level * m->level;
+        ld += (double)m->level_direct * m->level_direct;
+        for (int k = 0; k < 3; ++k) {
+            b[k]  += (double)m->band[k] * m->band[k];
+            bd[k] += (double)m->band_direct[k] * m->band_direct[k];
+        }
+        double ei = (m->energy > 0.f) ? (double)m->energy : 0.0;     /* NaN-safe */
+        double fi = (m->direct_frac >= 0.f && m->direct_frac <= 1.f) ? (double)m->direct_frac : 1.0;
+        e += ei; ed += fi * ei;
+        arr[i] = ((double)m->delay_samples + (double)m->delay_frac) / fs;
+        if (i == 0 || m->gate_samples < gate) gate = m->gate_samples;
+    }
+    const double inv = 1.0 / ZYLIA_MICS;
+    out->level        = (float)sqrt(lv * inv);
+    out->level_direct = (float)sqrt(ld * inv);
+    for (int k = 0; k < 3; ++k) {
+        out->band[k]        = (float)sqrt(b[k] * inv);
+        out->band_direct[k] = (float)sqrt(bd[k] * inv);
+    }
+    out->energy      = (float)(e * inv);
+    out->direct_frac = (e > 0.0) ? (float)(ed / e) : 1.f;
+    out->gate_samples = gate;
+    const double t = zylia_center_arrival(arr, c) * fs;           /* samples */
+    const double ti = floor(t + 0.5);
+    out->delay_samples = (int)ti;
+    out->delay_frac    = (float)(t - ti);
+    return 1;
+}
+
+int zylia_live_position(const double arrival_s[ZYLIA_MICS], const float center[3], int latency_known,
+                        double latency_s, double c, const float layout_pos[3], ZyliaLivePos* out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!arrival_s || !center || !layout_pos || !(c > 1.0) || !isfinite(c)) return 0;
+    for (int j = 0; j < ZYLIA_MICS; ++j) if (!isfinite(arrival_s[j])) return 0;
+    if (latency_known && !isfinite(latency_s)) return 0;
+    if (!zylia_doa(arrival_s, out->dir)) return 0;
+    double lx = (double)layout_pos[0] - center[0], ly = (double)layout_pos[1] - center[1], lz = (double)layout_pos[2] - center[2];
+    const double ld = sqrt(lx * lx + ly * ly + lz * lz);
+    out->layout_dist_m = (float)ld;
+    if (ld > 1e-9) { out->layout_dir[0] = (float)(lx / ld); out->layout_dir[1] = (float)(ly / ld); out->layout_dir[2] = (float)(lz / ld); }
+    double cs = (double)out->dir[0] * out->layout_dir[0] + (double)out->dir[1] * out->layout_dir[1] + (double)out->dir[2] * out->layout_dir[2];
+    if (cs > 1.0) cs = 1.0; else if (cs < -1.0) cs = -1.0;
+    out->dir_err_deg = (float)(acos(cs) * 180.0 / 3.14159265358979323846);
+    if (latency_known) {
+        const double d = c * (zylia_center_arrival(arrival_s, c) - latency_s);
+        out->have_distance = 1;
+        out->dist_m = (float)d;
+        double nn = 0.0;
+        for (int a = 0; a < 3; ++a) {
+            out->pos[a] = (float)((double)center[a] + d * out->dir[a]);
+            const double e = ((double)out->pos[a] - layout_pos[a]) * 1000.0;
+            out->delta_mm[a] = (float)e;
+            nn += e * e;
+        }
+        out->delta_norm_mm = (float)sqrt(nn);
+        out->dist_err_mm = (float)((d - ld) * 1000.0);
+    }
+    out->ok = 1;
+    return 1;
+}

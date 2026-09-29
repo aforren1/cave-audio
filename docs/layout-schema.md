@@ -60,6 +60,46 @@ ears, which is what the engine's loader assumes too. A headless `bwa_layout_tool
 writes/normalizes a layout without the GUI. To audition a saved layout in the full
 binaural playground: `bwa_playground cave_layout.json`.
 
+### Declaring the listening point
+
+The engine's reference point is `listening_point_m` when the file declares one, else the array
+centroid. That point is where a pose-less listener stands, what the world-locked decodes aim
+from, and the point every speaker without an explicit `aim` is assumed to face. On an array with
+more speakers overhead the centroid sits above your ears, so a rig layout should declare it.
+
+A file that never declared one keeps it absent when the tool saves, on purpose: a symmetric
+array wants the centroid. To add one, tick **declare listening point** under the ear-height
+slider, or do it headless:
+
+```
+bwa_layout_tool --export cave_layout.json ears=1.448 listen
+```
+
+`ears=` sets the ear height (1.448 m is 4.75 ft), and `listen` declares
+`listening_point_m` at that height, keeping the file's x and z when it had them, else 0. The same
+height becomes `reference.ears_m`, which the tool's `delay_ms` derivation aligns to. With a
+`directivity` model in the file and no listening point, the tool warns in the HUD and on export,
+because that is the combination that aims every speaker at the wrong point.
+
+### Preparing the rig layout
+
+The order that gets a rig file right, each step writing into the same `cave_layout.json`
+(every writer keeps the fields it does not own):
+
+1. **Positions and the channel map**: `bwa_layout_tool` (Stage 1 of
+   [hardware-validation.md](./hardware-validation.md)), then the acoustic survey,
+   `bwa_calibrate --zylia` ([calibration.md](./calibration.md)).
+2. **The listening point**: `bwa_layout_tool --export cave_layout.json ears=1.448 listen`.
+3. **The speaker model**: `uv run tools/directivity/clf_to_json.py Genelec_Oy-4410A.CF2 --into
+   cave_layout.json`.
+4. **Aims**: leave `aim` out for a speaker that points at the listening point; the engine
+   assumes that. `bwa_calibrate --aim-sheet aims.csv` prints the bearing and down-tilt each
+   mount needs and flags any speaker whose layout aim is over 20 degrees off. For the speakers
+   the cameras can see, `bwa_speaker_survey --write` measures the real aim
+   ([calibration.md](./calibration.md), "Optical speaker check").
+5. **Trims**, then **`--verify`** from the same placement, with the ZM-1's center at the
+   listening point.
+
 ### Scoring and the observer model
 
 The tool can also *evaluate* and
@@ -458,6 +498,7 @@ speaker's `aim`.
   "angles_deg": [0, 5, 10, /* ... */ 180],                      // 2..37, ascending from 0 (on axis), <= 180
   "split_hz":   1000,                                           // optional; the runtime's two-band split (default 1000)
   "loss_db":    [[0, -0.02, /* ... */], /* one row per band */],  // dB relative to on-axis, in [-80, 12]
+  "on_axis_db": [56.05, 69.62, /* ... */ 77.16],                // optional; one per band, in [-200, 200]
   "planes":     { /* the two principal polars, same shape */ }  // informational, engine-ignored
 }
 ```
@@ -466,6 +507,13 @@ At load the engine derives two curves from the table: the power mean of `loss_db
 bands below `split_hz` and over the bands at or above it. Those two are what the tracked
 compensation applies, as a broadband gain and a high shelf per speaker. `bwa_calibrate`
 reads the full table.
+
+`on_axis_db` is the model's absolute on-axis response, one value per band. The Genelec CF2
+states it in dB SPL, and the converter exports it when the file carries it. Only the
+differences between bands are used: `bwa_calibrate --live N --zylia` and `calib_view`'s Aim
+tab read its high-to-mid tilt as the tilt a speaker shows when it points straight at the mic
+(see [calibration.md](./calibration.md) -> "Live aiming"). Leave it out and everything else
+works; the live angle estimate then needs a reference speaker. The engine never reads it.
 
 ## Validation (loader contract)
 
@@ -487,7 +535,8 @@ if any of:
 - a `directivity` block is malformed: not an object, `bands_hz` outside 1..32 entries or
   not ascending, `angles_deg` outside 2..37 entries, not starting at 0, not ascending, or
   past 180, a `loss_db` row count or length that does not match, an entry outside
-  `[-80, 12]`, or a `split_hz` outside `[20, 20000]`.
+  `[-80, 12]`, a `split_hz` outside `[20, 20000]`, or an `on_axis_db` that is present
+  without one number per band or with an entry outside `[-200, 200]`.
 
 `schema_version` is not checked: the loader never reads it.
 

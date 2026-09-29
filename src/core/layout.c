@@ -129,6 +129,31 @@ float directivity_loss_lin(const Directivity* d, float angle_deg, float f_lo, fl
     return (float)(acc / NS);
 }
 
+float directivity_on_axis_db_at(const Directivity* d, float f_hz) {
+    if (!d || !d->nband || !d->has_on_axis || !(f_hz > 0.f)) return 0.f;
+    const double f = (double)f_hz;
+    int b = 0;
+    while (b < d->nband - 1 && d->band_hz[b + 1] <= f) ++b;
+    if (f <= d->band_hz[0])    return d->on_axis_db[0];
+    if (b >= d->nband - 1)     return d->on_axis_db[d->nband - 1];
+    const double u = (log(f) - log(d->band_hz[b])) / (log(d->band_hz[b + 1]) - log(d->band_hz[b]));
+    return (float)(d->on_axis_db[b] + (d->on_axis_db[b + 1] - d->on_axis_db[b]) * u);
+}
+
+float directivity_on_axis_lin(const Directivity* d, float f_lo, float f_hi) {
+    if (!d || !d->nband || !d->has_on_axis) return 1.f;
+    if (!(f_hi > f_lo) || !(f_lo > 0.f)) return 1.f;
+    /* the same 256-point uniform-in-frequency mean as directivity_loss_lin, relative to the first
+     * band so an absolute SPL of 80 dB does not ride through as a factor of 10^4 */
+    double acc = 0.0;
+    const int NS = 256;
+    for (int n = 0; n < NS; ++n) {
+        const float f = (float)(f_lo + (f_hi - f_lo) * (n + 0.5) / NS);
+        acc += pow(10.0, ((double)directivity_on_axis_db_at(d, f) - d->on_axis_db[0]) / 20.0);
+    }
+    return (float)(acc / NS);
+}
+
 /* The array's own angular scale (see layout.h): mean nearest-neighbor angle between speaker
  * directions seen from ref. Two features derive from it — SPCAP's lobe width (below) and the
  * hole-aware spread floor's knee (hole.c) — so it lives here once. */
@@ -523,6 +548,24 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
                 }
                 out->dir.loss_db[b][a] = (float)v->valuedouble;
             }
+        }
+        /* optional absolute on-axis response, one value per band (clf_to_json.py exports it when
+         * the vendor file carries it). Present but malformed rejects the file like the rest. */
+        cJSON* oa = cJSON_GetObjectItemCaseSensitive(dj, "on_axis_db");
+        if (oa) {
+            if (!cJSON_IsArray(oa) || cJSON_GetArraySize(oa) != nb) {
+                set_err(err, errcap, "layout: directivity on_axis_db needs one value per band"); goto done;
+            }
+            for (int b = 0; b < nb; ++b) {
+                cJSON* v = cJSON_GetArrayItem(oa, b);
+                /* a range check, not just finiteness: dB SPL on a speaker's axis, or a relative
+                 * curve; nothing real sits outside +/-200 */
+                if (!cJSON_IsNumber(v) || !(v->valuedouble >= -200.0 && v->valuedouble <= 200.0)) {
+                    set_err(err, errcap, "layout: directivity on_axis_db entry non-numeric, non-finite, or outside [-200, 200]"); goto done;
+                }
+                out->dir.on_axis_db[b] = (float)v->valuedouble;
+            }
+            out->dir.has_on_axis = 1;
         }
         out->dir.split_hz = 1000.f;
         cJSON* sp = cJSON_GetObjectItemCaseSensitive(dj, "split_hz");

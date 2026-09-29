@@ -70,6 +70,12 @@ typedef struct {
     float   split_hz;                         /* the two-band split the runtime comp shelves at */
     float   lo_db[BWA_DIR_MAX_ANGLES];        /* derived: power-mean loss over bands BELOW split_hz */
     float   hi_db[BWA_DIR_MAX_ANGLES];        /* derived: power-mean loss over bands AT/ABOVE it */
+    /* Optional: the model's ABSOLUTE on-axis response per band (dB SPL as the vendor file states
+     * it; only differences between bands are used), from the file's `on_axis_db`. The live aim
+     * estimate (bwa_calibrate --live N --zylia) reads its high-to-mid tilt as the tilt a speaker
+     * shows when it points at the mic. 0 = the file carries none. No runtime consumer. */
+    uint8_t has_on_axis;
+    float   on_axis_db[BWA_DIR_MAX_BANDS];
 } Directivity;
 
 /* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~176 KB, almost all
@@ -143,6 +149,12 @@ float directivity_loss_lin(const Directivity* d, float angle_deg, float f_lo, fl
 /* The loss (dB) at one angle and one frequency: linear in angle over the table, linear in log f
  * between band centers, clamped at the table's ends. 0 when the model is empty. Pure. */
 float directivity_loss_db_at(const Directivity* d, float angle_deg, float f_hz);
+/* The on-axis response (dB, as stored) at one frequency, linear in log f between band centers and
+ * clamped at the ends; and its AMPLITUDE mean over [f_lo, f_hi] the way directivity_loss_lin
+ * averages, relative to the first band (only ratios of it mean anything). Both return the neutral
+ * value (0 dB, 1) when the model carries no on_axis_db. Pure. */
+float directivity_on_axis_db_at(const Directivity* d, float f_hz);
+float directivity_on_axis_lin(const Directivity* d, float f_lo, float f_hi);
 
 /* The array's angular scale: the mean nearest-neighbor angular separation (RADIANS) of the speaker
  * directions seen from `ref`. 37.5 deg on the default 26-speaker cube grid. Returns 0 on a

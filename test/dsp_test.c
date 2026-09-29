@@ -141,7 +141,8 @@ static int write_layout_grid(const char* path, int mode) {
 
 /* a grid layout carrying a directivity model (two bands, five angles) with speaker 0's aim given
  * explicitly (non-unit, along +z). mode 0 = valid; 1 = a zero aim on speaker 1; 2 = a loss row of
- * the wrong length; 3 = bands not ascending; 4 = a loss entry past +12 dB. */
+ * the wrong length; 3 = bands not ascending; 4 = a loss entry past +12 dB; 5 = valid plus an
+ * on_axis_db; 6 = an on_axis_db of the wrong length; 7 = an on_axis_db entry past 200 dB. */
 static int write_layout_dir(const char* path, int mode) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
@@ -156,8 +157,10 @@ static int write_layout_dir(const char* path, int mode) {
         ++k;
     }
     fprintf(f, "],\n\"directivity\": { \"bands_hz\": [250, %d], \"angles_deg\": [0, 30, 60, 90, 180],\n"
-               "  \"split_hz\": 1000, \"loss_db\": [[0, -1, -2, -3, -6], [0, -3, -9, -15, %s]] } }\n",
-            mode == 3 ? 100 : 4000, mode == 2 ? "-25, 0" : mode == 4 ? "50" : "-25");
+               "  \"split_hz\": 1000, \"loss_db\": [[0, -1, -2, -3, -6], [0, -3, -9, -15, %s]]%s } }\n",
+            mode == 3 ? 100 : 4000, mode == 2 ? "-25, 0" : mode == 4 ? "50" : "-25",
+            mode == 5 ? ", \"on_axis_db\": [80, 74]" : mode == 6 ? ", \"on_axis_db\": [80]"
+                      : mode == 7 ? ", \"on_axis_db\": [80, 300]" : "");
     fclose(f);
     return k == 26;
 }
@@ -930,6 +933,24 @@ int main(void) {
         write_layout_dir(DJ, 2); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "a loss row of the wrong length is rejected");
         write_layout_dir(DJ, 3); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "non-ascending bands are rejected");
         write_layout_dir(DJ, 4); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "a loss entry past +12 dB is rejected");
+        /* the optional on-axis response (the live aim estimate's 0 deg tilt from the file) */
+        write_layout_dir(DJ, 0);
+        CHECK(layout_load(DJ, RATE, &B, err, sizeof err) && !B.dir.has_on_axis, "directivity: no on_axis_db reads as none");
+        CHECK(directivity_on_axis_lin(&B.dir, 1000.f, 3000.f) == 1.f, "directivity: no on-axis response is flat");
+        write_layout_dir(DJ, 5);
+        CHECK(layout_load(DJ, RATE, &B, err, sizeof err), err[0] ? err : "an on_axis_db loads");
+        CHECK(B.dir.has_on_axis && B.dir.on_axis_db[0] == 80.f && B.dir.on_axis_db[1] == 74.f, "directivity: on_axis_db parsed per band");
+        CHECK(fabs(directivity_on_axis_db_at(&B.dir, 1000.f) - 77.f) < 1e-4, "directivity: on-axis is linear in log f between bands");
+        CHECK(directivity_on_axis_db_at(&B.dir, 100.f) == 80.f && directivity_on_axis_db_at(&B.dir, 9000.f) == 74.f,
+              "directivity: on-axis clamps past the bands");
+        {   /* 250 to 4000 Hz falls 6 dB, so the mean over 1-3 kHz is below the first band, and a band
+             * wholly past the last center reads its -6 dB exactly */
+            const float lm = directivity_on_axis_lin(&B.dir, 1000.f, 3000.f);
+            const float lh = directivity_on_axis_lin(&B.dir, 5000.f, 20000.f);
+            CHECK(lm < 1.f && lm > lh && fabs(20.0 * log10(lh) + 6.0) < 1e-4, "directivity: the on-axis band mean follows the response");
+        }
+        write_layout_dir(DJ, 6); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "an on_axis_db of the wrong length is rejected");
+        write_layout_dir(DJ, 7); CHECK(!layout_load(DJ, RATE, &B, err, sizeof err), "an on_axis_db entry past 200 dB is rejected");
         remove(DJ);
     }
 

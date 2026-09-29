@@ -1000,6 +1000,34 @@ isolation bullets.
   moving to its own machine; a hardware endpoint does that work on the device. The
   control-only C ABI still tolerates splitting the machines if you want to.
 
+### The speakers are Dante devices too (Genelec 4410A)
+
+The CAVE's speakers are Genelec 4410A Smart IP boxes: powered over PoE, fed over Dante (or
+AES67) on the same network, and configured with Genelec's Smart IP Manager. So every speaker is
+its own Dante device with its own DSP, and each of those can quietly fight the engine. Set them
+once, the same on every box, before you calibrate:
+
+- **Speaker DSP flat.** Turn off every tone control and any room-response or delay setting in
+  Smart IP Manager. The engine owns level, delay and correction (the layout's trims), and the
+  directivity model assumes the factory response: Genelec's balloon file records that it was
+  measured with all tone controls off.
+- **One fixed level on every box.** Set the speakers' own volume once, identically, and leave it.
+  The trims are measured against it; change a speaker's volume later and its trim is wrong.
+- **One Dante latency on every box**, and 48 kHz everywhere. A box with a different latency
+  arrives late by that much, the calibration absorbs it into that speaker's `delay_ms`, and the
+  alignment breaks silently the day someone changes it back.
+- **Subscriptions follow the layout.** Speaker `index` k receives Digiface output k. Walk the
+  channels in Stage 1 of the runbook rather than trusting the patch sheet.
+- **One clock leader, chosen.** Two dozen more Dante devices join the election. Pin the leader
+  (the Digiface, or whichever node you choose) and check it in Dante Controller.
+- **PoE budget.** Each box draws its power from the switch port. Check the switch's total
+  PoE+ budget against the speaker count, 24 now and up to 36 later, with the per-port class the
+  4410A manual states.
+- **Same firmware on every box.** Two firmware versions are two different DSPs.
+- **Note any box mounted rolled on its side.** The directivity model averages the box's two
+  planes, which is off by up to 3 dB around 2 to 2.5 kHz for a box rolled 90 degrees
+  ([calibration.md](./calibration.md)).
+
 ## ASIO host bring-up (sequence for `asio_sink.cpp`)
 
 1. COM-load the driver (the SDK's `AsioDrivers`/`asiolist` helpers handle registry

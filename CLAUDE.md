@@ -277,11 +277,55 @@ src/
                          side only, never the audio thread.
   tracking/
     natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
+    natnet.c (survey)    besides the head tracker: the CONTROL-SIDE survey parsers natnet_parse_bodies
+                         (every body in a frame; shares the prefix walk + per-body read with the audio
+                         path so they cannot drift) and natnet_parse_modeldef (rigid-body descriptions
+                         WITH marker offsets, 3.0-4.5; the per-description sizeInBytes is 4.1+, a typed
+                         walk before it), plus NatNetRaw, a thread-free socket session for tools.
+                         natnet_resolve_name uses the same walk below 4.1: it used to assume the size
+                         field from 4.0 and so never resolved a name on a Motive 3.0 (NatNet 4.0)
+                         stream. [survey]
+    survey.h / survey.c  the optical speaker survey's math: aim = the normal of the best-fit plane through a
+                         body's markers (stuck flat on the baffle; sign toward the listening point, so
+                         Motive's orientation convention is moot; flatness + colinearity rejection, or a
+                         configured body axis), pose averaging, a Horn frame fit + a mirrored twin fit,
+                         the two-match check, spk<N>/speaker<N> name matching + --map. Pure. [survey]
     pose.h               the lock-free single-slot pose handoff (seqlock) from the receiver
                          thread to the audio thread. The ONE header that carries stdatomic.h,
                          so nothing else may include it casually (see Traps). [M6]
   calib/
     measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
+                         calib.c also carries --verify's residual math (calib_verify_residuals: arrivals
+                         against the ALIGNMENT GOAL, equal at the trim point, never the layout's own
+                         delay_ms, which would cancel a corrupted one) and the aiming sheet
+                         (calib_aim_angles/_row, calib_write_aim_sheet: bearing clockwise from room-ahead,
+                         down-tilt positive below horizontal, both projected on BWA_ROOM_*). The mic for
+                         everything on the rig is the ZM-1: zylia.c's zylia_pressure_proxy pools the 19
+                         capsules into one omni-like measurement (power mean, energy-weighted direct
+                         share, zylia_center_arrival, dead-capsule refusal; about +/-0.25 dB of leftover
+                         direction dependence against up to 16 dB for one capsule), and
+                         calib_capture.cpp's calib_stage_signal is the engine's own align stage applied to
+                         one channel, which is what --verify plays. `bwa_calibrate --zylia` names the MIC;
+                         --trims / --verify pick the mode (bare --zylia is still the position survey). The
+                         trims align delays AT THE MIC and the engine assumes the listening point, so the
+                         trim run warns when the mic is more than 5 cm from Layout.ref. [calib]
+                         LIVE AIMING (`bwa_calibrate --live N --zylia`, calib_view's Aim tab): one
+                         speaker swept repeatedly (a 0.5 s sweep + 0.25 s tail, CAL_LIVE_*, about one
+                         reading a second) through calib_live_read, the ONE reading the CLI and the tab
+                         share. It reports the ZM-1 position estimate (zylia_live_position) against the
+                         layout, and the aim as a peak-hold tilt meter plus an off-axis MAGNITUDE
+                         (calib_aim_curve / calib_aim_invert with a bracket and "on axis (under N)").
+                         One mic position cannot say which way a box points. The live tilt bands are
+                         CALIB_LIVE_*_HZ (3-10 kHz against 10 kHz up), NOT --check-aim's 1-3 / 3 kHz up:
+                         on the 4410A those fall 0.25 dB by 15 deg, under the 0.3 dB a reading is good to,
+                         so a meter on them could not find the peak; the live pair falls 1.0 dB there.
+                         The 0 deg tilt comes from a stored REFERENCE (a speaker known on-axis, like one
+                         bwa_speaker_survey confirmed) or else the file's `on_axis_db`, which
+                         clf_to_json.py now exports (byte 6456 of the 4410A CF2, self-checked, omitted
+                         rather than guessed). The simulator's true position and aim, on-axis response
+                         and screen are opt-in (CalibSimOpts); turned on globally they would shift every
+                         pinned simulated figure, and its static scratch makes the Capture and Aim tabs
+                         mutually exclusive. [live aiming]
     zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
                          validation-grade estimators — active-intensity DOA, capsule integrity,
                          SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
@@ -464,7 +508,12 @@ cmake/                 bw_audioConfig.cmake.in + bwa_bindings.cmake. The first i
                        the other has not. In-tree, `bwa::bw_audio` is an ALIAS of the real target,
                        so a binding never asks which mode built it. [engine sdk]
 docs/                  Specs. Start here.
-examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
+examples/              speaker_survey.c = bwa_speaker_survey: the camera-visible speakers' rigid bodies
+                       (named spk<N>) -> aim, position, and whether Motive's frame IS the layout's room
+                       frame (--write copies aims into a layout copy; --simulate is the rehearsal and the
+                       speaker_survey_* ctests via test/speaker_survey_check.cmake, which asserts on the
+                       report AND the exit code, since PASS_REGULAR_EXPRESSION ignores the exit code).
+                       cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
                        ambisonic.c (beds: AmbiX/FuMa load, rotate/tilt, renderer + max-rE A/B),
                        streaming.c (disk streaming + push sources), convenience.c (the convenience
                        tier: shared/async assets, bwa_source_desc, group + scene stops, each part
@@ -531,35 +580,41 @@ engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manyl
 release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
 phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
 everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
-tree registers 47 on Windows at full options and 38 off it, and each job's bindings tree registers
+tree registers 60 on Windows at full options and 46 off it, and each job's bindings tree registers
 the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 47 tests with the Steam Audio SDK, 42 without (the 5 SDK-gated ones are `reflect`,
+suite — 60 tests with the Steam Audio SDK, 55 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, the two
-`calibrate_sim_room_*` runs, and the four
+(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, the seven calibrate CLI runs
+(`calibrate_sim_room_aim`/`_trim`, `calibrate_verify_omni`/`_zylia`, `calibrate_zylia_trims`,
+`calibrate_aim_sheet`, `calibrate_live_zylia`), the eight optical-survey tests (`survey` plus seven `speaker_survey_*`),
+and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux, macOS or Android at the DEFAULT options it is 33: `calib_view`
+under their build flags. On Linux or macOS at the DEFAULT options it is 41: `calib_view`
 and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
-`validate_*` and `calibrate_sim_room_*` runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
-`BWA_BUILD_PLAYGROUND`, which defaults OFF. Those two are NOT Windows-bound (raylib + rlImGui +
+`validate_*` and seven calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
+`BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 34 at the defaults: the seven
+`speaker_survey_*` runs need a host CMake to drive them (`if(NOT CMAKE_CROSSCOMPILING)`), so only
+`survey` comes along. Those two GUI tools are NOT Windows-bound (raylib + rlImGui +
 imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
-back, for 40 with phonon and 35 without, MEASURED on Ubuntu 22.04 / gcc 11.4. They need a DISPLAY:
-a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs those 33
+back, for 48 with phonon and 43 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
+survey's eight). They need a DISPLAY:
+a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs its 34
 through `tools/android/run-tests.ps1` rather
 than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
 too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
-`lib/android-arm64` + `lib/android-x64`), so the count there is **38**:
-those 33 plus the SDK-gated five. Linux is verified locally, 38/38 against a static phonon built
+`lib/android-arm64` + `lib/android-x64`), so the count there is **46** on Linux and macOS and
+**39** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
+the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
 sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
 `test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
-`python_example_live_onset`), so the full-options Windows tree is 51 and the default Windows tree
-42; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
+`python_example_live_onset`), so the full-options Windows tree is 64 and the default Windows tree
+50; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
 example"), so a change to the stimulus is a change to five files plus the web page.
@@ -575,8 +630,8 @@ after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
-57 (47 + 10) and 61 at full options; a Linux or macOS box with Octave alone reaches 43 (38 + 5) and
-with both 48 (38 + 10). Each suite exits 77
+70 (60 + 10) and 74 at full options (74 measured, 2026-09-29); a Linux or macOS box with Octave
+alone reaches 51 (46 + 5) and with both 56 (46 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
@@ -585,7 +640,7 @@ into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's
 engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
-that is the 42 the linux and macos jobs report, and on Windows 51 registered with 48 run (the three
+that is the 50 the linux and macos jobs report, and on Windows 64 registered with 61 run (the three
 GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is
@@ -923,6 +978,17 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   pause, a scene fade) must be applied to EVERY buffer a decoder reads, and its test must run in
   every profile, because the direct render is a second output path, not a second consumer of the
   first. `bindings/web/tests/master_gain.test.mjs` and the two `rt_feature` checks pin it.
+- **A check whose expectation is computed from the value under test cannot catch that value.**
+  `bwa_calibrate --verify` first predicted each arrival as latency + distance/c + the layout's own
+  `delay_ms`, and a corrupted `delay_ms` then cancelled out of its own residual. The expectation is
+  the alignment GOAL (equal arrivals at the trim point); the `calibrate_verify_*` ctests corrupt one
+  delay and require the flag.
+- **A handedness check on coplanar points is blind.** Three points, or any set on one plane, fit a
+  mirror exactly as well as the truth (reflect across their own plane). `survey.c` therefore lets
+  positions decide handedness only when the mirrored fit is clearly worse, falls back to the aims,
+  and otherwise says UNDETERMINED: a 3-speaker "OK" from positions alone would be a guess. And the
+  room frame's right is -x (right-handed, +y up, +z ahead): the runbook said "step right, +x grows"
+  until 2026-09-29, which would have sent someone to mirror a correct Motive setup.
 - **A shipped artifact must not cite a doc it does not ship.** Both packs run
   `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
   permalinks at the packed commit and then fails the pack on any relative `.md` reference the

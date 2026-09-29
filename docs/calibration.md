@@ -1,6 +1,6 @@
 # Speaker calibration and room characterization
 
-How the speaker array (26 in the CAVE) is surveyed, trimmed, and characterized at install time, and
+How the speaker array (24 in the CAVE) is surveyed, trimmed, and characterized at install time, and
 how those numbers reach the engine. The tool is `bwa_calibrate` (`examples/calibrate.cpp`, opt-in
 `-DBWA_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
 `calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`). The ASIO
@@ -21,9 +21,10 @@ layouts with different speaker counts rather than mis-compare them.
 - **`bwa_calibrate`**, *survey + tuning*: measures positions acoustically, and the per-speaker
   delay/gain trims, into the same `cave_layout.json`.
 
-Bring-up order: `layout_tool` (channel map) → `calibrate --localize` (positions; or `--zylia` from
-one ZM-1 placement) → `calibrate` (trims) → `calibrate --room` (sanity-check the room). Then the
-engine loads the layout.
+Bring-up order: `calibrate --aim-sheet` (before the boxes go up) → `layout_tool` (channel map) →
+`calibrate --localize` (positions; or `--zylia` from one ZM-1 placement) → `calibrate` (trims; or
+`--zylia --trims`) → `calibrate --verify` from the same placement → `calibrate --room`
+(sanity-check the room). Then the engine loads the layout.
 
 ## How it measures (exponential sweep + deconvolution)
 
@@ -35,8 +36,10 @@ So the limit is the mic-position accuracy and the assumed speed of sound, not th
 second one: see "Air temperature" below.
 
 Use an **omnidirectional** measurement mic. It's flat and direction-independent, so each speaker's
-delay/level/response comes back uncolored. Measure *through* the acoustically-transparent screens.
-That's what the listener hears, and the trim captures the screen's slight HF loss automatically.
+delay/level/response comes back uncolored. If the ZM-1 is the only mic you have, `--zylia --trims`
+turns its 19 capsules into a stand-in for one: see "The ZM-1 as the trim mic" below. Measure
+*through* the acoustically-transparent screens. That's what the listener hears, and the trim
+captures the screen's slight HF loss automatically.
 
 ### What the screens do
 
@@ -130,16 +133,23 @@ it. Do not expect it to be audible.
   positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch).
   Tens of ms means an unexpected buffer (check the Dante latency setting). The solved value stays
   authoritative: the driver's numbers are nominal, the sweep measured reality.
-- **`--zylia`**: the same self-survey from **one** mic placement, with the ZM-1's 19 capsules
-  instead of five omni mic positions. Direction from arrival-time differences, distance from a known
-  latency (`--latency` or `--ref`). See "Zylia ZM-1: full 3D from one placement" below.
-- **default**: trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
+- **`--zylia`**: says the mic is a ZM-1 (its 19 capsules start at `--input`, `--mic` is the array
+  center). The mode comes from the other flags. Alone, `--zylia` is the same self-survey as
+  `--localize` from **one** mic placement: direction from arrival-time differences, distance from a
+  known latency (`--latency` or `--ref`). See "Zylia ZM-1: full 3D from one placement" below. With
+  `--trims` it measures the trims, and with `--verify` it runs the second pass, both through a
+  pressure proxy: see "The ZM-1 as the trim mic" below.
+- **default** (or **`--trims`**, the same mode spelled out): trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
   clips). Those trims align the array at **one** point. The engine can optionally re-reference them
   onto the tracked listener at runtime (`bwa_set_tracked_align`, off by default), the time-alignment
   counterpart of `--room-eq-grid` below. See
   [`spatialization.md`](./spatialization.md#re-aligning-to-the-tracked-listener-bwa_set_tracked_align-off-by-default).
+- **`--verify`**: the second pass. Plays every speaker through the trims the layout carries and
+  reports what is left over. Nothing is written. See "Verify: the second pass" below.
+- **`--aim-sheet out.csv`**: no audio. Writes the installer's aiming sheet and prints a readiness
+  summary. See "The aiming sheet" below.
 - **`--room`**: RT60 (Schroeder) + early reflections from the captured IRs. It measures **how live
   your room is**. **Do not copy the measured RT60 into the engine's reverb settings.** The room's
   own decay is a **floor**: you cannot render a space deader than the room you're in. Nearby
@@ -197,7 +207,9 @@ it. Do not expect it to be audible.
   from the layout target; press a key to stop). With no `--latency` it prints the driver's digital
   loop as a starting value: a hard **lower bound** (the true latency adds DAC/ADC + analog). One
   omni mic gives **distance**, not full 3D; for live 3D you'd need ≥4 fixed mics. Sub-sample peak
-  interpolation puts the reading at well under 1 mm.
+  interpolation puts the reading at well under 1 mm. With `--zylia` it is live aiming instead:
+  one speaker's position against the layout and its off-axis angle, once per sweep. See "Live
+  aiming" below.
 - **`--save-irs prefix`**: dump the per-speaker impulse responses (the deconvolved kernels). One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:
   convolving these IRs into the binaural monitor previews the installed sound while you work
@@ -217,7 +229,8 @@ it. Do not expect it to be audible.
   `align.c`, before the gain+delay.
 
   With the Zylia you can gate by *direction* (keep the speaker's DOA, reject off-axis reflections)
-  for a cleaner near-free-field correction than an omni gate; that's a follow-on.
+  for a cleaner near-free-field correction than an omni gate; that's a follow-on. Today
+  `--zylia --eq` is refused: see "The ZM-1 as the trim mic".
 
 - **`--room-eq`**: room correction **at the mic position**, for a **static listener only** (the
   fixed-observer SPCAP/VBAP deployments: one seat, one sweet spot; put the mic there, at ear
@@ -352,6 +365,121 @@ Not yet: the `--eq` correction FIR is still designed from the mic's bearing. Mea
 off-axis, it flattens the off-axis response, which is right for a mic at the listening
 point and wrong elsewhere. Dividing the model's off-axis curve out of it is a follow-on.
 
+## Verify: the second pass (`--verify`)
+
+The trim run sweeps the raw outputs and writes trims it never plays. `--verify` plays them. Run it
+from the same mic placement, right after the trims are written:
+
+```
+bwa_calibrate --layout cave_layout.json --mic 0 1.448 0 --verify
+bwa_calibrate --layout cave_layout.json --mic 0 1.448 0 --zylia --input 26 --verify
+```
+
+For each speaker it puts the sweep on that speaker's channel, silence on the others, runs it through
+the engine's own output stage (`align_create` plus `align_process`, the code the engine renders
+with), and plays that channel. It deconvolves the capture against the **raw** sweep, so the measured
+response carries the trims. `--simulate` does the same in the other order: it simulates the raw
+capture and runs the capture through the stage. The stage is linear and time-invariant, so the
+order does not change the result.
+
+**It checks the static stage**: `gain_db`, `delay_ms`, the `eq` FIR and a static `room_eq`. Three
+stages follow the listener, and all three are identity at the listening point: `room_eq_grid`
+(the engine interpolates it from the tracked position; verify plays it at its flat start), tracked
+alignment, and the directivity comp. Verify leaves all three at identity. With the mic at the
+listening point that is exactly what a listener there hears. With the mic anywhere else it is what
+a listener at the mic hears before the engine starts tracking them, and the tool prints a note
+saying so.
+
+Per speaker it prints two residuals, each with the median over the speakers removed:
+
+- **Arrival**, in microseconds: the measured arrival minus the aligned arrival. The trim solve
+  makes every arrival equal at the point it measured from, so from that placement the expected
+  arrival is one constant: the system latency plus the farthest speaker's flight time. The median
+  stands in for it, which also makes the check blind to the latency. `calib_verify_residuals`
+  takes the point the trims were aligned at and subtracts `(d_k(mic) - d_k(point)) / c`, but the
+  CLI passes the mic itself, so run verify from the trim run's placement.
+- **Level**, in dB: the measured level times the speaker-to-mic distance times the directivity
+  re-aim factor, the normalization the trim solve used to write `gain_db`. After correct gain
+  trims every speaker reads 0 dB.
+
+It flags an arrival beyond ±100 µs and a level beyond ±1 dB:
+
+- **100 µs** is 3.4 cm of path and about 5 samples. A correct pass leaves up to about one sample
+  (the trims are whole samples, and the peak interpolation adds a little), and an inter-speaker
+  delay moves a phantom image over a range of about 1 ms. So the threshold sits five times above
+  the first and at a tenth of the second.
+- **1 dB** is about the level just-noticeable difference for broadband noise, and far above what a
+  correct pass leaves.
+
+A summary line prints the peak-to-peak spread of both. Exit code 3 if anything is flagged, like
+`--check`. Nothing is written back.
+
+What a flag means:
+
+- **ARRIVAL** on one speaker: its `delay_ms` is not what the trim run wrote (a hand edit, a stale
+  file), the box moved, or its Dante latency differs from the others.
+- **LEVEL**: `gain_db` changed, the box's own volume differs, or an `eq` FIR moves the level band.
+  The trim solve does not account for the FIR's own level, so an `--eq` layout leaves some: 0.36 dB
+  of spread on the simulated 26-speaker example.
+- **DEAD**: no signal at all.
+
+In simulation (the 26-speaker example with the 4410A model, `--sim-room`, mic at `0.6 1.2 0.4`),
+a correct pass reads an arrival spread of 18.9 µs and a level spread of 0.01 dB, with the omni and
+with the ZM-1. Corrupt one speaker's `delay_ms` by 0.5 ms and another's `gain_db` by 3 dB and
+exactly those two flag, at about +490 µs and -3.00 dB. The `calibrate_verify_omni` and
+`calibrate_verify_zylia` ctests pin both halves.
+
+Unverified on hardware: the rig path plays a per-speaker signal (`calib_asio_capture_signal`), the
+sweep run through the stage, which is longer than the sweep by the longest delay, the FIR and
+50 ms. The tool refuses a layout whose delays would eat more than half of the 0.5 s capture tail.
+
+## The aiming sheet (`--aim-sheet`)
+
+Print it before the boxes go up:
+
+```
+bwa_calibrate --layout cave_layout.json --aim-sheet aim.csv
+```
+
+It opens no audio device. It loads the layout with the engine's own loader, so the sheet uses
+exactly the listening point and the default aims the engine uses: the target is `Layout.ref`, which
+is `listening_point_m` when the file declares one and the array centroid when it does not, and a
+speaker with no `aim` points at it. One CSV row per speaker, one plain header row, no comment lines,
+so a spreadsheet opens it as is:
+
+| column | what |
+| --- | --- |
+| `speaker`, `x_m`, `y_m`, `z_m` | the index and position |
+| `target_*_m`, `distance_m` | the listening point and the distance to it |
+| `aim_x/y/z`, `bearing_deg`, `down_tilt_deg` | the aim to set: toward the listening point |
+| `layout_aim_*`, `layout_aim_source` | the layout's own `aim`, and `explicit` (in the file) or `default` |
+| `layout_bearing_deg`, `layout_down_tilt_deg` | the layout aim as angles |
+| `layout_aim_off_deg` | the angle between the layout aim and the aim toward the listening point |
+| `loss_2k_db`, `loss_16k_db` | the directivity model's loss at that angle (empty with no model) |
+| `flag` | `OFF_AIM` when that angle is over 20 degrees |
+
+The angles are in the room frame (`src/core/frame.h`, `bw_audio.h`): +y is up, +z is room-ahead,
+and room-right is -x.
+
+- **Bearing** is horizontal, clockwise seen from above: 0 is room-ahead (+z), 90 room-right (-x),
+  180 behind (-z), 270 room-left (+x). Lay it out from the room axes with a protractor, not from a
+  compass: magnetic north is not room-ahead. A vertical aim has no bearing, and the sheet writes 0.
+- **Down-tilt** is the angle below the horizontal: positive points down, negative points up, and
+  90 is straight down. Read it with an inclinometer on a cabinet face parallel to the acoustic axis.
+
+It also prints a readiness summary: whether `listening_point_m` is declared, and its height in m
+and ft (4.75 ft is `"listening_point_m": [x, 1.448, z]` on a floor-origin layout); whether a
+directivity model is present; how many speakers carry an explicit `aim`; and every speaker whose
+layout aim is more than 20 degrees off the listening point. Exit code 3 if there is one. At 20
+degrees the 4410A's model loses 2.0 dB at 2 kHz and 3.6 dB at 16 kHz toward the listening point;
+at 30 degrees, the directivity report's flag, it is 3.7 and 6.9 dB. 20 sits between that flag and
+`--check-aim`'s 15. The `calibrate_aim_sheet` ctest aims one speaker 46 degrees off and reads 6.6 dB
+at 2 kHz and 12.1 dB at 16 kHz.
+
+A layout with no `aim` fields cannot be off aim: the loader points every speaker at the listening
+point, so the sheet's job there is the installer's numbers. Once `aim` fields are in the file, or
+the listening point moves, the flag column catches a box the file says points elsewhere.
+
 ## Zylia ZM-1: full 3D from one placement
 
 `--localize` needs the omni mic at ≥5 positions because one omni gives only **distance**. The ZM-1
@@ -435,6 +563,84 @@ into `cave_layout.json`. Two flags carry the physics the tool cannot know:
 `--zylia --simulate` runs the identical solve + writeback off-hardware from synthesized arrivals
 and recovers every position exactly. The capture shell itself is rig bring-up code like the rest
 ([hardware-validation.md](./hardware-validation.md), Stage 2).
+
+### The ZM-1 as the trim mic (`--zylia --trims`, `--zylia --verify`)
+
+On the rig the ZM-1 is the only measurement mic, so it measures the trims too. Put the array's
+center AT the listening point (`--mic` is the center, and here it is the 4.75 ft point): the
+delays equalize arrival at the mic, while the engine treats the trims as aligned at the
+listening point, and tracked alignment is identity only there. The trim run warns when the mic
+is more than 5 cm from it.
+
+```
+bwa_calibrate --layout cave_layout.json --zylia --trims --survey s.json --input 26 --mic 0 1.448 0
+bwa_calibrate --layout cave_layout.json --zylia --verify --survey s.json --input 26 --mic 0 1.448 0
+```
+
+`--zylia` only says which mic is plugged in. Bare `--zylia` is still the position survey above;
+`--trims` and `--verify` pick the other two modes. The trims want what an omni at the array center
+would measure: one delay, one level, one direct share per speaker. The ZM-1 has no capsule at its
+center, and above about 2 kHz no single capsule is a pressure mic: on a 49 mm rigid sphere the
+capsule facing the speaker reads up to +6 dB and one in the shadow reads far less. So the tool
+sweeps each speaker once, deconvolves all 19 capsules, and pools them (`zylia_pressure_proxy`):
+
+- **Level, bands, direct-sound fields**: the power mean over the capsules, that is the RMS of the
+  19 capsule values. The surface-averaged power of a plane wave on a sphere does not depend on
+  where the wave comes from, so the mean over 19 points spread over the surface is close to
+  direction-independent where any one capsule is not.
+- **Direct share**: energy-weighted over the capsules, so it stays a share of the pooled energy.
+- **Delay**: the arrival at the array center. That is the capsules' mean arrival, corrected for the
+  wavefront's tilt across the sphere along the measured direction (`zylia_center_arrival`, the same
+  code `--ref` uses). The correction matters: the capsule centroid sits 2.6 mm above the center, which
+  is up to 7.6 µs for a speaker straight overhead.
+- **The mic position** is the array center, `--mic`. `--survey` supplies the capsule geometry. Without
+  it the built-in table stands in: the power mean does not care about channel order, and the tilt
+  correction depends on the orientation by at most about 15 µs.
+
+**What is left of the direction dependence.** The `zylia` ctest models the rigid sphere
+analytically and rotates a plane wave over 400 directions:
+
+| frequency | 19-capsule power mean | one capsule |
+| --- | --- | --- |
+| 500 Hz | 0.04 dB | 0.8 dB |
+| 1 kHz | 0.21 dB | 3.6 dB |
+| 2 kHz | 0.34 dB | 6.8 dB |
+| 4 kHz | 0.55 dB | 11.4 dB |
+| 8 kHz | 0.53 dB | 16.7 dB |
+| 16 kHz | 0.52 dB | 22.5 dB |
+| broadband level (the trims' band) | 0.49 dB | 8.8 dB |
+
+Each figure is the max over min across directions. So a ZM-1 trim carries up to about ±0.25 dB of
+error that depends on the speaker's direction, against ±4 dB from one capsule. The leftover is the
+sampling error of 19 points that are a dodecahedron minus its nadir, not an even spread. A part that
+does NOT depend on direction, the sphere's own mean coloration against the free field, is common to
+every speaker and cancels out of relative trims.
+
+**The simulator places each capsule at its own position**: its own flight time, 1/r, directivity
+bearing and simulated room. It does not model the rigid sphere, so every simulated capsule is a
+free-field omni and the table above is the only place the shadowing shows up. With that caveat, a
+simulated ZM-1 trim run lands within 0.10 dB and one sample (20 µs) of the omni run on the
+26-speaker example with `--sim-room` and an off-axis mic, and within 0.04 dB and the same samples
+anechoic. The `calibrate_zylia_trims` ctest pins 0.25 dB and 25 µs.
+
+**The EQ modes.** `--eq` and `--room-eq` are refused with the ZM-1. Both invert one impulse response
+into a filter, and the ZM-1 has none that stands for the pressure at its center: above about 2 kHz
+every capsule carries the sphere's shadow, differently for every direction, and the filter would bake
+it in. The power mean is a level, not a response. `--room-eq-grid` works: it reads 30 to 200 Hz from
+the MEAN of the 19 capsule captures, and at 200 Hz the sphere is acoustically transparent (ka under
+0.2). `--room` and `--save-irs` read the same capsule mean. It is the center pressure below about
+2 kHz and a direction-dependent beam above it, so treat the RT60, the reflection levels and the
+saved IRs above 2 kHz as approximate.
+
+**A dead capsule stops the run.** One whose level is non-finite or more than 20 dB under the
+capsules' median would cost the power mean only 0.2 dB, but its "arrival" is the peak of noise, and
+one wild arrival in 19 moves the center arrival by milliseconds. So the tool names the capsule and
+its input and exits. The sphere's own shadow stays well above that line: a shadowed capsule's
+broadband level sits at most about 9 dB under a lit one's.
+
+Unverified on hardware: all of it. A live capsule's gain error enters the power mean at a
+nineteenth of its weight (one capsule 1 dB hot moves the mean by 0.06 dB), so run
+`bwa_zylia_probe` first and look for a hot channel as well as a dead one.
 
 ### Getting the ZM-1 onto Dante
 
@@ -582,6 +788,234 @@ transient trigger, snapshot publish):
   check of everything but the ASIO capture. The math is unit-tested in the `zylia` ctest, and the
   `zylia/sim_doa` UI test in `calib_view` drives the whole tab.
 
+## Optical speaker check (`bwa_speaker_survey`)
+
+The acoustic survey places every speaker. It does not check where a speaker points to better
+than about 10 degrees, and it cannot tell you whether Motive's frame is the room frame your
+layout is written in. The speakers the cameras can see answer both. On the CAVE that is about
+four, which is enough.
+
+### Set up the bodies in Motive
+
+1. Stick 4 markers flat on the speaker's front baffle, around the tweeter. Three work, but any
+   3 points lie on a plane, so the flatness check has nothing to check. Keep them at least 5 cm
+   apart and not in a line. Center them on the tweeter: the tool reports the marker centroid as
+   the speaker's position.
+2. Select the markers and create a rigid body. Name it `spk<N>` or `speaker<N>`, where N is the
+   speaker's `index` in the layout. `spk07`, `Speaker_7` and `SPK-7` all map to index 7. For any
+   other name, pass `--map <name>=<index>`.
+3. Stream rigid bodies. The tool asks the server for the model definitions, so it needs the
+   server's address, not only the multicast group.
+
+You do not need to know how Motive oriented the body. The aim is the normal of the best-fit
+plane through the body's markers, and the tool takes the side that faces the layout's listening
+point. A body whose markers cannot sit on the baffle can still give an aim: `--axis x,y,z`
+names the body-local axis that points along the speaker's axis. Then the body's orientation
+matters, so prefer the baffle.
+
+### Run it
+
+```
+bwa_speaker_survey cave_layout.json --server 192.168.1.10
+```
+
+It collects 3 seconds of frames (`--seconds`), averages each body and prints the report.
+`--local` pins the network interface, `--multicast` the group, and `--natnet M.m` the
+bitstream version when the handshake fails. Every other rigid body is listed once as ignored,
+so a typo in a name shows.
+
+`--baffle-offset-m x` says the layout's point for a speaker sits x m behind the baffle. The
+acoustic survey measures acoustic centers, so set this to compare like with like.
+
+### Read the report
+
+Per speaker:
+
+- `position`: optical against layout, and the distance in mm.
+- `aim`: optical against layout, and the angle in degrees. It also says whether the layout's aim
+  is explicit or the default, toward the listening point.
+- `markers`: the count, the RMS distance off their plane, and the verdict. More than 3 mm off
+  the plane, or markers in a line, gives no aim. The position is still reported.
+- `spread`: how still the body was. Over 2 mm or 0.5 degrees refuses the speaker.
+
+These numbers are in Motive's frame. The frame block below says whether that is the room's.
+
+Then the frame agreement: one rigid fit, rotation and translation, no scale, from the optical
+positions onto the layout's. It needs 3 speakers. With 2 you get only the distance check.
+
+- `rotation` and `translation`: how far Motive's frame is from the room frame. Under 0.5 degrees
+  and 10 mm reads as agreement.
+- `residual`: what the fit cannot explain. Large means a speaker is not where the layout says,
+  and the per-speaker lines under "after the fit" show which.
+- `handedness`: `OK`, `MIRRORED` or `UNDETERMINED`. The tool fits a second time with Motive's x
+  axis flipped, and a mirrored frame fits that one better. Speakers that all lie on one plane fit
+  a mirror exactly as well as the truth, so then only the aims can decide. When they cannot
+  either, it says `UNDETERMINED`. Add a speaker off that plane.
+
+If the frame disagrees, fix it in Motive (ground plane, axis convention) and re-run. The engine
+takes poses unchanged.
+
+### Write the aims
+
+The tool only reports by default. `--write out.json` copies the measured aims of the matched
+speakers into a copy of the layout. Every other field is kept. `--fields position` or
+`--fields aim,position` writes positions too. That replaces the acoustic survey's position with
+the optical one, so do it only when you trust the optical one more. It refuses a mirrored frame
+and warns when the frame disagrees, because the values are in Motive's frame.
+
+### Rehearse without Motive
+
+```
+bwa_speaker_survey cave_layout.json --simulate --sim-yaw 2 --sim-offset 0.05,0,0 --sim-aim-error 3
+```
+
+This builds Motive's packets from the layout and runs them through the same parsers. The knobs:
+`--sim-speakers` (which speakers are visible), `--sim-aim-error` (on the first), `--sim-yaw` and
+`--sim-offset` (Motive's frame against the room's), `--sim-mirror`, `--sim-noise-mm` (marker
+placement), `--sim-jitter-mm` (per frame) and `--sim-natnet`. It checks its answer against what
+it injected and prints `simulate PASS` or `FAIL`.
+
+Unverified against a live Motive: the socket path, and the assumption that Motive sends marker
+offsets in the body's own frame. For a body created in place on a fixed speaker the two readings
+agree.
+
+## Live aiming (`--live N --zylia`, the Aim tab)
+
+Some boxes you cannot see: they hang behind the acoustically transparent screens, or overhead.
+Live aiming turns the ZM-1 into an aiming instrument for them. It sweeps ONE speaker over and
+over, captures the 19 capsules, and prints a line per sweep while an installer turns the box and
+someone at the calibration PC reads the numbers out.
+
+```
+bwa_calibrate --layout cave_layout.json --live 7 --zylia --survey s.json --input 26 --latency 20.6 --aim-ref 3
+```
+
+`--mic` is the array center and defaults to the layout's listening point, which is where the
+ZM-1 sits on the rig (4.75 ft). `bwa_calib_view` has the same loop in its **Aim** tab, on a
+worker thread, for the speakers of layout A: a speaker picker, a big "dB below peak" number
+readable from a ladder, a meter with a peak-hold line, the angle estimates, the position, and a
+3D view with the layout's position and aim, the ZM-1, and the measured direction and position.
+
+### What one line says
+
+```
+  #1   pos   -8.9   -9.6   -1.0 mm (|d|  13.2)  dir 0.36 deg  dist 2.085 m (+0.3 mm) | tilt -1.35 dB  peak -1.35  below 0.00 dB | off-axis ref 25.6 deg [21.5-29.1], file 25.7 deg [21.6-29.3] | layout 0.0 deg | true 25.0 deg
+```
+
+That line is simulated, which is what the closing `true` field says; the rig prints no truth.
+
+- **Position**: where the box is against its layout `position`, in mm, plus the direction error
+  in degrees and the distance. Direction comes from the capsule arrival differences
+  (`zylia_doa`), distance from the arrival at the array center minus the system latency
+  (`zylia_live_position`). The distance is exactly as good as the latency: 20 µs of latency
+  error is 6.9 mm. Pass `--latency` (a loopback in meters at c) or `--ref <spk> <m>` (one taped
+  distance, swept once before the loop). Without either you get the direction only.
+- **Tilt, peak, below**: the direct-sound high-to-mid ratio (the gated `band_direct`, 10 kHz up
+  against 3 to 10 kHz, pooled over the capsules by `zylia_pressure_proxy`), the highest tilt seen
+  since the last reset, and how far this reading sits under it. These are NOT the `--check-aim`
+  bands (1 to 3 kHz against 3 kHz up): on the 4410A those fall only 0.25 dB by 15 degrees, under
+  what a reading is good to, so a meter on them cannot find the peak. The live pair falls 0.51 dB
+  at 10 degrees and 1.00 dB at 15 (`CALIB_LIVE_*_HZ` in `calib.h`).
+- **Off-axis**: the estimated angle between the box's axis and the line to the ZM-1, from a
+  stored reference (`ref`) and from the vendor file (`file`), each with its bracket.
+- **Layout**: the angle the layout's own `aim` makes with the line to the ZM-1, the target.
+
+Keys: `r` stores this reading as the on-axis reference, `p` resets the peak, any other key
+stops. `--sweeps N` stops after N readings.
+
+### What the angle is, and what it is not
+
+One mic position sees each speaker from one bearing. So it measures how far the axis is off
+the line to the mic, a **magnitude**, and never which way the box points: every axis on a cone
+around that line reads the same. The tool cannot tell you "turn left". Nothing here fits an axis;
+`--check-aim` does that from several placements.
+
+Two readings, for two jobs:
+
+- **The peak meter** needs no calibration. Treble falls off axis, so the tilt is highest when the
+  box points at the ZM-1. Turn until "below" reads 0. Whatever sits on the fixed speaker-to-mic
+  path (the screen, the ZM-1's own response, the gate) is the same at every aim, so it shifts the
+  tilt but cannot move the peak.
+- **The angle** says how far there is to go. It takes the measured tilt minus the tilt the same
+  path shows at 0 degrees, and inverts the model's tilt-versus-angle curve (`calib_aim_invert`).
+
+The curve is flattest near 0. On the 4410A, with the live bands, the tilt falls 0.18 dB at 5
+degrees, 0.51 dB at 10, 1.00 dB at 15 and 3.2 dB at 30. The estimate therefore comes with a
+bracket for ±0.3 dB of tilt (`CALIB_LIVE_TILT_TOL_DB`, about the ZM-1 proxy's leftover direction
+dependence), and a reading whose bracket reaches 0 prints **"on axis (under N deg)"** instead of
+a number: on the 4410A, under about 7 degrees. The peak is broad for the same reason. To land on
+it, find the two sides where "below" reaches 0.5 dB, about 10 degrees each way, and split the
+difference.
+
+### Where the 0 degree tilt comes from
+
+- **The file.** The Genelec CF2 carries the absolute on-axis response per band, which
+  `clf_to_json.py` exports as `on_axis_db` (see [layout-schema.md](./layout-schema.md)). Its tilt
+  over the same bands is the file's 0 degree tilt: +0.04 dB for the 4410A. It knows the speaker
+  and nothing else: not the ZM-1, not the gate, not the screen.
+- **A reference speaker, better on the rig.** Sweep a speaker you KNOW points at the ZM-1 and
+  store its tilt: `--aim-ref <spk>` before the loop, `r` during it, or **Store reference** in the
+  tab. The run prints the value, and `--aim-ref-db <dB>` reuses it later. It absorbs the ZM-1's
+  own response, the gate and the average effect of the screen, which the file cannot.
+
+The workflow with the optical check: run `bwa_speaker_survey` first. The four or so speakers
+the cameras see come back with measured aims; take one it reports within a degree or two of the
+layout aim toward the listening point, and use it as the reference. If none is visible, peak any
+reachable box by eye and by meter, and store that. Then aim the hidden boxes against it. Take the
+reference from a speaker that passes through the same kind of screen as the ones you aim.
+
+### Update rate
+
+The live mode plays its own shorter sweep: 0.5 s instead of 1.5 s, the same 20 Hz to 20 kHz, plus
+a 0.25 s tail (`CAL_LIVE_*` in `calib_capture.h`). The tail holds the ZM-1 chain's 60 ms of
+latency with 190 ms to spare, and nothing past the direct-sound gate is read. That is 0.75 s of
+capture per reading plus the 19 deconvolutions, which run on up to 8 threads. A whole simulated
+reading, synthesis included, takes about 0.3 s on the development machine, so expect 1 to 1.2
+readings a second on the rig; nobody has timed it there. The shorter sweep costs 4.8 dB of
+signal-to-noise against the full one.
+
+### Accuracy, in simulation
+
+`--simulate` synthesizes each reading with the live sweep and a box whose TRUE position and aim
+differ from the layout's: `--sim-move dx dy dz` (m) and `--sim-aim-steps a,b,...` (degrees off
+the layout aim, one per reading). The simulated box carries the file's on-axis response.
+`--sim-screen <dB>` puts a screen's high-frequency loss (a shelf above 4 kHz) on every path out
+of every box, which is the case the file cannot see. The numbers below are the 26-speaker example
+with the 4410A model, the ZM-1 at (0, 1.448, 0), speaker 7 turned, and speaker 16 as the
+reference:
+
+| true angle | below peak | reference | file | file, 3 dB screen |
+| --- | --- | --- | --- | --- |
+| 0 | 0.00 dB | on axis (under 7) | on axis (under 8) | 12.6 deg |
+| 5 | 0.15 dB | on axis (under 9) | on axis (under 10) | 14.2 deg |
+| 10 | 0.47 dB | 9.4 deg | 10.1 deg | 16.8 deg |
+| 15 | 0.95 dB | 14.4 deg | 14.9 deg | 20.4 deg |
+| 25 | 2.31 dB | 24.4 deg | 24.7 deg | 29.4 deg |
+| 40 | 4.39 dB | 39.0 deg | 39.3 deg | 45.9 deg |
+
+Behind the screen the reference reads the same as without it; the file does not. A 1 dB shelf
+moves the file estimate by only 1 to 3 degrees, because both live bands sit mostly above the
+shelf's corner, so a flat screen barely tilts them. A real screen's loss that rises with
+frequency tilts them more, which is why the reference is the rig's number. The simulated room
+(`--sim-room`, absorption 0.3) moves no entry: its first image arrives after the gate closes, so
+the gate removes it. A real box close to a wall gets a shorter gate and a coarser mid band, which
+this room does not reproduce. In every case the peak lands on the reading where the box points at
+the mic.
+
+Position: over seven speakers the direction reads 0.0 to 0.6 degrees off the truth, which is
+up to 20 mm across at 2 m, and the distance within 1 mm. The limit is the sub-sample peak of
+each capsule's impulse response, about 1 µs. A 10 cm move reads back as 89 to 109 mm along the
+right axis. On exact arrivals (the `zylia` ctest) the same move comes back within 1 mm. So read a
+position delta under about 3 cm as "where the layout says".
+
+The `calibrate_live_zylia` ctest pins the 10 cm move, the 25 degree estimate with the reference,
+the file's larger error behind the screen, and the peak at 0 degrees. The `aim/sim_live` test in
+`calib_view --tests` turns a simulated box away and back through the real UI.
+
+Unverified on hardware: all of it, the short sweep through the ASIO shell included. The
+simulator's capsules are free-field omnis on no sphere, so the ZM-1's own scattering, and how
+well a reference taken in one direction carries to another, are not in these numbers.
+
 ## Reviewing the results (`bwa_calib_view`)
 
 Before trusting a calibration run, LOOK at it. `bwa_calib_view` (opt-in `-DBWA_BUILD_CALIBVIEW=ON`)
@@ -596,10 +1030,12 @@ calibration itself (sweep, solve, write, on a worker thread, through the same ca
 and measure/solve DSP as the CLI; simulate hardware-free, ASIO full-duplex at the rig). One
 button loads the result into Diff for review before you accept it. Its directivity correction
 follows the CLI's `--mic` rule (see "Speaker directivity" above): off until you set the mic. The **Zylia tab** (live
-clap-DOA, see "Bring-up" above) covers the ZM-1.
+clap-DOA, see "Bring-up" above) covers the ZM-1, and the **Aim tab** runs live aiming (see
+"Live aiming" above).
 
 `bwa_calibrate` remains the headless CLI over the same code: scriptable, and the only place for
-the multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
+the multi-placement modes (`--localize`, `--zylia`, `--check`, the omni `--live`), for trims measured with
+the ZM-1 (the Capture tab reads one omni input), for `--verify` and for `--aim-sheet`.
 `bwa_calib_view --tests [filter]` runs its imgui_test_engine suite, wired into ctest as
 `calib_view`.
 

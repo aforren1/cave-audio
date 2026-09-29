@@ -105,6 +105,164 @@ float calib_aim_tilt_db(const Directivity* d, float angle_deg, const double band
 int calib_check_aim(const Layout* L, int s, const float (*mic)[3], const float* tilt_db, int K,
                     const double band_hz[2], double f2, CalibAimResult* out);
 
+/* ---- live aiming (bwa_calibrate --live N --zylia, calib_view's Aim tab; docs/calibration.md) ----
+ * One mic position sees one bearing per speaker, so the tilt above cannot fit an axis. What it CAN
+ * give is the MAGNITUDE of the angle between the speaker's axis and the direction to the mic, and
+ * never which way the box points: every axis on a cone around the mic direction reads the same.
+ *
+ * The tilt is the direct-sound high-to-mid ratio, 20 log10(band_direct[2] / band_direct[1]) over the
+ * CALIB_AIM_* bands. Two readings of it:
+ *   relative  the installer turns the box until the tilt PEAKS (calib_peak_*): no calibration, and
+ *             the loss of whatever sits on the fixed speaker-to-mic path (a screen, the mic's own
+ *             response) is the same at every aim, so it cannot move the peak;
+ *   absolute  measured tilt minus the tilt the SAME path shows at 0 deg, inverted through the
+ *             model's tilt-versus-angle curve. The 0 deg tilt comes from the vendor file's
+ *             on-axis response (calib_on_axis_tilt_db) or, better, from a speaker known to point at
+ *             the mic (a stored reference), which also absorbs the mic, the gate and the screen.
+ *
+ * The curve is SHALLOW near 0 (on the Genelec 4410A: 0.06 dB at 10 deg, 0.25 at 15, 0.9 at 25), so
+ * the inversion reports a bracket for a tilt uncertainty tol_db and says "on axis" when the bracket
+ * reaches 0 deg. CALIB_LIVE_TILT_TOL_DB is the default: the ZM-1 pressure proxy's residual direction
+ * dependence (0.55 dB max-min at 4 to 8 kHz, docs/calibration.md) is about +/-0.3 dB of tilt when the
+ * reference speaker and the measured one sit in different directions from the array. */
+#define CALIB_LIVE_TILT_TOL_DB 0.3f
+/* The LIVE aiming tilt bands: 3-10 kHz (mid) against 10 kHz up (high). Not CALIB_AIM_*_HZ: those
+ * were chosen for --check-aim, whose band edge had to stay clear of a position-dependent gate, and
+ * on the 4410A their tilt falls only 0.06 dB at 10 deg and 0.25 dB at 15, under the 0.3 dB the
+ * reading is good to, so a peak meter on them cannot find the peak. This pair falls 0.51 dB at 10
+ * deg and 1.00 dB at 15 (the waveguide's treble narrows far faster than the 3 kHz region), and a
+ * few-ms gate resolves both bands. The measurement side (measure_response's band_hz) and the model
+ * side (calib_aim_curve, calib_on_axis_tilt_db) MUST use the same pair. */
+#define CALIB_LIVE_MID_HZ  3000.0
+#define CALIB_LIVE_HIGH_HZ 10000.0
+#define CALIB_AIM_CURVE_N      721        /* the curve: 0 .. 180 deg in 0.25 deg steps */
+
+/* The model's tilt-versus-angle curve, curve[i] = calib_aim_tilt_db at i/4 deg (0 at 0 deg by the
+ * model's own convention). All zeros without a model. Pure; tens of ms, so build it once per model. */
+void calib_aim_curve(const Directivity* d, const double band_hz[2], double f2, float curve[CALIB_AIM_CURVE_N]);
+
+typedef struct {
+    int   ok;          /* 1 = inverted; 0 = a curve that never falls (no model) or a non-finite reading */
+    float rel_db;      /* the reading: measured tilt minus the 0 deg tilt */
+    float angle_deg;   /* the estimate: the smallest angle whose curve value reaches rel_db */
+    float lo_deg;      /* the bracket for rel_db +/- tol_db: lo from rel_db + tol_db, */
+    float hi_deg;      /* ... hi from rel_db - tol_db */
+    int   on_axis;     /* 1 = lo_deg is 0: report "on axis (under hi_deg)", never a number */
+    int   beyond;      /* 1 = the reading lies past the curve's range: at least max_deg */
+    float max_deg;     /* where the curve's running minimum bottoms out (the range it can invert) */
+} CalibAimAngle;
+
+/* Invert a reading through the curve. The curve is not monotonic everywhere (the 4410A reads
+ * +0.01 dB at 5 deg and has rear lobes), so the inversion walks its RUNNING MINIMUM from 0 deg,
+ * which is monotonic, up to the angle where that minimum stops falling; a reading past it
+ * (max_deg) is reported as beyond. A reading above 0 dB (brighter than on axis) is 0 deg. tol_db is
+ * clamped to >= 0. Pure. Returns out->ok. */
+int calib_aim_invert(const float curve[CALIB_AIM_CURVE_N], float rel_db, float tol_db, CalibAimAngle* out);
+
+/* The measured direct-sound tilt of one capture (or of zylia_pressure_proxy's pool): 1 and *out,
+ * or 0 when either band is non-positive or non-finite. */
+int calib_direct_tilt_db(const MeasureResult* m, float* out);
+
+/* The tilt the model's on-axis response gives over the same bands: the file's 0 deg reference.
+ * 1 and *out, or 0 when the model carries no on_axis_db. The curve above is relative to on axis,
+ * so the tilt of (on-axis response x loss) is taken as the sum of the two tilts; on the 4410A the
+ * on-axis response is flat enough (within 1.6 dB from 1 to 16 kHz) that the cross term is small. */
+int calib_on_axis_tilt_db(const Directivity* d, const double band_hz[2], double f2, float* out);
+
+/* Peak hold for the relative meter. Non-finite readings are ignored. update returns how far the
+ * reading sits BELOW the peak, in dB (>= 0; 0 at a new peak). Pure. */
+typedef struct {
+    int   n;           /* readings taken since the last reset */
+    float last_db;
+    float peak_db;
+    int   peak_index;  /* n at the reading that set the peak (1-based), 0 before any */
+} CalibPeakHold;
+void  calib_peak_reset(CalibPeakHold* p);
+float calib_peak_update(CalibPeakHold* p, float value_db);
+
+/* ---- the second pass (bwa_calibrate --verify; docs/calibration.md) ------------------------------
+ * The trim run sweeps the RAW outputs and writes trims it never plays. --verify sweeps every speaker
+ * THROUGH the layout's output stage (align.c, exactly as the engine builds it) from the same mic
+ * placement, deconvolves against the raw sweep so each measurement carries the trims, and this
+ * scores what is left over. `m` is those through-the-trims measurements. Per speaker k:
+ *
+ *   arrival_us[k] = t_k - (d_k(mic) - d_k(align_pt)) / c,  median removed, in microseconds
+ *   level_db[k]   = 20 log10(level_k * d_k(mic) * corr_k),  median removed
+ *
+ * t_k is the measured arrival (delay_samples + delay_frac, over fs). The trims' job is to make every
+ * arrival equal at the point they were solved from (calib_solve aligns the arrivals it measured), so
+ * with the mic at that point the expected arrival is one constant: the system latency plus the
+ * farthest speaker's flight time plus nothing per speaker. The median stands in for it, which also
+ * makes the check independent of the latency. `align_pt` is that point: pass the trim run's mic
+ * (bwa_calibrate does, since it verifies from the same placement), and the geometric term is zero;
+ * from another placement it predicts how the aligned arrivals spread apart. The level is normalized
+ * exactly the way calib_solve_corr normalizes the trim run's (distance divided out, the directivity
+ * re-aim factor `corr` applied, NULL = none), so after correct gain trims every speaker reads 0 dB.
+ *
+ * Flags: ARRIVAL beyond +/-CALIB_VERIFY_ARRIVAL_US, LEVEL beyond +/-CALIB_VERIFY_LEVEL_DB, DEAD for a
+ * non-positive or non-finite level (excluded from both medians; its residuals read 0). Why these:
+ * 100 us is 3.4 cm of path and about 5 samples, several times what a correct pass leaves (the trims
+ * are whole samples, so up to about 1 sample, 21 us, plus the peak interpolation) and a tenth of the
+ * ~1 ms range over which an inter-speaker delay moves a phantom; a 0.5 ms error reads 5x over it. 1 dB is
+ * about the level just-noticeable difference for broadband noise, and three times what a correct pass
+ * leaves in simulation. Returns the number of flagged speakers (0 = pass), or -1 on bad input.
+ * `sum` (NULL ok) gets the peak-to-peak spreads over the live speakers. Pure. */
+#define CALIB_VERIFY_ARRIVAL_US 100.0f
+#define CALIB_VERIFY_LEVEL_DB     1.0f
+#define CALIB_VERIFY_FLAG_ARRIVAL 0x01
+#define CALIB_VERIFY_FLAG_LEVEL   0x02
+#define CALIB_VERIFY_FLAG_DEAD    0x04
+typedef struct {
+    int   nlive;
+    int   nflag;              /* speakers with any flag */
+    float arrival_spread_us;  /* max - min over the live speakers */
+    float level_spread_db;
+} CalibVerifySummary;
+int calib_verify_residuals(const MeasureResult* m, const float (*pos)[3], const float mic[3],
+                           const float align_pt[3], int n, double fs, double c, const float* corr,
+                           float* arrival_us, float* level_db, int* flags, CalibVerifySummary* sum);
+
+/* ---- the aiming sheet (bwa_calibrate --aim-sheet; docs/calibration.md) --------------------------
+ * Angles an installer can set with a protractor and an inclinometer, in the ROOM frame (frame.h,
+ * bw_audio.h: +y up, +z room-ahead, room-right = -x):
+ *   bearing_deg    horizontal direction, clockwise seen from above: 0 = room-ahead (+z), 90 =
+ *                  room-right (-x), 180 = behind (-z), 270 = room-left (+x). In [0, 360). A vertical
+ *                  vector has no bearing and reads 0.
+ *   down_tilt_deg  elevation below the horizontal: +90 = straight down, 0 = level, negative = up.
+ * `v` need not be unit length. */
+void calib_aim_angles(const float v[3], float* bearing_deg, float* down_tilt_deg);
+
+/* One speaker's row of the sheet. The target is Layout.ref, which the loader sets to
+ * `listening_point_m` when the file declares one and to the array centroid otherwise, and which is
+ * also where a speaker with no `aim` points: so the sheet uses exactly the point the engine uses. */
+typedef struct {
+    float pos[3];
+    float target[3];          /* L->ref */
+    float dist_m;             /* |target - pos| */
+    float aim[3];             /* the aim to set: unit vector from pos toward target */
+    float bearing_deg, down_tilt_deg;
+    float layout_aim[3];      /* L->speakers[s].aim */
+    float layout_bearing_deg, layout_down_tilt_deg;
+    float off_deg;            /* angle between layout_aim and aim */
+    int   have_loss;          /* 1 = the layout carries a directivity model */
+    float loss_2k_db, loss_16k_db;   /* the model's loss at off_deg (<= 0 dB) */
+} CalibAimRow;
+int calib_aim_row(const Layout* L, int s, CalibAimRow* out);   /* 1, or 0 on bad input */
+
+/* What the loaded Layout cannot tell apart: whether the file DECLARED listening_point_m, and which
+ * speakers carry an explicit `aim` (the rest were pointed at ref by the loader). Reads the JSON at
+ * `path`; `aim_explicit` is n long (NULL ok). Returns 1, or 0 when the file cannot be read or its
+ * speaker count is not n. */
+int calib_layout_declared(const char* path, int n, int* has_listening_point, unsigned char* aim_explicit);
+
+/* Write the sheet as CSV: one plain header row, then one row per speaker (no comment lines, so a
+ * spreadsheet opens it as is). `aim_explicit` (NULL = all default) fills the aim-source column. A row
+ * whose layout aim is more than `flag_deg` off the aim toward the target gets flag OFF_AIM. `nflag`
+ * (NULL ok) receives the count. Returns 1, or 0 with a message in `err`. */
+int calib_write_aim_sheet(const char* csv_path, const Layout* L, const unsigned char* aim_explicit,
+                          float flag_deg, int* nflag, char* err, size_t errcap);
+#define CALIB_AIM_SHEET_FLAG_DEG 20.0f
+
 /* Read the layout JSON at `in_path`, set each speaker's `gain_db` + `delay_ms` (preserving index,
  * position, the dbap block, everything else), and write to `out_path` (may equal in_path). The file's
  * speaker count must equal `n`. Returns 1 on success, 0 with a message in `err`. */

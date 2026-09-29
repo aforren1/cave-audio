@@ -14,6 +14,11 @@
  * The socket/thread path goes through the os.h shim (Winsock or BSD sockets) and is
  * on-hardware-pending (it needs a live Motive server); the parser (natnet_parse_frame) is pure
  * and unit-tested against synthetic packets.
+ *
+ * The second half of this header serves control-side TOOLS, not the audio thread: every rigid
+ * body in a frame (natnet_parse_bodies), every rigid-body description with its marker offsets
+ * (natnet_parse_modeldef), and a thread-free socket session (NatNetRaw). bwa_speaker_survey
+ * (examples/speaker_survey.c) is the consumer.
  */
 #ifndef BWA_NATNET_H
 #define BWA_NATNET_H
@@ -112,5 +117,82 @@ bool natnet_parse_frame(const uint8_t* payload, size_t len, int major, int minor
  * datasets, so it needs NatNet major >= 4 (Motive's modern bitstream). Bounds-checked. */
 bool natnet_resolve_name(const uint8_t* payload, size_t len, int major, int minor,
                          const char* want_name, int32_t* out_id);
+
+/* ---- every rigid body, for control-side tools (bwa_speaker_survey) ----------------------------
+ * The single-body path above feeds the audio thread and stays as it is. These two parsers return
+ * EVERYTHING a frame and a MODELDEF carry about rigid bodies, for a tool that surveys many bodies
+ * at once. Both are pure and bounds-checked like the parsers above. */
+
+/* One rigid body from a NAT_FRAMEOFDATA payload. */
+typedef struct {
+    int32_t id;              /* streaming ID (matches NatNetBodyDesc.id) */
+    float   pos[3];          /* Motive frame, meters */
+    float   quat[4];         /* xyzw, Motive frame */
+    float   mean_error;      /* mean marker residual (m) */
+    bool    tracking_valid;  /* params bit 0: solved this frame */
+} NatNetBody;
+
+/* Every rigid body in a NAT_FRAMEOFDATA payload. Writes the first `cap` into out[] and returns how
+ * many it wrote; bodies past cap are still walked (bounds-checked) and dropped. Returns -1 on a
+ * malformed or truncated payload, or on NatNet major < 3 (the same floor as natnet_parse_frame). */
+int natnet_parse_bodies(const uint8_t* payload, size_t len, int major, int minor,
+                        NatNetBody* out, int cap);
+
+#define NATNET_NAME_MAX         256   /* the SDK's MAX_NAMELENGTH; a longer name is truncated */
+#define NATNET_RB_MAX_MARKERS    32   /* marker offsets kept per body; more are counted, not stored */
+
+/* One rigid-body description from a NAT_MODELDEF payload. */
+typedef struct {
+    char    name[NATNET_NAME_MAX];
+    int32_t id;              /* streaming ID */
+    int32_t parent_id;       /* -1 for a plain rigid body */
+    float   offset[3];       /* pivot offset from the parent (m) */
+    float   rot_offset[4];   /* xyzw, NatNet 4.2+ only; identity before */
+    int     n_markers;       /* marker count as the description declares it */
+    int     n_stored;        /* min(n_markers, NATNET_RB_MAX_MARKERS) */
+    float   markers[NATNET_RB_MAX_MARKERS][3];   /* marker positions in the BODY's frame (m) */
+} NatNetBodyDesc;
+
+/* Every rigid-body description in a NAT_MODELDEF payload, in wire order. Writes the first `cap`
+ * into out[] and returns how many it wrote (bodies past cap are walked and dropped), or -1 on
+ * NatNet major < 3 or an unreadable dataset count. A truncated or garbage payload returns the
+ * bodies read before the damage with `complete` (NULL ok) false; true means every description
+ * was walked and every rigid body in it parsed.
+ * Version handling (wire layouts from the SDK's PacketClient reference, never linked):
+ *   4.1+  : every description carries a sizeInBytes prefix, so any type is skipped by size. The
+ *           SDK's Python client gates that prefix on 4.1+ and its C++ PacketClient reads it
+ *           unconditionally (it only ever talks 4.x); the version-aware one wins here. Note that
+ *           natnet_resolve_name above assumes the prefix from 4.0.
+ *   3.0-4.0: no size prefix. Markerset (0), rigid body (1), skeleton (2) and camera (5)
+ *           descriptions are walked field by field; the walk STOPS at any other type (force
+ *           plate, device, ...), returns what it has and reports complete = false. Motive sends
+ *           markersets and rigid bodies first, so a stop there loses no rigid body in practice.
+ *   Rigid body: name\0 (2.0+), int32 ID, int32 parentID, float[3] offset, float[4] rotation
+ *           offset (4.2+), int32 nMarkers, then nMarkers float[3] positions, nMarkers int32
+ *           active labels, and (4.0+) nMarkers name\0 strings.
+ * A body with a malformed marker block is dropped rather than half-filled. */
+int natnet_parse_modeldef(const uint8_t* payload, size_t len, int major, int minor,
+                          NatNetBodyDesc* out, int cap, bool* complete);
+
+/* ---- a thread-free session for control-side tools --------------------------------------------
+ * natnet_open above owns a receiver thread and the audio thread's pose slot. A survey tool needs
+ * neither: it wants the MODELDEF once and then raw frames, on its own thread, blocking. Same
+ * config struct (rigid_body/rigid_body_name are ignored), same handshake, same sockets. */
+typedef struct NatNetRaw NatNetRaw;
+
+/* Handshake (when cfg->server is set), then bind the data port and join the group. NULL on
+ * failure with a message in err. */
+NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap);
+/* The bitstream version in use (handshake, else cfg->major/minor, else 3.1). */
+void       natnet_raw_version(const NatNetRaw* r, int* major, int* minor);
+/* Ask the server for the model definitions and copy the NAT_MODELDEF payload (without the 4-byte
+ * packet header) into buf. Returns the payload length, or -1 (no server, no reply, or cap too
+ * small). Blocks up to about a second. */
+int        natnet_raw_modeldef(NatNetRaw* r, uint8_t* buf, size_t cap);
+/* Wait for the next NAT_FRAMEOFDATA and copy its payload into buf (a payload longer than cap is
+ * cut, and the parsers then reject it). Returns the payload length, 0 on a receive timeout (about
+ * 200 ms), -1 on a socket error. Other message types are skipped. */
+int        natnet_raw_next_frame(NatNetRaw* r, uint8_t* buf, size_t cap);
+void       natnet_raw_close(NatNetRaw* r);
 
 #endif /* BWA_NATNET_H */

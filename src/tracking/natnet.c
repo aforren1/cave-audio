@@ -6,6 +6,10 @@
  *      down to the selected rigid body's pose. Unit-tested; safe on hostile/truncated input.
  *   2. the consumer — a UDP (multicast or unicast) data socket + a receiver thread that decodes
  *      each frame and publishes the pose into a seqlock. Sockets through os.h; on-hardware-pending.
+ *   3. for control-side tools: natnet_parse_bodies (every body in a frame; it shares the prefix
+ *      walk and the per-body read with part 1, so the two cannot drift), natnet_parse_modeldef
+ *      (every rigid-body description with its marker offsets), and NatNetRaw, a thread-free
+ *      socket session. None of it touches the pose slot the audio thread reads.
  *
  * Wire format (from the documented protocol; cross-checked against the NatNet 4.5 SDK's
  * PacketClient sample — third_party/NatNet-4.5, referenced but never linked):
@@ -101,11 +105,12 @@ static bool skip_section_fixed(const uint8_t* b, size_t len, size_t* off,
     return rd_skip(len, off, (size_t)count * each);
 }
 
-bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
-                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid,
-                        NatNetStamps* stamps) {
-    if (stamps) { stamps->timestamp = -1.0; stamps->mid_exposure = 0; }
-    if (major < 3) return false;                 /* pre-3 embeds per-RB marker data: unsupported */
+/* Walk a FrameOfData from its start to the first rigid-body record. On success *off_out sits on
+ * body 0, *n_out is the body count and *rb_end_out the 4.1+ end of the rigid-body section (0 when
+ * there is no size prefix, or the prefix lies). Shared by the single-body parser that feeds the
+ * audio thread and the every-body parser the survey tool uses, so the two cannot drift. */
+static bool seek_rigid_bodies(const uint8_t* p, size_t len, int major, int minor,
+                              size_t* off_out, int32_t* n_out, size_t* rb_end_out) {
     size_t off = 0;
     int32_t n, sect;
 
@@ -137,26 +142,44 @@ bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
         if (sect >= 0 && off + (size_t)sect <= len && off + (size_t)sect >= off)
             rb_end = off + (size_t)sect;                               /* a lying count: no suffix hop */
     }
-    const bool have_params = ((major == 2 && minor >= 6) || major > 2);   /* always true for major >= 3 */
+    *off_out = off; *n_out = n; *rb_end_out = rb_end;
+    return true;
+}
+
+/* One rigid-body record: int32 ID, float[3] pos, float[4] quat, float meanError, int16 params. */
+static bool read_rigid_body(const uint8_t* p, size_t len, size_t* off, int major, int minor, NatNetBody* b) {
+    if (!rd_i32(p, len, off, &b->id)) return false;
+    if (!rd_f32(p, len, off, &b->pos[0]) || !rd_f32(p, len, off, &b->pos[1]) ||
+        !rd_f32(p, len, off, &b->pos[2])) return false;
+    if (!rd_f32(p, len, off, &b->quat[0]) || !rd_f32(p, len, off, &b->quat[1]) ||
+        !rd_f32(p, len, off, &b->quat[2]) || !rd_f32(p, len, off, &b->quat[3])) return false;
+    if (!rd_f32(p, len, off, &b->mean_error)) return false;
+    b->tracking_valid = true;
+    if ((major == 2 && minor >= 6) || major > 2) {                     /* always true for major >= 3 */
+        int16_t prm;
+        if (!rd_i16(p, len, off, &prm)) return false;
+        b->tracking_valid = (prm & 0x01) != 0;                         /* bit 0: tracked this frame */
+    }
+    return true;
+}
+
+bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
+                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid,
+                        NatNetStamps* stamps) {
+    if (stamps) { stamps->timestamp = -1.0; stamps->mid_exposure = 0; }
+    if (major < 3) return false;                 /* pre-3 embeds per-RB marker data: unsupported */
+    size_t off, rb_end;
+    int32_t n;
+    if (!seek_rigid_bodies(p, len, major, minor, &off, &n, &rb_end)) return false;
+
     bool found = false;
     for (int32_t i = 0; i < n && !found; ++i) {
-        int32_t id;
-        float x, y, z, qx, qy, qz, qw, meanErr;
-        if (!rd_i32(p, len, &off, &id)) return false;
-        if (!rd_f32(p, len, &off, &x)  || !rd_f32(p, len, &off, &y)  || !rd_f32(p, len, &off, &z))  return false;
-        if (!rd_f32(p, len, &off, &qx) || !rd_f32(p, len, &off, &qy) ||
-            !rd_f32(p, len, &off, &qz) || !rd_f32(p, len, &off, &qw)) return false;
-        if (!rd_f32(p, len, &off, &meanErr)) return false;
-        bool tv = true;
-        if (have_params) {
-            int16_t prm;
-            if (!rd_i16(p, len, &off, &prm)) return false;
-            tv = (prm & 0x01) != 0;                                    /* bit 0: tracked this frame */
-        }
-        if (want_id <= 0 || id == want_id) {
-            pos[0] = x; pos[1] = y; pos[2] = z;
-            quat[0] = qx; quat[1] = qy; quat[2] = qz; quat[3] = qw;
-            if (tracking_valid) *tracking_valid = tv;
+        NatNetBody b;
+        if (!read_rigid_body(p, len, &off, major, minor, &b)) return false;
+        if (want_id <= 0 || b.id == want_id) {
+            memcpy(pos, b.pos, sizeof b.pos);
+            memcpy(quat, b.quat, sizeof b.quat);
+            if (tracking_valid) *tracking_valid = b.tracking_valid;
             found = true;
         }
     }
@@ -190,8 +213,24 @@ bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
 
 bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
                          const char* want_name, int32_t* out_id) {
-    (void)minor;
-    if (major < 4 || !want_name || !out_id) return false;  /* per-description size prefix is NatNet 4.0+ */
+    if (major < 3 || !want_name || !out_id) return false;
+    /* The per-description sizeInBytes prefix is NatNet 4.1+ (the SDK's version-aware Python client
+     * gates it there; its C++ PacketClient reads it unconditionally but only talks 4.x). This
+     * resolver used to assume it from 4.0, so a Motive 3.0 server (NatNet 4.0) misread every
+     * description and name tracking never resolved. Below 4.1 there is no prefix to skip by, so
+     * hand the payload to the typed walk natnet_parse_modeldef does. Receiver thread, at connect:
+     * the heap scratch is fine here, never on the audio thread. */
+    if (!((major == 4 && minor >= 1) || major > 4)) {
+        enum { RN_CAP = 128 };
+        NatNetBodyDesc* d = (NatNetBodyDesc*)malloc(sizeof *d * RN_CAP);
+        if (!d) return false;
+        const int n = natnet_parse_modeldef(p, len, major, minor, d, RN_CAP, NULL);
+        bool found = false;
+        for (int i = 0; i < n && !found; ++i)
+            if (strcmp(d[i].name, want_name) == 0) { *out_id = d[i].id; found = true; }
+        free(d);
+        return found;
+    }
     size_t off = 0;
     int32_t nDatasets;
     if (!rd_i32(p, len, &off, &nDatasets) || nDatasets < 0) return false;
@@ -219,6 +258,125 @@ bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
         off = next;                                        /* skip the rest of this description */
     }
     return false;
+}
+
+/* ---- every rigid body (control-side tools; see natnet.h) ------------------ */
+
+int natnet_parse_bodies(const uint8_t* p, size_t len, int major, int minor,
+                        NatNetBody* out, int cap) {
+    if (major < 3 || cap < 0 || (cap > 0 && !out)) return -1;
+    size_t off, rb_end;
+    int32_t n;
+    if (!seek_rigid_bodies(p, len, major, minor, &off, &n, &rb_end)) return -1;
+    int w = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        NatNetBody b;
+        if (!read_rigid_body(p, len, &off, major, minor, &b)) return -1;   /* a cut frame is dropped whole */
+        if (w < cap) out[w++] = b;
+    }
+    return w;
+}
+
+/* Copy a NUL-terminated string that must end before `end` into dst (truncated to cap - 1). */
+static bool rd_name(const uint8_t* b, size_t end, size_t* off, char* dst, size_t cap) {
+    size_t k = 0;
+    while (*off < end) {
+        char c = (char)b[(*off)++];
+        if (c == 0) { dst[k] = 0; return true; }
+        if (k + 1 < cap) dst[k++] = c;
+    }
+    dst[k] = 0;
+    return false;
+}
+
+/* The SDK's own sanity bound on a description's marker count (PacketClient: "Unreasonable number
+ * of markers"). It also keeps count * 12 far from size_t overflow on a 32-bit build. */
+#define NN_DESC_MAX_MARKERS 16000
+
+/* One rigid-body description, bounded by `end` (the description's own size on 4.1+, the payload
+ * length before). Layout in natnet.h. */
+static bool read_rb_desc(const uint8_t* p, size_t end, size_t* off, int major, int minor, NatNetBodyDesc* d) {
+    memset(d, 0, sizeof *d);
+    d->rot_offset[3] = 1.f;
+    if (!rd_name(p, end, off, d->name, sizeof d->name)) return false;
+    if (!rd_i32(p, end, off, &d->id) || !rd_i32(p, end, off, &d->parent_id)) return false;
+    for (int c = 0; c < 3; ++c) if (!rd_f32(p, end, off, &d->offset[c])) return false;
+    if (major > 4 || (major == 4 && minor >= 2))
+        for (int c = 0; c < 4; ++c) if (!rd_f32(p, end, off, &d->rot_offset[c])) return false;
+    int32_t nm;
+    if (!rd_i32(p, end, off, &nm) || nm < 0 || nm > NN_DESC_MAX_MARKERS) return false;
+    d->n_markers = nm;
+    d->n_stored  = nm < NATNET_RB_MAX_MARKERS ? nm : NATNET_RB_MAX_MARKERS;
+    for (int32_t i = 0; i < nm; ++i) {
+        float v[3];
+        for (int c = 0; c < 3; ++c) if (!rd_f32(p, end, off, &v[c])) return false;
+        if (i < NATNET_RB_MAX_MARKERS) memcpy(d->markers[i], v, sizeof v);
+    }
+    if (!rd_skip(end, off, (size_t)nm * 4)) return false;             /* active labels */
+    if (major >= 4)
+        for (int32_t i = 0; i < nm; ++i) if (!rd_cstr(p, end, off)) return false;   /* marker names */
+    return true;
+}
+
+int natnet_parse_modeldef(const uint8_t* p, size_t len, int major, int minor,
+                          NatNetBodyDesc* out, int cap, bool* complete) {
+    if (complete) *complete = false;
+    if (major < 3 || cap < 0 || (cap > 0 && !out)) return -1;
+    size_t off = 0;
+    int32_t nsets;
+    if (!rd_i32(p, len, &off, &nsets) || nsets < 0) return -1;
+    const bool sized = has_size_prefix(major, minor);
+    NatNetBodyDesc scratch;                    /* skeleton bones, and bodies past cap */
+    int w = 0;
+    bool clean = true;
+    for (int32_t i = 0; i < nsets; ++i) {
+        int32_t type;
+        if (!rd_i32(p, len, &off, &type)) return w;
+        if (sized) {
+            int32_t size;
+            if (!rd_i32(p, len, &off, &size) || size < 0) return w;
+            size_t next = off + (size_t)size;
+            if (next > len || next < off) return w;          /* a lying size: stop, overflow-safe */
+            if (type == 1) {
+                NatNetBodyDesc* d = (w < cap) ? &out[w] : &scratch;
+                size_t o = off;
+                if (read_rb_desc(p, next, &o, major, minor, d)) { if (w < cap) ++w; }
+                else clean = false;                          /* dropped; the size still gets us past it */
+            }
+            off = next;
+            continue;
+        }
+        /* 3.0-4.0: no size prefix, so every description in front of a rigid body must be walked */
+        switch (type) {
+        case 0: {                                            /* markerset: name, nMarkers, names */
+            int32_t nm;
+            if (!rd_cstr(p, len, &off) || !rd_i32(p, len, &off, &nm) || nm < 0) return w;
+            for (int32_t k = 0; k < nm; ++k) if (!rd_cstr(p, len, &off)) return w;
+            break;
+        }
+        case 1: {
+            NatNetBodyDesc* d = (w < cap) ? &out[w] : &scratch;
+            if (!read_rb_desc(p, len, &off, major, minor, d)) return w;
+            if (w < cap) ++w;
+            break;
+        }
+        case 2: {                                            /* skeleton: name, ID, nBones, bone descs */
+            int32_t sid, nb;
+            if (!rd_cstr(p, len, &off) || !rd_i32(p, len, &off, &sid) ||
+                !rd_i32(p, len, &off, &nb) || nb < 0) return w;
+            for (int32_t k = 0; k < nb; ++k)
+                if (!read_rb_desc(p, len, &off, major, minor, &scratch)) return w;
+            break;
+        }
+        case 5:                                              /* camera: name, float[3] pos, float[4] quat */
+            if (!rd_cstr(p, len, &off) || !rd_skip(len, &off, 28)) return w;
+            break;
+        default:
+            return w;                                        /* force plate, device, ...: stop here */
+        }
+    }
+    if (complete) *complete = clean;
+    return w;
 }
 
 /* ---- consumer (UDP through the os.h shim; on-hardware-pending) ------------- */
@@ -498,5 +656,117 @@ void natnet_close(NatNet* nn) {
     os_thread_join(&nn->thread);
     os_udp_close(nn->sock);
     free(nn);
+    os_net_cleanup();
+}
+
+/* ---- thread-free session for control-side tools (see natnet.h) ------------ */
+
+struct NatNetRaw {
+    os_socket sock;
+    int       major, minor;
+    char      server[64];          /* copied: the caller's config need not outlive the open */
+    uint16_t  command_port;
+    uint8_t   pkt[65536];          /* one whole datagram (max UDP); heap-resident with the session */
+};
+
+NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap) {
+    if (!cfg) { nn_err(err, errcap, "natnet: null config"); return NULL; }
+    if (cfg->server && cfg->server[0] && !os_ipv4_valid(cfg->server)) {
+        nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname");
+        return NULL;
+    }
+    if (cfg->server && strlen(cfg->server) >= sizeof ((NatNetRaw*)0)->server) {
+        nn_err(err, errcap, "natnet: tracker server address too long"); return NULL;
+    }
+    if (cfg->multicast && cfg->multicast[0] && !os_ipv4_valid(cfg->multicast)) {
+        nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)");
+        return NULL;
+    }
+    if (os_net_startup() != 0) { nn_err(err, errcap, "natnet: socket startup failed"); return NULL; }
+    NatNetRaw* r = (NatNetRaw*)calloc(1, sizeof *r);
+    if (!r) { nn_err(err, errcap, "natnet: out of memory"); os_net_cleanup(); return NULL; }
+    r->sock = OS_INVALID_SOCKET;
+    if (cfg->server) strcpy(r->server, cfg->server);
+    r->command_port = cfg->command_port ? cfg->command_port : 1510;
+
+    /* the same version policy as natnet_open: the handshake is authoritative when a server is set */
+    if (r->server[0]) handshake_version(cfg, &r->major, &r->minor, NULL);
+    if (r->major <= 0) { r->major = cfg->major; r->minor = cfg->minor; }
+    if (r->major <= 0) { r->major = 3; r->minor = 1; }
+
+    r->sock = os_udp_open();
+    if (r->sock == OS_INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
+    os_udp_set_reuseaddr(r->sock);
+    os_udp_set_rcvtimeo_ms(r->sock, 200);
+    if (os_udp_bind_any(r->sock, cfg->data_port ? cfg->data_port : 1511) != 0) {
+        nn_err(err, errcap, "natnet: bind() failed"); goto fail;
+    }
+    if (cfg->multicast && cfg->multicast[0] &&
+        os_udp_join_multicast(r->sock, cfg->multicast, cfg->local_iface) != 0) {
+        nn_err(err, errcap, "natnet: multicast join failed"); goto fail;
+    }
+    return r;
+fail:
+    os_udp_close(r->sock);
+    free(r);
+    os_net_cleanup();
+    return NULL;
+}
+
+void natnet_raw_version(const NatNetRaw* r, int* major, int* minor) {
+    if (major) *major = r ? r->major : 0;
+    if (minor) *minor = r ? r->minor : 0;
+}
+
+int natnet_raw_modeldef(NatNetRaw* r, uint8_t* buf, size_t cap) {
+    if (!r || !r->server[0] || !buf) return -1;
+    os_socket s = os_udp_open();
+    if (s == OS_INVALID_SOCKET) return -1;
+    os_udp_set_rcvtimeo_ms(s, 800);
+    uint8_t req[4]; uint16_t id = NAT_REQUEST_MODELDEF, nb = 0;
+    memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
+    os_udp_sendto(s, req, sizeof req, r->server, r->command_port);
+
+    uint8_t* pkt = r->pkt;
+    int out = -1;
+    for (int tries = 0; tries < 8 && out < 0; ++tries) {
+        int got = os_udp_recv(s, pkt, sizeof r->pkt);
+        if (got < 4) break;
+        uint16_t msg, nbytes;
+        memcpy(&msg, pkt, 2); memcpy(&nbytes, pkt + 2, 2);
+        if (msg != NAT_MODELDEF) continue;
+        size_t plen = (size_t)got - 4;
+        if (nbytes <= plen) plen = nbytes;
+        if (plen > cap) break;
+        memcpy(buf, pkt + 4, plen);
+        out = (int)plen;
+    }
+    os_udp_close(s);
+    return out;
+}
+
+int natnet_raw_next_frame(NatNetRaw* r, uint8_t* buf, size_t cap) {
+    if (!r || !buf) return -1;
+    uint8_t* pkt = r->pkt;
+    for (;;) {
+        int got = os_udp_recv(r->sock, pkt, sizeof r->pkt);
+        if (got == OS_UDP_TIMEOUT) return 0;
+        if (got < 0) return -1;
+        if (got < 4) continue;
+        uint16_t msg, nbytes;
+        memcpy(&msg, pkt, 2); memcpy(&nbytes, pkt + 2, 2);
+        if (msg != NAT_FRAMEOFDATA) continue;
+        size_t plen = (size_t)got - 4;
+        if (nbytes <= plen) plen = nbytes;             /* trust the smaller of header/recv */
+        if (plen > cap) plen = cap;                    /* a cut payload fails the parser, safely */
+        memcpy(buf, pkt + 4, plen);
+        return (int)plen;
+    }
+}
+
+void natnet_raw_close(NatNetRaw* r) {
+    if (!r) return;
+    os_udp_close(r->sock);
+    free(r);
     os_net_cleanup();
 }

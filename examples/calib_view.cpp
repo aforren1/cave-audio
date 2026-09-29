@@ -7,7 +7,7 @@
  * layout as A and the written-back one as B) so a swapped channel, a bad mic placement, or a bogus
  * localize solve shows up as an absurd delta instead of an evening of confusion at the rig.
  *
- *   bwa_calib_view [layoutA.json] [layoutB.json]     # B optional: diff mode
+ *   bwa_calib_view [layoutA.json] [layoutB.json]     # B optional: diff mode (the Aim tab aims A's speakers)
  *       --irs <prefix>                              # preload <prefix>_NN.wav IR kernels
  *       --tests [filter]                            # run the imgui_test_engine suite (optionally
  *                                                   #   filtered, e.g. --tests viewer) and exit
@@ -42,6 +42,8 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 #include "calib/calib.h"                 /* trims solve + layout writeback (self-guarded extern "C") */
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <thread>
 
 #include <d3d11.h>
@@ -390,6 +392,8 @@ static void driver_pick(const char* id, char* buf, size_t cap) {
     bwTip("pick a registered ASIO driver (fills the field; clear the field for auto-pick)");
 }
 
+static bool aim_running(void);        /* the Aim tab's worker (below) owns the same shell and simulator */
+
 static void cap_fail(const char* m) { snprintf(J.msg, sizeof J.msg, "%s", m); J.state.store(3, std::memory_order_release); }
 
 static void cap_worker(void) {
@@ -554,7 +558,10 @@ static void tab_capture(void) {
     ImGui::EndDisabled();
 
     if (!running) {
-        if (ImGui::Button("Run calibration")) {
+        ImGui::BeginDisabled(aim_running());
+        const bool run_clicked = ImGui::Button("Run calibration");
+        ImGui::EndDisabled();
+        if (run_clicked) {
             if (J.th_live) { J.th.join(); J.th_live = false; }   /* reap the previous run */
             snprintf(J.ran_layout, sizeof J.ran_layout, "%s", J.layout);   /* snapshot: this run's paths */
             snprintf(J.ran_out,    sizeof J.ran_out,    "%s", J.out);
@@ -1024,6 +1031,378 @@ static void tab_zylia(void) {
     }
 }
 
+/* ============ Aim tab — live aiming of ONE speaker with the ZM-1 (bwa_calibrate --live N --zylia) ============
+ * The installer turns a box nobody can see (behind a screen, overhead); this tab sweeps it about once
+ * a second with the live sweep and shows, against layout A: where the box is (zylia_live_position:
+ * DOA x the center arrival minus the latency), and how far its axis is off the direction to the ZM-1,
+ * as a tilt PEAK METER (turn until it peaks: no calibration, and the screen's loss cannot move the
+ * peak) and as an estimated MAGNITUDE (the tilt against the 0 deg tilt of a stored reference or of
+ * the file's on_axis_db, inverted through the model). One mic position never says which way the box
+ * points, and the UI says so. The capture runs on a worker thread through calib_live_read, the SAME
+ * reading the CLI takes. Simulate mode synthesizes it with a draggable true position and aim. */
+#define AIM_HIST 90
+
+struct AimData {                         /* everything worker and UI share; copied out under the lock */
+    float move[3];                       /* simulate: the true position's offset from the layout (m) */
+    float turn_deg, tilt_deg;            /* simulate: the true aim, turned about +y then tilted, off the layout aim */
+    float screen_db;                     /* simulate: a screen's HF loss on every path out of the box */
+    int   n;                             /* readings published since Start */
+    int   dead;                          /* the last reading's dead capsule, -1 = none */
+    bool  have_pos; ZyliaLivePos lp;
+    bool  have_tilt; float tilt_db, below_db;
+    CalibPeakHold pk;
+    bool  have_ref; float tilt_ref;
+    CalibAimAngle a_ref, a_file;
+    float true_deg;                      /* simulate: the truth's angle off the mic */
+    float true_pos[3], true_aim[3];
+    float hist[AIM_HIST]; int nhist;     /* tilt, newest last */
+};
+
+struct AimJob {
+    int   spk;
+    bool  simulate, room;
+    float center[3]; bool center_set; char center_for[512];
+    float latency_ms; bool latency_set;  /* the rig's measured loop latency; simulate knows its own */
+    char  driver[128]; int in_first;
+    std::atomic<int>  state;             /* 0 idle / 1 running / 2 stopped / 3 failed */
+    std::atomic<bool> stop;
+    char  msg[256];
+    std::thread th; bool th_live;
+    /* snapshotted at Start for the worker */
+    int   r_spk; bool r_sim, r_room; float r_center[3]; double r_latency_s; bool r_lat_known;
+    bool  have_model, have_file; float tilt0_file, layout_deg;
+    std::mutex mu;
+    AimData d;
+};
+static AimJob AJ;
+static bool aim_running(void) { return AJ.state.load(std::memory_order_acquire) == 1; }
+static Layout g_aim_L;                   /* the worker's copy of layout A (never a stack local) */
+static float  g_aim_curve[CALIB_AIM_CURVE_N];
+
+/* the true aim of the simulated box: the layout aim turned about +y, then tilted about the
+ * perpendicular calib_sim_rotate uses */
+static void aim_truth(const Layout* L, int s, float turn_deg, float tilt_deg, float out[3]) {
+    const float* a = L->speakers[s].aim;
+    const float t = turn_deg * 3.14159265f / 180.f, c = cosf(t), sn = sinf(t);
+    const float r[3] = { c * a[0] + sn * a[2], a[1], -sn * a[0] + c * a[2] };
+    calib_sim_rotate(r, tilt_deg, out);
+}
+
+/* recompute the angle estimates from the current tilt and references (cheap: the curve is built) */
+static void aim_estimates(AimData& d) {
+    memset(&d.a_ref, 0, sizeof d.a_ref);
+    memset(&d.a_file, 0, sizeof d.a_file);
+    if (!d.have_tilt || !AJ.have_model) return;
+    if (d.have_ref)     calib_aim_invert(g_aim_curve, d.tilt_db - d.tilt_ref, CALIB_LIVE_TILT_TOL_DB, &d.a_ref);
+    if (AJ.have_file)   calib_aim_invert(g_aim_curve, d.tilt_db - AJ.tilt0_file, CALIB_LIVE_TILT_TOL_DB, &d.a_file);
+}
+
+static void aim_fail(const char* m) { snprintf(AJ.msg, sizeof AJ.msg, "%s", m); AJ.state.store(3, std::memory_order_release); }
+
+static void aim_worker(void) {
+    const Layout* L = &g_aim_L;
+    const int s = AJ.r_spk;
+    static float lsweep[CAL_LIVE_NSWEEP];
+    static float cap19[(size_t)ZYLIA_MICS * CAL_CAPLEN];      /* the ASIO shell's row stride */
+    measure_sweep(lsweep, CAL_LIVE_NSWEEP, CAL_F1, CAL_F2, CAL_FS);
+    if (AJ.r_sim) calib_sim_set_room(AJ.r_room ? 0.3f : 0.f);
+#ifdef BWA_HAVE_ASIO
+    bool asio_up = false;
+    if (!AJ.r_sim) {
+        if (calib_asio_open_multi(AJ.driver[0] ? AJ.driver : NULL, AJ.in_first, ZYLIA_MICS, (int)L->count, lsweep, cap19) != 0) {
+            aim_fail("ASIO open failed (the layout's outputs + 19 ZM-1 inputs on one device; see console)"); return; }
+        asio_up = true;
+    }
+#else
+    if (!AJ.r_sim) { aim_fail("built without the ASIO SDK - simulate only"); return; }
+#endif
+    const double C = g_room_sos > 0.0 ? g_room_sos : BWA_SOS_REF_MPS;
+    while (!AJ.stop.load(std::memory_order_relaxed)) {
+        CalibSimOpts o; memset(&o, 0, sizeof o);
+        float tp[3], ta[3];
+        {
+            std::lock_guard<std::mutex> lk(AJ.mu);
+            for (int a = 0; a < 3; ++a) tp[a] = L->speakers[s].pos[a] + AJ.d.move[a];
+            aim_truth(L, s, AJ.d.turn_deg, AJ.d.tilt_deg, ta);
+            o.screen_db = AJ.d.screen_db;
+        }
+        o.on_axis = 1; o.true_pos = tp; o.true_aim = ta;
+        CalibLiveReading rd;
+        if (!calib_live_read(s, L, AJ.r_center, C, AJ.r_sim, &o, lsweep, cap19, &rd)) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            if (AJ.r_sim) calib_sim_set_room(0.f);
+            aim_fail("capture timed out (speaker not wired? see console)");
+            return;
+        }
+        ZyliaLivePos lp;
+        const bool have_pos = rd.ok && zylia_live_position(rd.arr, AJ.r_center, AJ.r_lat_known, AJ.r_latency_s, C,
+                                                             L->speakers[s].pos, &lp);
+        {
+            std::lock_guard<std::mutex> lk(AJ.mu);
+            AimData& d = AJ.d;
+            d.dead = rd.ok ? -1 : rd.dead;
+            d.have_pos = have_pos;
+            if (have_pos) d.lp = lp;
+            d.have_tilt = rd.ok && rd.have_tilt;
+            if (d.have_tilt) {
+                d.tilt_db  = rd.tilt_db;
+                d.below_db = calib_peak_update(&d.pk, rd.tilt_db);
+                if (d.nhist == AIM_HIST) { memmove(d.hist, d.hist + 1, (AIM_HIST - 1) * sizeof d.hist[0]); --d.nhist; }
+                d.hist[d.nhist++] = rd.tilt_db;
+            }
+            memcpy(d.true_pos, tp, sizeof tp); memcpy(d.true_aim, ta, sizeof ta);
+            d.true_deg = directivity_off_axis_deg(tp, ta, AJ.r_center);
+            aim_estimates(d);
+            ++d.n;
+        }
+        if (AJ.r_sim) std::this_thread::sleep_for(std::chrono::milliseconds(20));   /* leave the UI a core */
+    }
+#ifdef BWA_HAVE_ASIO
+    if (asio_up) calib_asio_close();
+#endif
+    if (AJ.r_sim) calib_sim_set_room(0.f);                       /* do not leak the room into the Capture tab */
+    snprintf(AJ.msg, sizeof AJ.msg, "stopped");
+    AJ.state.store(2, std::memory_order_release);
+}
+
+static void aim_start(void) {
+    if (AJ.th_live) { AJ.th.join(); AJ.th_live = false; }
+    g_aim_L = V.A;
+    AJ.r_spk = AJ.spk; AJ.r_sim = AJ.simulate; AJ.r_room = AJ.room;
+    memcpy(AJ.r_center, AJ.center, sizeof AJ.center);
+    if (AJ.simulate)         { AJ.r_latency_s = CAL_SIM_LATENCY_SAMPLES / CAL_FS; AJ.r_lat_known = true; }
+    else if (AJ.latency_set) { AJ.r_latency_s = AJ.latency_ms * 1e-3;            AJ.r_lat_known = true; }
+    else                     { AJ.r_latency_s = 0.0;                              AJ.r_lat_known = false; }
+    const double band[2] = { CALIB_LIVE_MID_HZ, CALIB_LIVE_HIGH_HZ };   /* the live meter's bands (calib.h) */
+    AJ.have_model = g_aim_L.dir.nband > 0;
+    if (AJ.have_model) calib_aim_curve(&g_aim_L.dir, band, CAL_F2, g_aim_curve);
+    AJ.have_file = AJ.have_model && calib_on_axis_tilt_db(&g_aim_L.dir, band, CAL_F2, &AJ.tilt0_file);
+    AJ.layout_deg = layout_speaker_off_axis_deg(&g_aim_L, (uint32_t)AJ.spk, AJ.center);
+    {
+        std::lock_guard<std::mutex> lk(AJ.mu);
+        AJ.d.n = 0; AJ.d.dead = -1; AJ.d.have_pos = AJ.d.have_tilt = false; AJ.d.nhist = 0;
+        calib_peak_reset(&AJ.d.pk);                              /* a new box: a new peak (the reference stays) */
+        aim_estimates(AJ.d);
+    }
+    AJ.msg[0] = 0;
+    AJ.stop.store(false);
+    AJ.state.store(1, std::memory_order_release);
+    AJ.th = std::thread(aim_worker); AJ.th_live = true;
+}
+
+static void aim_fmt(const CalibAimAngle& a, char* buf, size_t cap) {
+    if (!a.ok)          snprintf(buf, cap, "-");
+    else if (a.beyond)  snprintf(buf, cap, ">= %.0f deg", a.max_deg);
+    else if (a.on_axis) snprintf(buf, cap, "on axis (under %.0f deg)", a.hi_deg);
+    else                snprintf(buf, cap, "%.1f deg  [%.0f to %.0f]", a.angle_deg, a.lo_deg, a.hi_deg);
+}
+
+static void tab_aim(void) {
+    const int st = AJ.state.load(std::memory_order_acquire);
+    const bool running = st == 1;
+    if (!V.hasA) {
+        ImGui::TextDisabled("load layout A (the rig's layout, with its directivity model) to aim its speakers");
+        return;
+    }
+    /* the ZM-1 sits at layout A's listening point until the user says otherwise */
+    if (strcmp(AJ.center_for, V.pathA) != 0) {
+        snprintf(AJ.center_for, sizeof AJ.center_for, "%s", V.pathA);
+        if (!AJ.center_set) memcpy(AJ.center, V.A.ref, sizeof AJ.center);
+    }
+    if (AJ.spk < 0) AJ.spk = 0;
+    if (AJ.spk >= (int)V.A.count) AJ.spk = (int)V.A.count - 1;
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(uiScaled(110));
+    ImGui::InputInt("speaker##aim", &AJ.spk);
+    bwTip("the speaker to aim: layout A's index (the side panel lists them)");
+    if (AJ.spk < 0) AJ.spk = 0;
+    if (AJ.spk >= (int)V.A.count) AJ.spk = (int)V.A.count - 1;
+    ImGui::SameLine();
+    const float* sp = V.A.speakers[AJ.spk].pos;
+    ImGui::TextDisabled("at (%.2f %.2f %.2f)", sp[0], sp[1], sp[2]);
+    ImGui::SameLine(0, uiScaled(16));
+    ImGui::Checkbox("simulate##aim", &AJ.simulate);
+    bwTip("no hardware: synthesize each reading (the live sweep, the 19 capsules, the directivity model at the "
+          "TRUE angle) with a box you can move and turn below");
+    if (AJ.simulate) { ImGui::SameLine(); ImGui::Checkbox("room##aim", &AJ.room);
+                       bwTip("put the simulated shoebox room around the array (bwa_calibrate --sim-room 0.3)"); }
+    ImGui::SetNextItemWidth(uiScaled(220));
+    if (ImGui::InputFloat3("ZM-1 center (m)##aim", AJ.center, "%.3f")) AJ.center_set = true;
+    bwTip("the array center, room coordinates. Defaults to layout A's listening point (4.75 ft on the rig)");
+    if (!AJ.simulate) {
+        ImGui::SameLine(0, uiScaled(16));
+        ImGui::SetNextItemWidth(uiScaled(100));
+        if (ImGui::InputFloat("latency (ms)##aim", &AJ.latency_ms, 0.f, 0.f, "%.3f")) AJ.latency_set = AJ.latency_ms > 0.f;
+        bwTip("the measured loop latency (bwa_calibrate --zylia --ref prints it; about 60 ms through Dante Via). "
+              "0 = unknown: direction only, no distance. 20 us of error is 6.9 mm of distance");
+#ifdef BWA_HAVE_ASIO
+        ImGui::SetNextItemWidth(uiScaled(160));
+        ImGui::InputTextWithHint("##aimdrv", "ASIO driver (auto)", AJ.driver, sizeof AJ.driver);
+        driver_pick("##aimdrvpick", AJ.driver, sizeof AJ.driver);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
+        ImGui::InputInt("first ZM-1 input##aim", &AJ.in_first);
+        bwTip("the driver input carrying the ZM-1's first capsule; the 19 capsules are consecutive from here");
+        if (AJ.in_first < 0) AJ.in_first = 0;
+#else
+        ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
+#endif
+    }
+    ImGui::EndDisabled();
+
+    const bool capture_busy = J.state.load(std::memory_order_acquire) == 1;   /* one sweep shell, one simulator */
+    if (!running) {
+        ImGui::BeginDisabled(capture_busy);
+        if (ImGui::Button("Start##aim")) aim_start();
+        ImGui::EndDisabled();
+        bwTip(capture_busy ? "the Capture tab is running a calibration" : "sweep the speaker over and over (about one reading a second on the rig)");
+    } else if (ImGui::Button("Stop##aim")) AJ.stop.store(true);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", st == 3 ? AJ.msg : (running ? "running" : (st == 2 ? "stopped" : "idle")));
+    if (st == 3) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED"); }
+
+    if (AJ.simulate) {                                          /* the simulated truth, live */
+        std::lock_guard<std::mutex> lk(AJ.mu);
+        ImGui::SetNextItemWidth(uiScaled(220));
+        ImGui::DragFloat3("true offset (m)##aim", AJ.d.move, 0.002f, -0.5f, 0.5f, "%.3f");
+        bwTip("where the simulated box really is, relative to its layout position");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(uiScaled(90));
+        ImGui::DragFloat("turn (deg)##aim", &AJ.d.turn_deg, 0.25f, -90.f, 90.f, "%.1f");
+        bwTip("the simulated box's aim, turned about vertical off its layout aim (no effect on a box aimed straight up or down)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(uiScaled(90));
+        ImGui::DragFloat("tilt (deg)##aim", &AJ.d.tilt_deg, 0.25f, -90.f, 90.f, "%.1f");
+        bwTip("... and tilted off it");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(uiScaled(90));
+        ImGui::DragFloat("screen (dB)##aim", &AJ.d.screen_db, 0.05f, 0.f, 6.f, "%.2f");
+        bwTip("a screen's high-frequency loss on every path out of the box (a shelf above 4 kHz). The peak and a "
+              "stored reference do not care; the file's 0 deg tilt does");
+    }
+
+    AimData d;
+    { std::lock_guard<std::mutex> lk(AJ.mu); d = AJ.d; }
+    ImGui::Separator();
+
+    /* -------- left: the meter and the numbers; right: the 3D view -------- */
+    ImGui::BeginChild("aimmeter", ImVec2(uiScaled(520), 0));
+    {
+        if (ImGui::Button("Store reference")) {
+            std::lock_guard<std::mutex> lk(AJ.mu);
+            if (AJ.d.have_tilt) { AJ.d.have_ref = true; AJ.d.tilt_ref = AJ.d.tilt_db; aim_estimates(AJ.d); }
+        }
+        bwTip("take THIS reading as the on-axis tilt: do it on a speaker known to point at the ZM-1 (one the "
+              "optical survey confirmed, or one you just peaked). It absorbs the ZM-1, the gate and the screen");
+        ImGui::SameLine();
+        if (ImGui::Button("Reset peak")) {
+            std::lock_guard<std::mutex> lk(AJ.mu);
+            calib_peak_reset(&AJ.d.pk); AJ.d.below_db = 0.f;
+        }
+        bwTip("forget the held peak (a new box, or the peak came from a bad reading)");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear reference")) {
+            std::lock_guard<std::mutex> lk(AJ.mu);
+            AJ.d.have_ref = false; aim_estimates(AJ.d);
+        }
+        if (d.have_ref) { ImGui::SameLine(); ImGui::TextDisabled("ref %+.2f dB", d.tilt_ref); }
+
+        /* the number read from a ladder: how far below the peak */
+        const float fs0 = ImGui::GetStyle().FontSizeBase;
+        const bool at_peak = d.have_tilt && d.below_db < 0.1f;
+        ImGui::PushFont(NULL, fs0 * 4.0f);
+        if (d.have_tilt) ImGui::TextColored(at_peak ? ImVec4(0.45f, 0.9f, 0.5f, 1.f) : ImVec4(0.95f, 0.8f, 0.35f, 1.f),
+                                            "%.1f dB", d.below_db);
+        else             ImGui::TextDisabled("-- dB");
+        ImGui::PopFont();
+        ImGui::TextUnformatted(at_peak ? "AT PEAK: the treble is as high as it has been" : "below the peak: turn the box until this reads 0");
+
+        /* the meter: the reading as a bar over [peak - 6 dB, peak + 0.5 dB], the held peak as a line */
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float w = ImGui::GetContentRegionAvail().x, h = uiScaled(34);
+            dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(40, 42, 50, 255), 3.f);
+            if (d.have_tilt && d.pk.peak_index) {
+                const float lo = d.pk.peak_db - 6.f, hi = d.pk.peak_db + 0.5f;
+                float t = (d.tilt_db - lo) / (hi - lo); t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+                const float tp = (d.pk.peak_db - lo) / (hi - lo);
+                dl->AddRectFilled(p0, ImVec2(p0.x + w * t, p0.y + h), at_peak ? IM_COL32(90, 200, 110, 255) : IM_COL32(230, 180, 70, 255), 3.f);
+                dl->AddLine(ImVec2(p0.x + w * tp, p0.y - 3.f), ImVec2(p0.x + w * tp, p0.y + h + 3.f), IM_COL32(250, 250, 250, 255), 3.f);
+            }
+            ImGui::Dummy(ImVec2(w, h + 4.f));
+        }
+        if (d.have_tilt) ImGui::Text("tilt %+.2f dB   peak %+.2f dB (reading %d of %d)", d.tilt_db, d.pk.peak_db, d.pk.peak_index, d.pk.n);
+        else             ImGui::TextDisabled(running ? "waiting for the first reading..." : "Start to measure");
+        if (d.dead >= 0) ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.f), "capsule %d (input %d) is dead or silent: reading skipped",
+                                            d.dead, AJ.in_first + d.dead);
+        if (d.nhist > 1 && ImPlot::BeginPlot("##aimhist", ImVec2(-1, uiScaled(110)), ImPlotFlags_NoLegend | ImPlotFlags_NoMenus)) {
+            ImPlot::SetupAxes(NULL, "tilt dB", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, AIM_HIST, ImPlotCond_Always);
+            ImPlot::PlotLine("tilt", d.hist, d.nhist);
+            ImPlot::EndPlot();
+        }
+
+        /* the angle: a magnitude, next to the target */
+        ImGui::Separator();
+        ImGui::PushFont(NULL, fs0 * 1.6f);
+        char a1[64], a2[64];
+        aim_fmt(d.a_ref, a1, sizeof a1);
+        aim_fmt(d.a_file, a2, sizeof a2);
+        ImGui::Text("off axis (ref):  %s", d.have_ref ? a1 : "store a reference");
+        ImGui::Text("off axis (file): %s", AJ.have_file ? a2 : "no on_axis_db");
+        ImGui::Text("layout expects:  %.1f deg", AJ.layout_deg);
+        if (AJ.simulate && d.n) ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.55f, 1.f), "truth (simulate): %.1f deg", d.true_deg);
+        ImGui::PopFont();
+        ImGui::TextWrapped("The angle is a MAGNITUDE: how far the box's axis is off the line to the ZM-1, never which way "
+                           "it points. Near 0 deg the model's curve is flat, so a box within the 'under N deg' bracket "
+                           "reads as on axis. Use the peak meter to aim; the angle says how far there is to go.");
+        if (!AJ.have_model) ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.f), "layout A has no directivity model: the meter works, the angle does not");
+
+        /* the position */
+        ImGui::Separator();
+        if (d.have_pos && d.lp.have_distance)
+            ImGui::Text("position: %+.0f %+.0f %+.0f mm off the layout (|d| %.0f mm)\ndirection %.2f deg off, distance %.3f m (%+.0f mm)",
+                        d.lp.delta_mm[0], d.lp.delta_mm[1], d.lp.delta_mm[2], d.lp.delta_norm_mm, d.lp.dir_err_deg, d.lp.dist_m, d.lp.dist_err_mm);
+        else if (d.have_pos)
+            ImGui::Text("direction %.2f deg off the layout (no latency: no distance)", d.lp.dir_err_deg);
+        else
+            ImGui::TextDisabled("position: -");
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    if (ImPlot3D::BeginPlot("##aim3d", ImGui::GetContentRegionAvail(), ImPlot3DFlags_NoPan)) {
+        ImPlot3D::SetupAxes("x (m)", "z (m)", "y up (m)", ImPlot3DAxisFlags_AutoFit, ImPlot3DAxisFlags_AutoFit, ImPlot3DAxisFlags_AutoFit);
+        const Layout& L = V.A;
+        if (V.hasA) ImPlot3D::PlotScatter("speakers", V.ax, V.ay, V.az, (int)L.count,
+                                          ImPlot3DSpec(ImPlot3DProp_MarkerSize, 3.0f, ImPlot3DProp_MarkerFillColor, IM_COL32(120, 120, 140, 160)));
+        const int s = AJ.spk;
+        const float* p = L.speakers[s].pos; const float* a = L.speakers[s].aim;
+        float lx[2] = { p[0], p[0] + 0.4f * a[0] }, ly[2] = { p[2], p[2] + 0.4f * a[2] }, lz[2] = { p[1], p[1] + 0.4f * a[1] };
+        ImPlot3D::PlotScatter("layout", &lx[0], &ly[0], &lz[0], 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 7.0f));
+        ImPlot3D::PlotLine("layout aim", lx, ly, lz, 2);
+        float cx = AJ.center[0], cy = AJ.center[2], cz = AJ.center[1];
+        ImPlot3D::PlotScatter("ZM-1", &cx, &cy, &cz, 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 6.0f));
+        if (d.have_pos) {                                        /* the measured direction, and the position on it */
+            const float r = d.lp.have_distance ? d.lp.dist_m : d.lp.layout_dist_m;
+            float ex[2] = { cx, AJ.center[0] + r * d.lp.dir[0] }, ey[2] = { cy, AJ.center[2] + r * d.lp.dir[2] },
+                  ez[2] = { cz, AJ.center[1] + r * d.lp.dir[1] };
+            ImPlot3D::PlotLine("measured direction", ex, ey, ez, 2);
+            if (d.lp.have_distance) ImPlot3D::PlotScatter("measured", &ex[1], &ey[1], &ez[1], 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 6.0f));
+        }
+        if (AJ.simulate && d.n) {                                /* the truth the estimate should land on */
+            float tx[2] = { d.true_pos[0], d.true_pos[0] + 0.4f * d.true_aim[0] }, ty[2] = { d.true_pos[2], d.true_pos[2] + 0.4f * d.true_aim[2] },
+                  tz[2] = { d.true_pos[1], d.true_pos[1] + 0.4f * d.true_aim[1] };
+            ImPlot3D::PlotScatter("truth", &tx[0], &ty[0], &tz[0], 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 5.0f));
+            ImPlot3D::PlotLine("true aim", tx, ty, tz, 2);
+        }
+        ImPlot3D::EndPlot();
+    }
+}
+
 static void draw_ui(void) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -1090,6 +1469,7 @@ static void draw_ui(void) {
         if (ImGui::BeginTabItem("Diff"))    { tab_diff();    ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Capture")) { tab_capture(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Zylia"))   { tab_zylia();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Aim"))     { tab_aim();     ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
@@ -1108,6 +1488,7 @@ static void draw_ui(void) {
 static const char* FIX_A = "calibview_fix_a.json";
 static const char* FIX_B = "calibview_fix_b.json";
 static const char* FIX_D = "calibview_fix_d.json";   /* A plus a directivity model and a listening point */
+static const char* FIX_E = "calibview_fix_e.json";   /* A plus a listening point and a model with on_axis_db */
 
 static int write_fixture(const char* path, int variant_b) {
     FILE* f = fopen(path, "wb");
@@ -1131,7 +1512,20 @@ static int write_fixture(const char* path, int variant_b) {
         fprintf(f, " }%s\n", idx < 25 ? "," : "");
         ++idx;
     }
-    if (variant_b == 2)
+    if (variant_b == 3) {
+        /* loss = -g (1 - cos theta) per band: the flat top a waveguide has near 0 deg */
+        const float bands[6] = { 500, 1000, 2000, 4000, 8000, 16000 }, g[6] = { 0.5f, 1.f, 2.f, 4.f, 8.f, 14.f };
+        const int ang[8] = { 0, 10, 20, 30, 45, 60, 90, 180 };
+        fprintf(f, "  ],\n  \"listening_point_m\": [0.1, 0, 0.1],\n  \"directivity\": { \"bands_hz\": [500, 1000, 2000, 4000, 8000, 16000],\n"
+                   "    \"angles_deg\": [0, 10, 20, 30, 45, 60, 90, 180], \"split_hz\": 1000,\n"
+                   "    \"on_axis_db\": [80, 80, 80, 80, 80, 80],\n    \"loss_db\": [");
+        for (int b = 0; b < 6; ++b) {
+            fprintf(f, "%s[", b ? ", " : "");
+            for (int a = 0; a < 8; ++a) fprintf(f, "%s%.3f", a ? ", " : "", -g[b] * (1.0 - cos(ang[a] * 3.14159265358979 / 180.0)));
+            fprintf(f, "]");
+        }
+        fprintf(f, "] }\n}\n");
+    } else if (variant_b == 2)
         fprintf(f, "  ],\n  \"listening_point_m\": [0.2, 0.3, -0.1],\n"
                    "  \"directivity\": { \"bands_hz\": [250, 4000], \"angles_deg\": [0, 30, 60, 90, 180],\n"
                    "    \"split_hz\": 1000, \"loss_db\": [[0, -1, -2, -3, -6], [0, -4, -10, -16, -25]] }\n}\n");
@@ -1321,11 +1715,71 @@ static void register_tests(ImGuiTestEngine* e) {
         zylia_set_capsules(NULL);                                /* don't leak the override into other tests */
     };
 
+    /* live aiming, simulate, through the real UI: a box on its layout aim reads at the peak; store it
+     * as the reference; turn the box 25 deg away and the meter drops while the estimate grows; turn it
+     * back and it peaks again and reads "on axis". The worker publishes a reading per sweep, and the
+     * truth is read at the start of each, so every check waits for TWO new readings after a change. */
+    t = IM_REGISTER_TEST(e, "aim", "sim_live");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto wait_readings = [&](int more) {
+            int n0; { std::lock_guard<std::mutex> lk(AJ.mu); n0 = AJ.d.n; }
+            double t0 = ImGui::GetTime();
+            for (;;) {
+                int n; { std::lock_guard<std::mutex> lk(AJ.mu); n = AJ.d.n; }
+                if (n >= n0 + more || AJ.state.load() != 1 || ImGui::GetTime() - t0 > 60.0) break;
+                ctx->Yield();
+            }
+        };
+        auto snap = [&]() { AimData d; std::lock_guard<std::mutex> lk(AJ.mu); d = AJ.d; return d; };
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/##A");
+        ctx->KeyCharsReplaceEnter(FIX_E);
+        ctx->ItemClick("**/Load A");
+        IM_CHECK(V.hasA && V.A.dir.has_on_axis);
+        ctx->ItemClick("**/Aim");
+        ctx->Yield(2);
+        ctx->ItemInputValue("**/speaker##aim", 3);               /* (-1.5, 0, -1.5): level with the ZM-1, so a turn is the full angle */
+        ctx->ItemCheck("**/simulate##aim");
+        ctx->Yield(2);
+        IM_CHECK_LT(fabsf(AJ.center[0] - 0.1f) + fabsf(AJ.center[1]) + fabsf(AJ.center[2] - 0.1f), 1e-4f);   /* the ZM-1 defaults to the listening point */
+        ctx->ItemInputValue("**/turn (deg)##aim", 0.0f);
+        ctx->ItemClick("**/Start##aim");
+        wait_readings(2);
+        AimData d = snap();
+        IM_CHECK_EQ(AJ.state.load(), 1);
+        IM_CHECK(d.have_tilt && d.below_db < 0.05f);
+        IM_CHECK(d.a_file.ok && d.a_file.on_axis);                /* the fixture's flat on-axis response */
+        IM_CHECK(d.have_pos && d.lp.delta_norm_mm < 25.f);        /* where the layout says */
+        ctx->ItemClick("**/Store reference");
+        d = snap();
+        IM_CHECK(d.have_ref && d.a_ref.on_axis);
+
+        ctx->ItemInputValue("**/turn (deg)##aim", 25.0f);
+        wait_readings(2);
+        d = snap();
+        printf("aim test: turned 25 deg: truth %.1f, below %.2f dB, ref %.1f deg [%.1f-%.1f]\n",
+               d.true_deg, d.below_db, d.a_ref.angle_deg, d.a_ref.lo_deg, d.a_ref.hi_deg);
+        IM_CHECK_GT(d.below_db, 0.5f);                            /* the meter drops */
+        IM_CHECK(d.a_ref.ok && !d.a_ref.on_axis);                 /* the estimate grows */
+        IM_CHECK_LT(fabsf(d.a_ref.angle_deg - d.true_deg), 3.0f);
+        ctx->CaptureScreenshotWindow("//calib view");
+
+        ctx->ItemInputValue("**/turn (deg)##aim", 0.0f);
+        wait_readings(2);
+        d = snap();
+        IM_CHECK_LT(d.below_db, 0.05f);                           /* back at the peak */
+        IM_CHECK(d.a_ref.ok && d.a_ref.on_axis);                  /* and "on axis" */
+        ctx->ItemClick("**/Stop##aim");
+        double t0 = ImGui::GetTime();
+        while (AJ.state.load() == 1 && ImGui::GetTime() - t0 < 30.0) ctx->Yield();
+        IM_CHECK_EQ(AJ.state.load(), 2);
+    };
+
     t = IM_REGISTER_TEST(e, "viewer", "tabs");                   /* every tab renders without faulting */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
-        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff", "**/Capture", "**/Zylia" };
-        for (int i = 0; i < 7; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
+        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff", "**/Capture", "**/Zylia", "**/Aim" };
+        for (int i = 0; i < 8; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
         ctx->ItemClick("**/EQ");                                 /* the checkbox lives inside the EQ tab */
         ctx->Yield(2);
         ctx->ItemClick("**/overlay all speakers");
@@ -1431,7 +1885,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--tests [filter]]\n"
                    "  calibration station: array 3D view, trims, EQ curves, IRs, a layout diff (A vs\n"
-                   "  B), the Capture tab (sweep->measure->solve->writeback), and the Zylia DOA tab.\n");
+                   "  B), the Capture tab (sweep->measure->solve->writeback), the Zylia DOA tab, and the\n"
+                   "  Aim tab (live aiming of one of A's speakers with the ZM-1).\n");
             return 0;
         }
         else if (argv[i][0] != '-' && npos < 2) {
@@ -1443,7 +1898,7 @@ int main(int argc, char** argv) {
     for (int k = 0; k < EQ_PTS; ++k) V.eqfreq[k] = 20.0f * powf(1000.0f, (float)k / (EQ_PTS - 1));
     J.simulate = true;                                            /* hardware capture is the rig-day opt-out */
     if (selftest) {
-        if (!write_fixture(FIX_A, 0) || !write_fixture(FIX_B, 1) || !write_fixture(FIX_D, 2)) {
+        if (!write_fixture(FIX_A, 0) || !write_fixture(FIX_B, 1) || !write_fixture(FIX_D, 2) || !write_fixture(FIX_E, 3)) {
             fprintf(stderr, "calib_view: cannot write fixtures in cwd\n"); return 1; }
     } else {
         if (!V.pathA[0]) snprintf(V.pathA, sizeof V.pathA, "cave_layout.json");
@@ -1537,5 +1992,6 @@ int main(int argc, char** argv) {
     for (int i = 0; i < BWA_MAX_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
     if (Z.live) zylia_capture_close();
     if (J.th_live) { J.cancel.store(true); J.th.join(); }        /* reap a still-running capture job */
+    if (AJ.th_live) { AJ.stop.store(true); AJ.th.join(); }       /* ... and a live aiming run */
     return rc;
 }
