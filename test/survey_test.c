@@ -186,8 +186,8 @@ static void test_avg(void) {
         if (i % 3 == 0) for (int k = 0; k < 4; ++k) q[k] = -q[k];   /* same rotation, other sign */
         CHECK(survey_avg_add(&a, p, q), "avg add");
     }
-    const float nanp[3] = { NAN, 0, 0 }, zq[4] = { 0, 0, 0, 0 };
-    CHECK(!survey_avg_add(&a, nanp, base) && !survey_avg_add(&a, nanp + 1, zq), "avg rejects non-finite / zero quat");
+    const float nanp[3] = { NAN, 0, 0 }, okp[3] = { 0, 0, 0 }, zq[4] = { 0, 0, 0, 0 };
+    CHECK(!survey_avg_add(&a, nanp, base) && !survey_avg_add(&a, okp, zq), "avg rejects non-finite / zero quat");
     float p[3], q[4], sm, sd;
     CHECK(survey_avg_result(&a, p, q, &sm, &sd), "avg result");
     float dq = fabsf(q[0] * base[0] + q[1] * base[1] + q[2] * base[2] + q[3] * base[3]);

@@ -3142,8 +3142,10 @@ static void directivity_track(RtCore* c) {
          * left of the clamped high-band comp after the clamped broadband part, so the treble never
          * exceeds +/-10 dB however the two halves split (align.c re-clamps as a backstop) */
         float g = c->dir_ref_lo[k] - lo, h = c->dir_ref_hi[k] - hi;
-        if (g >  BWA_DIR_GAIN_MAX_DB)  g =  BWA_DIR_GAIN_MAX_DB;  if (g < -BWA_DIR_GAIN_MAX_DB)  g = -BWA_DIR_GAIN_MAX_DB;
-        if (h >  BWA_DIR_SHELF_MAX_DB) h =  BWA_DIR_SHELF_MAX_DB; if (h < -BWA_DIR_SHELF_MAX_DB) h = -BWA_DIR_SHELF_MAX_DB;
+        if (g >  BWA_DIR_GAIN_MAX_DB)  g =  BWA_DIR_GAIN_MAX_DB;
+        if (g < -BWA_DIR_GAIN_MAX_DB)  g = -BWA_DIR_GAIN_MAX_DB;
+        if (h >  BWA_DIR_SHELF_MAX_DB) h =  BWA_DIR_SHELF_MAX_DB;
+        if (h < -BWA_DIR_SHELF_MAX_DB) h = -BWA_DIR_SHELF_MAX_DB;
         gn[k] = g;
         sh[k] = h - g;
     }

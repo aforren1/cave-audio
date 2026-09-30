@@ -710,7 +710,10 @@ static double xt_shape(double t) {                       /* t in samples from th
 static void test_ir_tdoa(void) {
     const double C = 343.0, LAT = 0.0047, FS = 48000.0;
     const float center[3] = { 0.1f, 1.2f, -0.3f };
-    enum { NIR = 700, XW = 256, XPRE = 64 };
+    /* NIR must hold the latest window: arrivals land near (2.5 m / c + LAT) x FS = 575 samples and the
+     * window runs to 192 past the peak. It was 700, and the window read past each row's end, which
+     * passed on Windows (the next capsule's quiet row followed) and failed every direction on Linux. */
+    enum { NIR = 1024, XW = 256, XPRE = 64 };
     static float ir[ZYLIA_MICS][NIR], win[ZYLIA_MICS][XW];
     double worst_peak = 0.0, worst_xc = 0.0, off_lo = 1e30, off_hi = -1e30;
     uint32_t seed = 12345;
@@ -725,7 +728,8 @@ static void test_ir_tdoa(void) {
             double peak[ZYLIA_MICS];
             int start[ZYLIA_MICS];
             const float* wp[ZYLIA_MICS];
-            for (int j = 0; j < ZYLIA_MICS; ++j) {
+            int bad = 0;
+            for (int j = 0; j < ZYLIA_MICS && !bad; ++j) {
                 const double t0 = arr[j] * FS;
                 int p = 0; float pm = -1.f;
                 for (int i = 0; i < NIR; ++i) {
@@ -741,9 +745,11 @@ static void test_ir_tdoa(void) {
                 if (den < 0.0) { const double d = 0.5 * (pa - pc) / den; if (d > -0.5 && d < 0.5) frac = d; }
                 peak[j] = ((double)p + frac) / FS;
                 start[j] = p - XPRE;
+                if (start[j] < 0 || start[j] + XW > NIR) { bad = 1; break; }   /* never read past a row */
                 for (int i = 0; i < XW; ++i) win[j][i] = ir[j][start[j] + i];
                 wp[j] = win[j];
             }
+            if (bad) { ok_all = 0; continue; }
             double xc[ZYLIA_MICS];
             if (!zylia_ir_tdoa(wp, start, XW, FS, xc)) { ok_all = 0; continue; }
             float dt[3], dp[3], dx[3];
