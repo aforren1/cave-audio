@@ -690,6 +690,93 @@ static void test_live_position(void) {
     CHECK(!zylia_live_position(arr, center, 1, LAT, C, layout, &lp) && !lp.ok, "live: a NaN arrival is refused");
 }
 
+/* ---- capsule arrivals by cross-correlating the impulse responses (zylia_ir_tdoa) ----
+ * Each capsule's IR is the same asymmetric shape (a band-limited impulse plus a smaller, later lobe of
+ * the opposite sign, which a two-way box's crossover gives it) at that capsule's exact arrival, plus a
+ * little noise. The OLD arrival, a parabola through each capsule's own |IR| peak, is biased by where
+ * the peak falls between samples; the cross-correlation compares the same shape shifted and is not.
+ * The DOA error from each, over directions all around the array, is the measure. */
+static double xt_sinc(double x) { return fabs(x) < 1e-12 ? 1.0 : sin(M_PI * x) / (M_PI * x); }
+static double xt_shape(double t) {                       /* t in samples from the arrival */
+    const double bw = 0.85;                               /* 0.85 x Nyquist: 20 kHz at 48 kHz */
+    double h = 0.0;
+    const double lobes[2][2] = { { 0.0, 1.0 }, { 2.3, -0.35 } };
+    for (int l = 0; l < 2; ++l) {
+        const double x = t - lobes[l][0];
+        if (fabs(x) < 24.0) h += lobes[l][1] * bw * xt_sinc(bw * x) * (0.5 + 0.5 * cos(M_PI * x / 24.0));
+    }
+    return h;
+}
+static void test_ir_tdoa(void) {
+    const double C = 343.0, LAT = 0.0047, FS = 48000.0;
+    const float center[3] = { 0.1f, 1.2f, -0.3f };
+    enum { NIR = 700, XW = 256, XPRE = 64 };
+    static float ir[ZYLIA_MICS][NIR], win[ZYLIA_MICS][XW];
+    double worst_peak = 0.0, worst_xc = 0.0, off_lo = 1e30, off_hi = -1e30;
+    uint32_t seed = 12345;
+    int n = 0, ok_all = 1;
+    for (int az = 0; az < 360; az += 23)
+        for (int el = -60; el <= 75; el += 27) {
+            const double a = az * M_PI / 180.0, e = el * M_PI / 180.0;
+            const double src[3] = { center[0] + 2.5 * cos(e) * sin(a), center[1] + 2.5 * sin(e),
+                                    center[2] + 2.5 * cos(e) * cos(a) };
+            double arr[ZYLIA_MICS];
+            synth(center, src, LAT, C, arr);
+            double peak[ZYLIA_MICS];
+            int start[ZYLIA_MICS];
+            const float* wp[ZYLIA_MICS];
+            for (int j = 0; j < ZYLIA_MICS; ++j) {
+                const double t0 = arr[j] * FS;
+                int p = 0; float pm = -1.f;
+                for (int i = 0; i < NIR; ++i) {
+                    seed = seed * 1664525u + 1013904223u;
+                    const double noise = 1e-3 * (((double)(seed >> 9) / 4194304.0) - 1.0);
+                    ir[j][i] = (float)(xt_shape((double)i - t0) + noise);
+                    if (fabsf(ir[j][i]) > pm) { pm = fabsf(ir[j][i]); p = i; }
+                }
+                /* the old arrival: measure.c's parabola through |IR| at the peak */
+                double frac = 0.0;
+                const double pa = fabs(ir[j][p - 1]), pb = fabs(ir[j][p]), pc = fabs(ir[j][p + 1]);
+                const double den = pa - 2.0 * pb + pc;
+                if (den < 0.0) { const double d = 0.5 * (pa - pc) / den; if (d > -0.5 && d < 0.5) frac = d; }
+                peak[j] = ((double)p + frac) / FS;
+                start[j] = p - XPRE;
+                for (int i = 0; i < XW; ++i) win[j][i] = ir[j][start[j] + i];
+                wp[j] = win[j];
+            }
+            double xc[ZYLIA_MICS];
+            if (!zylia_ir_tdoa(wp, start, XW, FS, xc)) { ok_all = 0; continue; }
+            float dt[3], dp[3], dx[3];
+            zylia_doa(arr, dt); zylia_doa(peak, dp); zylia_doa(xc, dx);
+            const double want[3] = { dt[0], dt[1], dt[2] };
+            const double ep = ang_deg(dp, want), ex = ang_deg(dx, want);
+            if (ep > worst_peak) worst_peak = ep;
+            if (ex > worst_xc)   worst_xc = ex;
+            /* the absolute offset (what a distance reads): the mean arrival against the truth's. A
+             * CONSTANT offset is the IR shape's own peak shift, the same for every speaker, and the
+             * latency calibration (--ref / --latency, measured with this same estimator) cancels it;
+             * what would corrupt a distance is an offset that moves with direction */
+            double mt = 0.0, mx = 0.0;
+            for (int j = 0; j < ZYLIA_MICS; ++j) { mt += arr[j]; mx += xc[j]; }
+            const double da = (mx - mt) / ZYLIA_MICS * 1e6;
+            if (da < off_lo) off_lo = da;
+            if (da > off_hi) off_hi = da;
+            ++n;
+        }
+    printf("ir tdoa: %d directions, worst DOA error %.3f deg from each capsule's |IR| peak, %.3f deg "
+           "cross-correlated; mean-arrival offset %.2f..%.2f us (spread %.2f us, %.2f mm)\n",
+           n, worst_peak, worst_xc, off_lo, off_hi, off_hi - off_lo, (off_hi - off_lo) * 1e-6 * C * 1e3);
+    CHECK(ok_all && n > 50, "ir tdoa: every direction refines");
+    CHECK(worst_xc < 0.05, "ir tdoa: the cross-correlated arrivals put the DOA within 0.05 deg");
+    CHECK(worst_peak > 4.0 * worst_xc, "ir tdoa: and clearly beat each capsule's own |IR| peak");
+    CHECK(off_hi - off_lo < 1.0, "ir tdoa: the common offset (the distance) varies under 1 us with direction");
+    /* a window too short for the reference taper is refused, not read past */
+    const float* wp[ZYLIA_MICS]; int st[ZYLIA_MICS]; double pk[ZYLIA_MICS], out[ZYLIA_MICS];
+    for (int j = 0; j < ZYLIA_MICS; ++j) { wp[j] = win[j]; st[j] = 0; pk[j] = 0.0; }
+    (void)pk;
+    CHECK(!zylia_ir_tdoa(wp, st, ZYLIA_XC_PRE + ZYLIA_XC_POST, FS, out), "ir tdoa: a short window is refused");
+}
+
 int main(void) {
     const double C = 343.0, LAT = 0.0047;       /* arbitrary nonzero system latency */
     const float center[3] = { 0.1f, 1.2f, -0.3f };   /* array placed off-origin in the room */
@@ -698,6 +785,7 @@ int main(void) {
     test_survey();
     test_comb();
     test_pressure_proxy();
+    test_ir_tdoa();
     test_live_position();
 
     struct { double pos[3]; const char* name; } cases[] = {

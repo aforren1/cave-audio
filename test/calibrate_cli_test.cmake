@@ -242,8 +242,10 @@ elseif(MODE STREQUAL "live_zylia")
   to_milli(mx "${px}")
   to_milli(my "${py}")
   to_milli(mz "${pz}")
-  # 20 mm: the direction carries up to about 0.5 deg of sub-sample peak error, 18 mm at 2.1 m
-  if(mx LESS 80000 OR mx GREATER 120000 OR my LESS -20000 OR my GREATER 20000 OR mz LESS -20000 OR mz GREATER 20000)
+  # 5 mm: the capsule arrivals are cross-correlated (zylia_ir_tdoa), which reads the direction to a few
+  # hundredths of a degree in simulation; each capsule's own |IR| peak read 0.5 deg (18 mm at 2.1 m)
+  # and failed this bound at +88.7 -13.2 +3.2 mm
+  if(mx LESS 95000 OR mx GREATER 105000 OR my LESS -5000 OR my GREATER 5000 OR mz LESS -5000 OR mz GREATER 5000)
     message(FATAL_ERROR "calibrate_cli_test: pos: the 10 cm move read back as (${px} ${py} ${pz}) mm")
   endif()
 

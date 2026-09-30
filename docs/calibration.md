@@ -541,8 +541,24 @@ early-reflection map is the actionable part.)
 
 The speaker survey above is wired end to end: the capture shell opens the layout's `n` outputs
 plus 19 consecutive inputs starting at `--input`, on ONE ASIO device (the ZM-1 over Dante Via,
-next section). It sweeps each speaker, deconvolves all 19 capsules (measure.c), and hands the
-sub-sample arrivals to `zylia_localize`. `--mic x y z` is the array **center**. Positions go back
+next section). It sweeps each speaker, deconvolves all 19 capsules (measure.c), times them against
+each other by cross-correlation, and hands the arrivals to `zylia_localize`.
+
+**How the capsules are timed.** Each capsule's own impulse-response peak, fitted with a parabola,
+is biased by where the true peak falls between samples, and 19 independently biased arrivals cost
+the direction about 1 degree. So every ZM-1 sweep path (this survey, `--zylia --trims` and
+`--verify`, and live aiming) keeps a short window of each capsule's impulse response and
+cross-correlates it with the strongest capsule's (`zylia_ir_tdoa`, the sweep counterpart of the
+clap path's `zylia_tdoa`). That compares the same waveform shifted, so the correlation peak is
+symmetric, and the peak is refined on a windowed-sinc interpolation rather than a parabola. The
+absolute time comes from the reference capsule's own peak on the same interpolation: a constant of
+the speaker's impulse shape, which the latency calibration (`--ref` or `--latency`) measures with
+the same estimator and cancels. In the `zylia` ctest, over 96 directions, the direction lands within
+0.02 degrees of the truth, against 1.0 from each capsule's own peak, and the absolute time varies
+by 0.07 µs (0.02 mm) with direction. What simulation cannot show is the rigid sphere: sound
+bends around it, so the arrival-time differences are not quite a free-field plane wave's, and that
+error lands in the capsule geometry, which the capsule survey measures with this family of
+estimator. `--mic x y z` is the array **center**. Positions go back
 into `cave_layout.json`. Two flags carry the physics the tool cannot know:
 
 - **`--survey <file>`**: a room-axes capsule survey (calib_view → Zylia tab → Capsule survey).
@@ -1002,11 +1018,13 @@ the gate removes it. A real box close to a wall gets a shorter gate and a coarse
 this room does not reproduce. In every case the peak lands on the reading where the box points at
 the mic.
 
-Position: over seven speakers the direction reads 0.0 to 0.6 degrees off the truth, which is
-up to 20 mm across at 2 m, and the distance within 1 mm. The limit is the sub-sample peak of
-each capsule's impulse response, about 1 µs. A 10 cm move reads back as 89 to 109 mm along the
-right axis. On exact arrivals (the `zylia` ctest) the same move comes back within 1 mm. So read a
-position delta under about 3 cm as "where the layout says".
+Position: over seven speakers, with and without the simulated room, the direction reads 0.01 to
+0.06 degrees off the truth and the position within 1.6 mm. A 10 cm move reads back as 100.7 mm with
+nothing sideways. Before the capsules were cross-correlated, the direction read up to 0.6 degrees
+off (20 mm at 2 m) and the same move read 89 mm with 13 mm sideways. The rig will do worse than
+the simulation by whatever the sphere's scattering and the capsule survey leave, which nothing here
+has measured. So read a delta under about 1 cm as "where the layout says" until the rig shows
+otherwise.
 
 The `calibrate_live_zylia` ctest pins the 10 cm move, the 25 degree estimate with the reference,
 the file's larger error behind the screen, and the peak at 0 degrees. The `aim/sim_live` test in

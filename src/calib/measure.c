@@ -166,7 +166,14 @@ static int ir_peak(const float* ir, int from, int to) {        /* strongest |tap
 
 int measure_response(const float* capture, int ncap, const float* ref, int nref,
                      double f1, double f2, double fs, const double band_hz[2], MeasureResult* out) {
+    return measure_response_win(capture, ncap, ref, nref, f1, f2, fs, band_hz, out, NULL, 0, 0, NULL);
+}
+
+int measure_response_win(const float* capture, int ncap, const float* ref, int nref,
+                         double f1, double f2, double fs, const double band_hz[2], MeasureResult* out,
+                         float* win, int win_len, int pre, int* win_start) {
     if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
+    if (win && (win_len <= 0 || pre < 0 || !win_start)) return 0;
     /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
     if ((int64_t)ncap + nref > (1 << 30)) return 0;
     float* ir = NULL;
@@ -184,6 +191,11 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
         float a = fabsf(ir[p-1]), b = fabsf(ir[p]), c = fabsf(ir[p+1]);
         float den = a - 2.f*b + c;
         if (den < 0.f) { float d = 0.5f * (a - c) / den; if (d > -0.5f && d < 0.5f) out->delay_frac = d; }
+    }
+    if (win) {
+        const int s0 = p > pre ? p - pre : 0;
+        for (int i = 0; i < win_len; ++i) win[i] = (s0 + i < L) ? ir[s0 + i] : 0.f;
+        *win_start = s0;
     }
     int ok = direct_fields(ir, L, p, f1, f2, fs, band_hz, e_full, out);
     free(ir);

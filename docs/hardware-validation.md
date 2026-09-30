@@ -220,7 +220,7 @@ Then the real sequence:
       installer turns the box while someone reads "below peak" aloud: turn until it reads 0,
       then find the two sides where it falls 0.5 dB (about 10 degrees each way) and split the
       difference, because the top is flat to within the reading's noise for about 7 degrees. The reported angle is a magnitude only. The position line
-      says whether the box sits where the layout says: a delta over about 3 cm is a real move
+      says whether the box sits where the layout says: a delta over about 1 cm is a real move
       or a stale layout. Pass: every hidden box reads "on axis" against the reference, which
       on the 4410A means within about 7 degrees. Unverified
       on hardware: the whole mode, including the short live sweep through the ASIO shell.

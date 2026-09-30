@@ -1214,6 +1214,103 @@ int zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
 
 /* ---- the ZM-1 as a pressure mic (zylia.h) ---- */
 
+/* the Kaiser-windowed sinc the correlation interpolation uses: half-width 8, beta 6 (the same
+ * design arraysim.c's delay tap measured flat to 16 kHz at 44.1 and 48 kHz) */
+static double xc_bessel_i0(double x) {
+    double sum = 1.0, term = 1.0;
+    for (int k = 1; k < 64 && term > 1e-12 * sum; ++k) { term *= (x / (2.0 * k)) * (x / (2.0 * k)); sum += term; }
+    return sum;
+}
+#define XC_HALF 8
+static double xc_kernel(double x) {
+    if (fabs(x) >= XC_HALF + 0.5) return 0.0;
+    const double sn = fabs(x) < 1e-12 ? 1.0 : sin(M_PI * x) / (M_PI * x);
+    const double r = x / (XC_HALF + 0.5);
+    return sn * xc_bessel_i0(6.0 * sqrt(1.0 - r * r)) / xc_bessel_i0(6.0);
+}
+/* r(tau) from integer samples r[k] at lags k0 .. k0+nk-1 */
+static double xc_interp(const double* r, int k0, int nk, double tau) {
+    double acc = 0.0;
+    const int lo = (int)floor(tau) - XC_HALF, hi = (int)floor(tau) + XC_HALF + 1;
+    for (int k = lo; k <= hi; ++k)
+        if (k >= k0 && k < k0 + nk) acc += r[k - k0] * xc_kernel(tau - (double)k);
+    return acc;
+}
+
+/* golden-section maximum of sgn * the interpolated curve on [c - 1, c + 1] */
+static double xc_argmax(const double* r, int k0, int nk, int c, double sgn) {
+    const double g = 0.6180339887498949;
+    double a = c - 1.0, b = c + 1.0;
+    double x1 = b - g * (b - a), x2 = a + g * (b - a);
+    double f1 = sgn * xc_interp(r, k0, nk, x1), f2 = sgn * xc_interp(r, k0, nk, x2);
+    for (int it = 0; it < 60 && b - a > 1e-6; ++it) {
+        if (f1 < f2) { a = x1; x1 = x2; f1 = f2; x2 = a + g * (b - a); f2 = sgn * xc_interp(r, k0, nk, x2); }
+        else         { b = x2; x2 = x1; f2 = f1; x1 = b - g * (b - a); f1 = sgn * xc_interp(r, k0, nk, x1); }
+    }
+    return 0.5 * (a + b);
+}
+
+int zylia_ir_tdoa(const float* const win[ZYLIA_MICS], const int start[ZYLIA_MICS], int win_len,
+                  double fs, double arrival_s[ZYLIA_MICS]) {
+    if (!win || !start || !arrival_s || !(fs > 0.0) || win_len < ZYLIA_XC_PRE + ZYLIA_XC_POST + 1 || win_len > 1024)
+        return 0;
+    /* the reference: the capsule whose IR peak is strongest (facing the speaker, least shadowed) */
+    int ref = 0; float pk = -1.f; int pki = 0;
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        if (!win[ch]) return 0;
+        for (int i = 0; i < win_len; ++i) {
+            const float a = fabsf(win[ch][i]);
+            if (a > pk) { pk = a; ref = ch; pki = i; }
+        }
+    }
+    if (!(pk > 0.f)) return 0;
+    /* the reference's weight: flat over the direct sound, raised-cosine edges 8 samples wide */
+    const int t0 = pki - ZYLIA_XC_PRE, t1 = pki + ZYLIA_XC_POST;         /* in the ref window's index */
+    if (t0 < 0 || t1 >= win_len) return 0;
+    double w[ZYLIA_XC_PRE + ZYLIA_XC_POST + 1];
+    for (int i = t0; i <= t1; ++i) {
+        const int e = (i - t0 < t1 - i) ? i - t0 : t1 - i;               /* distance to the nearer edge */
+        w[i - t0] = e >= 8 ? 1.0 : 0.5 - 0.5 * cos(M_PI * (double)(e + 1) / 9.0);
+        w[i - t0] *= (double)win[ref][i];
+    }
+    /* lags: the aperture (the farthest capsule pair, 2R/c) plus a margin, plus the interpolation's
+     * reach on both sides so the refined peak never reads past the computed curve */
+    const int ap = (int)ceil(2.0 * 0.05 / 300.0 * fs) + 4;   /* 2R/c with R = 50 mm (the ZM-1 is 49) and a slow c */
+    enum { NK_MAX = 2 * 96 + 2 * XC_HALF + 3 };
+    const int kspan = ap + XC_HALF + 1;
+    if (2 * kspan + 1 > NK_MAX) return 0;                                /* only a silly sample rate */
+    double delta[ZYLIA_MICS];
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        if (ch == ref) { delta[ch] = 0.0; continue; }
+        /* r(k) = sum_t wref(t) * x_ch(t + k), t on the ABSOLUTE axis: capsule ch delayed by d
+         * relative to the reference peaks at k = d */
+        double r[NK_MAX];
+        const int nk = 2 * kspan + 1, k0 = -kspan;
+        const int off = start[ref] - start[ch];            /* ref index i -> ch index i + off + k */
+        int best = 0; double rb = -1e300;
+        for (int j = 0; j < nk; ++j) {
+            const int k = k0 + j;
+            double acc = 0.0;
+            for (int i = t0; i <= t1; ++i) {
+                const int ic = i + off + k;
+                if (ic >= 0 && ic < win_len) acc += w[i - t0] * (double)win[ch][ic];
+            }
+            r[j] = acc;
+            if (k >= -ap && k <= ap && acc > rb) { rb = acc; best = k; }
+        }
+        if (best <= -ap || best >= ap) return 0;          /* no interior peak: not this array's geometry */
+        delta[ch] = xc_argmax(r, k0, nk, best, 1.0);
+    }
+    /* the absolute axis: the reference's own continuous peak on the same interpolation (of the signed
+     * IR, so a polarity-inverted peak is still a peak) */
+    double rw[1024];
+    for (int i = 0; i < win_len; ++i) rw[i] = (double)win[ref][i];
+    const double tpk = xc_argmax(rw, 0, win_len, pki, win[ref][pki] < 0.f ? -1.0 : 1.0);
+    const double anchor = (double)start[ref] + tpk;
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) arrival_s[ch] = (anchor + delta[ch]) / fs;
+    return 1;
+}
+
 double zylia_center_arrival(const double arrival_s[ZYLIA_MICS], double c) {
     if (!arrival_s) return 0.0;
     if (!(c > 1.0)) c = 343.0;                          /* a caller's bad c must not divide by zero */

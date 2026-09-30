@@ -133,6 +133,15 @@ int  calib_stage_pad(const Layout* L);
 void calib_measure_rows(const float* rows, int nrows, int stride, int ncap, const float* sweep, int nsweep,
                         const double band_hz[2], MeasureResult* res, int* ok);
 
+/* calib_measure_rows for the ZM-1's 19 capsule rows, then every capsule's arrival refined by
+ * cross-correlating the capsules' impulse responses (zylia_ir_tdoa) and written back into
+ * res[j].delay_samples / delay_frac, so every consumer of those fields (the pressure proxy's center
+ * arrival, zylia_doa, zylia_localize, the live position) reads the refined value. When the refine
+ * cannot run (a dead capsule, no interior peak) the |IR|-peak arrivals stand. Returns 1 when the
+ * refine ran, 0 when it fell back. */
+int  calib_measure_zylia_rows(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
+                              const double band_hz[2], MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]);
+
 /* One live aiming reading (bwa_calibrate --live N --zylia, calib_view's Aim tab): sweep speaker `spk`
  * with the live sweep (`lsweep`, CAL_LIVE_NSWEEP samples), capture the 19 capsules into cap19
  * ([19][CAL_CAPLEN], the ASIO shell's rows), deconvolve each over the tilt bands (CALIB_AIM_*), and

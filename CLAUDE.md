@@ -303,7 +303,13 @@ src/
                          everything on the rig is the ZM-1: zylia.c's zylia_pressure_proxy pools the 19
                          capsules into one omni-like measurement (power mean, energy-weighted direct
                          share, zylia_center_arrival, dead-capsule refusal; about +/-0.25 dB of leftover
-                         direction dependence against up to 16 dB for one capsule), and
+                         direction dependence against up to 16 dB for one capsule; every ZM-1 sweep
+                         path TIMES the capsules with zylia_ir_tdoa, cross-correlating each capsule's
+                         impulse-response window with the strongest one and refining on a windowed-sinc
+                         interpolation, absolute time from the reference's own interpolated peak: DOA
+                         0.02 deg worst over 96 directions in the zylia ctest, against 1.0 deg from each
+                         capsule's parabola-fitted |IR| peak; calib_measure_zylia_rows is the one helper
+                         that writes the refined arrivals back into each MeasureResult), and
                          calib_capture.cpp's calib_stage_signal is the engine's own align stage applied to
                          one channel, which is what --verify plays. `bwa_calibrate --zylia` names the MIC;
                          --trims / --verify pick the mode (bare --zylia is still the position survey). The

@@ -372,6 +372,41 @@ void calib_measure_rows(const float* rows, int nrows, int stride, int ncap, cons
     for (auto& t : pool) t.join();
 }
 
+int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
+                             const double band_hz[2], MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]) {
+    /* each capsule's IR window: from 64 samples before its own peak, 256 long, which holds the
+     * reference taper (-ZYLIA_XC_PRE .. +ZYLIA_XC_POST around the strongest peak) plus the array's
+     * aperture either side */
+    enum { XW = 256, XPRE = 64 };
+    static float win[ZYLIA_MICS][XW];                 /* control thread, one caller at a time */
+    int start[ZYLIA_MICS] = { 0 };
+    unsigned hw = std::thread::hardware_concurrency();
+    const int nw = hw < 2 ? 1 : (hw > 8 ? 8 : (int)hw);
+    std::atomic<int> next(0);
+    auto work = [&]() {
+        for (int j; (j = next.fetch_add(1)) < ZYLIA_MICS; )
+            ok[j] = measure_response_win(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
+                                         CAL_F1, CAL_F2, CAL_FS, band_hz, &res[j],
+                                         win[j], XW, XPRE, &start[j]);
+    };
+    std::vector<std::thread> pool;
+    for (int w = 1; w < nw; ++w) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    for (int j = 0; j < ZYLIA_MICS; ++j) if (!ok[j]) return 0;
+    const float* wp[ZYLIA_MICS];
+    double arr[ZYLIA_MICS];
+    for (int j = 0; j < ZYLIA_MICS; ++j) wp[j] = win[j];
+    if (!zylia_ir_tdoa(wp, start, XW, CAL_FS, arr)) return 0;
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        const double a = arr[j] * CAL_FS;
+        const double ai = floor(a + 0.5);
+        res[j].delay_samples = (int)ai;
+        res[j].delay_frac    = (float)(a - ai);
+    }
+    return 1;
+}
+
 int calib_live_read(int spk, const Layout* L, const float center[3], double sos, int simulate,
                     const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out) {
     memset(out, 0, sizeof *out);
@@ -393,7 +428,7 @@ int calib_live_read(int spk, const Layout* L, const float center[3], double sos,
     const double band[2] = { CALIB_LIVE_MID_HZ, CALIB_LIVE_HIGH_HZ };
     MeasureResult rj[ZYLIA_MICS];
     int okj[ZYLIA_MICS] = { 0 };
-    calib_measure_rows(cap19, ZYLIA_MICS, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, rj, okj);
+    calib_measure_zylia_rows(cap19, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, rj, okj);
     for (int j = 0; j < ZYLIA_MICS; ++j) if (!okj[j]) { out->dead = j; return 1; }
     int dead = -1;
     if (zylia_pressure_proxy(rj, CAL_FS, sos, &out->pooled, &dead) != 1) { out->dead = dead; return 1; }

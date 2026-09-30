@@ -78,6 +78,14 @@ int measure_direct_gate(int first_refl, double fs);
 int measure_response(const float* capture, int ncap, const float* ref, int nref,
                      double f1, double f2, double fs, const double band_hz[2], MeasureResult* out);
 
+/* measure_response, plus a window of the impulse response on the ABSOLUTE capture time axis: win[i]
+ * = ir[*win_start + i] for i < win_len, *win_start = the arrival peak - `pre` (clamped at 0), zeros
+ * past the IR's end. Several captures' windows then share one time axis, which is what a
+ * cross-correlation of them needs (zylia_ir_tdoa). win NULL = measure_response. */
+int measure_response_win(const float* capture, int ncap, const float* ref, int nref,
+                         double f1, double f2, double fs, const double band_hz[2], MeasureResult* out,
+                         float* win, int win_len, int pre, int* win_start);
+
 /* Room report: deconvolve as measure_response, then characterize the room from the IR (Schroeder RT60
  * + early reflections). If `ir_out` is non-NULL, the deconvolved impulse response from the direct
  * arrival onward is copied into it (up to `ir_cap` samples) — the room-preview convolution kernel, so

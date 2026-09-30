@@ -117,7 +117,8 @@ static int measure_speaker(Pass& P, int s, int through, MeasureResult* out) {
     if (!P.zylia) return measure_response(P.cap, CAPLEN, P.sweep, NSWEEP, F1, F2, FS, BAND_HZ, out);
     MeasureResult rj[ZYLIA_MICS];
     int okj[ZYLIA_MICS] = { 0 };
-    calib_measure_rows(P.cap19, ZYLIA_MICS, CAPLEN, CAPLEN, P.sweep, NSWEEP, BAND_HZ, rj, okj);   /* 19 deconvolutions, threaded */
+    calib_measure_zylia_rows(P.cap19, CAPLEN, CAPLEN, P.sweep, NSWEEP, BAND_HZ, rj, okj);   /* 19 deconvolutions, threaded,
+                                                                                            * arrivals refined by cross-correlation */
     float lmin = 1e30f, lmax = 0.f;
     for (int j = 0; j < ZYLIA_MICS; ++j) {
         if (!okj[j]) return 0;
@@ -936,11 +937,11 @@ int main(int argc, char** argv) {
                     calib_asio_close(); free(cap19); free(arr); free(res); free(cap); free(sweep);
                     return 1;
                 }
-                for (int j = 0; j < ZYLIA_MICS; ++j) {
-                    MeasureResult r;
-                    measure_response(cap19 + (size_t)j * CAPLEN, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
-                    row[j] = ((double)r.delay_samples + r.delay_frac) / FS;
-                }
+                MeasureResult rz[ZYLIA_MICS];
+                int okz[ZYLIA_MICS] = { 0 };
+                if (!calib_measure_zylia_rows(cap19, CAPLEN, CAPLEN, sweep, NSWEEP, BAND_HZ, rz, okz))
+                    printf("  speaker %2d: capsule cross-correlation did not run; using each capsule's own peak\n", s);
+                for (int j = 0; j < ZYLIA_MICS; ++j) row[j] = ((double)rz[j].delay_samples + rz[j].delay_frac) / FS;
             }
 #endif
         }

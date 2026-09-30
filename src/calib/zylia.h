@@ -360,6 +360,29 @@ int  zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
  * returns the plain mean (no tilt correction). */
 double zylia_center_arrival(const double arrival_s[ZYLIA_MICS], double c);
 
+/* Capsule arrivals from their IMPULSE RESPONSES by cross-correlation, the sweep counterpart of
+ * zylia_tdoa. Each capsule's own |IR| peak with a parabola (measure_response's delay_frac) is biased
+ * by where the true peak falls between samples, and 19 independently biased arrivals cost the DOA
+ * about 0.5 deg. Cross-correlating every capsule's IR with the strongest one compares the SAME
+ * waveform shifted, so the correlation peak is symmetric and its position is the delay.
+ *   win[i]    capsule i's IR window, absolute time axis (measure_response_win), win_len samples each
+ *             (at most 1024);
+ *   start[i]  the window's first sample index.
+ * The common offset comes from the reference capsule's own peak on the same interpolation, so it is
+ * a constant of the speaker's impulse shape (the latency calibration, --ref or --latency, measures
+ * with this same estimator and cancels it), not a bias that moves with where the peak falls between
+ * samples, as an average of parabola peaks would.
+ * The reference's window is weighted by a flat-top taper over [-ZYLIA_XC_PRE, +ZYLIA_XC_POST] around
+ * its peak (the direct sound; a reflection a few ms later stays out), lags span the array's
+ * aperture plus a margin, and the peak lag is refined on a windowed-sinc interpolation of the
+ * correlation (unbiased for a band-limited signal, where a parabola is not). Writes arrival_s in
+ * seconds; returns 1, or 0 when a window is too short or a correlation has no interior peak.
+ * Pure; control thread (allocates nothing, ~135k multiply-adds). */
+#define ZYLIA_XC_PRE  32
+#define ZYLIA_XC_POST 96
+int  zylia_ir_tdoa(const float* const win[ZYLIA_MICS], const int start[ZYLIA_MICS], int win_len,
+                   double fs, double arrival_s[ZYLIA_MICS]);
+
 /* Pool 19 per-capsule measure_response results (capsule i = cap[i], all against the same sweep)
  * into one pressure-proxy MeasureResult:
  *   level, band[3], level_direct, band_direct[3] -> the RMS across capsules (the power mean);
