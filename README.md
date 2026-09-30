@@ -24,9 +24,14 @@ speaker array. These parts need the hardware:
 
 - the multichannel ASIO path into the Digiface, and the full-duplex capture that both
   measurement tools use,
-- live Motive tracking. The NatNet parser and its lifecycle are tested off-wire only.
+- live Motive tracking. The NatNet parser and its lifecycle are tested off-wire only. That
+  covers the head tracker, the optical speaker check and the tracked ZM-1 stand, including
+  the assumption that Motive sends marker offsets in the body's own frame.
 - the Zylia channel order and azimuth reference. Both survive every off-hardware check,
-  and both report a confident wrong direction if they are wrong.
+  and both report a confident wrong direction if they are wrong. So does the ZM-1's rigid
+  sphere, which bends the arrival differences away from the free-field model the
+  simulation uses.
+- the live-aiming rate (about one reading a second in simulation, never timed on the rig).
 - the by-ear checks: HRTF quality, the A/B/X knob bake-off, room EQ on the array.
 
 [`docs/hardware-validation.md`](./docs/hardware-validation.md) is the ordered runbook for
@@ -299,7 +304,7 @@ bwa_commit(e);
 | [`docs/backends.md`](./docs/backends.md) | the sink contract and every device backend |
 | [`docs/integration.md`](./docs/integration.md) | the five bindings, coordinate seam |
 | [`docs/layout-schema.md`](./docs/layout-schema.md) | `cave_layout.json` format |
-| [`docs/calibration.md`](./docs/calibration.md) | trims, EQ, acoustic survey, room report |
+| [`docs/calibration.md`](./docs/calibration.md) | trims, EQ, acoustic and optical survey, aiming, placing the mic, room report |
 | [`docs/validation.md`](./docs/validation.md) | `bwa_validate`: grading the array's phantom images |
 | [`docs/hardware-validation.md`](./docs/hardware-validation.md) | the rig-day runbook and its pass criteria |
 | [`docs/glossary.md`](./docs/glossary.md) | one-line definitions for the whole vocabulary |
@@ -316,7 +321,8 @@ Opt-in, in workflow order (design, calibrate, audition). `bwa_layout_tool` and
 `bwa_playground` build on Windows and Linux: they are raylib plus Dear ImGui and nothing
 else. `bwa_calib_view` is a Windows-only target, because it is on the win32 and d3d11
 ImGui backend and it links the full-duplex ASIO capture. So are the capture tools
-(`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`), for the ASIO half alone. The
+(`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`), for the ASIO half alone.
+`bwa_speaker_survey` builds everywhere: it needs only the NatNet stream. The
 browser playground under [`bindings/web/playground/`](./bindings/web/playground/) is a port
 of `bwa_playground`'s scenes on three.js, minus the reverb bed; it is the one you can open
 without building anything.
@@ -348,19 +354,46 @@ Headless: `--export`, `--score`, `--optimize`.
 ![bwa_calib_view: layout diff](docs/img/calib_view_diff.png)
 
 The Capture tab runs sweep, measure, solve, and writeback (simulated, or full-duplex
-ASIO with a measurement mic), then loads the result into a layout diff: A the
+ASIO with an omni mic), then loads the result into a layout diff: A the
 input, B what was written. You catch a swapped channel or a bad mic placement
 before you trust the file.
 
 Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IRs.
 The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere: a
-seconds-fast check of capsule mapping and geometry.
+seconds-fast check of capsule mapping and geometry, and the capsule survey.
+The Aim tab is live aiming for the speakers you cannot see (below).
 
 ![bwa_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
 
-`bwa_calibrate` is the same pipeline headless (`--simulate`, `--localize`, `--zylia`);
+`bwa_calibrate` is the whole pipeline headless, and `--simulate` runs every mode with
+no hardware. On the rig the ZM-1 is the only mic, and `--zylia` says so:
+
+| Step | Command | What it does |
+| --- | --- | --- |
+| Aiming sheet | `--aim-sheet aim.csv` | the bearing and down-tilt each mount needs, before the boxes go up |
+| Positions | `--zylia` | every speaker from one ZM-1 placement: direction plus range |
+| Trims | `--zylia --trims` | delay and gain per speaker, the 19 capsules pooled into one omni-like reading |
+| Verify | `--zylia --verify` | play the trims back through the engine's output stage and flag what is off |
+| Live aiming | `--live N --zylia` | sweep one speaker over and over while someone turns it |
+| Aim check | `--localize f --check-aim` | fit each box's real axis from several mic placements |
+
 `bwa_zylia_probe` is a console level meter. See
 [`docs/calibration.md`](./docs/calibration.md).
+
+**Place the mic with the tracker.** With the ZM-1 on a stand that Motive tracks, add
+`--track <body>` to any of the sweeping modes. The tool shows where the array's center is
+against the target in mm, waits until it is there and still, measures from where it
+actually is, and stops the run if the stand is bumped. `bwa_calib_view` has the same
+readout as a Placement panel on its Capture and Aim tabs. A ring of markers around the
+ZM-1's equator works: `--mount-offset ring` finds the array center from them.
+
+**Aim the boxes you cannot see.** Most of the array hangs behind the screens or
+overhead. Live aiming turns the ZM-1 into an aiming instrument: the treble tilt peaks
+when a box points at the mic, so an installer turns the box until the meter reads 0 dB
+below its peak. For the few speakers the cameras can see, `bwa_speaker_survey` measures
+the aim and position optically from rigid bodies named `spk<N>`, and checks that
+Motive's frame is the room frame. One of those makes a good reference for aiming the
+rest.
 
 **One array, several audiences.** You survey the speaker positions once. The trims and
 EQ are relative to a reference point, so one installation can keep several calibrated
@@ -395,7 +428,8 @@ alone gives a physical source through the same chain, so the miss reads against 
 instead of in a vacuum, and every cell carries a comb depth beside its angle. Each live
 A/B knob is a swept axis: dual-band, CAP, the spread modes, decorrelation, the
 hole-aware floor, tracked alignment, and the SPCAP focus. `--simulate` runs the whole
-flow with no hardware. Same `-DBWA_BUILD_CALIBRATE=ON` switch. See
+flow with no hardware. With the ZM-1 on a tracked stand, `--track` measures each listening position rather
+than trusting a typed one. Same `-DBWA_BUILD_CALIBRATE=ON` switch. See
 [`docs/validation.md`](./docs/validation.md).
 
 ### Audition: `bwa_playground`

@@ -302,6 +302,7 @@ add_library(bwa_core OBJECT
   src/calib/calib.c
   src/calib/zylia.c
   src/calib/valid.c
+  src/calib/placement.c        # the tracked ZM-1's placement math; pure, no atomics
   src/core/stream.c
   ${CJSON_C}
 )
@@ -1149,6 +1150,11 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_zylia PRIVATE bwa_core)
   add_test(NAME zylia COMMAND test_zylia)
 
+  # the tracked ZM-1's placement math (pure; no atomics, so no MSVC flag)
+  add_executable(test_placement test/placement_test.c)
+  target_link_libraries(test_placement PRIVATE bwa_core)
+  add_test(NAME placement COMMAND test_placement)
+
   add_executable(test_valid test/valid_test.c)
   target_link_libraries(test_valid PRIVATE bwa_core)
   add_test(NAME valid COMMAND test_valid)
@@ -1406,7 +1412,8 @@ if(BWA_BUILD_CALIBVIEW)
   # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
   # between them (they'd otherwise tear each other down).
   target_sources(bwa_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
-                                       examples/asio_session.cpp)
+                                       examples/asio_session.cpp
+                                       examples/mic_track.cpp)   # the Placement panel's tracked ZM-1
   if(BWA_WITH_ASIO)
     bwa_add_asio_host(bwa_calib_view)
   endif()
@@ -1426,7 +1433,8 @@ if(NOT WIN32 AND BWA_BUILD_CALIBRATE)
 endif()
 if(BWA_BUILD_CALIBRATE)
   enable_language(CXX)
-  add_executable(bwa_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)
+  add_executable(bwa_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp
+                               examples/mic_track.cpp)
   target_link_libraries(bwa_calibrate PRIVATE bwa_core)
   bwa_tool_icon(bwa_calibrate)
   if(BWA_WITH_ASIO)
@@ -1441,7 +1449,8 @@ if(BWA_BUILD_CALIBRATE)
   # Phantom-localization validation: render a source, measure where the array actually put it.
   # Full-duplex like the sweep above (speaker feeds out + the ZM-1's 19 capsules in, one device),
   # but steady-state, so it needs no latency solve. --simulate runs the whole flow off-hardware.
-  add_executable(bwa_validate examples/validate.cpp examples/valid_capture.cpp examples/asio_session.cpp)
+  add_executable(bwa_validate examples/validate.cpp examples/valid_capture.cpp examples/asio_session.cpp
+                              examples/mic_track.cpp)
   target_link_libraries(bwa_validate PRIVATE bwa_core)
   if(BWA_WITH_ASIO)
     bwa_add_asio_host(bwa_validate)
@@ -1456,8 +1465,18 @@ if(BWA_BUILD_CALIBRATE)
     # ...and the tracked-mount path. This asserts the placement hook FIRES, not that the result looks
     # right: in simulate the field is synthesized from the same capsule table the estimator reads, so
     # a wrong table cancels out. The hook was once passed in and never called, which left --track
-    # silently inert while announcing that the tracker was measuring. Exits 4 if it regresses.
+    # silently inert while announcing that the tracker was measuring. Exits 5 if it regresses (4 is
+    # the bump).
     add_test(NAME validate_track COMMAND bwa_validate --simulate --track-sim --azimuths 4 --no-prompt)
+    # ...and the placement itself, as bwa_calibrate --track has it (test/validate_cli_test.cmake): the
+    # gate waits and every cell is scored from the MEASURED center, checked against the scripted stand's
+    # truth and the CSV; a bump mid-placement exits 4, drops that placement and keeps the one before.
+    foreach(_bwa_vcli track_settle track_bump)
+      add_test(NAME validate_${_bwa_vcli}
+               COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_validate> -DMODE=${_bwa_vcli}
+                       -DWORK=${CMAKE_BINARY_DIR}/validate_cli_${_bwa_vcli}
+                       -P ${CMAKE_SOURCE_DIR}/test/validate_cli_test.cmake)
+    endforeach()
     # ...and the SPCAP focus sweep: more than one measured condition per panner, which is a different
     # session shape (the condition list replaces the panner list) and a different report. The DSP the
     # sweep reads is pinned in the valid/zylia ctests; this pins that the tool actually walks it.
@@ -1499,7 +1518,22 @@ if(BWA_BUILD_CALIBRATE)
     # trim mic, --aim-sheet, and --live N --zylia (live aiming: a moved and a turned speaker, bounded
     # by --sweeps / --sim-aim-steps). Multi-step, so each drives bwa_calibrate from a CMake script
     # that checks exit codes and the report; scratch lands in calib_cli_<mode>/ in the build tree.
-    foreach(_bwa_cli verify_omni verify_zylia zylia_trims aim_sheet live_zylia)
+    # --track (the tracked ZM-1 stand, simulated by --track-sim): a settled placement with a flag offset,
+    # the marker-ring offset, a bump mid-run, the refusals, and a body-frame survey. The survey fixture
+    # is a ZM-1-shaped table (a 49 mm dodecahedron minus its nadir vertex) in the stand's body frame,
+    # with a probed offset, written HERE in the build tree like the layout above.
+    file(WRITE "${CMAKE_BINARY_DIR}/calib_cli_track_survey_fixture.json"
+         "{ \"frame\": \"body\", \"mount_offset_m\": [0.02, -0.11, 0.04], \"residual_us\": 0.5, \"radius_m\": 0.049,\n"
+         "  \"spread\": 0.9, \"observations\": 14, \"capsules\": [\n"
+         "  [0.000000,0.049000,0.000000],[0.026007,0.036522,-0.019768],[-0.030123,0.036522,-0.012638],\n"
+         "  [0.004116,0.036522,0.032406],[-0.044623,0.016333,0.011957],[-0.022733,0.016333,-0.040217],\n"
+         "  [0.011957,0.016333,-0.044623],[-0.023463,0.016333,0.039796],[0.046196,0.016333,0.000421],\n"
+         "  [0.032667,0.016333,0.032667],[-0.032667,-0.016333,-0.032667],[-0.046196,-0.016333,-0.000421],\n"
+         "  [0.023463,-0.016333,-0.039796],[-0.011957,-0.016333,0.044623],[0.044623,-0.016333,-0.011957],\n"
+         "  [0.022733,-0.016333,0.040217],[-0.004116,-0.036522,-0.032406],[-0.026007,-0.036522,0.019768],\n"
+         "  [0.030123,-0.036522,0.012638] ] }\n")
+    foreach(_bwa_cli verify_omni verify_zylia zylia_trims aim_sheet live_zylia
+                     track_settle track_ring track_bump track_refuse track_survey)
       add_test(NAME calibrate_${_bwa_cli}
                COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DMODE=${_bwa_cli}
                        -DLAYOUT=${CMAKE_BINARY_DIR}/calib_sim_room_layout.json

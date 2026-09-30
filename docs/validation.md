@@ -479,12 +479,16 @@ bwa_validate --simulate --tracked-align both --dual-band both --cap both
 | `--spread <0..1>` | the source's own width; set it before sweeping the three knobs that act on width |
 | `--factorial` | measure the cross product of the axes instead of one knob at a time |
 | `--out <file.csv>` | every cell, one row each |
-| `--no-prompt` | don't wait for ENTER between placements (unattended runs) |
-| `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs `--survey` |
-| `--survey <file>` | body-frame capsule survey the tracker rotates per placement |
+| `--no-prompt` | don't wait for ENTER between placements (untracked, unattended runs; a tracked run waits for its gate instead) |
+| `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs a body-frame `--survey` |
+| `--survey <file>` | capsule survey. With `--track`: a body-frame survey the tracker rotates per placement. Without: a room-axes survey taken at the current mounting; a body-frame one is refused |
+| `--mount-offset x,y,z` or `ring` | the body origin to the array center, body axes, meters; only beside a body-frame survey that carries no offset. See below |
+| `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it |
+| `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
-| `--track-sim` | self-check, see below |
+| `--track-sim` | with `--simulate`: a scripted stand instead of Motive. See below |
+| `--track-sim-bump <n>` | knock the scripted stand 15 mm after the nth capture |
 | `--no-reference` | skip the physical reference arm (each speaker driven alone) |
 | `--tone <hz>` | measure with a sustained tone instead of broadband; see below |
 | `--inject-fault <ch>` | self-check, see below |
@@ -531,29 +535,103 @@ Two things the tool will not do for you:
 - **The coupling must be rigid and stay rigid.** No shock mount, and do not loosen the collar after
   surveying. You are propagating an orientation through the mount, so a quarter turn on the thread is
   90° of azimuth error and nothing downstream notices. Mark the collar.
-- **The offset must be probed.** `zylia_survey` takes source positions relative to a center, so it
-  cannot solve for that center. The rotation falls out of the survey plus one pose sample; the
-  translation does not.
+- **The offset must be probed or fitted.** `zylia_survey` takes source positions relative to a
+  center, so it cannot solve for that center. The rotation falls out of the survey plus one pose
+  sample; the translation does not. Probe it into the survey, or fit the marker ring
+  (`--mount-offset ring`, below).
 
-With `--track` the placements you pass become the **plan**, not the measurement. The tool prints
-tracked beside planned with the delta, and warns past half a meter: a wrong rigid body or a frame
-mix-up shows up immediately rather than as a puzzling result three hours later. This is also the
-undemanding use of the tracker: the mic is static during a capture, so one good pose per
-placement is enough.
+With `--track` the placements you pass become the **plan**, not the measurement. The placement is
+the one `bwa_calibrate --track` uses ([calibration.md](./calibration.md), "Placing the ZM-1 with the
+tracker"): one live line with the measured center, the plan, the delta per axis and in total, and
+`HOLD` or `OK`. The run waits until the gate opens, then scores every cell of that placement from the
+MEASURED center, both the tracked solve and the microphone position. After every capture it checks
+for a bump.
 
-Two safety behaviors worth knowing:
+```
+bwa_validate --driver <name> --mic-in <n> --positions mics.txt --track zm1 --natnet-server 10.0.0.5 --survey body.json
+```
+
+#### The gate: tolerance, not stillness alone
+
+The gate opens when the center has been within `--place-tol-mm` of the plan and still (every center
+of the last 0.5 s within 2 mm of their mean) for 1 s. The measured center is what the run uses, so the
+tolerance does not bound a measurement error. You could gate on stillness alone, the way
+`bwa_calibrate --localize` does. This tool does not, for two reasons:
+
+- **The plan is the experiment's design.** "Right +0.7" and "seated -0.4" are the conditions the
+  contrasts are read against, and the CSV is a before/after record across sessions. The tolerance
+  keeps the realized placement on that design.
+- **Stillness alone opens on the wrong placement.** The stand is still at the previous placement when
+  the next one starts. With no tolerance the gate opens there after 1.5 s unless you have already
+  picked the stand up. Placements are tens of centimeters apart, so any tolerance keeps it shut.
+
+The default is 20 mm, twice the trims' 10 mm. The trims need 10 mm because a centimeter is 29 µs of
+arrival error. Validation reads directions from wherever the center turns out to be, so hitting the
+plan closer than 2 cm buys nothing: 2 cm of the 0.7 m envelope step is 3%. The bump limit is half the
+tolerance, 10 mm. At the 1.4 m source radius that is 0.4° of direction, a fifth of the estimator's
+2° anechoic floor. A placement with a full knob sweep can take an hour, and a tighter limit would stop
+it for creep no result can resolve.
+
+On the rig a key takes the current reading anyway, with a warning. With no live pose it skips that
+placement. `--place-timeout <s>` (default 300) gives up on a gate that never opens and also skips the
+placement. A skipped placement is reported, never measured from a guess.
+
+#### The bump check
+
+After every capture the tool reads the center again. A move past half the tolerance stops the session
+with exit 4:
+
+- **The bumped placement is dropped.** Its cells were measured from two points, and none of them go
+  into the report or the CSV.
+- **The placements before it are kept.** Each was checked after every one of its own captures. The
+  report and the CSV cover them, and the tool names the placements left to rerun.
+
+After each placement the tool prints the bump history: the number of checks, the largest move, and
+the captures that had no live pose to check.
+
+The check reads the center, not the orientation. A stand that turns about the array center moves
+nothing it can see, and a turn of 1° is 1° of direction error. Keep the coupling rigid (above).
+
+#### The mount offset
+
+The center is `pose_pos + R(pose) · offset`, and the offset comes from one of:
+
+- **the body-frame survey**, when it carries a probed offset. Then `--mount-offset` is refused: two
+  offsets for one mount is a mistake, not a choice;
+- **`--mount-offset x,y,z`** (meters, body axes), beside a body-frame survey saved with no offset;
+- **`--mount-offset ring`**, beside a body-frame survey with no offset: the center of the circle
+  through the body's markers, from Motive's model definition. It needs `--natnet-server` and assumes
+  the ring sits at the array center's height ([calibration.md](./calibration.md), "The ring offset");
+- **nothing**: 0. The rigid body's pivot is taken as the array center.
+
+Unlike the trims, this tool always needs the body-frame survey (it turns capsule arrival differences
+into directions), so `--mount-offset` matters only for a survey that has no offset of its own.
+
+#### Two safety behaviors
 
 - **A stale pose is refused, not reused.** `pose_read` hands back the last *published* pose forever,
   and NatNet only publishes tracking-valid frames. So an occluded stand or a wrong streaming id would
-  silently return the *previous* placement's pose, and the tool would accept it as this one's
-  measurement. Each placement is gated on `natnet_status() == LIVE`. A placement with no live pose is
-  skipped and reported rather than measured against a stale one.
-- **`--track-sim` proves the wiring** without a rig: it drives the same path from a synthetic mount
-  pose and exits nonzero unless the placement hook fired for every placement. That check exists
-  because the hook was once passed into the session loop and never called. `--track` stayed inert
-  while it announced the tracker was measuring. Asserting on the *result* would not have caught it:
-  in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong
-  table cancels out and looks healthy. It is the `validate_track` ctest.
+  silently return the *previous* placement's pose. A pose counts only while `natnet_status()` reports
+  the body LIVE, and with no live pose the gate reads `HOLD` and never opens.
+- **`--track-sim` proves the wiring** without a rig (with `--simulate`). A scripted stand walks in
+  from 8.4 cm off each plan over 2 s, settles 5.4 mm off it, yawed 30° and 1.5° off level, and the
+  simulated captures come from its TRUE center, which it computes with its own quaternion code. With
+  no `--survey` the built-in capsule table stands in as the body frame. The run exits 5 unless the
+  placement hook fired for every placement. That check exists because the hook was once passed into
+  the session loop and never called. `--track` stayed inert while it announced the tracker was
+  measuring. Asserting on the *result* would not have caught it: in simulate the field is
+  synthesized from the same capsule table the estimator reads, so a wrong table cancels out and looks
+  healthy. `--track-sim-bump <n>` knocks the stand 15 mm after the nth capture.
+
+The ctests: `validate_track` checks that the hook fires. `validate_track_settle` checks that the gate
+waits and that every CSV cell carries the measured center, which sits within 1 mm of the scripted
+stand's truth and 5 mm off the plan. It runs at a 40 mm tolerance, so a center computed a few
+centimeters wrong fails the truth check instead of timing out at the gate. `validate_track_bump`
+knocks the stand during the second placement: exit 4, that placement dropped, the first one's cells
+kept.
+
+Unverified against live Motive: the socket, the pose timing, the gate against real jitter, and the
+model definition the ring reads.
 
 ### The physical reference arm
 
@@ -892,7 +970,9 @@ through different capsules, which separates capsule error from field structure f
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the engine-versus-direct regression, determinism, the per-knob effects, the sweep |
-| - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep |
+| - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep; `validate_track`: the placement hook fires |
+| `examples/mic_track.cpp` | the tracked ZM-1: NatNet, the mount offset, the capsule re-aim, the gate's console loop and the bump check, shared with `bwa_calibrate` |
+| `test/validate_cli_test.cmake` | the `validate_track_settle` and `validate_track_bump` ctests: the measured center against the scripted stand's truth and the CSV, and the bump |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

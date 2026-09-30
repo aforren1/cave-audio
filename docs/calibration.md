@@ -120,9 +120,10 @@ it. Do not expect it to be audible.
 - **`--localize positions.txt`**: acoustic self-survey. Capture every speaker at K ≥ 5 known mic
   positions. `calib_trilaterate` solves each speaker's 3D position *and* the unknown constant system
   latency jointly (linear least squares). This **sees speakers optical trackers can't**: the sweep
-  passes through the screens. Pair it with the OptiTrack you already have for head tracking: put a
-  marker on the *mic* (open line-of-sight) so OptiTrack hands you the known mic positions, and let
-  acoustics locate the screen-hidden speakers. Spread the mic positions out and make them
+  passes through the screens. Pair it with the OptiTrack you already have for head tracking: put
+  the mic on a tracked stand and add `--track <body>`, so the tool records each MEASURED mic
+  position (see "Placing the ZM-1 with the tracker" below), and let acoustics locate the
+  screen-hidden speakers. Spread the mic positions out and make them
   non-coplanar ([GDOP](./glossary.md#gdop)): clustered points amplify error. Cross-check against
   the install drawings.
 
@@ -563,8 +564,9 @@ into `cave_layout.json`. Two flags carry the physics the tool cannot know:
 
 - **`--survey <file>`**: a room-axes capsule survey (calib_view → Zylia tab → Capsule survey).
   Without one the tool trusts the built-in table, and an unpinned channel order or yaw rotates the
-  whole recovered layout. The tool warns, but it cannot check. (The tool refuses a body-frame
-  survey: it has no tracker to re-aim one with. That's `bwa_validate --track`.)
+  whole recovered layout. The tool warns, but it cannot check. A body-frame survey needs the
+  tracker to re-aim it: without `--track` the tool refuses one, and with `--track` this survey
+  requires one (see "Placing the ZM-1 with the tracker").
 - **`--latency <m>`** or **`--ref <spk> <m>`**: the distance calibration. `--latency` is a
   loopback-measured round trip in meters at c. `--ref` solves it from ONE tape-measured
   center→speaker distance instead (that speaker's mean arrival, wavefront-tilt corrected), so a
@@ -586,7 +588,8 @@ On the rig the ZM-1 is the only measurement mic, so it measures the trims too. P
 center AT the listening point (`--mic` is the center, and here it is the 4.75 ft point): the
 delays equalize arrival at the mic, while the engine treats the trims as aligned at the
 listening point, and tracked alignment is identity only there. The trim run warns when the mic
-is more than 5 cm from it.
+is more than 5 cm from it. With a tracked stand, `--track <body>` puts the center there for you
+and measures where it ended up: see "Placing the ZM-1 with the tracker".
 
 ```
 bwa_calibrate --layout cave_layout.json --zylia --trims --survey s.json --input 26 --mic 0 1.448 0
@@ -895,6 +898,149 @@ Unverified against a live Motive: the socket path, and the assumption that Motiv
 offsets in the body's own frame. For a body created in place on a fixed speaker the two readings
 agree.
 
+## Placing the ZM-1 with the tracker (`--track`)
+
+On the rig the ZM-1 stands on a rigid stand with OptiTrack markers, and Motive's frame is the room
+frame. Without the tracker, every mic position you give `bwa_calibrate` is a number you typed.
+`--track <body>` makes it a measurement. Before each placement's captures the tool shows where the
+array's center is against where it should be, waits until it is there and still, and then
+measures from where the center actually is. After every capture it checks that the stand did not
+move.
+
+```
+bwa_calibrate --layout cave_layout.json --zylia --trims --input 26 --track zm1 --natnet-server 10.0.0.5 --mount-offset ring
+```
+
+### What each job needs
+
+| job | target | tolerance | why |
+| --- | --- | --- | --- |
+| trims, `--verify` | `--mic`, else the listening point | 10 mm | 1 cm is up to 29 µs of arrival error, and verify flags at 100 µs. The engine assumes the trims align at the listening point. |
+| live aiming | `--mic`, else the listening point | 10 mm | the position readout is relative to the center |
+| `--localize` | each row of the file | 100 mm | trilateration needs each position KNOWN, not hit |
+| `--room-eq-grid` | `--mic` (required) | 10 mm | the measured position becomes the grid key |
+| `--zylia` position survey | `--mic` (required) | 10 mm | the center is where every direction starts |
+
+For `--localize` the tolerance is loose, 100 mm (or `--place-tol-mm` if you set it wider), and
+the tool records the MEASURED position. That is what the solve needs: a row you missed by 3 cm costs
+nothing once it is known. The tolerance is not zero, because the stand is still standing at the
+previous row when the next wait starts, and a gate that accepted stillness anywhere would record
+that row twice.
+
+`--check`, the omni `--live` and `--aim-sheet` take no placement, and refuse `--track`.
+
+### Set it up
+
+- A rigid stand and a rigid coupling, no shock mount, markers on the stand and not on the sphere
+  (the ZM-1 mount prep in [hardware-validation.md](./hardware-validation.md), "Before you go").
+- A rigid body for the stand in Motive. Note its streaming ID and its name. Tracking by name needs
+  `--natnet-server <ip>`, because the name resolves through Motive's model definitions.
+- The mount offset: from the rigid body's pivot to the array's acoustic center, in the body's own
+  axes. The tool computes `center = p + R(q) · offset` from every pose. Give it one of:
+  - **a body-frame survey** (`--survey`), which carries the probed offset;
+  - **`--mount-offset x,y,z`** in meters. With no body-frame survey, this center depends on how
+    Motive orients the rigid body. It does not depend on which way the ZM-1 faces;
+  - **`--mount-offset ring`**: fit the markers (below);
+  - **nothing**: an offset of 0. Move the rigid body's pivot to the array center in Motive first.
+
+The tool prints which source it used.
+
+### What needs a survey
+
+Only a mode that turns capsule arrival DIFFERENCES into a room direction needs the array's
+orientation: the `--zylia` position survey and the live-aim position readout. Tracked, those two
+need a BODY-FRAME survey, and the tool re-aims its capsule table from each pose. Without one the
+position survey is refused, and live aiming runs its tilt meter with the position readout off.
+
+Everything else only needs the center: the trims, `--verify`, the live tilt meter, `--localize` and
+`--room-eq-grid`. The pressure proxy's power mean does not change when the array rotates, and
+neither does `zylia_center_arrival`: its direction and the capsule centroid are both in the
+array's own frame, so their dot product is the same at any orientation. These modes take no
+survey, a body-frame one, or a room-axes one, which is then installed for its channel order and
+geometry only and never re-aimed.
+
+### The ring offset (`--mount-offset ring`)
+
+If the markers sit in a ring around the housing's equator, Motive's default pivot is their
+CENTROID, and the centroid lies on the ring's axis only when the markers are evenly spaced. You
+space them unevenly so the body has a yaw: 0, 90, 180 and 225 degrees on a 60 mm ring puts the
+centroid 11.5 mm off the axis. `ring` reads the body's marker offsets from Motive's model
+definition, fits a plane through them and a circle in that plane, and takes the circle's center as
+the offset (`place_ring_fit`). It needs `--natnet-server`, and at least 3 markers. It refuses markers on
+one line, markers more than 3 mm RMS off one plane, and a circle residual over 3 mm RMS. The report
+gives the centroid-to-center distance, the radius and both residuals.
+
+It assumes the ring sits at the height of the array center, the capsule sphere's equator. The fit
+cannot see a ring that sits higher or lower on the housing, and that vertical error passes
+straight into the center.
+
+### The readout and the gate
+
+```
+  center (+0.003 +1.450 +0.004)  target (+0.000 +1.448 +0.000)  dx   +3.0 dy   +2.0 dz   +4.0 mm  |d|   5.4 mm  HOLD settling
+```
+
+One line, updated in place: the measured center, the target, the delta per axis and in total, and
+`HOLD` or `OK`. `HOLD` says why: `moving`, `off target`, `settling`, or no live pose. The gate
+(`placement.h`) opens when all of these hold:
+
+- **Still**: every center of the last 0.5 s sits within a spread limit of their mean. The limit is
+  a quarter of the tolerance, clamped to 0.5 to 2 mm: Motive's jitter on a rigid body is a few
+  tenths of a millimeter, and 2 mm is well under the bump limit.
+- **Within tolerance**: the window's mean is within `--place-tol-mm` of the target (default 10).
+  The test is on the total distance, not per axis.
+- **Held**: both have stayed true for 1 s. A stand reads still the moment the hand pauses; it has
+  settled only once it stays put after the hand is gone.
+
+Then the window's mean IS the mic position. The tool prints it with the mount's yaw (bearing of the
+body's +z, clockwise from above, 0 = room-ahead) and tilt, re-aims a body-frame table, and starts.
+A pose only counts while NatNet reports the body LIVE: the last published pose stays readable
+forever, so an occluded stand would otherwise hand back an old one.
+
+On the rig a key takes the current reading anyway, with a warning. With no pose at all it aborts.
+`--place-timeout <s>` (default 300) aborts a wait that never ends.
+
+### The bump check
+
+After every capture the tool reads the center again and compares it with the one the run took. A
+move past half the tolerance stops the run with exit 4 and writes nothing. Once the mic moves, the
+run's speakers were measured from two points, and a trim set like that is wrong in a way no later
+pass can see. The report prints the largest move over the run. Re-place the ZM-1 and run again.
+
+The trims, `--verify`, `--localize`, `--room-eq-grid`, the `--zylia` survey and live aiming all
+check.
+
+### In `bwa_calib_view`: the Placement panel
+
+The Capture and Aim tabs share a **Placement (tracked ZM-1)** panel: the rigid body, the server
+and the multicast group, Connect and Disconnect, an optional survey with an offset field or `ring`
+beside it, a tolerance slider, and the target, which follows the tab's layout's listening point
+until you edit it. While connected it shows the distance in large type, green once the gate is
+open, the move in room words and as an arrow seen from above (screen up is the front, screen right
+is room-right), the per-axis delta and the mount's yaw.
+
+A run started while tracking is live waits for the gate, takes the measured center instead of the
+typed field, shows the delta it used, and stops on a bump with the move and the capture it
+happened after. The Aim tab's 3D view marks the tracked center. The poller runs on its own thread,
+so the window never waits on NatNet.
+
+### Rehearse without Motive (`--track-sim`)
+
+`--track-sim` (with `--simulate`) replaces Motive with a scripted stand: it walks in from 8.4 cm
+off the target over 2 s, settles 5.4 mm off it, yawed 30 degrees and 1.5 degrees off level. The
+simulated captures come from its TRUE center, which it computes with its own quaternion code, so a
+tool that measured wrong, or solved at the target, is solved at a point the captures did not come
+from. `--track-sim-bump N` knocks it 15 mm after the Nth capture. With `--mount-offset ring` it
+serves a model definition with the uneven 60 mm ring above. The Placement panel's **simulate**
+and **bump mid-run** boxes are the same source.
+
+The `calibrate_track_*` ctests run all of it: a settled trim run solved at the true center and not
+the target, the ring, a bump, the refusals and a body-frame survey. `placement` unit-tests the math,
+and `calib_view --tests placement` drives the panel.
+
+Unverified against live Motive: the whole live path, the socket, the pose timing, and the model
+definition the ring reads.
+
 ## Live aiming (`--live N --zylia`, the Aim tab)
 
 Some boxes you cannot see: they hang behind the acoustically transparent screens, or overhead.
@@ -907,7 +1053,9 @@ bwa_calibrate --layout cave_layout.json --live 7 --zylia --survey s.json --input
 ```
 
 `--mic` is the array center and defaults to the layout's listening point, which is where the
-ZM-1 sits on the rig (4.75 ft). `bwa_calib_view` has the same loop in its **Aim** tab, on a
+ZM-1 sits on the rig (4.75 ft). The position readout is relative to that center, so it needs the
+center to about 1 cm: with a tracked stand, add `--track <body>` and the tool places and measures
+it (see "Placing the ZM-1 with the tracker"). `bwa_calib_view` has the same loop in its **Aim** tab, on a
 worker thread, for the speakers of layout A: a speaker picker, a big "dB below peak" number
 readable from a ladder, a meter with a peak-hold line, the angle estimates, the position, and a
 3D view with the layout's position and aim, the ZM-1, and the measured direction and position.
@@ -1049,7 +1197,8 @@ and measure/solve DSP as the CLI; simulate hardware-free, ASIO full-duplex at th
 button loads the result into Diff for review before you accept it. Its directivity correction
 follows the CLI's `--mic` rule (see "Speaker directivity" above): off until you set the mic. The **Zylia tab** (live
 clap-DOA, see "Bring-up" above) covers the ZM-1, and the **Aim tab** runs live aiming (see
-"Live aiming" above).
+"Live aiming" above). Capture and Aim share the **Placement** panel for a tracked stand (see
+"Placing the ZM-1 with the tracker" above).
 
 `bwa_calibrate` remains the headless CLI over the same code: scriptable, and the only place for
 the multi-placement modes (`--localize`, `--zylia`, `--check`, the omni `--live`), for trims measured with

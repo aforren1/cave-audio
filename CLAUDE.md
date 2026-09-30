@@ -336,6 +336,11 @@ src/
                          validation-grade estimators — active-intensity DOA, capsule integrity,
                          SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
                          copies cost in timbre, the measurable side of SPCAP focus). [calib]
+    placement.h/.c       the tracked ZM-1's placement math: center = p + R(q).offset, the gate (still within
+                         clamp(tol/4, 0.5..2 mm) over 0.5 s, within tolerance on the MEAN, held 1 s), the bump check
+                         (half the tolerance), mount yaw/tilt, and place_ring_fit (plane + algebraic circle through a
+                         marker ring: the offset for --mount-offset ring, because Motive's centroid pivot sits off an
+                         UNEVEN ring's axis). Pure, sane.h-guarded, test_placement. [placement]
     valid.h / valid.c    phantom-localization validation: render a source, measure where the array
                          actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
                          contrasts). The PHANTOM arm renders through a REAL ENGINE CORE (a cached
@@ -514,7 +519,14 @@ cmake/                 bw_audioConfig.cmake.in + bwa_bindings.cmake. The first i
                        the other has not. In-tree, `bwa::bw_audio` is an ALIAS of the real target,
                        so a binding never asks which mode built it. [engine sdk]
 docs/                  Specs. Start here.
-examples/              speaker_survey.c = bwa_speaker_survey: the camera-visible speakers' rigid bodies
+examples/              mic_track.h/.cpp: the tracked ZM-1 shared by bwa_calibrate --track, bwa_validate --track and
+                       calib_view's Placement panel: NatNet open (gated on NN_STATUS_LIVE), the offset source
+                       (body-frame survey, --mount-offset x,y,z, ring, or 0), capsule re-aim, the scripted
+                       --track-sim stand (its truth from its own quaternion code, never placement.c), and the
+                       console gate/bump loop. Only DIRECTION modes (the --zylia survey, the live position
+                       readout, bwa_validate) need a body-frame survey: the pressure proxy and
+                       zylia_center_arrival do not change when the array rotates.
+                       speaker_survey.c = bwa_speaker_survey: the camera-visible speakers' rigid bodies
                        (named spk<N>) -> aim, position, and whether Motive's frame IS the layout's room
                        frame (--write copies aims into a layout copy; --simulate is the rehearsal and the
                        speaker_survey_* ctests via test/speaker_survey_check.cmake, which asserts on the
@@ -586,32 +598,33 @@ engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manyl
 release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
 phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
 everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
-tree registers 60 on Windows at full options and 46 off it, and each job's bindings tree registers
+tree registers 68 on Windows at full options and 47 off it, and each job's bindings tree registers
 the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 60 tests with the Steam Audio SDK, 55 without (the 5 SDK-gated ones are `reflect`,
+suite — 68 tests with the Steam Audio SDK, 63 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, the seven calibrate CLI runs
+(`calib_view`, `layout_tool`, `playground`), the six `validate_*` runs (four plus `validate_track_settle`/`_bump`), the seven calibrate CLI runs
 (`calibrate_sim_room_aim`/`_trim`, `calibrate_verify_omni`/`_zylia`, `calibrate_zylia_trims`,
-`calibrate_aim_sheet`, `calibrate_live_zylia`), the eight optical-survey tests (`survey` plus seven `speaker_survey_*`),
+`calibrate_aim_sheet`, `calibrate_live_zylia`), the five tracked-placement runs (`calibrate_track_settle`/
+`_ring`/`_bump`/`_refuse`/`_survey`), the eight optical-survey tests (`survey` plus seven `speaker_survey_*`),
 and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux or macOS at the DEFAULT options it is 41: `calib_view`
+under their build flags. On Linux or macOS at the DEFAULT options it is 42: `calib_view`
 and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
-`validate_*` and seven calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
-`BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 34 at the defaults: the seven
+`validate_*` and twelve calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
+`BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 35 at the defaults: the seven
 `speaker_survey_*` runs need a host CMake to drive them (`if(NOT CMAKE_CROSSCOMPILING)`), so only
 `survey` comes along. Those two GUI tools are NOT Windows-bound (raylib + rlImGui +
 imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
-back, for 48 with phonon and 43 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
+back, for 49 with phonon and 44 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
 survey's eight). They need a DISPLAY:
-a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs its 34
+a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs its 35
 through `tools/android/run-tests.ps1` rather
 than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
 too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
-`lib/android-arm64` + `lib/android-x64`), so the count there is **46** on Linux and macOS and
-**39** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
+`lib/android-arm64` + `lib/android-x64`), so the count there is **47** on Linux and macOS and
+**40** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
 the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
 sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
@@ -619,8 +632,8 @@ sleep-lateness bound, which a no-SDK library of the same commit misses identical
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
-`python_example_live_onset`), so the full-options Windows tree is 64 and the default Windows tree
-50; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
+`python_example_live_onset`), so the full-options Windows tree is 72 and the default Windows tree
+51; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
 example"), so a change to the stimulus is a change to five files plus the web page.
@@ -636,8 +649,8 @@ after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
-70 (60 + 10) and 74 at full options (74 measured, 2026-09-29); a Linux or macOS box with Octave
-alone reaches 51 (46 + 5) and with both 56 (46 + 10). Each suite exits 77
+78 (68 + 10) and 82 at full options (82 registered, 2026-09-30); a Linux or macOS box with Octave
+alone reaches 52 (47 + 5) and with both 57 (47 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
@@ -646,7 +659,7 @@ into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's
 engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
-that is the 50 the linux and macos jobs report, and on Windows 64 registered with 61 run (the three
+that is the 51 the linux and macos jobs report, and on Windows 72 registered with 69 run (the three
 GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is
@@ -989,6 +1002,12 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `delay_ms`, and a corrupted `delay_ms` then cancelled out of its own residual. The expectation is
   the alignment GOAL (equal arrivals at the trim point); the `calibrate_verify_*` ctests corrupt one
   delay and require the flag.
+- **A gate in front of an assertion can catch a break for the wrong reason.** With the default
+  10 mm placement tolerance, a center computed 3 cm wrong never opened the gate, so the test failed
+  by a 300 s timeout and never reached the check against the truth. It went red, but not because the
+  thing under test was caught. The `calibrate_track_*` settle and ring runs widen the tolerance so the
+  truth assertion is what fires. Related: a CMake `function()` that calls `run()` must re-export
+  `${name}_OUT` with `PARENT_SCOPE`, or the caller's `expect` silently matches an empty string.
 - **A handedness check on coplanar points is blind.** Three points, or any set on one plane, fit a
   mirror exactly as well as the truth (reflect across their own plane). `survey.c` therefore lets
   positions decide handedness only when the mirrored fit is clearly worse, falls back to the aims,

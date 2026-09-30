@@ -33,6 +33,7 @@ extern "C" {
 #include "dsp/sos.h"           /* room-temperature speed of sound: --temp / --c, or the layout's */
 }
 #include "calib_capture.h" /* sweep constants + the simulate/ASIO capture backends */
+#include "mic_track.h"     /* --track: the ZM-1's stand as a tracked rigid body */
 
 #include <cmath>
 #include <cstdio>
@@ -69,6 +70,78 @@ static void record_sos(const char* path, double sos) {
         fprintf(stderr, "calibrate: warning: could not record speed of sound (%s)\n", err);
 }
 
+/* ---- --track: the ZM-1's stand as a tracked rigid body (docs/calibration.md, "Placing the ZM-1 with
+ * the tracker") ----
+ * Before the captures of a placement, wait until the measured center sits within --place-tol-mm of the
+ * target and has stayed still (placement.h), then take THAT as the mic position. After each capture,
+ * the bump check: a run measured across a moved mic is wrong, so it stops. With --track-sim the
+ * simulated captures are synthesized at the simulated stand's TRUE center (mic_track_sim_truth), not at
+ * the mic variable the tool solves with, so a run that forgot to take the measured center, or took it
+ * wrong, is solved at a point the captures did not come from. */
+static MicTrack  g_mt;                    /* static: it carries an atomic; main is not reentrant */
+static int       g_tracked, g_track_sim;
+static float     g_tol_m = PLACE_TOL_DEFAULT_M;
+static double    g_place_timeout = 300.0;
+static MicPlaced g_placed;
+static float     g_taken[3];              /* the center the current placement took */
+static float     g_sim_at[3];             /* --track-sim: the true center the next capture comes from */
+static float     g_max_move;
+static int       g_nchecks, g_nunchecked;
+
+static const double CAPTURE_S = CAL_CAPLEN / CAL_FS, LIVE_CAPTURE_S = CAL_LIVE_CAPLEN / CAL_FS;
+
+static void track_sim_sync(void) { if (g_track_sim) mic_track_sim_truth(&g_mt, g_sim_at); }
+
+/* --localize's gate: trilateration needs each position KNOWN, not hit, so the row is only roughly
+ * enforced. But not "still anywhere": the stand is still at the PREVIOUS row the moment the gate
+ * restarts, and a stillness-only gate opened there after its 1.5 s and recorded that row twice. Rows
+ * worth trilaterating from sit far more than this apart. */
+#define LOCALIZE_TOL_M 0.10f
+
+/* Wait for the placement and take the measured center into mic_out. accept_still: --localize, where
+ * the tolerance is loose (LOCALIZE_TOL_M, or --place-tol-mm if wider). Returns 0, or 1 (timed out). */
+static int track_place(const float target[3], int accept_still, const char* what, float mic_out[3]) {
+    PlaceCfg cfg;
+    place_cfg_default(&cfg, accept_still ? (g_tol_m > LOCALIZE_TOL_M ? g_tol_m : LOCALIZE_TOL_M) : g_tol_m);
+    if (mic_track_place_console(&g_mt, target, &cfg, g_place_timeout, !g_track_sim, what, &g_placed)) return 1;
+    memcpy(mic_out, g_placed.center, sizeof g_placed.center);
+    memcpy(g_taken, g_placed.center, sizeof g_taken);
+    if (accept_still && g_placed.dist_m > g_tol_m)
+        printf("placement: %.1f mm from the planned position (the %.0f mm guide): trilateration needs the position\n"
+               "           KNOWN, not hit, so the measured one is recorded\n", g_placed.dist_m * 1e3, g_tol_m * 1e3);
+    g_max_move = 0.f; g_nchecks = 0; g_nunchecked = 0;
+    track_sim_sync();
+    return 0;
+}
+
+/* The bump check after one capture. Returns 0 (in place, or no pose to judge by), 4 (bumped: the
+ * message is printed, and the caller stops without writing anything). */
+static int track_after_capture(double capture_s, const char* what, int idx) {
+    if (!g_tracked) return 0;
+    float moved = 0.f, now[3] = { 0.f, 0.f, 0.f };
+    const int b = mic_track_bump_console(&g_mt, g_taken, g_tol_m, capture_s, &moved, now);
+    if (b < 0) { ++g_nunchecked; return 0; }
+    ++g_nchecks;
+    if (moved > g_max_move) g_max_move = moved;
+    track_sim_sync();
+    if (b == 0) return 0;
+    fprintf(stderr, "calibrate: BUMP: the ZM-1 moved %.1f mm during the %s, after %s %d (limit %.1f mm, half the\n"
+                    "           tolerance). Center taken (%.4f %.4f %.4f), now (%.4f %.4f %.4f). What was measured\n"
+                    "           across a moved mic is wrong, so the run stops and writes nothing: re-place the ZM-1\n"
+                    "           and run again.\n",
+            moved * 1e3, what, !strcmp(what, "live aiming") ? "reading" : "speaker", idx, 0.5f * g_tol_m * 1e3f,
+            g_taken[0], g_taken[1], g_taken[2], now[0], now[1], now[2]);
+    return 4;
+}
+
+static void track_report(const char* what) {
+    if (!g_tracked) return;
+    printf("placement: %s at the measured center (%.4f %.4f %.4f), mount yaw %.1f deg, tilt %.1f deg;\n"
+           "           %d bump check(s), the largest move %.1f mm (limit %.1f mm); %d capture(s) had no live pose to check\n",
+           what, g_taken[0], g_taken[1], g_taken[2], g_placed.yaw_deg, g_placed.tilt_deg, g_nchecks,
+           g_max_move * 1e3, 0.5f * g_tol_m * 1e3f, g_nunchecked);
+}
+
 /* One speaker's capture and measurement, shared by the trim loop and --verify so the two passes
  * cannot measure differently. The mic is the omni (one capture, `cap`) or, with --zylia, the ZM-1:
  * 19 capsule captures in `cap19`, each deconvolved on its own and pooled by zylia_pressure_proxy,
@@ -82,6 +155,7 @@ static void record_sos(const char* path, double sos) {
 struct Pass {
     const Layout* L;
     const float*  mic;
+    const float*  sim_at;              /* --track-sim: synthesize here (the true center), not at mic */
     double        sos;
     int           simulate, zylia;
     const float*  sweep;
@@ -99,8 +173,9 @@ static int measure_speaker(Pass& P, int s, int through, MeasureResult* out) {
     const int nrow = P.zylia ? ZYLIA_MICS : 1;
     float* rows = P.zylia ? P.cap19 : P.cap;
     if (P.simulate) {
-        if (P.zylia) calib_sim_capture_zylia(s, P.L, P.mic, P.caps, ZYLIA_MICS, P.sos, P.sweep, P.cap19);
-        else         calib_sim_capture(s, P.L, P.mic, P.sos, P.sweep, P.cap);
+        const float* at = P.sim_at ? P.sim_at : P.mic;
+        if (P.zylia) calib_sim_capture_zylia(s, P.L, at, P.caps, ZYLIA_MICS, P.sos, P.sweep, P.cap19);
+        else         calib_sim_capture(s, P.L, at, P.sos, P.sweep, P.cap);
         if (through && !calib_stage_rows(P.L, s, rows, nrow, CAPLEN, P.tmp)) return 0;
     }
 #ifdef BWA_HAVE_ASIO
@@ -238,6 +313,8 @@ struct LiveArgs {
     float*  cap19;              /* [19][CAL_CAPLEN], the ASIO shell's rows */
     int     in_first;
     int     have_survey;
+    const float* sim_at;        /* --track-sim: the true center the simulated readings come from */
+    int     pos_ok;             /* 0 = tracked with no body-frame survey: no position readout */
 };
 
 static void live_true_aim(const Layout* L, int s, float deg, float out[3]) {
@@ -253,7 +330,7 @@ static int live_sweep_one(const LiveArgs& A, int spk, float aim_err_deg, const f
         live_true_aim(A.L, spk, aim_err_deg, ta);
         o.true_pos = tp; o.true_aim = ta;
     }
-    if (!calib_live_read(spk, A.L, A.mic, A.sos, A.simulate, &o, lsweep, A.cap19, r)) {
+    if (!calib_live_read(spk, A.L, A.sim_at ? A.sim_at : A.mic, A.sos, A.simulate, &o, lsweep, A.cap19, r)) {
         fprintf(stderr, "\ncalibrate: capture timed out on speaker %d\n", spk); return 0;
     }
     if (!r->ok)
@@ -299,7 +376,10 @@ static int live_zylia(const LiveArgs& A) {
         printf("live: 0 deg tilt from the file's on_axis_db: %+.2f dB (a reference speaker replaces it)\n", tilt0_file);
     else
         printf("live: the model has no on_axis_db, so the angle needs a reference (--aim-ref, --aim-ref-db, or r)\n");
-    if (!A.simulate && !A.have_survey)
+    if (!A.pos_ok)
+        printf("live: tracked with no body-frame survey: the POSITION readout is off. It turns capsule arrival\n"
+               "      differences into a room direction, which needs the array's orientation; the tilt meter does not.\n");
+    else if (!A.simulate && !A.have_survey)
         printf("live: no --survey: the built-in capsule table. The channel order and the ZM-1's yaw are unpinned,\n"
                "      and a yaw error rotates the measured direction (docs/calibration.md, capsule self-survey).\n");
 
@@ -349,9 +429,12 @@ static int live_zylia(const LiveArgs& A) {
         }
         if (!live_sweep_one(A, s, aim_err, lsweep, &rd)) return 1;
         ++done;
+        const int bump = track_after_capture(LIVE_CAPTURE_S, "live aiming", t + 1);
+        if (bump) return bump;
         if (!rd.ok) continue;
         ZyliaLivePos lp;
-        zylia_live_position(rd.arr, A.mic, lat_known, latency, C, tp, &lp);
+        memset(&lp, 0, sizeof lp);
+        if (A.pos_ok) zylia_live_position(rd.arr, A.mic, lat_known, latency, C, tp, &lp);
         char line[640]; size_t k = 0;
         k += snprintf(line + k, sizeof line - k, "  #%-3d", t + 1);
         if (lp.ok && lp.have_distance)
@@ -359,6 +442,8 @@ static int live_zylia(const LiveArgs& A) {
                           lp.delta_mm[0], lp.delta_mm[1], lp.delta_mm[2], lp.delta_norm_mm, lp.dir_err_deg, lp.dist_m, lp.dist_err_mm);
         else if (lp.ok)
             k += snprintf(line + k, sizeof line - k, " dir %.2f deg off the layout (no distance)", lp.dir_err_deg);
+        else if (!A.pos_ok)
+            k += snprintf(line + k, sizeof line - k, " position: n/a (no body-frame survey)");
         else
             k += snprintf(line + k, sizeof line - k, " position: DOA solve failed");
         if (rd.have_tilt) {
@@ -437,6 +522,13 @@ int main(int argc, char** argv) {
     const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
+    const char* track_body = NULL;                            /* --track: the ZM-1 stand's rigid body (id or name) */
+    const char* nn_server = NULL;                             /* --natnet-server: Motive's host */
+    const char* nn_multicast = "239.255.42.99";               /* --natnet-multicast */
+    int    track_sim = 0, track_sim_bump = 0;                 /* --track-sim, --track-sim-bump N */
+    int    mount_ring = 0, mount_off_set = 0;                 /* --mount-offset ring | x,y,z */
+    float  mount_off[3] = { 0.f, 0.f, 0.f };
+    int    tol_set = 0, timeout_set = 0;
     /* Room-temperature speed of sound. Every acoustic RANGE below is c * delay, so a 2% error in c
      * is a 2% systematic in every surveyed position (8 cm at 4 m) — the dominant error term in the
      * survey, well above the 7 mm timing resolution. Precedence: --temp/--c, else the layout's
@@ -510,6 +602,43 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        else if (!strcmp(argv[i],"--track") && i+1<argc)           track_body = argv[++i];
+        else if (!strcmp(argv[i],"--natnet-server") && i+1<argc)   nn_server = argv[++i];
+        else if (!strcmp(argv[i],"--natnet-multicast") && i+1<argc) nn_multicast = argv[++i];
+        else if (!strcmp(argv[i],"--track-sim"))                   track_sim = 1;
+        else if (!strcmp(argv[i],"--track-sim-bump") && i+1<argc) {
+            track_sim_bump = atoi(argv[++i]);
+            if (track_sim_bump < 1) { fprintf(stderr, "calibrate: --track-sim-bump wants a capture count >= 1 (got %s)\n", argv[i]); return 2; }
+        }
+        else if (!strcmp(argv[i],"--place-tol-mm") && i+1<argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 1.0 && v <= 500.0)) {
+                fprintf(stderr, "calibrate: --place-tol-mm wants a tolerance in mm, 1 to 500 (got %s)\n", argv[i]); return 2; }
+            g_tol_m = (float)(v * 1e-3); tol_set = 1;
+        }
+        else if (!strcmp(argv[i],"--place-timeout") && i+1<argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 1.0 && v <= 86400.0)) {
+                fprintf(stderr, "calibrate: --place-timeout wants seconds, 1 to 86400 (got %s)\n", argv[i]); return 2; }
+            g_place_timeout = v; timeout_set = 1;
+        }
+        else if (!strcmp(argv[i],"--mount-offset") && i+1<argc) {   /* "ring" or "x,y,z" (body axes, m) */
+            const char* s = argv[++i];
+            if (!strcmp(s, "ring")) mount_ring = 1;
+            else {
+                char* end = NULL; const char* q = s;
+                for (int a = 0; a < 3; ++a) {
+                    double v = strtod(q, &end);
+                    if (end == q || !(v >= -PLACE_MAX_OFFSET_M && v <= PLACE_MAX_OFFSET_M)) {
+                        fprintf(stderr, "calibrate: --mount-offset wants ring or x,y,z in meters, body axes (got %s)\n", s); return 2; }
+                    mount_off[a] = (float)v;
+                    q = end;
+                    if (a < 2) { if (*q != ',') { fprintf(stderr, "calibrate: --mount-offset wants ring or x,y,z (got %s)\n", s); return 2; } ++q; }
+                }
+                if (*q) { fprintf(stderr, "calibrate: --mount-offset wants ring or x,y,z (got %s)\n", s); return 2; }
+            }
+            mount_off_set = 1;
+        }
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); mic_set = 1; }
         else if (!strcmp(argv[i],"--temp") && i+1<argc) {   /* "22.8", "22.8C", "73F" */
             if (!sos_parse_temp(argv[++i], &sos)) {
@@ -526,7 +655,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] | --track-sim [--track-sim-bump N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s]\n"
                                "  --zylia: the mic is a ZM-1; --input is the FIRST of its 19 consecutive capture channels,\n"
                                "  --mic is the array center. Alone it is the single-placement position survey: distances\n"
                                "  need --latency (loopback, m at c) or --ref <spk> <m> (one tape-measured center->speaker\n"
@@ -554,7 +683,25 @@ int main(int argc, char** argv) {
                                "  the reference, p resets the peak, any other key stops. --sweeps N bounds any --live run.\n"
                                "  --sim-move / --sim-aim-steps (simulate only): the live speaker's true offset (m) and its\n"
                                "  true aim error (deg off the layout aim) per reading. --sim-screen dB: a screen's HF loss\n"
-                               "  (a shelf above 4 kHz) on every speaker's path, which a reference absorbs and the file cannot.\n"); return 2; }
+                               "  (a shelf above 4 kHz) on every speaker's path, which a reference absorbs and the file cannot.\n"
+                               "  --track <id|name>: the ZM-1's stand is a tracked rigid body (Motive's frame is the room frame).\n"
+                               "  Before the captures the tool shows a live line (the measured center, the target, dx/dy/dz and\n"
+                               "  |d| in mm, HOLD or OK) and waits until the center is within --place-tol-mm (default 10) of the\n"
+                               "  target and still (2 mm for 0.5 s, then held 1 s); that center IS the mic position. After every\n"
+                               "  capture it checks for a bump (a move past half the tolerance) and stops with exit 4. Targets:\n"
+                               "  trims, --verify, --live: --mic, else the layout's listening point; the --zylia survey and\n"
+                               "  --room-eq-grid: --mic (required); --localize: each row, loosely (100 mm, or --place-tol-mm if\n"
+                               "  wider, so the gate cannot open at the previous row), and the MEASURED position is recorded,\n"
+                               "  which is what trilateration needs. The mount offset (body origin to the array center, body axes) comes from a body-frame\n"
+                               "  --survey, or --mount-offset x,y,z, or --mount-offset ring (fit the circle through the body's\n"
+                               "  markers from Motive's model definition, needs --natnet-server; it assumes the marker ring sits\n"
+                               "  at the array center's height), else 0. Only the modes that turn capsule arrival differences into\n"
+                               "  a room DIRECTION need a body-frame survey: the --zylia survey, and the --live position readout.\n"
+                               "  --natnet-server is REQUIRED to track by name. On the rig a key takes the current reading anyway,\n"
+                               "  with a warning; --place-timeout s (default 300) aborts the wait. Unverified against live Motive.\n"
+                               "  --track-sim (simulate only): a scripted stand walks in from 8 cm off the target, settles about\n"
+                               "  5 mm off it, and the captures come from its TRUE center; --track-sim-bump N knocks it 15 mm\n"
+                               "  after the Nth capture.\n"); return 2; }
     }
     if (n_temp && n_c) {
         fprintf(stderr, "calibrate: --temp and --c set the same thing; pass one\n"); return 2; }
@@ -594,6 +741,24 @@ int main(int argc, char** argv) {
                         "           each direction, and the filter would bake that coloring in. The trims use a power\n"
                         "           mean over the 19 capsules, which is a level, not a response. --room-eq-grid (30 to\n"
                         "           200 Hz, where the sphere is acoustically transparent) works; for --eq use an omni.\n"); return 2; }
+    /* --track: which modes place the mic, and what each one needs */
+    g_tracked = track_body != NULL || track_sim;
+    g_track_sim = track_sim;
+    const int zylia_survey_mode = zylia && !trims && !verify && live_speaker < 0;
+    if (track_body && track_sim) {
+        fprintf(stderr, "calibrate: --track and --track-sim are alternatives: a real stand or the simulated one\n"); return 2; }
+    if (track_sim && !simulate) {
+        fprintf(stderr, "calibrate: --track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
+    if (track_sim_bump && !track_sim) {
+        fprintf(stderr, "calibrate: --track-sim-bump knocks the SIMULATED stand; pass --track-sim\n"); return 2; }
+    if (!g_tracked && (tol_set || timeout_set || mount_off_set || nn_server)) {
+        fprintf(stderr, "calibrate: --place-tol-mm/--place-timeout/--mount-offset/--natnet-server are --track options\n"); return 2; }
+    if (g_tracked && (check || (live_speaker >= 0 && !zylia) || aim_csv)) {
+        fprintf(stderr, "calibrate: --track places the mic for the trims, --verify, --localize, --room-eq-grid, the --zylia\n"
+                        "           survey and --live N --zylia; --check, the omni --live and --aim-sheet take no placement\n"); return 2; }
+    if (g_tracked && (zylia_survey_mode || rq_grid) && !mic_set) {
+        fprintf(stderr, "calibrate: --track with %s needs --mic x y z: the target the ZM-1 is placed at\n",
+                rq_grid ? "--room-eq-grid" : "the --zylia position survey"); return 2; }
     if (check_aim && !localize_file) {
         fprintf(stderr, "calibrate: --check-aim rides the --localize captures; pass --localize positions.txt\n"); return 2; }
     if (sim_aim_err != 0.0 && !simulate) {
@@ -622,14 +787,22 @@ int main(int argc, char** argv) {
     if (aim_csv) return aim_sheet(layout_path, L, aim_csv);   /* no device, no sweep, nothing written to the layout */
     /* live aiming: the ZM-1 sits at the listening point unless --mic says otherwise */
     if (live_zy && !mic_set) memcpy(mic, L.ref, sizeof mic);
+    /* --track: mic is the TARGET until the placement measures it. The trims, --verify and live aiming aim
+     * at the listening point unless --mic says otherwise; the measured center is a real position, so the
+     * directivity re-aim below may use it (mic_set). */
+    if (g_tracked && !localize_file) {
+        if (!mic_set) memcpy(mic, L.ref, sizeof mic);
+        mic_set = 1;
+    }
     /* No explicit flag: inherit the rig's own c from the layout it was surveyed with. Falls back to
      * the 20 C reference, which is also what the synthetic-capture path assumes (calib_capture.cpp),
      * so --simulate stays bit-identical unless you deliberately ask for another temperature. */
     const char* sos_src = "default";
     if (sos_set)                                sos_src = "--temp/--c";
     else if (calib_read_sos(layout_path, &sos)) sos_src = "layout";
-    printf("calibrate: %d speakers from %s; mic at (%.2f %.2f %.2f)%s\n",
-           n, layout_path, mic[0], mic[1], mic[2], simulate ? "  [SIMULATE]" : "");
+    printf("calibrate: %d speakers from %s; mic %s (%.2f %.2f %.2f)%s\n",
+           n, layout_path, g_tracked ? "TARGET (--track measures the mic)" : "at", mic[0], mic[1], mic[2],
+           simulate ? "  [SIMULATE]" : "");
     printf("           speed of sound %.1f m/s (%s)\n", sos, sos_src);
     if (simulate) {
         char rd[256];
@@ -664,18 +837,53 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: --ref wants a speaker 0..%d and a distance >= 0.2 m (got %d, %.3f)\n",
                 n - 1, ref_spk, ref_dist); return 2;
     }
-    if (survey_path) {   /* pins the ZM-1's channel order + orientation; installs via zylia_set_capsules */
+    if (survey_path && !g_tracked) {   /* pins the ZM-1's channel order + orientation; installs via zylia_set_capsules */
         ZyliaMount mount; char serr[192] = {0};
         if (!zylia_survey_load(survey_path, &mount, serr, sizeof serr)) {
             fprintf(stderr, "calibrate: survey: %s\n", serr); return 1; }
         if (mount.body_frame) {
-            fprintf(stderr, "calibrate: survey %s is BODY-FRAME (tracked mount); this tool has no tracker, so\n"
-                            "           it cannot re-aim the table. Use a room-axes survey taken at the CURRENT\n"
-                            "           mounting (calib_view -> Zylia -> Capsule survey), or bwa_validate --track.\n",
+            fprintf(stderr, "calibrate: survey %s is BODY-FRAME (tracked mount): with no tracker the table cannot be\n"
+                            "           re-aimed. Pass --track <body> (the stand's rigid body), or use a room-axes survey\n"
+                            "           taken at the CURRENT mounting (calib_view -> Zylia -> Capsule survey).\n",
                     survey_path);
             return 1;
         }
         printf("calibrate: capsule survey %s installed (channel order + orientation pinned)\n", survey_path);
+    }
+    if (g_tracked) {   /* the survey (if any) loads through the tracker, which knows what the mode needs */
+        MicTrackCfg mc;
+        memset(&mc, 0, sizeof mc);
+        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast;
+        mc.survey_path = survey_path;
+        mc.need_body_frame = zylia_survey_mode;               /* the one mode that turns DOAs into room directions */
+        mc.have_offset = mount_off_set && !mount_ring;
+        memcpy(mc.offset_m, mount_off, sizeof mc.offset_m);
+        mc.offset_ring = mount_ring;
+        mc.sim = track_sim ? MIC_SIM_SCRIPT : MIC_SIM_OFF;
+        mc.sim_bump_after = track_sim_bump;
+        mc.virtual_clock = 1;                                 /* simulated time: no waiting on the wall clock */
+        char e[400] = { 0 };
+        const int rc = mic_track_open(&g_mt, &mc, e, sizeof e);
+        if (rc) {
+            fprintf(stderr, "calibrate: %s\n", e);
+            if (zylia_survey_mode && rc == 2)
+                fprintf(stderr, "           (the --zylia survey turns capsule arrival differences into room directions, so a\n"
+                                "           tracked run needs the array's orientation: a BODY-FRAME survey. The trims, --verify\n"
+                                "           and the live tilt meter only need the center: --mount-offset.)\n");
+            return rc;
+        }
+        std::atexit([]() { mic_track_close(&g_mt); });
+        char d[800];
+        mic_track_describe(&g_mt, d, sizeof d);
+        for (char* line = strtok(d, "\n"); line; line = strtok(NULL, "\n")) printf("track: %s\n", line);
+        if (track_sim)
+            printf("track: SIMULATED stand (--track-sim), tolerance %.1f mm, bump limit %.1f mm%s\n", g_tol_m * 1e3f,
+                   0.5f * g_tol_m * 1e3f, track_sim_bump ? ", knocked 15 mm mid-run (--track-sim-bump)" : "");
+        else
+            printf("track: rigid body '%s', tolerance %.1f mm, bump limit %.1f mm (unverified against live Motive)\n",
+                   track_body, g_tol_m * 1e3f, 0.5f * g_tol_m * 1e3f);
+        if (survey_path)
+            printf("calibrate: capsule survey %s installed\n", survey_path);
     }
 
     float* sweep = (float*)malloc((size_t)NSWEEP * sizeof(float));
@@ -731,13 +939,31 @@ int main(int argc, char** argv) {
         if (check_aim && !L.dir.nband)
             printf("check-aim: the layout carries no directivity model, so there is nothing to check the tilts against\n"
                    "           (tools/directivity/clf_to_json.py --into %s)\n", layout_path);
+        float planned[64][3];
+        memcpy(planned, micpos, sizeof planned);
         for (int k = 0; k < K; ++k) {
-            if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
+            if (g_tracked) {
+                /* the row is the PLAN; the tracker measures where the mic actually stands, and that
+                 * is what the trilateration gets */
+                char what[64]; snprintf(what, sizeof what, "localize position %d/%d", k + 1, K);
+                if (track_place(planned[k], 1, what, micpos[k])) {
+#ifdef BWA_HAVE_ASIO
+                    if (asio_up) calib_asio_close();
+#endif
+                    return 1;
+                }
+            } else if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
             for (int s = 0; s < n; ++s) {
-                if (simulate) calib_sim_capture(s, &L, micpos[k], sos, sweep, cap);
+                if (simulate) calib_sim_capture(s, &L, g_track_sim ? g_sim_at : micpos[k], sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
                 else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); calib_asio_close(); return 1; }
 #endif
+                if (const int bump = track_after_capture(CAPTURE_S, "localize placement", s)) {
+#ifdef BWA_HAVE_ASIO
+                    if (asio_up) calib_asio_close();
+#endif
+                    return bump;
+                }
                 /* AIM_BAND_HZ, not BAND_HZ: only the delay and the tilt are read here, and the tilt is
                  * the DIRECT sound's, over the bands calib_check_aim predicts it on */
                 MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, AIM_BAND_HZ, &r);
@@ -751,6 +977,12 @@ int main(int argc, char** argv) {
 #ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif
+        if (g_tracked) {
+            printf("localize: the MEASURED mic positions the trilateration uses (planned in brackets):\n");
+            for (int k = 0; k < K; ++k)
+                printf("  pos %2d: (%+.4f %+.4f %+.4f)  [%+.3f %+.3f %+.3f]\n", k + 1, micpos[k][0], micpos[k][1], micpos[k][2],
+                       planned[k][0], planned[k][1], planned[k][2]);
+        }
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
         double* latv = (double*)malloc((size_t)n * sizeof(double));
         int failed = 0;
@@ -880,6 +1112,12 @@ int main(int argc, char** argv) {
 #endif
             return 1;
         }
+        if (g_tracked && track_place(mic, 0, "live aiming", mic)) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            return 1;
+        }
         static LiveArgs A;                                     /* static: main is not reentrant */
         A.L = &L; A.spk = live_speaker; memcpy(A.mic, mic, sizeof A.mic); A.sos = sos; A.simulate = simulate;
         A.known_latency_m = known_latency; A.ref_spk = ref_spk; A.ref_dist = ref_dist;
@@ -887,6 +1125,8 @@ int main(int argc, char** argv) {
         A.sweeps = sweeps; memcpy(A.sim_move, sim_move, sizeof A.sim_move); A.sim_screen_db = sim_screen;
         A.sim_steps = sim_steps; A.nsteps = nsteps;
         A.cap19 = cap19; A.in_first = mic_in; A.have_survey = survey_path != NULL;
+        A.sim_at = g_track_sim ? g_sim_at : NULL;
+        A.pos_ok = !g_tracked || g_mt.body_frame;             /* a tracked position readout needs the orientation */
 #ifdef BWA_HAVE_ASIO
         if (!simulate && known_latency < 0.0 && ref_spk < 0) {
             long il = 0, ol = 0;
@@ -896,6 +1136,7 @@ int main(int argc, char** argv) {
         }
 #endif
         const int rc = live_zylia(A);
+        track_report("live aiming ran");
 #ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif
@@ -905,6 +1146,14 @@ int main(int argc, char** argv) {
 
     /* --- ZM-1 single-position localization: ONE mic placement, 19 capsules -> direction + distance --- */
     if (zylia && !trims && !verify) {
+        /* tracked: the measured center is the array center, and the body-frame table is re-aimed for
+         * however the stand is turned, BEFORE the capsule positions are read below */
+        if (g_tracked && track_place(mic, 0, "zylia survey", mic)) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            return 1;
+        }
         float caps[ZYLIA_MICS][3]; zylia_capsules(caps);       /* the installed survey if any, else built-in */
         const double C = sos;
         printf("zylia: array at (%.2f %.2f %.2f), %d capsules%s\n",
@@ -921,8 +1170,9 @@ int main(int argc, char** argv) {
             double* row = arr + (size_t)s * ZYLIA_MICS;
             if (simulate) {                                    /* exact wavefront from the speaker's true pos */
                 double lat0 = (known_latency >= 0.0) ? known_latency / C : 0.0;
+                const float* at = g_track_sim ? g_sim_at : mic;    /* --track-sim: the stand's TRUE center */
                 for (int j = 0; j < ZYLIA_MICS; ++j) {
-                    double cx = mic[0]+caps[j][0], cy = mic[1]+caps[j][1], cz = mic[2]+caps[j][2];
+                    double cx = at[0]+caps[j][0], cy = at[1]+caps[j][1], cz = at[2]+caps[j][2];
                     double dx = cx-L.speakers[s].pos[0], dy = cy-L.speakers[s].pos[1], dz = cz-L.speakers[s].pos[2];
                     row[j] = sqrt(dx*dx+dy*dy+dz*dz)/C + lat0;
                 }
@@ -944,6 +1194,13 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < ZYLIA_MICS; ++j) row[j] = ((double)rz[j].delay_samples + rz[j].delay_frac) / FS;
             }
 #endif
+            if (const int bump = track_after_capture(CAPTURE_S, "position survey", s)) {
+#ifdef BWA_HAVE_ASIO
+                if (asio_up) calib_asio_close();
+#endif
+                free(cap19); free(arr); free(res); free(cap); free(sweep);
+                return bump;
+            }
         }
 #ifdef BWA_HAVE_ASIO
         if (asio_up) { calib_asio_close(); asio_up = 0; }
@@ -1004,6 +1261,7 @@ int main(int argc, char** argv) {
             free(arr); free(pos); free(res); free(cap); free(sweep);
             return 1;
         }
+        track_report("the position survey measured");
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         record_sos(out_path, sos);
         printf("zylia: wrote %d positions to %s\n", n, out_path);
@@ -1082,9 +1340,18 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    /* tracked: the measured center becomes the mic, and a body-frame table is re-aimed, BEFORE the
+     * capsule positions are read into P below */
+    if (g_tracked && track_place(mic, 0, verify ? "verify" : (rq_grid ? "room-eq-grid" : "trims"), mic)) {
+#ifdef BWA_HAVE_ASIO
+        if (asio_up) calib_asio_close();
+#endif
+        return 1;
+    }
     /* the trim loop and --verify capture through one helper (measure_speaker), omni or ZM-1 */
     static Pass P;                                             /* static: main is not reentrant */
     P.L = &L; P.mic = mic; P.sos = sos; P.simulate = simulate; P.zylia = zylia;
+    P.sim_at = g_track_sim ? g_sim_at : NULL;
     P.sweep = sweep; P.cap = cap; P.cap19 = cap19;
     zylia_capsules(P.caps);                                    /* the installed survey, else the built-in table */
     P.nplay = nplay;
@@ -1126,6 +1393,12 @@ int main(int argc, char** argv) {
 #endif
                 fprintf(stderr, "calibrate: verify capture failed on speaker %d\n", i); return 1;
             }
+            if (const int bump = track_after_capture(CAPTURE_S, "verify", i)) {
+#ifdef BWA_HAVE_ASIO
+                if (asio_up) calib_asio_close();
+#endif
+                return bump;
+            }
             if (zylia) printf("  speaker %2d: delay=%9.2f  level=%.4f  capsule level spread %.1f dB\n",
                               i, res[i].delay_samples + res[i].delay_frac, res[i].level, P.capsule_spread_db);
             else       printf("  speaker %2d: delay=%9.2f  level=%.4f\n", i, res[i].delay_samples + res[i].delay_frac, res[i].level);
@@ -1159,6 +1432,9 @@ int main(int argc, char** argv) {
         }
         printf("verify: arrival spread %.1f us (flag beyond +/-%.0f us), level spread %.2f dB (flag beyond +/-%.1f dB)\n",
                vs.arrival_spread_us, CALIB_VERIFY_ARRIVAL_US, vs.level_spread_db, CALIB_VERIFY_LEVEL_DB);
+        printf("verify: residuals against the mic at (%.4f %.4f %.4f)%s\n", mic[0], mic[1], mic[2],
+               g_tracked ? ", the measured center" : "");
+        track_report("verify measured");
         printf("verify: %d speaker(s) flagged. Nothing is written.\n", vs.nflag);
         free(vpos); free(corr); free(aus); free(ldb); free(flg);
         free(P.play); free(P.tmp); free(cap19); free(res); free(cap); free(sweep);
@@ -1178,6 +1454,12 @@ int main(int argc, char** argv) {
             if (asio_up) calib_asio_close();
 #endif
             return 1;
+        }
+        if (const int bump = track_after_capture(CAPTURE_S, rq_grid ? "room-eq-grid run" : "trim run", i)) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            return bump;
         }
         printf("  speaker %2d: delay=%6d  level=%.4f  bands=[%.3f %.3f %.3f]",
                i, res[i].delay_samples, res[i].level, res[i].band[0], res[i].band[1], res[i].band[2]);
@@ -1251,6 +1533,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i) { if (gdb[i]<gmin) gmin=gdb[i]; if (gdb[i]>gmax) gmax=gdb[i]; if (dms[i]>dmax) dmax=dms[i]; }
     printf("trims: gain_db in [%.2f, %.2f]  max delay %.3f ms\n", gmin, gmax, dmax);
     for (int i = 0; i < n; ++i) printf("  spk %2d: gain_db=%+.2f  delay_ms=%.3f\n", i, gdb[i], dms[i]);
+    printf("trims: arrivals aligned at the mic (%.4f %.4f %.4f)%s\n", mic[0], mic[1], mic[2],
+           g_tracked ? ", the measured center" : "");
+    track_report(rq_grid ? "room-eq-grid measured" : "trims measured");
 
     {   /* The delays equalize arrival AT THE MIC (calib_solve), but the engine treats the trims as
          * aligned at Layout.ref: tracked alignment re-references them from ref onto the listener and

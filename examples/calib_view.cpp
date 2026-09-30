@@ -40,6 +40,7 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 #include "calib_capture.h"         /* sweep constants + the simulate/ASIO capture backends (Capture tab) */
 #include "calib/measure.h"               /* measurement DSP (self-guarded extern "C") */
 #include "calib/calib.h"                 /* trims solve + layout writeback (self-guarded extern "C") */
+#include "mic_track.h"             /* the Placement panel: the ZM-1's stand as a tracked rigid body */
 
 #include <atomic>
 #include <chrono>
@@ -332,6 +333,324 @@ static void tab_diff(void) {
     ImGui::EndTable();
 }
 
+/* ============ Placement panel: the tracked ZM-1, shared by the Capture and Aim tabs ============
+ * The same stand bwa_calibrate --track follows (mic_track.cpp over placement.c), on its own poller
+ * thread: the thread opens NatNet (which can block on the handshake, so the GUI never does), polls
+ * the pose at about 100 Hz, runs the gate, and publishes a snapshot under a mutex. A run (Capture or
+ * Aim) started while it is live waits in ITS worker for the gate, takes the measured center instead
+ * of the typed field, and after every capture notes it (the simulated bump is keyed on the count) and
+ * compares a FRESH center (two polls newer than the note, ordering rather than timing) against the one
+ * it took. The panel itself only reads snapshots. Unverified against live Motive. */
+struct PlaceSnap {
+    bool      have_pose;
+    float     q[4];
+    PlaceGate g;                         /* the gate after the last poll: state, center, mean, delta */
+    float     yaw_deg, tilt_deg;
+    bool      have_truth; float truth[3];/* simulate: the stand's true center */
+    unsigned long long seq;              /* polls published */
+};
+
+struct PlaceJob {
+    /* config: the UI writes these only while disconnected */
+    char  body[64], server[64], multicast[64], survey[512];
+    bool  sim, sim_bump;
+    int   offset_mode;                   /* 0 = the x,y,z field, 1 = ring */
+    float offset[3];
+    /* live settings: the UI writes, the poller reads, under mu */
+    float tol_mm;
+    float target[3]; bool target_set; char target_for[512];
+    std::atomic<int>  state;             /* 0 disconnected / 1 connecting / 2 live / 3 failed */
+    std::atomic<bool> stop;
+    char  msg[400], desc[800];
+    bool  body_frame;                    /* valid while live */
+    std::thread th; bool th_live;
+    std::mutex mu;
+    PlaceSnap d;
+    MicTrack  mt;                        /* the poller owns it; runs only note captures and re-aim */
+};
+static PlaceJob PL;
+#define PL_SIM_BUMP_AFTER 3              /* the simulated knock: after the third capture */
+
+static bool pl_live(void) { return PL.state.load(std::memory_order_acquire) == 2; }
+static PlaceSnap pl_snap(void) { std::lock_guard<std::mutex> lk(PL.mu); return PL.d; }
+
+static void pl_worker(void) {
+    MicTrackCfg mc;
+    memset(&mc, 0, sizeof mc);
+    mc.body = PL.body; mc.server = PL.server[0] ? PL.server : NULL; mc.multicast = PL.multicast[0] ? PL.multicast : NULL;
+    mc.survey_path = PL.survey[0] ? PL.survey : NULL;
+    mc.have_offset = PL.offset_mode == 0;
+    memcpy(mc.offset_m, PL.offset, sizeof mc.offset_m);
+    mc.offset_ring = PL.offset_mode == 1;
+    mc.sim = PL.sim ? MIC_SIM_SCRIPT : MIC_SIM_OFF;
+    mc.sim_bump_after = (PL.sim && PL.sim_bump) ? PL_SIM_BUMP_AFTER : 0;
+    char e[400] = { 0 };
+    if (mic_track_open(&PL.mt, &mc, e, sizeof e) != 0) {
+        snprintf(PL.msg, sizeof PL.msg, "%s", e);
+        PL.state.store(3, std::memory_order_release);
+        return;
+    }
+    mic_track_describe(&PL.mt, PL.desc, sizeof PL.desc);
+    PL.body_frame = PL.mt.body_frame != 0;
+    PlaceCfg cfg;
+    float tgt[3], tol;
+    { std::lock_guard<std::mutex> lk(PL.mu); memcpy(tgt, PL.target, sizeof tgt); tol = PL.tol_mm; memset(&PL.d, 0, sizeof PL.d); }
+    place_cfg_default(&cfg, tol * 1e-3f);
+    PlaceGate g;
+    place_gate_init(&g, &cfg);
+    mic_track_sim_target(&PL.mt, tgt);
+    PL.msg[0] = 0;
+    PL.state.store(2, std::memory_order_release);
+    while (!PL.stop.load(std::memory_order_relaxed)) {
+        float nt[3], ntol;
+        { std::lock_guard<std::mutex> lk(PL.mu); memcpy(nt, PL.target, sizeof nt); ntol = PL.tol_mm; }
+        if (memcmp(nt, tgt, sizeof tgt) != 0) {              /* a new target: the simulated stand walks there */
+            memcpy(tgt, nt, sizeof tgt);
+            mic_track_sim_target(&PL.mt, tgt);
+            place_gate_reset(&g);
+        }
+        if (ntol != tol) { tol = ntol; place_cfg_default(&cfg, tol * 1e-3f); place_gate_init(&g, &cfg); }
+        MicPose ps;
+        const bool have = mic_track_read(&PL.mt, &ps) != 0;
+        place_gate_update(&g, mic_track_now(&PL.mt), have ? ps.center : NULL, tgt);
+        PlaceSnap s;
+        memset(&s, 0, sizeof s);
+        s.have_pose = have;
+        if (have) {
+            memcpy(s.q, ps.q, sizeof s.q);
+            place_mount_angles(ps.q, &s.yaw_deg, &s.tilt_deg);
+        }
+        s.g = g;
+        s.have_truth = mic_track_sim_truth(&PL.mt, s.truth) != 0;
+        {
+            std::lock_guard<std::mutex> lk(PL.mu);
+            s.seq = PL.d.seq + 1;
+            PL.d = s;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    mic_track_close(&PL.mt);
+    PL.state.store(0, std::memory_order_release);
+}
+
+static void pl_connect(void) {
+    if (PL.th_live) { PL.th.join(); PL.th_live = false; }
+    PL.stop.store(false);
+    PL.msg[0] = 0; PL.desc[0] = 0;
+    PL.state.store(1, std::memory_order_release);
+    PL.th = std::thread(pl_worker); PL.th_live = true;
+}
+
+/* What a run took from the panel: the center, the delta it used, and whether it moved. */
+struct PlaceTake {
+    bool  used;                          /* this run took its center from the tracker */
+    float center[3], target[3], delta_mm[3], dist_mm;
+    float tol_m;
+    bool  bumped; float bump_mm; int bump_after;
+    bool  have_truth; float truth[3];    /* simulate: the truth at the take (the tests read it) */
+};
+
+/* In a run's worker: wait for the gate, then take the window mean. 0 = taken; 1 = canceled; 2 = lost
+ * the tracker; 3 = timed out. */
+static int pl_take(PlaceTake* tk, const std::atomic<bool>& cancel, double timeout_s, float q_out[4]) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        if (cancel.load(std::memory_order_relaxed)) return 1;
+        if (!pl_live()) return 2;
+        PlaceSnap s = pl_snap();
+        if (s.g.state == PLACE_OK) {
+            float tgt[3];
+            { std::lock_guard<std::mutex> lk(PL.mu); memcpy(tgt, PL.target, sizeof tgt); tk->tol_m = PL.tol_mm * 1e-3f; }
+            memcpy(tk->center, s.g.mean, sizeof tk->center);
+            memcpy(tk->target, tgt, sizeof tk->target);
+            for (int a = 0; a < 3; ++a) tk->delta_mm[a] = (s.g.mean[a] - tgt[a]) * 1e3f;
+            tk->dist_mm = s.g.mean_dist_m * 1e3f;
+            tk->have_truth = s.have_truth;
+            memcpy(tk->truth, s.truth, sizeof tk->truth);
+            memcpy(q_out, s.q, 4 * sizeof(float));
+            tk->used = true; tk->bumped = false; tk->bump_mm = 0.f; tk->bump_after = -1;
+            return 0;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) return 3;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+/* In a run's worker, after capture `idx`: note it, wait for a fresh center, compare. Returns 1 when
+ * the mic moved past half the tolerance (tk records it); 0 otherwise, including no fresh pose. The
+ * simulated truth for the NEXT capture comes back in truth_out (when simulating). */
+static int pl_after_capture(PlaceTake* tk, int idx, double capture_s, float truth_out[3]) {
+    unsigned long long s0;
+    { std::lock_guard<std::mutex> lk(PL.mu); s0 = PL.d.seq; }
+    mic_track_note_capture(&PL.mt, capture_s);
+    for (int tries = 0; tries < 100 && pl_live(); ++tries) {   /* up to about a second */
+        PlaceSnap s = pl_snap();
+        if (s.seq >= s0 + 2) {
+            if (s.have_truth && truth_out) memcpy(truth_out, s.truth, 3 * sizeof(float));
+            if (!s.have_pose) return 0;
+            float moved = 0.f;
+            if (place_bump(tk->center, s.g.center, tk->tol_m, &moved) == 1) {
+                tk->bumped = true; tk->bump_mm = moved * 1e3f; tk->bump_after = idx;
+                return 1;
+            }
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return 0;
+}
+
+/* The panel. `ref` is the tab's layout listening point (NULL = none), `ref_for` names that layout so
+ * the target follows it until the user edits the field. */
+static void placement_panel(const float* ref, const char* ref_for, bool run_busy) {
+    if (!ImGui::CollapsingHeader("Placement (tracked ZM-1)")) return;
+    ImGui::PushID("placement");
+    const int st = PL.state.load(std::memory_order_acquire);
+    if (PL.th_live && (st == 0 || st == 3)) { PL.th.join(); PL.th_live = false; }   /* the thread has ended */
+    if (PL.tol_mm <= 0.f) PL.tol_mm = PLACE_TOL_DEFAULT_M * 1e3f;
+    if (!PL.multicast[0]) snprintf(PL.multicast, sizeof PL.multicast, "239.255.42.99");
+    if (ref && ref_for && strcmp(PL.target_for, ref_for) != 0) {
+        snprintf(PL.target_for, sizeof PL.target_for, "%s", ref_for);
+        if (!PL.target_set) { std::lock_guard<std::mutex> lk(PL.mu); memcpy(PL.target, ref, sizeof PL.target); }
+    }
+    const bool connected = st == 1 || st == 2;
+
+    ImGui::BeginDisabled(connected);
+    ImGui::SetNextItemWidth(uiScaled(110));
+    ImGui::InputTextWithHint("##plbody", "rigid body", PL.body, sizeof PL.body);
+    bwTip("the stand's rigid body: its streaming id, or its name (a name needs the server)");
+    ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(120));
+    ImGui::InputTextWithHint("##plsrv", "Motive IP", PL.server, sizeof PL.server);
+    bwTip("Motive's host (numeric IPv4). Needed to track by name and for the ring offset");
+    ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(110));
+    ImGui::InputText("##plmc", PL.multicast, sizeof PL.multicast);
+    bwTip("NatNet multicast group");
+    ImGui::SameLine(); ImGui::Checkbox("simulate##pl", &PL.sim);
+    bwTip("no Motive: a scripted stand walks in from 8 cm off the target over 2 s and settles about 5 mm off it");
+    if (PL.sim) { ImGui::SameLine(); ImGui::Checkbox("bump mid-run##pl", &PL.sim_bump);
+                  bwTip("knock the simulated stand 15 mm after the third capture of a run"); }
+    ImGui::SetNextItemWidth(-uiScaled(300));
+    ImGui::InputTextWithHint("##plsurvey", "survey (optional)", PL.survey, sizeof PL.survey);
+    bwTip("a capsule survey. BODY-FRAME: it carries the mount offset and follows the stand (the Aim tab's position "
+          "readout needs one). Room axes: channel order and geometry only. Trims and the tilt meter need no survey");
+    ImGui::SameLine(); if (ImGui::Button("...##plsv")) pick_file(PL.survey, sizeof PL.survey, "survey json (*.json)\0*.json\0all files (*.*)\0*.*\0");
+    ImGui::SameLine(); ImGui::RadioButton("offset##plo", &PL.offset_mode, 0);
+    ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(170));
+    ImGui::BeginDisabled(PL.offset_mode != 0);
+    ImGui::InputFloat3("##ploff", PL.offset, "%.3f");
+    ImGui::EndDisabled();
+    bwTip("body origin to the array center, in the rigid body's axes (m). 0 = you moved Motive's pivot to the "
+          "array center. A body-frame survey's own offset wins");
+    ImGui::SameLine(); ImGui::RadioButton("ring##plo", &PL.offset_mode, 1);
+    bwTip("fit the circle through the body's markers (Motive's model definition, needs the server): for markers in "
+          "a ring around the housing's equator. It assumes the ring sits at the array center's height");
+    ImGui::EndDisabled();
+
+    if (!connected) { if (ImGui::Button("Connect##pl")) pl_connect(); }
+    else {
+        ImGui::BeginDisabled(run_busy);
+        if (ImGui::Button("Disconnect##pl")) PL.stop.store(true);
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (st == 1) ImGui::TextDisabled("connecting...");
+    else if (st == 3) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED: %s", PL.msg);
+    else if (st == 0) ImGui::TextDisabled("not tracking: runs use the typed position");
+    else ImGui::TextDisabled("%s", PL.sim ? "tracking the SIMULATED stand" : "tracking (unverified against live Motive)");
+
+    ImGui::SetNextItemWidth(uiScaled(220));
+    float tol = PL.tol_mm;
+    if (ImGui::SliderFloat("tolerance (mm)##pl", &tol, 1.f, 50.f, "%.0f")) { std::lock_guard<std::mutex> lk(PL.mu); PL.tol_mm = tol; }
+    bwTip("how close the center must sit to the target: about 10 mm for trims and verify (1 cm is up to 29 us of "
+          "arrival), a guide only for localize positions. A bump is a move past half of it");
+    float tg[3];
+    { std::lock_guard<std::mutex> lk(PL.mu); memcpy(tg, PL.target, sizeof tg); }
+    ImGui::SetNextItemWidth(uiScaled(220));
+    if (ImGui::InputFloat3("target (m)##pl", tg, "%.3f")) {
+        std::lock_guard<std::mutex> lk(PL.mu); memcpy(PL.target, tg, sizeof tg); PL.target_set = true;
+    }
+    bwTip("where the ZM-1's center should be, room coordinates. Defaults to the layout's listening point");
+    if (PL.target_set && ref) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("use listening point##pl")) {
+            std::lock_guard<std::mutex> lk(PL.mu); memcpy(PL.target, ref, sizeof PL.target); PL.target_set = false;
+        }
+    }
+    if (st == 2) {
+        const PlaceSnap s = pl_snap();
+        const bool ok = s.g.state == PLACE_OK;
+        const ImVec4 col = ok ? ImVec4(0.45f, 0.9f, 0.5f, 1.f) : (s.have_pose ? ImVec4(0.95f, 0.8f, 0.35f, 1.f) : ImVec4(1.f, 0.42f, 0.42f, 1.f));
+        const float fs0 = ImGui::GetStyle().FontSizeBase;
+        ImGui::BeginGroup();
+        ImGui::PushFont(NULL, fs0 * 3.0f);
+        if (s.have_pose) ImGui::TextColored(col, "%.1f mm", s.g.dist_m * 1e3f);
+        else             ImGui::TextColored(col, "no pose");
+        ImGui::PopFont();
+        ImGui::TextColored(col, "%s", ok ? "OK: in tolerance and still" : (s.have_pose ? place_state_name(s.g.state) : "occluded, wrong id, or not streaming"));
+        ImGui::EndGroup();
+        ImGui::SameLine(0, uiScaled(24));
+        /* the compass: seen from above, screen up = the front (+z), screen right = room-right (-x) */
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float R = uiScaled(34);
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const ImVec2 c(p0.x + R + 2, p0.y + R + 2);
+            dl->AddCircle(c, R, IM_COL32(120, 120, 140, 255), 32, 1.5f);
+            dl->AddText(ImVec2(c.x - uiScaled(14), p0.y - 2), IM_COL32(160, 160, 170, 255), "front");
+            if (s.have_pose) {
+                const float mx = -s.g.delta[0], mz = -s.g.delta[2];          /* the move = target - center */
+                const float h = sqrtf(mx * mx + mz * mz);
+                if (h > 5e-4f) {
+                    const float ux = -mx / h, uy = -mz / h;                   /* screen: right = -x, up = +z */
+                    const float L = R * (h > 0.02f ? 0.9f : 0.35f + 0.55f * h / 0.02f);
+                    const ImVec2 tip(c.x + ux * L, c.y + uy * L);
+                    dl->AddLine(c, tip, ImGui::GetColorU32(col), 3.f);
+                    const ImVec2 nrm(-uy, ux);
+                    dl->AddTriangleFilled(tip, ImVec2(tip.x - ux * 9 + nrm.x * 6, tip.y - uy * 9 + nrm.y * 6),
+                                          ImVec2(tip.x - ux * 9 - nrm.x * 6, tip.y - uy * 9 - nrm.y * 6), ImGui::GetColorU32(col));
+                }
+                /* the height bar: up or down */
+                const float my = -s.g.delta[1];
+                const float bx = c.x + R + uiScaled(18);
+                dl->AddLine(ImVec2(bx, c.y - R), ImVec2(bx, c.y + R), IM_COL32(120, 120, 140, 255), 1.5f);
+                if (fabsf(my) > 5e-4f) {
+                    const float L = R * (fabsf(my) > 0.02f ? 0.9f : 0.35f + 0.55f * fabsf(my) / 0.02f);
+                    const float sy = my > 0.f ? -1.f : 1.f;
+                    dl->AddLine(ImVec2(bx, c.y), ImVec2(bx, c.y + sy * L), ImGui::GetColorU32(col), 3.f);
+                    dl->AddTriangleFilled(ImVec2(bx, c.y + sy * L), ImVec2(bx - 6, c.y + sy * (L - 9)), ImVec2(bx + 6, c.y + sy * (L - 9)),
+                                          ImGui::GetColorU32(col));
+                }
+            }
+            ImGui::Dummy(ImVec2(2 * R + uiScaled(30), 2 * R + 4));
+        }
+        ImGui::SameLine(0, uiScaled(16));
+        ImGui::BeginGroup();
+        if (s.have_pose) {
+            char words[128];
+            mic_track_move_words(s.g.delta, words, sizeof words);
+            ImGui::Text("%s", words);
+            ImGui::Text("dx %+.1f  dy %+.1f  dz %+.1f mm  (center minus target)", s.g.delta[0] * 1e3f, s.g.delta[1] * 1e3f, s.g.delta[2] * 1e3f);
+            ImGui::Text("center (%.3f %.3f %.3f)  spread %.1f mm", s.g.center[0], s.g.center[1], s.g.center[2], s.g.spread_m * 1e3f);
+            ImGui::Text("mount yaw %.1f deg, tilt %.1f deg%s", s.yaw_deg, s.tilt_deg, PL.body_frame ? ", capsule table follows the stand" : "");
+            if (s.g.state == PLACE_SETTLING) ImGui::TextDisabled("held %.1f of %.1f s", s.g.held_s, s.g.cfg.hold_s);
+        }
+        ImGui::EndGroup();
+        if (PL.desc[0]) ImGui::TextDisabled("%s", PL.desc);
+    }
+    ImGui::PopID();
+    ImGui::Separator();
+}
+
+/* the line a tab shows about what its last run took */
+static void place_take_line(const PlaceTake& tk) {
+    if (!tk.used) return;
+    ImGui::Text("tracked: the run took the center (%.4f %.4f %.4f), %+.1f %+.1f %+.1f mm from the target (%.1f mm)",
+                tk.center[0], tk.center[1], tk.center[2], tk.delta_mm[0], tk.delta_mm[1], tk.delta_mm[2], tk.dist_mm);
+    if (tk.bumped)
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "BUMP: the ZM-1 moved %.1f mm after capture %d (limit %.1f mm): "
+                           "re-place it and run again", tk.bump_mm, tk.bump_after, tk.tol_m * 0.5e3f);
+}
+
 /* ============ Capture tab — run the calibration sweep (bwa_calibrate's core flow, in-window) ============
  * A worker thread runs sweep -> measure_response per speaker -> calib_solve -> writeback, using the
  * SAME calib_capture backends and measure/calib DSP as the CLI (simulate today; the ASIO full-duplex
@@ -359,6 +678,10 @@ struct CapJob {
     float mic_ref[3];
     int   dir_note;                                  /* 0 no model, 1 model + mic unset (off), 2 model + mic set (on) */
     bool  corr_applied;                              /* the last run re-aimed the trims (valid when state == 2) */
+    bool  ran_tracked;                               /* the Placement panel was live at Run: take its center */
+    float mic_run[3];                                /* the worker's mic: the field at Run, or the tracked center */
+    PlaceTake tk;                                    /* what the run took (read by the UI once state != 1) */
+    std::atomic<int> phase;                          /* 1 = waiting for the placement gate */
     unsigned mic_scope_id;                           /* ImGui ID scope of the mic field (the test drives it) */
 
     std::atomic<int>  state;                         /* 0 idle / 1 running / 2 done / 3 failed */
@@ -409,6 +732,21 @@ static void cap_worker(void) {
     memset(eq_lens, 0, sizeof eq_lens);
     measure_sweep(sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS);
 
+    /* the Placement panel was live at Run: wait for its gate, then the measured center IS the mic */
+    J.tk.used = false;
+    if (J.ran_tracked) {
+        J.phase.store(1);
+        float q[4];
+        const int r = pl_take(&J.tk, J.cancel, 300.0, q);
+        J.phase.store(0);
+        if (r) {
+            cap_fail(r == 1 ? "canceled" : r == 2 ? "the tracker went away before the placement settled"
+                                                  : "placement timed out (300 s): the ZM-1 never sat in tolerance and still");
+            return;
+        }
+        memcpy(J.mic_run, J.tk.center, sizeof J.mic_run);
+    }
+
 #ifdef BWA_HAVE_ASIO
     bool asio_up = false;
     if (!J.simulate) {
@@ -423,6 +761,9 @@ static void cap_worker(void) {
 #endif
 
     const double band[2] = { CAL_BAND_LO, CAL_BAND_HI };
+    float sim_at[3];                                             /* simulate + a tracked stand: its TRUE center */
+    const bool sim_truth = J.tk.used && J.tk.have_truth && J.simulate;
+    if (sim_truth) memcpy(sim_at, J.tk.truth, sizeof sim_at);
     for (int i = 0; i < n; ++i) {
         if (J.cancel.load(std::memory_order_relaxed)) {
 #ifdef BWA_HAVE_ASIO
@@ -431,7 +772,7 @@ static void cap_worker(void) {
             cap_fail("canceled");
             return;
         }
-        if (J.simulate) calib_sim_capture(i, &L, J.mic, g_room_sos, sweep, cap);
+        if (J.simulate) calib_sim_capture(i, &L, sim_truth ? sim_at : J.mic_run, g_room_sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
         else if (!calib_asio_capture(i)) { calib_asio_close(); cap_fail("capture timed out (speaker not wired? see console)"); return; }
 #endif
@@ -453,6 +794,17 @@ static void cap_worker(void) {
                 }
             }
         }
+        /* the bump check: a trim set measured across a moved mic is wrong, so the run stops */
+        if (J.tk.used && pl_after_capture(&J.tk, i, CAL_CAPLEN / CAL_FS, sim_truth ? sim_at : NULL)) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            char m[200];
+            snprintf(m, sizeof m, "BUMP: the ZM-1 moved %.1f mm after speaker %d (limit %.1f mm): nothing written",
+                     J.tk.bump_mm, i, J.tk.tol_m * 0.5e3f);
+            cap_fail(m);
+            return;
+        }
         J.done_count.store(i + 1, std::memory_order_release);    /* publish the completed row */
     }
 #ifdef BWA_HAVE_ASIO
@@ -466,10 +818,10 @@ static void cap_worker(void) {
      * factor and the same rule as the CLI (calib_directivity_corr, only with --mic), so the two tools
      * cannot write different trims from one capture */
     static float corr[BWA_MAX_CHANNELS];
-    const float* cp = (J.ran_mic_set && calib_directivity_corr(&L, J.mic, 2.0 * CAL_F1, 0.5 * CAL_F2, res, corr))
+    const float* cp = (J.ran_mic_set && calib_directivity_corr(&L, J.mic_run, 2.0 * CAL_F1, 0.5 * CAL_F2, res, corr))
                     ? corr : NULL;
     J.corr_applied = cp != NULL;
-    calib_solve_corr(res, pos, J.mic, n, CAL_FS, cp, gdb, dms);
+    calib_solve_corr(res, pos, J.mic_run, n, CAL_FS, cp, gdb, dms);
     memcpy(J.gain_db, gdb, sizeof gdb);
     memcpy(J.trim_ms, dms, sizeof dms);
     if (!calib_write_layout(J.ran_layout, J.ran_out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
@@ -556,6 +908,9 @@ static void tab_capture(void) {
     if (!J.simulate) ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
 #endif
     ImGui::EndDisabled();
+    placement_panel(J.have_ref ? J.mic_ref : NULL, J.layout, running || aim_running());
+    if (pl_live() && !running)
+        ImGui::TextDisabled("tracking is live: a run waits for the placement gate and takes the measured center, not the mic field");
 
     if (!running) {
         ImGui::BeginDisabled(aim_running());
@@ -566,6 +921,9 @@ static void tab_capture(void) {
             snprintf(J.ran_layout, sizeof J.ran_layout, "%s", J.layout);   /* snapshot: this run's paths */
             snprintf(J.ran_out,    sizeof J.ran_out,    "%s", J.out);
             J.ran_mic_set = J.mic_set;
+            memcpy(J.mic_run, J.mic, sizeof J.mic_run);
+            J.ran_tracked = pl_live();                            /* tracking: the measured center replaces the field */
+            if (J.ran_tracked) J.ran_mic_set = true;              /* ...and it is a real position (the re-aim may use it) */
             J.cancel.store(false); J.done_count.store(0); J.n.store(0); J.msg[0] = 0;
             J.state.store(1, std::memory_order_release);
             J.th = std::thread(cap_worker); J.th_live = true;
@@ -576,6 +934,9 @@ static void tab_capture(void) {
 
     if (st == 0) { ImGui::TextDisabled("sweeps every speaker, solves the trims, writes the layout - then diff it right here"); return; }
 
+    if (st == 1 && J.phase.load() == 1)
+        ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "waiting for the placement gate (the Placement panel above)");
+    if (st != 1) place_take_line(J.tk);                      /* the worker is done writing it */
     int dc = J.done_count.load(std::memory_order_acquire);
     int jn = J.n.load();
     int n  = jn > 0 ? jn : BWA_MAX_CHANNELS;
@@ -1056,6 +1417,8 @@ struct AimData {                         /* everything worker and UI share; copi
     float true_deg;                      /* simulate: the truth's angle off the mic */
     float true_pos[3], true_aim[3];
     float hist[AIM_HIST]; int nhist;     /* tilt, newest last */
+    PlaceTake tk;                        /* tracked: what the run took, and a bump */
+    bool  waiting;                       /* tracked: waiting for the placement gate */
 };
 
 struct AimJob {
@@ -1070,6 +1433,7 @@ struct AimJob {
     std::thread th; bool th_live;
     /* snapshotted at Start for the worker */
     int   r_spk; bool r_sim, r_room; float r_center[3]; double r_latency_s; bool r_lat_known;
+    bool  r_tracked, r_pos_ok;          /* the Placement panel was live at Start; a position readout is allowed */
     bool  have_model, have_file; float tilt0_file, layout_deg;
     std::mutex mu;
     AimData d;
@@ -1117,6 +1481,33 @@ static void aim_worker(void) {
     if (!AJ.r_sim) { aim_fail("built without the ASIO SDK - simulate only"); return; }
 #endif
     const double C = g_room_sos > 0.0 ? g_room_sos : BWA_SOS_REF_MPS;
+    /* the Placement panel was live at Start: wait for its gate; the measured center replaces the
+     * typed one, and a body-frame table is re-aimed for how the stand is turned */
+    PlaceTake tk;
+    memset(&tk, 0, sizeof tk);
+    float sim_at[3];
+    bool sim_truth = false;
+    if (AJ.r_tracked) {
+        { std::lock_guard<std::mutex> lk(AJ.mu); AJ.d.waiting = true; }
+        float q[4];
+        const int r = pl_take(&tk, AJ.stop, 300.0, q);
+        { std::lock_guard<std::mutex> lk(AJ.mu); AJ.d.waiting = false; AJ.d.tk = tk; }
+        if (r) {
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            if (AJ.r_sim) calib_sim_set_room(0.f);
+            if (r == 1) { snprintf(AJ.msg, sizeof AJ.msg, "stopped"); AJ.state.store(2, std::memory_order_release); }
+            else aim_fail(r == 2 ? "the tracker went away before the placement settled"
+                                 : "placement timed out (300 s): the ZM-1 never sat in tolerance and still");
+            return;
+        }
+        memcpy(AJ.r_center, tk.center, sizeof AJ.r_center);
+        if (AJ.r_pos_ok) mic_track_aim_capsules(&PL.mt, q);
+        sim_truth = AJ.r_sim && tk.have_truth;
+        if (sim_truth) memcpy(sim_at, tk.truth, sizeof sim_at);
+    }
+    int nread = 0;
     while (!AJ.stop.load(std::memory_order_relaxed)) {
         CalibSimOpts o; memset(&o, 0, sizeof o);
         float tp[3], ta[3];
@@ -1128,7 +1519,7 @@ static void aim_worker(void) {
         }
         o.on_axis = 1; o.true_pos = tp; o.true_aim = ta;
         CalibLiveReading rd;
-        if (!calib_live_read(s, L, AJ.r_center, C, AJ.r_sim, &o, lsweep, cap19, &rd)) {
+        if (!calib_live_read(s, L, sim_truth ? sim_at : AJ.r_center, C, AJ.r_sim, &o, lsweep, cap19, &rd)) {
 #ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
@@ -1137,8 +1528,10 @@ static void aim_worker(void) {
             return;
         }
         ZyliaLivePos lp;
-        const bool have_pos = rd.ok && zylia_live_position(rd.arr, AJ.r_center, AJ.r_lat_known, AJ.r_latency_s, C,
-                                                             L->speakers[s].pos, &lp);
+        const bool have_pos = rd.ok && AJ.r_pos_ok &&
+                              zylia_live_position(rd.arr, AJ.r_center, AJ.r_lat_known, AJ.r_latency_s, C, L->speakers[s].pos, &lp);
+        ++nread;
+        const bool bumped = AJ.r_tracked && pl_after_capture(&tk, nread, CAL_LIVE_CAPLEN / CAL_FS, sim_truth ? sim_at : NULL);
         {
             std::lock_guard<std::mutex> lk(AJ.mu);
             AimData& d = AJ.d;
@@ -1153,9 +1546,21 @@ static void aim_worker(void) {
                 d.hist[d.nhist++] = rd.tilt_db;
             }
             memcpy(d.true_pos, tp, sizeof tp); memcpy(d.true_aim, ta, sizeof ta);
-            d.true_deg = directivity_off_axis_deg(tp, ta, AJ.r_center);
+            d.true_deg = directivity_off_axis_deg(tp, ta, sim_truth ? sim_at : AJ.r_center);
             aim_estimates(d);
+            d.tk = tk;
             ++d.n;
+        }
+        if (bumped) {                                            /* the position readout is off by the move */
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            if (AJ.r_sim) calib_sim_set_room(0.f);
+            char m[200];
+            snprintf(m, sizeof m, "BUMP: the ZM-1 moved %.1f mm after reading %d (limit %.1f mm): re-place it and start again",
+                     tk.bump_mm, nread, tk.tol_m * 0.5e3f);
+            aim_fail(m);
+            return;
         }
         if (AJ.r_sim) std::this_thread::sleep_for(std::chrono::milliseconds(20));   /* leave the UI a core */
     }
@@ -1172,6 +1577,8 @@ static void aim_start(void) {
     g_aim_L = V.A;
     AJ.r_spk = AJ.spk; AJ.r_sim = AJ.simulate; AJ.r_room = AJ.room;
     memcpy(AJ.r_center, AJ.center, sizeof AJ.center);
+    AJ.r_tracked = pl_live();                                /* the worker takes the measured center */
+    AJ.r_pos_ok = !AJ.r_tracked || PL.body_frame;            /* a tracked DOA needs the array's orientation */
     if (AJ.simulate)         { AJ.r_latency_s = CAL_SIM_LATENCY_SAMPLES / CAL_FS; AJ.r_lat_known = true; }
     else if (AJ.latency_set) { AJ.r_latency_s = AJ.latency_ms * 1e-3;            AJ.r_lat_known = true; }
     else                     { AJ.r_latency_s = 0.0;                              AJ.r_lat_known = false; }
@@ -1183,6 +1590,7 @@ static void aim_start(void) {
     {
         std::lock_guard<std::mutex> lk(AJ.mu);
         AJ.d.n = 0; AJ.d.dead = -1; AJ.d.have_pos = AJ.d.have_tilt = false; AJ.d.nhist = 0;
+        memset(&AJ.d.tk, 0, sizeof AJ.d.tk); AJ.d.waiting = false;
         calib_peak_reset(&AJ.d.pk);                              /* a new box: a new peak (the reference stays) */
         aim_estimates(AJ.d);
     }
@@ -1251,6 +1659,10 @@ static void tab_aim(void) {
 #endif
     }
     ImGui::EndDisabled();
+    placement_panel(V.A.ref, V.pathA, running || J.state.load(std::memory_order_acquire) == 1);
+    if (pl_live() && !running)
+        ImGui::TextDisabled("tracking is live: Start waits for the placement gate and takes the measured center%s",
+                            PL.body_frame ? "" : "; no body-frame survey, so no position readout (the tilt meter works)");
 
     const bool capture_busy = J.state.load(std::memory_order_acquire) == 1;   /* one sweep shell, one simulator */
     if (!running) {
@@ -1285,6 +1697,9 @@ static void tab_aim(void) {
 
     AimData d;
     { std::lock_guard<std::mutex> lk(AJ.mu); d = AJ.d; }
+    if (running && d.waiting)
+        ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "waiting for the placement gate (the Placement panel above)");
+    place_take_line(d.tk);
     ImGui::Separator();
 
     /* -------- left: the meter and the numbers; right: the 3D view -------- */
@@ -1353,7 +1768,8 @@ static void tab_aim(void) {
         aim_fmt(d.a_file, a2, sizeof a2);
         ImGui::Text("off axis (ref):  %s", d.have_ref ? a1 : "store a reference");
         ImGui::Text("off axis (file): %s", AJ.have_file ? a2 : "no on_axis_db");
-        ImGui::Text("layout expects:  %.1f deg", AJ.layout_deg);
+        ImGui::Text("layout expects:  %.1f deg", d.tk.used ? layout_speaker_off_axis_deg(&g_aim_L, (uint32_t)AJ.r_spk, d.tk.center)
+                                                           : AJ.layout_deg);
         if (AJ.simulate && d.n) ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.55f, 1.f), "truth (simulate): %.1f deg", d.true_deg);
         ImGui::PopFont();
         ImGui::TextWrapped("The angle is a MAGNITUDE: how far the box's axis is off the line to the ZM-1, never which way "
@@ -1368,6 +1784,8 @@ static void tab_aim(void) {
                         d.lp.delta_mm[0], d.lp.delta_mm[1], d.lp.delta_mm[2], d.lp.delta_norm_mm, d.lp.dir_err_deg, d.lp.dist_m, d.lp.dist_err_mm);
         else if (d.have_pos)
             ImGui::Text("direction %.2f deg off the layout (no latency: no distance)", d.lp.dir_err_deg);
+        else if (AJ.r_tracked && !AJ.r_pos_ok)
+            ImGui::TextDisabled("position: off (tracked with no body-frame survey: a direction needs the array's orientation)");
         else
             ImGui::TextDisabled("position: -");
     }
@@ -1384,12 +1802,20 @@ static void tab_aim(void) {
         float lx[2] = { p[0], p[0] + 0.4f * a[0] }, ly[2] = { p[2], p[2] + 0.4f * a[2] }, lz[2] = { p[1], p[1] + 0.4f * a[1] };
         ImPlot3D::PlotScatter("layout", &lx[0], &ly[0], &lz[0], 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 7.0f));
         ImPlot3D::PlotLine("layout aim", lx, ly, lz, 2);
-        float cx = AJ.center[0], cy = AJ.center[2], cz = AJ.center[1];
+        const float* zc = d.tk.used ? d.tk.center : AJ.center;  /* the center the readings used */
+        float cx = zc[0], cy = zc[2], cz = zc[1];
         ImPlot3D::PlotScatter("ZM-1", &cx, &cy, &cz, 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 6.0f));
+        if (pl_live()) {                                         /* the tracked center, live */
+            const PlaceSnap ps = pl_snap();
+            if (ps.have_pose) {
+                float mx = ps.g.center[0], my = ps.g.center[2], mz = ps.g.center[1];
+                ImPlot3D::PlotScatter("ZM-1 tracked", &mx, &my, &mz, 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 4.0f));
+            }
+        }
         if (d.have_pos) {                                        /* the measured direction, and the position on it */
             const float r = d.lp.have_distance ? d.lp.dist_m : d.lp.layout_dist_m;
-            float ex[2] = { cx, AJ.center[0] + r * d.lp.dir[0] }, ey[2] = { cy, AJ.center[2] + r * d.lp.dir[2] },
-                  ez[2] = { cz, AJ.center[1] + r * d.lp.dir[1] };
+            float ex[2] = { cx, zc[0] + r * d.lp.dir[0] }, ey[2] = { cy, zc[2] + r * d.lp.dir[2] },
+                  ez[2] = { cz, zc[1] + r * d.lp.dir[1] };
             ImPlot3D::PlotLine("measured direction", ex, ey, ez, 2);
             if (d.lp.have_distance) ImPlot3D::PlotScatter("measured", &ex[1], &ey[1], &ez[1], 1, ImPlot3DSpec(ImPlot3DProp_MarkerSize, 6.0f));
         }
@@ -1533,6 +1959,16 @@ static int write_fixture(const char* path, int variant_b) {
         fprintf(f, "  ]\n}\n");
     fclose(f);
     return 1;
+}
+
+/* the Placement tests' helpers (TestFunc is a plain function pointer, so no captures) */
+static void pl_wait_state(ImGuiTestContext* ctx, int want, double secs) {
+    const double t0 = ImGui::GetTime();
+    while (PL.state.load() != want && ImGui::GetTime() - t0 < secs) ctx->Yield();
+}
+static float dist3(const float a[3], const float b[3]) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
 static void register_tests(ImGuiTestEngine* e) {
@@ -1775,6 +2211,137 @@ static void register_tests(ImGuiTestEngine* e) {
         IM_CHECK_EQ(AJ.state.load(), 2);
     };
 
+    /* ---- the Placement panel, on the simulated stand (mic_track's MIC_SIM_SCRIPT, wall clock): it walks
+     * in from 8.4 cm off the target over 2 s, settles 5.4 mm off, and with "bump mid-run" is knocked
+     * 15 mm after the third capture. The truth the checks use is the script's own (PlaceSnap.truth,
+     * computed apart from placement.c), never the value under test. */
+    /* the gate goes green only once the stand has settled: it reads MOVING on the way in, and OK no
+     * sooner than the 2 s approach plus the 1 s hold, with the truth by then at its settled spot */
+    t = IM_REGISTER_TEST(e, "placement", "sim_gate");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        ctx->ItemClick("**/##cl");   ctx->KeyCharsReplaceEnter(FIX_A);
+        ctx->ItemOpen("**/Placement (tracked ZM-1)");
+        ctx->Yield(2);
+        ctx->ItemCheck("**/simulate##pl");
+        ctx->ItemUncheck("**/bump mid-run##pl");
+        ctx->ItemClick("**/Connect##pl");
+        const double t0 = ImGui::GetTime();
+        pl_wait_state(ctx, 2, 10.0);
+        IM_CHECK_EQ(PL.state.load(), 2);
+        bool saw_moving = false;
+        double t_ok = -1.0;
+        PlaceSnap s;
+        while (ImGui::GetTime() - t0 < 20.0) {
+            s = pl_snap();
+            if (s.g.state == PLACE_MOVING) saw_moving = true;
+            if (s.g.state == PLACE_OK) { t_ok = ImGui::GetTime() - t0; break; }
+            ctx->Yield();
+        }
+        printf("placement test: gate opened %.2f s after Connect, %.1f mm off the target\n", t_ok, s.g.mean_dist_m * 1e3f);
+        IM_CHECK(saw_moving);                                     /* it was red on the way in */
+        IM_CHECK_GT(t_ok, 3.0);                                   /* approach 2 s + hold 1 s, no sooner */
+        IM_CHECK(s.have_truth);
+        float tgt[3]; { std::lock_guard<std::mutex> lk(PL.mu); memcpy(tgt, PL.target, sizeof tgt); }
+        const float settled[3] = { tgt[0] + 0.003f, tgt[1] - 0.002f, tgt[2] + 0.004f };
+        IM_CHECK_LT(dist3(s.truth, settled), 0.0005f);            /* the truth HAS settled when it goes green */
+        IM_CHECK_LT(dist3(s.g.mean, s.truth), 0.001f);            /* and the gate's mean is that truth */
+        ctx->CaptureScreenshotWindow("//calib view");
+    };
+
+    /* a run started while tracking is live takes the MEASURED center, not the typed field: the trims are
+     * solved at the stand's true center, a few mm off the target; the Aim tab does the same, and with
+     * no body-frame survey it keeps the tilt meter and refuses the position readout */
+    t = IM_REGISTER_TEST(e, "placement", "run_uses_center");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        IM_CHECK_EQ(PL.state.load(), 2);                          /* sim_gate left it connected */
+        J.mic_set = false;
+        ctx->ItemClick("**/##cl");   ctx->KeyCharsReplaceEnter(FIX_A);
+        ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_place_out.json");
+        ctx->ItemCheck("**/simulate");
+        ctx->ItemClick("**/Run calibration");
+        double t0 = ImGui::GetTime();
+        while (J.state.load() == 1 && ImGui::GetTime() - t0 < 90.0) ctx->Yield();
+        IM_CHECK_EQ(J.state.load(), 2);
+        IM_CHECK(J.tk.used);
+        IM_CHECK(!J.tk.bumped);
+        printf("placement test: run took (%.4f %.4f %.4f), %.1f mm off the target, truth %.2f mm away\n",
+               J.mic_run[0], J.mic_run[1], J.mic_run[2], J.tk.dist_mm, dist3(J.mic_run, J.tk.truth) * 1e3f);
+        IM_CHECK_LT(dist3(J.mic_run, J.tk.truth), 0.001f);        /* solved where the mic stood */
+        IM_CHECK_GT(dist3(J.mic_run, J.tk.target), 0.003f);       /* ...which is not the target */
+        IM_CHECK_GT(dist3(J.mic_run, J.mic), 0.003f);             /* ...nor the typed field */
+        IM_CHECK(J.tk.dist_mm > 3.f && J.tk.dist_mm < 9.f);        /* the delta the run shows */
+        ctx->CaptureScreenshotWindow("//calib view");
+
+        /* the Aim tab: layout A, speaker 3, simulate */
+        ctx->ItemClick("**/##A");
+        ctx->KeyCharsReplaceEnter(FIX_A);
+        ctx->ItemClick("**/Load A");
+        ctx->ItemClick("**/Aim");
+        ctx->Yield(2);
+        ctx->ItemCheck("**/simulate##aim");
+        ctx->ItemInputValue("**/speaker##aim", 3);
+        ctx->ItemClick("**/Start##aim");
+        t0 = ImGui::GetTime();
+        for (;;) {
+            int n; { std::lock_guard<std::mutex> lk(AJ.mu); n = AJ.d.n; }
+            if (n >= 1 || AJ.state.load() != 1 || ImGui::GetTime() - t0 > 60.0) break;
+            ctx->Yield();
+        }
+        AimData d; { std::lock_guard<std::mutex> lk(AJ.mu); d = AJ.d; }
+        IM_CHECK_EQ(AJ.state.load(), 1);
+        IM_CHECK(d.tk.used);
+        IM_CHECK_LT(dist3(d.tk.center, d.tk.truth), 0.001f);
+        IM_CHECK(d.have_tilt);                                    /* the tilt meter runs */
+        IM_CHECK(!d.have_pos);                                    /* no body-frame survey: no position */
+        ctx->CaptureScreenshotWindow("//calib view");
+        ctx->ItemClick("**/Stop##aim");
+        t0 = ImGui::GetTime();
+        while (AJ.state.load() == 1 && ImGui::GetTime() - t0 < 30.0) ctx->Yield();
+        IM_CHECK_EQ(AJ.state.load(), 2);
+    };
+
+    /* the stand knocked 15 mm after the third capture: the run stops, flags it, writes nothing */
+    t = IM_REGISTER_TEST(e, "placement", "bump");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        ctx->ItemOpen("**/Placement (tracked ZM-1)");
+        ctx->Yield(2);
+        if (PL.state.load() == 2) { ctx->ItemClick("**/Disconnect##pl"); pl_wait_state(ctx, 0, 10.0); }
+        IM_CHECK_EQ(PL.state.load(), 0);
+        ctx->ItemCheck("**/simulate##pl");
+        ctx->ItemCheck("**/bump mid-run##pl");
+        ctx->ItemClick("**/Connect##pl");
+        pl_wait_state(ctx, 2, 10.0);
+        IM_CHECK_EQ(PL.state.load(), 2);
+        remove("calibview_bump_out.json");
+        ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_bump_out.json");
+        ctx->ItemClick("**/Run calibration");
+        const double t0 = ImGui::GetTime();
+        while (J.state.load() == 1 && ImGui::GetTime() - t0 < 90.0) ctx->Yield();
+        printf("placement test: bump run: state %d, %s\n", J.state.load(), J.msg);
+        IM_CHECK_EQ(J.state.load(), 3);
+        IM_CHECK(J.tk.bumped);
+        IM_CHECK_EQ(J.tk.bump_after, PL_SIM_BUMP_AFTER - 1);      /* noticed right after the third capture */
+        IM_CHECK(J.tk.bump_mm > 10.f && J.tk.bump_mm < 20.f);
+        IM_CHECK(strstr(J.msg, "BUMP") != NULL);
+        FILE* f = fopen("calibview_bump_out.json", "rb");
+        IM_CHECK(f == NULL);                                      /* nothing written */
+        if (f) fclose(f);
+        ctx->CaptureScreenshotWindow("//calib view");
+        ctx->ItemClick("**/Disconnect##pl");                      /* leave no tracker behind */
+        pl_wait_state(ctx, 0, 10.0);
+        ctx->ItemUncheck("**/bump mid-run##pl");
+        IM_CHECK_EQ(PL.state.load(), 0);
+    };
+
     t = IM_REGISTER_TEST(e, "viewer", "tabs");                   /* every tab renders without faulting */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
@@ -1993,5 +2560,6 @@ int main(int argc, char** argv) {
     if (Z.live) zylia_capture_close();
     if (J.th_live) { J.cancel.store(true); J.th.join(); }        /* reap a still-running capture job */
     if (AJ.th_live) { AJ.stop.store(true); AJ.th.join(); }       /* ... and a live aiming run */
+    if (PL.th_live) { PL.stop.store(true); PL.th.join(); }       /* ... and the placement poller */
     return rc;
 }

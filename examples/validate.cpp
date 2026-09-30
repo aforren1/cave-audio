@@ -28,18 +28,16 @@
  *   bwa_validate --simulate --inject-fault 7         prove the integrity layer catches a bad capsule
  *   bwa_validate --driver "ASIO MADIface USB" --mic-in 26
  *   bwa_validate --layout cave_layout.json --positions mics.txt --out cells.csv
+ *   bwa_validate --simulate --track-sim              rehearse the tracked placement (gate + bump check)
  */
 /* valid.h / layout.h / zylia.h are C headers with no extern "C" of their own (the codebase keeps
  * them that way and wraps at the C++ call site — see calib_capture.h). */
 extern "C" {
 #include "calib/valid.h"
-#include "tracking/natnet.h"
 }
+#include "mic_track.h"       /* the tracked ZM-1 stand: survey, offset, pose, the self-check pose */
 #include "valid_capture.h"
 #include "bw_audio.h"
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>          /* Sleep, while waiting for a tracker pose */
 
 #include <math.h>
 #include <stdio.h>
@@ -56,6 +54,13 @@ extern "C" {
 #define MAX_COND  96       /* measured conditions; a factorial past this is refused, with the count */
 #define LBL       32
 #define CLBL      48       /* condition-label width */
+/* --track's placement tolerance, twice bwa_calibrate's 10 mm. The run scores every cell from the
+ * MEASURED center, so the tolerance does not bound a measurement error: it keeps the realized placement
+ * on the plan (2 cm of the 0.7 m envelope step is 3%) and keeps the gate shut while the stand still sits
+ * at the previous placement. The bump limit is half of it, 10 mm, which is 0.4 deg of direction at the
+ * 1.4 m source radius, a fifth of the estimator's ~2 deg anechoic floor; tighter would stop an
+ * hour-long placement for creep no result could resolve (docs/validation.md). */
+#define VAL_PLACE_TOL_M 0.020f
 
 static const char* pan_name(int p) {
     return p == BWA_PAN_DBAP ? "DBAP" : (p == BWA_PAN_SPCAP ? "SPCAP" : "VBAP");
@@ -126,6 +131,7 @@ typedef struct {
     float*        feeds;        /* scratch for the hardware path: [nspk][VAL_CAPLEN] */
     int           inject;       /* capsule to corrupt, or -1 — a self-check, see --inject-fault */
     unsigned int  rng;
+    const float*  sim_at;       /* --track-sim: synthesize at the stand's TRUE center, not at `mic` */
 } CapCtx;
 
 typedef int (*CaptureFn)(CapCtx*, const Cond* q, const float solve[3], const float mic[3],
@@ -151,7 +157,11 @@ static void inject_fault(CapCtx* ctx, float* cap19, int ch) {
 
 static int cap_simulate(CapCtx* ctx, const Cond* q, const float solve[3], const float mic[3],
                         const float src[3], float* cap19) {
-    if (!valid_simulate(ctx->L, q->panner, &q->r, solve, mic, src, VAL_FS, 343.0,
+    /* The field comes from where the mic IS. Untracked that is the typed position; with --track-sim it
+     * is the simulated stand's truth, so the scoring (which reads `mic`, the measured center) is
+     * checked against a position it did not produce. */
+    const float* at = ctx->sim_at ? ctx->sim_at : mic;
+    if (!valid_simulate(ctx->L, q->panner, &q->r, solve, at, src, VAL_FS, 343.0,
                         cap19, VAL_ANALYZE)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
@@ -239,68 +249,102 @@ static int load_positions(const char* path, float (*out)[3], char (*names)[LBL],
  * ~2 deg of direction error — the same size as the phantom penalties being measured. If the stand is
  * a tracked rigid body, both the position AND the mount orientation become measurements instead.
  *
- * The survey has to be a BODY-FRAME one (zylia.h): capsules in the stand's axes plus the probed
- * offset from the stand's body origin to the array's acoustic center. Then per placement:
+ * The survey has to be a BODY-FRAME one (zylia.h): capsules in the stand's axes, and the offset from
+ * the stand's body origin to the array's acoustic center from the survey or --mount-offset. Then per
+ * placement:
  *   capsules_room = R(pose) . capsules_body      and      center = pose_pos + R(pose) . offset
  *
- * This is the easy use of the tracker — the mic is static during a capture, so one good pose per
- * placement is enough. No prediction, no velocity, no clock domain. A wrong reading is also obvious
- * rather than subtle, which is why the planned position is printed next to the measured one. */
+ * The placement is bwa_calibrate --track's (docs/calibration.md, "Placing the ZM-1 with the tracker"):
+ * a live readout against the PLANNED position, a gate that opens once the center is within the
+ * tolerance and still, and that settled center, not the plan, is the mic position every cell of the
+ * placement is scored from. After every capture the bump check reads the center again: a placement
+ * measured across a moved mic is wrong, so it is dropped and the session stops (exit 4).
+ *
+ * With --track-sim the simulated captures come from the scripted stand's TRUE center
+ * (mic_track_sim_truth, its own quaternion code), not from lis[li], so a run that scored from the
+ * plan, or from a center computed wrong, scores from a point the captures did not come from. */
 typedef struct {
-    NatNet*    nn;                          /* NULL => the synthetic self-check pose, see --track-sim */
-    float      caps_body[ZYLIA_MICS][3];
-    ZyliaMount mount;
+    MicTrack*  mt;                          /* the tracker, or the scripted stand (--track-sim) */
     /* The PLANNED placements, kept in their own storage. They must not alias the array `place` writes
      * into: the call site passes lis[li] as the out-param, so reading the plan back out of lis after
-     * writing it would compare the tracked position against itself, silently zeroing the delta and
-     * disarming the wrong-rigid-body warning below. */
+     * writing it would compare the measured position against itself. */
     float      planned[MAX_LIS][3];
+    float      tol_m;                       /* the gate's tolerance; the bump limit is half of it */
+    double     timeout_s;
+    int        keys;                        /* on the rig a key takes the current reading anyway */
+    int        sim;                         /* --track-sim: sync the true center after every read */
+    MicPlaced  placed;
+    float      taken[3];                    /* the center the current placement took */
+    float      sim_at[3];                   /* --track-sim: the true center the next capture comes from */
+    float      max_move;
+    int        nchecks, nunchecked;
 } TrackCtx;
+static MicTrack g_mt;                       /* static: it carries an atomic, and main is not reentrant */
 
-/* Apply one mount pose: re-aim the capsule table and derive the array center. Split out so the
- * synthetic self-check pose and a real tracker pose go through EXACTLY the same maths. */
-static void track_apply(TrackCtx* T, const float p[3], const float q[4], int li, float mic_out[3]) {
-    float R[9], caps_room[ZYLIA_MICS][3];
-    zylia_quat_to_matrix(q, R);
-    zylia_capsules_rotate(T->caps_body, R, 0, caps_room);
-    zylia_set_capsules(caps_room);                       /* the array as it is turned RIGHT NOW */
-    const float* o = T->mount.offset_m;
-    float plan[3] = { T->planned[li][0], T->planned[li][1], T->planned[li][2] };
-    mic_out[0] = p[0] + R[0]*o[0] + R[1]*o[1] + R[2]*o[2];
-    mic_out[1] = p[1] + R[3]*o[0] + R[4]*o[1] + R[5]*o[2];
-    mic_out[2] = p[2] + R[6]*o[0] + R[7]*o[1] + R[8]*o[2];
-    double d = sqrt((double)(mic_out[0]-plan[0])*(mic_out[0]-plan[0]) +
-                    (double)(mic_out[1]-plan[1])*(mic_out[1]-plan[1]) +
-                    (double)(mic_out[2]-plan[2])*(mic_out[2]-plan[2]));
-    printf("  tracked: (%.3f, %.3f, %.3f)  planned (%.2f, %.2f, %.2f)  delta %.0f mm\n",
-           mic_out[0], mic_out[1], mic_out[2], plan[0], plan[1], plan[2], d * 1000.0);
-    if (d > 0.5) printf("  WARNING: half a meter from the plan - right rigid body? right frame?\n");
-}
+static const double VAL_CAPTURE_S = (double)VAL_CAPLEN / VAL_FS;
 
+static void track_sim_sync(TrackCtx* T) { if (T->sim) mic_track_sim_truth(T->mt, T->sim_at); }
+
+/* Wait for the gate at the planned position and take the MEASURED center into mic_out; the capsule
+ * table is re-aimed for however the stand ended up turned. Returns 1 placed, 0 timed out or aborted
+ * (the placement is skipped, as a placement with no live pose always was). */
 static int track_place(void* user, int li, float mic_out[3]) {
     TrackCtx* T = (TrackCtx*)user;
-    if (!T->nn) {                                        /* --track-sim: a fixed synthetic pose */
-        const float p[3] = { 0.05f, 0.02f, -0.03f };
-        const float q[4] = { 0.0f, 0.3826834f, 0.0f, 0.9238795f };   /* 45 deg yaw */
-        track_apply(T, p, q, li, mic_out);
-        return 1;
+    PlaceCfg cfg;
+    place_cfg_default(&cfg, T->tol_m);
+    char what[48];
+    snprintf(what, sizeof what, "position %d", li + 1);
+    if (mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, what, &T->placed)) {
+        fprintf(stderr, "  no settled, LIVE pose for the tracked rigid body - refusing to measure this\n"
+                        "  placement from a guess\n");
+        return 0;
     }
-    float p[3], q[4];
-    for (int tries = 0; tries < 200; ++tries) {           /* ~2 s for a live pose to show up */
-        /* Reading the pose alone is NOT enough. It returns the last PUBLISHED pose forever, and natnet only
-         * publishes tracking-valid frames, so from the second placement on an occluded stand or a
-         * wrong streaming id would hand back the PREVIOUS placement's pose and be accepted as this
-         * one's measurement. Gate on liveness, which is what natnet_status is for. */
-        if (natnet_status(T->nn) == NN_STATUS_LIVE && natnet_read_pose(T->nn, p, q)) {
-            track_apply(T, p, q, li, mic_out);
-            return 1;
-        }
-        Sleep(10);
-    }
-    fprintf(stderr, "  no LIVE pose for the tracked rigid body (occluded, wrong id, or Motive not "
-                    "streaming) - refusing to reuse a stale one\n");
-    return 0;
+    memcpy(mic_out, T->placed.center, sizeof T->placed.center);
+    memcpy(T->taken, T->placed.center, sizeof T->taken);
+    /* only a key-forced reading can land here: the gate itself never opens past the tolerance */
+    if (T->placed.dist_m > 0.5f)
+        printf("  WARNING: half a meter from the plan - right rigid body? right frame?\n");
+    T->max_move = 0.f; T->nchecks = 0; T->nunchecked = 0;
+    track_sim_sync(T);
+    return 1;
 }
+
+/* The bump check after one capture: 0 in place (or no pose to judge by), 4 bumped (the message is
+ * printed; the session drops this placement and stops). k counts the placement's captures from 1. */
+static int track_after_capture(void* user, int li, int k) {
+    TrackCtx* T = (TrackCtx*)user;
+    float moved = 0.f, now[3] = { 0.f, 0.f, 0.f };
+    const int b = mic_track_bump_console(T->mt, T->taken, T->tol_m, VAL_CAPTURE_S, &moved, now);
+    if (b < 0) { ++T->nunchecked; return 0; }
+    ++T->nchecks;
+    if (moved > T->max_move) T->max_move = moved;
+    track_sim_sync(T);
+    if (b == 0) return 0;
+    fprintf(stderr, "\nvalidate: BUMP: the ZM-1 moved %.1f mm during placement %d, after capture %d (limit %.1f mm,\n"
+                    "          half the tolerance). Center taken (%.4f %.4f %.4f), now (%.4f %.4f %.4f). What was\n"
+                    "          measured across a moved mic is wrong, so this placement's cells are dropped and the\n"
+                    "          session stops: re-place the ZM-1 and rerun from this placement.\n",
+            moved * 1e3, li + 1, k, 0.5f * T->tol_m * 1e3f,
+            T->taken[0], T->taken[1], T->taken[2], now[0], now[1], now[2]);
+    return 4;
+}
+
+static void track_report(void* user, int li) {
+    TrackCtx* T = (TrackCtx*)user;
+    printf("  placement %d measured at (%.4f %.4f %.4f), mount yaw %.1f deg, tilt %.1f deg;\n"
+           "    %d bump check(s), the largest move %.1f mm (limit %.1f mm); %d capture(s) had no live pose to check\n",
+           li + 1, T->taken[0], T->taken[1], T->taken[2], T->placed.yaw_deg, T->placed.tilt_deg,
+           T->nchecks, T->max_move * 1e3, 0.5f * T->tol_m * 1e3f, T->nunchecked);
+}
+
+/* The tracked session's hooks. NULL in run_session = an untracked run (the typed position is the
+ * mic position, and the operator confirms each placement with ENTER). */
+typedef struct {
+    int  (*place)(void* user, int li, float mic_out[3]);   /* 1 = placed, 0 = skip this placement */
+    int  (*after_capture)(void* user, int li, int k);     /* 0 = in place, nonzero = bumped: stop */
+    void (*report)(void* user, int li);                   /* after a placement's captures */
+    void* user;
+} PlaceHooks;
 
 /* ---- the session ---------------------------------------------------------------------------- */
 
@@ -334,42 +378,57 @@ static void capsule_check_once(int* checked, const float* cap19, unsigned char* 
 
 /* Sweep every placement. Identical for both backends — that is the point: the hardware run executes
  * exactly the code --simulate already proved.
- * `place` (optional) resolves each placement's microphone position before its cells are measured, and
- * for a tracked mount also re-aims the capsule table. A placement it cannot resolve is SKIPPED, so
- * the caller's accounting has to come from what actually happened rather than from nlis: `nchecked`
- * counts placements that were measured, `nflagged` those where the injected capsule was caught. */
+ * `hooks` (NULL = untracked) places each placement before its cells are measured: the tracked mount
+ * waits for the gate, takes the measured center as the mic position and re-aims the capsule table. A
+ * placement it cannot resolve is SKIPPED, so the caller's accounting has to come from what actually
+ * happened rather than from nlis: `nchecked` counts placements that were measured, `nflagged` those
+ * where the injected capsule was caught. After every capture the hooks' bump check runs; a bump DROPS
+ * that placement's cells (the ones already written roll back) and ends the session, with the
+ * placement's index in *bumped (-1 = none). The placements before it were checked after every capture
+ * of their own and are kept. */
 static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                        const Cond* cond, int ncond,
                        float (*lis)[3], char (*lisname)[LBL], int nlis,
                        float (*tg)[3], int ntgt, int ngrid, float radius, int do_ref,
-                       int prompt, int (*place)(void*, int, float[3]), void* place_user,
-                       ValidCell* cells, int* nchecked, int* nflagged, int* nplaced) {
+                       int prompt, const PlaceHooks* hooks,
+                       ValidCell* cells, int* nchecked, int* nflagged, int* nplaced, int* bumped) {
     float* cap19 = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * VAL_ANALYZE);
     if (!cap19) { fprintf(stderr, "out of memory\n"); return 0; }
     int w = 0;
     if (nflagged) *nflagged = 0;
     if (nchecked) *nchecked = 0;
     if (nplaced) *nplaced = 0;
+    *bumped = -1;
 
-    for (int li = 0; li < nlis; ++li) {
+    for (int li = 0; li < nlis && *bumped < 0; ++li) {
         unsigned char flags[ZYLIA_MICS] = { 0 };
-        int checked = 0;
+        int checked = 0, ncap = 0, bump = 0;
+        const int w0 = w;                         /* a bump rolls the placement back to here */
         printf("\n--- placement %d/%d: %s (%.2f, %.2f, %.2f) ---\n",
                li + 1, nlis, lisname[li], lis[li][0], lis[li][1], lis[li][2]);
-        if (prompt) {
-            printf(place ? "Move the ZM-1 to roughly there, then press ENTER (the tracker measures it).\n"
-                         : "Place the ZM-1 there, then press ENTER (measure the position, do not eyeball it).\n");
+        /* Untracked, the typed position IS the mic position, so the operator confirms it. Tracked, the
+         * gate replaces the prompt: it waits for the stand itself. */
+        if (prompt && !hooks) {
+            printf("Place the ZM-1 there, then press ENTER (measure the position, do not eyeball it).\n");
             int c; while ((c = getchar()) != '\n' && c != EOF) { }
         }
-        /* With a tracked mount the typed placement is only the PLAN: the pose is the measurement, and
-         * it also re-aims the capsule table for however the stand ended up turned. */
-        if (place) {
-            if (!place(place_user, li, lis[li])) {
+        /* With a tracked mount the typed placement is only the PLAN: the settled center is the
+         * measurement, and the pose also re-aims the capsule table for however the stand is turned. */
+        if (hooks) {
+            if (!hooks->place(hooks->user, li, lis[li])) {
                 fprintf(stderr, "  skipping placement %d/%d (no usable pose)\n", li + 1, nlis);
                 continue;
             }
             if (nplaced) ++(*nplaced);            /* counts INVOCATIONS: 0 means the hook is unwired */
         }
+        /* One capture, then the bump check. A bump stops every loop below, and the capture that
+         * noticed it is not scored: the mic had already moved when it was taken. */
+        auto capture = [&](const Cond* q, const float* solve, const float* src) -> int {
+            const int got = cap(ctx, q, solve, lis[li], src, cap19);
+            ++ncap;
+            if (hooks && hooks->after_capture(hooks->user, li, ncap)) bump = 1;
+            return got && !bump;
+        };
 
         /* The physical baseline: drive each speaker alone. No panner, so this is measured once per
          * placement rather than per panner/mode. It is also the fastest possible sanity check on the
@@ -408,15 +467,15 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
          * degenerate — a distance-blurred panner still spreads a source that sits on a speaker, and
          * how much it spreads is exactly the rendering cost being asked about. */
         if (do_ref)
-            for (int ci = 0; ci < ncond; ++ci)
-                for (int tracked = 1; tracked >= 0; --tracked)
-                    for (uint32_t sp = 0; sp < L->count; ++sp) {
+            for (int ci = 0; ci < ncond && !bump; ++ci)
+                for (int tracked = 1; tracked >= 0 && !bump; --tracked)
+                    for (uint32_t sp = 0; sp < L->count && !bump; ++sp) {
                         const float* q = L->speakers[sp].pos;
                         float src[3] = { q[0], q[1], q[2] };
                         const float* solve = tracked ? lis[li] : L->ref;
                         ValidCell* c = &cells[w];
                         int got = 0;
-                        if (cap(ctx, &cond[ci], solve, lis[li], src, cap19)) {
+                        if (capture(&cond[ci], solve, src)) {
                             /* first capture of the placement lands here, so the check runs here */
                             capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                             got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
@@ -431,9 +490,9 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                         ++w;
                     }
 
-        for (int ci = 0; ci < ncond; ++ci)
-            for (int tracked = 1; tracked >= 0; --tracked)
-                for (int t = 0; t < ntgt; ++t) {
+        for (int ci = 0; ci < ncond && !bump; ++ci)
+            for (int tracked = 1; tracked >= 0 && !bump; --tracked)
+                for (int t = 0; t < ntgt && !bump; ++t) {
                     (void)ngrid;
                     float src[3] = { L->ref[0] + radius*tg[t][0],
                                      L->ref[1] + radius*tg[t][1],
@@ -442,7 +501,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     ValidCell* c = &cells[w];
                     int got = 0;
 
-                    if (cap(ctx, &cond[ci], solve, lis[li], src, cap19)) {
+                    if (capture(&cond[ci], solve, src)) {
                         /* still needed: with --no-reference this grid arm captures first */
                         capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                         got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
@@ -456,6 +515,15 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     c->lis = li; c->tgt = t;
                     ++w;
                 }
+
+        if (bump) {
+            printf("  placement %d/%d: %d cell(s) DROPPED (bumped); %d later placement(s) not measured\n",
+                   li + 1, nlis, w - w0, nlis - li - 1);
+            w = w0;
+            *bumped = li;
+            break;
+        }
+        if (hooks) hooks->report(hooks->user, li);
 
         /* per-placement summary, so a bad placement is visible before you move the mic again.
          * Comb depth sits beside the angular miss because they are different failures: a render can
@@ -520,7 +588,13 @@ int main(int argc, char** argv) {
     const char* survey_path = NULL;  /* body-frame capsule survey to follow it with */
     const char* nn_server = NULL;
     const char* nn_multicast = "239.255.42.99";
-    int track_sim = 0;               /* synthetic mount pose: exercises the tracked path, no rig */
+    int track_sim = 0;               /* the scripted stand: exercises the tracked path, no rig */
+    int track_sim_bump = 0;          /* --track-sim-bump N: knock it after the Nth capture */
+    float place_tol_m = VAL_PLACE_TOL_M;
+    double place_timeout = 300.0;
+    int tol_set = 0, timeout_set = 0;
+    int mount_ring = 0, mount_off_set = 0;   /* --mount-offset ring | x,y,z */
+    float mount_off[3] = { 0.f, 0.f, 0.f };
     int do_ref = 1;                  /* physical reference arm: each speaker driven alone */
     float radius = 1.4f;
     float focus_req[MAX_FOCUS] = { 0.f };   /* 0 = the array's derived default, resolved below */
@@ -557,6 +631,41 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--natnet-server") && i+1 < argc) nn_server = argv[++i];
         else if (!strcmp(argv[i], "--natnet-multicast") && i+1 < argc) nn_multicast = argv[++i];
         else if (!strcmp(argv[i], "--track-sim"))                   track_sim = 1;
+        else if (!strcmp(argv[i], "--track-sim-bump") && i+1 < argc) {
+            char* end = NULL; long v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || v < 1 || v > 1000000) {
+                fprintf(stderr, "--track-sim-bump wants a capture count >= 1 (got %s)\n", argv[i]); return 2; }
+            track_sim_bump = (int)v;
+        }
+        else if (!strcmp(argv[i], "--place-tol-mm") && i+1 < argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 1.0 && v <= 500.0)) {
+                fprintf(stderr, "--place-tol-mm wants a tolerance in mm, 1 to 500 (got %s)\n", argv[i]); return 2; }
+            place_tol_m = (float)(v * 1e-3); tol_set = 1;
+        }
+        else if (!strcmp(argv[i], "--place-timeout") && i+1 < argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 1.0 && v <= 86400.0)) {
+                fprintf(stderr, "--place-timeout wants seconds, 1 to 86400 (got %s)\n", argv[i]); return 2; }
+            place_timeout = v; timeout_set = 1;
+        }
+        else if (!strcmp(argv[i], "--mount-offset") && i+1 < argc) {   /* "ring" or "x,y,z" (body axes, m) */
+            const char* s = argv[++i];
+            if (!strcmp(s, "ring")) mount_ring = 1;
+            else {
+                char* end = NULL; const char* q = s;
+                for (int a = 0; a < 3; ++a) {
+                    double v = strtod(q, &end);
+                    if (end == q || !(v >= -PLACE_MAX_OFFSET_M && v <= PLACE_MAX_OFFSET_M)) {
+                        fprintf(stderr, "--mount-offset wants ring or x,y,z in meters, body axes (got %s)\n", s); return 2; }
+                    mount_off[a] = (float)v;
+                    q = end;
+                    if (a < 2) { if (*q != ',') { fprintf(stderr, "--mount-offset wants ring or x,y,z (got %s)\n", s); return 2; } ++q; }
+                }
+                if (*q) { fprintf(stderr, "--mount-offset wants ring or x,y,z (got %s)\n", s); return 2; }
+            }
+            mount_off_set = 1;
+        }
         else if (!strcmp(argv[i], "--no-reference"))                do_ref = 0;
         else if (!strcmp(argv[i], "--density")   && i+1 < argc)     density = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--factorial"))                   factorial = 1;
@@ -670,12 +779,27 @@ int main(int argc, char** argv) {
                    "                        a time. Cells explode; the count is printed either way.\n"
                    "\n"
                    "  --out <file.csv>      write every cell\n"
-                   "  --no-prompt           don't wait for ENTER between placements (unattended runs)\n"
+                   "  --no-prompt           don't wait for ENTER between placements (untracked, unattended\n"
+                   "                        runs; a tracked run waits for its gate instead)\n"
                    "  --track <id|name>     follow the ZM-1's stand as a tracked rigid body: the pose\n"
                    "                        gives the mic POSITION and re-aims the capsule table, so a\n"
-                   "                        remount costs nothing. Placements become plans, the tracker\n"
-                   "                        measures. Needs --survey.\n"
-                   "  --survey <file>       BODY-FRAME capsule survey (zylia_survey_save with a mount)\n"
+                   "                        remount costs nothing. Placements become PLANS: a live line\n"
+                   "                        shows the center against the plan and the run waits until\n"
+                   "                        it is within --place-tol-mm and still (2 mm for 0.5 s, then\n"
+                   "                        held 1 s); that MEASURED center is the mic position. After\n"
+                   "                        every capture a move past half the tolerance drops the\n"
+                   "                        placement and stops with exit 4. Needs a body-frame --survey.\n"
+                   "  --survey <file>       capsule survey. Tracked: BODY-FRAME (zylia_survey_save with a\n"
+                   "                        mount). Untracked: ROOM-AXES, taken at the current mounting\n"
+                   "  --mount-offset x,y,z|ring  body origin to array center, body axes, meters; only\n"
+                   "                        for a body-frame survey that carries no offset. ring fits\n"
+                   "                        the marker ring from Motive's model definition (needs\n"
+                   "                        --natnet-server; assumes the ring sits at the array\n"
+                   "                        center's height)\n"
+                   "  --place-tol-mm <mm>   placement tolerance (default 20); the bump limit is half\n"
+                   "  --place-timeout <s>   give up on a placement's gate after this (default 300);\n"
+                   "                        the placement is skipped. On the rig a key takes the\n"
+                   "                        current reading anyway, with a warning\n"
                    "  --natnet-server <ip>  Motive host; REQUIRED to --track by name (the streaming id\n"
                    "                        is resolved from Motive's model definitions)\n"
                    "  --natnet-multicast <g>  NatNet group (default 239.255.42.99)\n"
@@ -690,9 +814,12 @@ int main(int argc, char** argv) {
                    "                        against a real source rather than an absolute number, and\n"
                    "                        it is the fastest check that the chain is sane at all  - \n"
                    "                        only skip it to save rig time.\n"
-                   "  --track-sim           SELF-CHECK: drive the tracked path from a synthetic mount\n"
-                   "                        pose, no rig. Still needs --survey. Nonzero exit if the\n"
-                   "                        placement hook does not fire for every placement.\n"
+                   "  --track-sim           SELF-CHECK (with --simulate): a scripted stand walks in\n"
+                   "                        from 8 cm off each plan, settles 5 mm off it, and the\n"
+                   "                        captures come from its TRUE center. With no --survey the\n"
+                   "                        built-in capsule table stands in as the body frame. Exit 5\n"
+                   "                        if the placement hook does not fire for every placement.\n"
+                   "  --track-sim-bump <n>  knock the scripted stand 15 mm after the nth capture\n"
                    "  --inject-fault <ch>   SELF-CHECK: corrupt capsule <ch> in every capture and\n"
                    "                        require the integrity layer to catch it (nonzero exit if\n"
                    "                        it doesn't). Proves the check + exclusion chain on YOUR\n"
@@ -701,6 +828,15 @@ int main(int argc, char** argv) {
         } else { fprintf(stderr, "unknown argument: %s (try --help)\n", argv[i]); return 2; }
     }
     if (naz < 3 || naz > 36) { fprintf(stderr, "--azimuths must be 3..36\n"); return 2; }
+    const int tracked_run = track_body != NULL || track_sim;
+    if (track_body && track_sim) {
+        fprintf(stderr, "--track and --track-sim are alternatives: a real stand or the simulated one\n"); return 2; }
+    if (track_sim && !simulate) {
+        fprintf(stderr, "--track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
+    if (track_sim_bump && !track_sim) {
+        fprintf(stderr, "--track-sim-bump knocks the SIMULATED stand; pass --track-sim\n"); return 2; }
+    if (!tracked_run && (tol_set || timeout_set || mount_off_set || nn_server)) {
+        fprintf(stderr, "--place-tol-mm/--place-timeout/--mount-offset/--natnet-server are --track options\n"); return 2; }
     if (inject != -1 && (inject < 0 || inject >= ZYLIA_MICS)) {
         fprintf(stderr, "--inject-fault must be 0..%d\n", ZYLIA_MICS-1); return 2; }
 
@@ -864,70 +1000,78 @@ int main(int argc, char** argv) {
     if (inject >= 0) printf("SELF-CHECK: capsule %d will be corrupted in every capture\n", inject);
 
     /* ---- optional tracked mount ---- */
-    TrackCtx trk;
+    static TrackCtx trk;                          /* static: MAX_LIS plans, and main is not reentrant */
     memset(&trk, 0, sizeof trk);
-    int (*place_fn)(void*, int, float[3]) = NULL;
-    void* place_user = NULL;
-    if (track_body || track_sim) {
-        if (!survey_path && !track_sim) {
-            fprintf(stderr, "--track needs --survey <body-frame survey>: the pose gives the mount's\n"
-                            "orientation, but only a survey knows how the capsules sit inside it.\n");
-            return 2;
-        }
-        char e[192] = { 0 };
-        if (!survey_path) {
-            /* --track-sim with no survey: stand the built-in table in as the body frame. This
-             * self-check is about whether the placement hook is WIRED, not about the loader, and
-             * keeping it survey-free means it needs no committed fixture to run under ctest. */
-            zylia_set_capsules(NULL);
-            trk.mount.body_frame = 1;
+    PlaceHooks hooks = { &track_place, &track_after_capture, &track_report, &trk };
+    const PlaceHooks* hooks_in = NULL;
+    if (tracked_run) {
+        /* The whole mount goes through mic_track: the survey (validate turns capsule arrival
+         * differences into directions, so it needs the BODY-FRAME table and refuses anything else),
+         * the offset (the survey's, or --mount-offset beside a survey that carries none; mic_track
+         * refuses both forms beside a survey that carries its own), and the tracker or the scripted
+         * stand. */
+        MicTrackCfg mc;
+        memset(&mc, 0, sizeof mc);
+        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast;
+        mc.survey_path = survey_path;
+        mc.need_body_frame = 1;
+        mc.have_offset = mount_off_set && !mount_ring;
+        memcpy(mc.offset_m, mount_off, sizeof mc.offset_m);
+        mc.offset_ring = mount_ring;
+        /* --track-sim with no survey: stand the built-in table in as the body frame. This self-check is
+         * about whether the placement is WIRED, not about the loader, and keeping it survey-free
+         * means it needs no committed fixture to run under ctest. */
+        mc.sim = track_sim ? MIC_SIM_SCRIPT : MIC_SIM_OFF;
+        mc.sim_builtin_body = track_sim;
+        mc.sim_bump_after = track_sim_bump;
+        mc.virtual_clock = 1;                     /* simulated time: no waiting on the wall clock */
+        char e[400] = { 0 };
+        const int rc = mic_track_open(&g_mt, &mc, e, sizeof e);
+        if (rc) { fprintf(stderr, "%s\n", e); return rc; }
+        trk.mt = &g_mt;
+        trk.tol_m = place_tol_m;
+        trk.timeout_s = place_timeout;
+        trk.keys = !track_sim;
+        trk.sim = track_sim;
+        if (track_sim && !survey_path)
             printf("track self-check: no --survey, using the built-in capsule table as the body frame\n");
-        } else if (!zylia_survey_load(survey_path, &trk.mount, e, sizeof e)) {
-            fprintf(stderr, "survey: %s\n", e);
-            return 2;
-        }
-        if (!trk.mount.body_frame) {
-            fprintf(stderr, "survey %s is in ROOM axes, not the mount's body frame - it is tied to one\n"
-                            "orientation, so it cannot follow a moving stand. Re-save it with a mount.\n",
-                    survey_path);
-            return 2;
-        }
-        if (!trk.mount.have_offset)
-            printf("NOTE: survey carries no mount offset; assuming the body origin IS the array center\n");
-        zylia_capsules(trk.caps_body);            /* the loaded table, still in body axes */
+        char desc[800];
+        mic_track_describe(&g_mt, desc, sizeof desc);
+        for (char* line = strtok(desc, "\n"); line; line = strtok(NULL, "\n")) printf("track: %s\n", line);
         /* snapshot the plans: `place` writes into lis[], so they cannot be read back from there */
         for (int i = 0; i < nlis && i < MAX_LIS; ++i) memcpy(trk.planned[i], lis[i], sizeof lis[i]);
-        place_fn = &track_place; place_user = &trk;
-
-        if (track_sim) {                          /* self-check: synthetic pose, no tracker needed */
-            printf("TRACK SELF-CHECK: a synthetic mount pose drives the same path a tracker would\n");
-        } else {
-            NatNetConfig nc;
-            memset(&nc, 0, sizeof nc);
-            nc.multicast = nn_multicast;
-            nc.server = nn_server;
-            nc.data_port = 1511; nc.command_port = 1510;
-            char* endp = NULL;
-            long id = strtol(track_body, &endp, 10);
-            if (endp && *endp == 0) nc.rigid_body = (int32_t)id;      /* numeric => streaming id */
-            else {
-                if (!nn_server) {
-                    fprintf(stderr, "--track by NAME needs --natnet-server <ip>: the streaming id is\n"
-                                    "resolved from Motive's model definitions. Or pass the id directly.\n");
-                    return 2;
-                }
-                nc.rigid_body_name = track_body;
-            }
-            trk.nn = natnet_open(&nc, e, sizeof e);
-            if (!trk.nn) { fprintf(stderr, "tracker: %s\n", e); return 1; }
-            printf("tracking rigid body '%s' - placements are PLANS, the pose is the measurement\n",
-                   track_body);
+        hooks_in = &hooks;
+        if (track_sim)
+            printf("track: SIMULATED stand (--track-sim), tolerance %.1f mm, bump limit %.1f mm%s\n",
+                   place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f,
+                   track_sim_bump ? ", knocked 15 mm mid-run (--track-sim-bump)" : "");
+        else
+            printf("track: rigid body '%s', tolerance %.1f mm, bump limit %.1f mm (unverified against live Motive)\n",
+                   track_body, place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f);
+        printf("track: placements are PLANS; each one's settled, measured center is the mic position\n");
+    } else if (survey_path) {
+        /* untracked: a ROOM-AXES survey pins the channel order and the orientation of the CURRENT
+         * mounting. It used to be dropped silently here, so a rig run fell back to the built-in table
+         * while the runbook said it read the survey. A body-frame one cannot be re-aimed without the
+         * tracker, which is calibrate's rule too. */
+        ZyliaMount mount; char serr[192] = { 0 };
+        if (!zylia_survey_load(survey_path, &mount, serr, sizeof serr)) {
+            fprintf(stderr, "survey: %s\n", serr);
+            return 1;
         }
+        if (mount.body_frame) {
+            fprintf(stderr, "survey %s is BODY-FRAME (tracked mount): with no tracker the table cannot be\n"
+                            "re-aimed. Pass --track <body>, or use a room-axes survey taken at the CURRENT\n"
+                            "mounting (calib_view -> Zylia -> Capsule survey).\n", survey_path);
+            return 1;
+        }
+        printf("capsule survey %s installed (room axes: channel order + orientation pinned)\n", survey_path);
     }
 
     CapCtx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu;
+    ctx.sim_at = track_sim ? trk.sim_at : NULL;
     CaptureFn cap = &cap_simulate;
     int prompt = 0;
 
@@ -956,16 +1100,16 @@ int main(int argc, char** argv) {
     ValidCell* cells = (ValidCell*)calloc((size_t)ncell, sizeof(ValidCell));
     if (!cells) { fprintf(stderr, "out of memory\n"); return 1; }
 
-    int nflagged = 0, nchecked = 0, nplaced = 0;
+    int nflagged = 0, nchecked = 0, nplaced = 0, bumped = -1;
     int w = run_session(&L, cap, &ctx, cond, ncond, lis, lisname, nlis,
-                        tg, ntgt, ngrid, radius, do_ref, prompt, place_fn, place_user,
-                        cells, &nchecked, &nflagged, &nplaced);
+                        tg, ntgt, ngrid, radius, do_ref, prompt, hooks_in,
+                        cells, &nchecked, &nflagged, &nplaced, &bumped);
 
 #ifdef BWA_HAVE_ASIO
     if (have_hw) valid_asio_close();
 #endif
     free(ctx.feeds);
-    if (trk.nn) natnet_close(trk.nn);
+    if (trk.mt) mic_track_close(trk.mt);
 
     /* ---- matched-cell contrasts, the claim worth making ---- */
     printf("\nmatched-cell contrast (fixed - tracked), median of paired differences\n");
@@ -1158,6 +1302,21 @@ int main(int argc, char** argv) {
 
     free(cells);
 
+    /* A bump ends the run: the report above covers the placements before it, and the bumped one's
+     * cells were dropped, never scored into it. Exit 4, as bwa_calibrate's bump does, and before the
+     * self-checks below, because a run that stopped has not passed anything. */
+    if (bumped >= 0) {
+        char kept[48], left[48];
+        if (bumped == 0)      snprintf(kept, sizeof kept, "no placement");
+        else if (bumped == 1) snprintf(kept, sizeof kept, "placement 1 only");
+        else                  snprintf(kept, sizeof kept, "placements 1 to %d only", bumped);
+        if (bumped + 1 == nlis) snprintf(left, sizeof left, "placement %d", nlis);
+        else                    snprintf(left, sizeof left, "placements %d to %d", bumped + 1, nlis);
+        fprintf(stderr, "\nvalidate: stopped by a BUMP at placement %d/%d: the report and the CSV hold %s.\n"
+                        "          Re-place the ZM-1 and rerun %s.\n", bumped + 1, nlis, kept, left);
+        return 4;
+    }
+
     /* the self-checks are TESTS, so they have to be able to fail */
     if (inject >= 0) {
         printf("\nself-check: capsule %d flagged at %d/%d MEASURED placements\n",
@@ -1179,9 +1338,9 @@ int main(int argc, char** argv) {
             fprintf(stderr, "TRACK SELF-CHECK FAILED: the placement hook is not wired into the "
                             "session loop - --track would run with the survey's body-frame capsule "
                             "table installed as if it were room axes\n");
-            return 4;
+            return 5;                             /* not 4: that is the bump */
         }
-        printf("track self-check PASSED: pose -> capsule re-aim -> mic position is wired\n");
+        printf("track self-check PASSED: gate -> capsule re-aim -> measured mic position is wired\n");
     }
     return 0;
 }

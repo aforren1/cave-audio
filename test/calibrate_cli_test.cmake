@@ -12,6 +12,13 @@
 #   live_zylia    --live N --zylia --simulate: a speaker moved 10 cm reads back as moved; a speaker
 #                 turned 25 deg off reads about 25 deg against a reference speaker and worse from the
 #                 file behind a simulated screen; the tilt peaks where the box points at the mic.
+#   track_settle  --zylia --trims --track-sim --mount-offset x,y,z: waits (HOLD, then OK), takes the measured
+#                 center, which is the simulated stand's TRUE center and not the target, and solves there.
+#   track_ring    the same with --mount-offset ring (the simulated MODELDEF's uneven marker ring).
+#   track_bump    the stand knocked 15 mm mid-run: exit 4, the bump message, nothing written.
+#   track_refuse  the refusals: the tracked --zylia survey without a body-frame survey (and with a room-axes
+#                 one), the live position readout without one (the tilt meter still runs), stray flags.
+#   track_survey  a body-frame survey (offset + table): the tracked position survey lands every speaker.
 #
 # LAYOUT carries a directivity model (the calibrate_sim_room_* fixture). Every run uses the simulated
 # room and an off-axis mic, so the directivity re-aim and the direct share are both in play. All
@@ -23,6 +30,7 @@ foreach(v EXE MODE LAYOUT WORK)
     message(FATAL_ERROR "calibrate_cli_test: -D${v}= is required")
   endif()
 endforeach()
+get_filename_component(FIXDIR "${LAYOUT}" DIRECTORY)   # the build-tree fixtures sit beside the layout
 file(REMOVE_RECURSE "${WORK}")
 file(MAKE_DIRECTORY "${WORK}")
 
@@ -75,6 +83,92 @@ function(to_milli out s)
   string(REGEX REPLACE "^0+([0-9])" "\\1" fp "${fp}")
   math(EXPR v "${sign} * (${ip} * 1000 + ${fp})")
   set(${out} ${v} PARENT_SCOPE)
+endfunction()
+
+# A decimal number -> integer tenths of a millimeter (four decimals of a meter), for the --track modes.
+function(to_dmm out s)
+  set(sign 1)
+  if(s MATCHES "^[-+]")
+    if(s MATCHES "^-")
+      set(sign -1)
+    endif()
+    string(SUBSTRING "${s}" 1 -1 s)
+  endif()
+  if(NOT s MATCHES "^([0-9]+)\\.([0-9]*)$")
+    message(FATAL_ERROR "calibrate_cli_test: cannot parse the coordinate '${s}'")
+  endif()
+  set(ip "${CMAKE_MATCH_1}")
+  set(fp "${CMAKE_MATCH_2}0000")
+  string(SUBSTRING "${fp}" 0 4 fp)
+  string(REGEX REPLACE "^0+([0-9])" "\\1" fp "${fp}")
+  math(EXPR v "${sign} * (${ip} * 10000 + ${fp})")
+  set(${out} ${v} PARENT_SCOPE)
+endfunction()
+
+# grab(<name> <regex with three captured coordinates> <var prefix>): x/y/z in tenths of a mm
+function(grab name regex pfx)
+  if(NOT "${${name}_OUT}" MATCHES "${regex}")
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: no match for '${regex}' (log: ${WORK}/${name}.log)")
+  endif()
+  set(a "${CMAKE_MATCH_1}")
+  set(b "${CMAKE_MATCH_2}")
+  set(c "${CMAKE_MATCH_3}")
+  to_dmm(x "${a}")
+  to_dmm(y "${b}")
+  to_dmm(z "${c}")
+  set(${pfx}_x ${x} PARENT_SCOPE)
+  set(${pfx}_y ${y} PARENT_SCOPE)
+  set(${pfx}_z ${z} PARENT_SCOPE)
+  set(${pfx}_s "(${a} ${b} ${c})" PARENT_SCOPE)
+endfunction()
+
+# dist2(<out> <a> <b>): squared distance between two grabbed points, in (tenths of a mm)^2
+function(dist2 out a b)
+  math(EXPR dx "${${a}_x} - ${${b}_x}")
+  math(EXPR dy "${${a}_y} - ${${b}_y}")
+  math(EXPR dz "${${a}_z} - ${${b}_z}")
+  math(EXPR d "${dx} * ${dx} + ${dy} * ${dy} + ${dz} * ${dz}")
+  set(${out} ${d} PARENT_SCOPE)
+endfunction()
+
+set(NUM "([-+]?[0-9]+\\.[0-9]+)")
+
+# A settled tracked trim run: it must WAIT (the readout shows HOLD before OK), take the measured
+# center, and solve the trims there. The simulated captures come from the scripted stand's TRUE
+# center, which mic_track computes on its own, so the solve's mic is checked against a truth the tool
+# did not produce, and against the target, which it must NOT be.
+function(track_settled name)
+  # a 40 mm tolerance: a center computed wrong by a few cm must still pass the gate, so the check
+  # against the truth below is what catches it (at 10 mm the gate would just time out)
+  run(${name} 0 --layout "${LAYOUT}" --out ${name}.json ${SIM} --zylia --trims --track-sim
+      --place-tol-mm 40 --place-timeout 60 ${ARGN})
+  set(${name}_OUT "${${name}_OUT}" PARENT_SCOPE)      # the caller's expects read it too
+  expect(${name} "HOLD moving" "the readout shows the stand moving in")
+  expect(${name} "OK *\nplacement: measured center" "the gate opens and the placement is announced")
+  grab(${name} "placement: [a-z-]+: target \\(${NUM} ${NUM} ${NUM}\\)" tgt)
+  grab(${name} "placement: measured center \\(${NUM} ${NUM} ${NUM}\\), [0-9.]+ mm from the target; mount yaw -30\\.0 deg" meas)
+  grab(${name} "track-sim: true center \\(${NUM} ${NUM} ${NUM}\\)" truth)
+  grab(${name} "trims: arrivals aligned at the mic \\(${NUM} ${NUM} ${NUM}\\), the measured center" used)
+  dist2(d_used_meas used meas)
+  dist2(d_used_truth used truth)
+  dist2(d_used_tgt used tgt)
+  message(STATUS "${name}: target ${tgt_s}, measured ${meas_s}, true ${truth_s}, solved at ${used_s}")
+  if(NOT d_used_meas EQUAL 0)
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: the trims were solved at ${used_s}, not the measured center ${meas_s}")
+  endif()
+  # 1 mm from the truth (the window mean against one jittered instant is a tenth of that)
+  if(d_used_truth GREATER 100)
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: the measured center ${used_s} is not the stand's true center ${truth_s}")
+  endif()
+  # the script settles about 5 mm off the target: the solve must not sit on the target
+  if(d_used_tgt LESS 900)
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: the trims were solved at the target ${tgt_s}, not where the mic stood")
+  endif()
+  expect(${name} "placement: trims measured at the measured center \\([^)]*\\), mount yaw -30\\.0 deg, tilt 1\\.5 deg;\n +26 bump check\\(s\\), the largest move 0\\.[0-9] mm \\(limit 20\\.0 mm\\)"
+         "the report carries the center, the mount's yaw, and a bump history with no bump")
+  if(NOT EXISTS "${WORK}/${name}.json")
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: no trims were written")
+  endif()
 endfunction()
 
 # The trims pair: write trims, verify them clean, corrupt two speakers, verify again.
@@ -295,6 +389,137 @@ elseif(MODE STREQUAL "live_zylia")
   run(two_refs 2 ${LIVE} --aim-ref 16 --aim-ref-db -0.4)
   run(sim_on_rig 2 --layout live_layout.json --live 7 --zylia --sim-move 0.1 0 0)
   run(omni_ref 2 --layout live_layout.json --live 7 --simulate --aim-ref 16)
+
+elseif(MODE STREQUAL "track_settle")
+  # no survey and a nonzero --mount-offset: the center is p + R(q) offset, with the simulated stand
+  # yawed 30 deg, so a tool that dropped R would land 30 mm off the truth
+  track_settled(settle --mount-offset 0.03,-0.12,0.05)
+  expect(settle "track: mount offset \\(0\\.0300 -0\\.1200 0\\.0500\\) m in body axes, from --mount-offset" "the offset source is named")
+  expect(settle "depends on how Motive orients the rigid body" "a flag offset with no survey says what it depends on")
+  # --localize steps through the rows. The scripted stand lingers at the previous row after each
+  # retarget (MIC_SIM_LINGER_S, longer than the gate's window plus hold), so a gate on stillness alone
+  # opens there and records the previous row again; each row's measured center must sit near ITS row.
+  # With that broken gate the run actually dies first, with exit 4: it starts measuring at the old row,
+  # the stand then walks to the new one mid-capture, and the bump check stops it. The exit code is
+  # checked before the rows, so exit 4 is how this goes red; the row check stands behind it.
+  file(WRITE "${WORK}/rows.txt" "1.2 1.2 0.8\n-1.1 1.5 0.9\n0.9 1.8 -1.0\n-1.0 1.0 -0.9\n0.0 2.0 0.0\n")
+  run(loc 0 --layout "${LAYOUT}" --out loc.json ${SIM} --localize rows.txt --track-sim --place-timeout 60)
+  set(rest "${loc_OUT}")
+  foreach(k 1 2 3 4 5)
+    string(FIND "${rest}" "placement: localize position ${k}/5: target" at)
+    if(at LESS 0)
+      message(FATAL_ERROR "calibrate_cli_test: loc: row ${k} was never placed (log: ${WORK}/loc.log)")
+    endif()
+    string(SUBSTRING "${rest}" ${at} -1 rest)
+    set(cut_OUT "${rest}")
+    grab(cut "placement: localize position ${k}/5: target \\(${NUM} ${NUM} ${NUM}\\)" row)
+    grab(cut "placement: measured center \\(${NUM} ${NUM} ${NUM}\\)" got)
+    dist2(d got row)
+    # the script settles 5.4 mm off each row: 20 mm allows that and nothing like the next row over
+    if(d GREATER 40000)
+      message(FATAL_ERROR "calibrate_cli_test: loc: row ${k} ${row_s} was recorded at ${got_s} (log: ${WORK}/loc.log)")
+    endif()
+    string(SUBSTRING "${rest}" 1 -1 rest)
+  endforeach()
+
+elseif(MODE STREQUAL "track_ring")
+  # --mount-offset ring: the simulated MODELDEF carries 4 markers at 0/90/180/225 deg on a 60 mm ring,
+  # pivot at their centroid (11.5 mm off the ring's axis); the offset must be the ring's center
+  track_settled(ring --mount-offset ring)
+  expect(ring "the center of the 4-marker ring: 11\\.5 mm from\ntrack: the marker centroid, radius 60\\.0 mm"
+         "the ring fit is reported with its centroid distance and radius")
+  expect(ring "sits at the array center's height" "the ring's height assumption is stated")
+
+elseif(MODE STREQUAL "track_bump")
+  # knocked 15 mm after the fifth capture: the run stops, exit 4, nothing written
+  run(bump 4 --layout "${LAYOUT}" --out bump.json ${SIM} --zylia --trims --track-sim --track-sim-bump 5)
+  if(NOT "${bump_OUT}" MATCHES "placement: measured center")
+    message(FATAL_ERROR "calibrate_cli_test: bump: the run never placed the mic (log: ${WORK}/bump.log)")
+  endif()
+  file(READ "${WORK}/bump.log" blog)
+  if(NOT blog MATCHES "calibrate: BUMP: the ZM-1 moved 1[4-6]\\.[0-9] mm during the trim run, after speaker 4 \\(limit 5\\.0 mm")
+    message(FATAL_ERROR "calibrate_cli_test: bump: no bump message naming the move and the speaker (log: ${WORK}/bump.log)")
+  endif()
+  if(EXISTS "${WORK}/bump.json")
+    message(FATAL_ERROR "calibrate_cli_test: bump: trims were written across a moved mic")
+  endif()
+  # the same knock on --verify
+  run(vbump 4 --layout "${LAYOUT}" ${SIM} --zylia --verify --track-sim --track-sim-bump 3)
+
+elseif(MODE STREQUAL "track_refuse")
+  # the --zylia position survey turns DOAs into room directions: tracked, it needs a BODY-FRAME survey
+  run(nosurvey 2 --layout "${LAYOUT}" --out ns.json ${SIM} --zylia --track-sim --mic 0 1.5 0)
+  file(READ "${WORK}/nosurvey.log" nlog)
+  if(NOT nlog MATCHES "needs --survey <body-frame survey>" OR NOT nlog MATCHES "a BODY-FRAME survey")
+    message(FATAL_ERROR "calibrate_cli_test: nosurvey: the refusal does not say why (log: ${WORK}/nosurvey.log)")
+  endif()
+  # ...a room-axes survey is refused for it too (the fixture below with its frame field dropped)
+  file(READ "${FIXDIR}/calib_cli_track_survey_fixture.json" fx)
+  string(JSON fx REMOVE "${fx}" frame)
+  string(JSON fx REMOVE "${fx}" mount_offset_m)
+  file(WRITE "${WORK}/room_axes.json" "${fx}")
+  run(roomaxes 2 --layout "${LAYOUT}" --out ra.json ${SIM} --zylia --track-sim --mic 0 1.5 0 --survey room_axes.json)
+  file(READ "${WORK}/roomaxes.log" rlog)
+  if(NOT rlog MATCHES "is in ROOM axes, not the mount's body frame")
+    message(FATAL_ERROR "calibrate_cli_test: roomaxes: a room-axes survey was not refused for the tracked position survey")
+  endif()
+  # ...but the trims only need the center: the same room-axes survey is accepted there
+  run(roomtrims 0 --layout "${LAYOUT}" --out rt.json ${SIM} --zylia --trims --track-sim --survey room_axes.json)
+  expect(roomtrims "track: room-axes survey: installed for its channel order and geometry, NOT re-aimed" "a room-axes survey rides along")
+  # live aiming with no body-frame survey: the tilt meter runs, the position readout is refused
+  file(READ "${LAYOUT}" js)
+  string(JSON js SET "${js}" listening_point_m "[0, 1.448, 0]")
+  file(WRITE "${WORK}/live_layout.json" "${js}")
+  run(live 0 --layout live_layout.json --live 7 --zylia --simulate --track-sim --sweeps 2)
+  expect(live "the POSITION readout is off" "the live mode says why there is no position")
+  expect(live "\n  #1 +position: n/a \\(no body-frame survey\\) \\| tilt [-+][0-9.]+ dB" "reading 1 has a tilt and no position")
+  # flags that make no sense
+  run(nosim 2 --layout "${LAYOUT}" --track-sim --zylia --trims)
+  run(check 2 --layout "${LAYOUT}" ${SIM} --track 3 --check)
+  run(tolnotrack 2 --layout "${LAYOUT}" ${SIM} --place-tol-mm 5)
+  run(gridnomic 2 --layout "${LAYOUT}" ${SIM} --track-sim --room-eq-grid)
+
+elseif(MODE STREQUAL "track_survey")
+  # A BODY-FRAME survey carries the offset (here 0.02 -0.11 0.04 in body axes) and a table the tool
+  # re-aims for the yawed stand; the tracked position survey then writes every speaker where the
+  # layout has it. (In simulate the captures come from the re-aimed table the solve reads, so this
+  # checks the center and the survey path, not the re-aim itself: see validate_track.)
+  file(READ "${FIXDIR}/calib_cli_track_survey_fixture.json" fx)
+  file(WRITE "${WORK}/body.json" "${fx}")
+  run(survey 0 --layout "${LAYOUT}" --out surveyed.json ${SIM} --zylia --track-sim --mic 0 1.5 0 --survey body.json)
+  expect(survey "track: mount offset \\(0\\.0200 -0\\.1100 0\\.0400\\) m in body axes, from the survey" "the survey's offset is used")
+  expect(survey "track: body-frame survey: the capsule table follows the stand" "the table is re-aimed")
+  expect(survey "capsule table re-aimed" "the placement re-aimed it")
+  grab(survey "placement: measured center \\(${NUM} ${NUM} ${NUM}\\)" meas)
+  grab(survey "track-sim: true center \\(${NUM} ${NUM} ${NUM}\\)" truth)
+  dist2(d meas truth)
+  if(d GREATER 100)
+    message(FATAL_ERROR "calibrate_cli_test: survey: measured ${meas_s} is not the true center ${truth_s}")
+  endif()
+  file(READ "${LAYOUT}" jl)
+  file(READ "${WORK}/surveyed.json" js)
+  string(JSON n LENGTH "${jl}" speakers)
+  math(EXPR last "${n} - 1")
+  set(worst 0)
+  foreach(k RANGE ${last})
+    foreach(a 0 1 2)
+      string(JSON pa GET "${jl}" speakers ${k} position ${a})
+      string(JSON pb GET "${js}" speakers ${k} position ${a})
+      to_milli(ma "${pa}")
+      to_milli(mb "${pb}")
+      math(EXPR dd "${ma} - ${mb}")
+      if(dd LESS 0)
+        math(EXPR dd "-${dd}")
+      endif()
+      if(dd GREATER worst)
+        set(worst ${dd})
+      endif()
+    endforeach()
+  endforeach()
+  message(STATUS "tracked position survey: worst speaker coordinate off the layout ${worst} mm")
+  if(worst GREATER 3)
+    message(FATAL_ERROR "calibrate_cli_test: survey: a speaker landed ${worst} mm off the layout")
+  endif()
 
 else()
   message(FATAL_ERROR "calibrate_cli_test: unknown MODE '${MODE}'")
