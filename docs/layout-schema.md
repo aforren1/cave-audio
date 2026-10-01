@@ -49,6 +49,10 @@ The tool exports this schema with `delay_ms` auto-derived from the positions
 (max-distance alignment). A `directivity` block and any per-speaker `aim` in the loaded
 file survive the export verbatim; the tool never edits them.
 
+The tool is the **plan editor**. Open a file that a survey has already written (one that
+carries `plan_position`) and it edits the plan instead, and saves the plan only. See
+"Plan versus as-built" below.
+
 **The selected speaker's beam.** In edit mode the selected speaker shows its acoustic axis and,
 with a `directivity` model in the file, two rings at the distance of the ears: the -3 dB
 half-angle at 2 kHz (yellow) and at the top band (orange), so the ring's radius is the lateral
@@ -87,8 +91,9 @@ The order that gets a rig file right, each step writing into the same `cave_layo
 (every writer keeps the fields it does not own):
 
 1. **Positions and the channel map**: `bwa_layout_tool` (Stage 1 of
-   [hardware-validation.md](./hardware-validation.md)), then the acoustic survey,
-   `bwa_calibrate --zylia` ([calibration.md](./calibration.md)).
+   [hardware-validation.md](./hardware-validation.md)). What it saves is the plan. Then
+   the acoustic survey, `bwa_calibrate --zylia` ([calibration.md](./calibration.md)),
+   writes the as-built positions and keeps the plan beside them (see below).
 2. **The listening point**: `bwa_layout_tool --export cave_layout.json ears=1.448 listen`.
 3. **The speaker model**: `uv run tools/directivity/clf_to_json.py Genelec_Oy-4410A.CF2 --into
    cave_layout.json`.
@@ -449,14 +454,64 @@ cannot see the problem it most needs to.
 | field | type | meaning |
 |-------|------|---------|
 | `index` | int `0..N-1` | bus/output channel for this speaker (N = the number of `speakers[]` records). Must be unique and cover `0..N-1` with no gaps - a complete permutation. |
-| `position` | `[x, y, z]` float | surveyed position in room space (meters, RH). Each component must be finite and within ±1000 m. |
+| `position` | `[x, y, z]` float | the speaker's **acoustic center** in room space (meters, RH): not its front baffle and not its mounting point. See "Positions are acoustic centers" below. Each component must be finite and within ±1000 m. |
 | `gain_db` | float | measured per-speaker level trim, applied in the align stage (`align_process`). `0.0` = no trim. Must be in **[-100, 24]**; anything outside rejects the file. |
 | `delay_ms` | float | per-speaker delay to time-align arrival to the reference; converted to whole samples at `sample_rate` on load. `0.0` = the reference (farthest) speaker. A negative value clamps to `0`; anything **over 1000 ms rejects the file**. |
 | `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bwa_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
 | `pin` | string (optional) | authoring only, engine-ignored: `"plane"` holds this speaker to the ear-plane slab (`pin_slab_m`) during optimization and snap. The allocation constraint from the authoring section above. |
 | `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bwa_calibrate --room-eq`. **Static-listener room correction** - see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
 | `aim` | `[x, y, z]` float (optional) | the speaker's acoustic axis as a direction vector in room space (any length; normalized on load). Omit it and the speaker is aimed at the listening point, which is the CAVE's case. A zero or non-finite vector rejects the file. Only the `directivity` model reads it. |
+| `plan_position` | `[x, y, z]` float (optional) | tools only, engine-ignored: where the installer planned this speaker's acoustic center. The first survey writes it (see "Plan versus as-built" below). Same checks as `position`: three finite numbers within ±1000 m. |
+| `plan_aim` | `[x, y, z]` float (optional) | tools only, engine-ignored: the planned acoustic axis. Same checks as `aim`. Needs `plan_position` in the same record. Omit it and the plan points at the listening point from `plan_position`. |
 
+### Positions are acoustic centers
+
+Every position in this file is a speaker's acoustic center: `position`, and `plan_position` too.
+The engine renders a speaker as a point source at `position`, and the point a box radiates from is
+its acoustic center, somewhere behind the front baffle. So:
+
+- Plan each box's acoustic center, not its baffle or its bracket.
+- `bwa_calibrate --localize` measures acoustic centers, so its output already is one.
+- `bwa_speaker_survey` sees markers ON the baffle. `--baffle-offset-m` moves each optical point back
+  to the acoustic center along the box's aim, and on a layout `--localize` measured, the tool reads
+  that depth itself ([calibration.md: Optical speaker check](./calibration.md#optical-speaker-check-bwa_speaker_survey)).
+
+### Plan versus as-built
+
+A rig layout describes two things that drift apart: where you planned each box, and where it
+ended up. `position` and `aim` are the **as-built**: the engine renders from them, and the
+measuring tools overwrite them. `plan_position` and `plan_aim` are the **plan**: the engine never
+reads them, and only the tools use them.
+
+The rule for a record:
+
+- A record with `plan_position` has a plan: `plan_position`, plus `plan_aim`, or the direction to
+  the listening point when `plan_aim` is absent.
+- A record without `plan_position` is its own plan: its `position` and `aim`.
+
+**Who writes the plan.** A measuring writer that overwrites `position` or `aim` first copies the
+record's current `position` into `plan_position`, and its `aim` (when it has one) into
+`plan_aim`, if the record has no `plan_position` yet. It never touches an existing one. So the
+first survey records the plan and every later survey leaves it alone. The measuring writers are
+`bwa_calibrate --localize`, the `bwa_calibrate --zylia` position survey and
+`bwa_speaker_survey --write`. Each one prints how many plans it recorded.
+
+**Who reads it.** Live aiming (`bwa_calibrate --live N --zylia` and `bwa_calib_view`'s Aim tab)
+measures each box against its plan and says so in its header line. With no plan in the file, it
+measures against `position` and `aim`, and says that instead.
+
+**Editing the plan.** `bwa_layout_tool` decides by the file:
+
+- No `plan_position` anywhere: a plan file. The tool edits `position` and `aim` and writes the
+  whole file, as it always has.
+- Any `plan_position`: an as-built file. The tool loads each speaker's plan as the thing you edit
+  and draws the as-built positions as blue dots. Its save patches only `plan_position`,
+  `plan_aim`, `pin`, `pin_slab_m` and `listening_point_m`, and writes `plan_position` on every
+  speaker. The measured `position` and `aim`, the trims, `eq` and the grid pass through
+  untouched. The speaker count cannot change in this mode. The preview (P) plays the plan.
+
+**Which file you keep.** One. The file you save from the layout tool is the plan. After the first
+survey writes into it, it holds both, so you never need a second copy to know what you intended.
 ### Tracked room EQ: top-level `room_eq_grid` (optional)
 
 The moving-listener form of `room_eq`, written by `bwa_calibrate --room-eq-grid` (one
@@ -532,6 +587,8 @@ if any of:
   positions disagreeing on a speaker's `fc`/`q` ladder, or the file carrying both
   `room_eq` and `room_eq_grid`;
 - a speaker's `aim` is present but not three finite numbers, or is the zero vector;
+- a speaker's `plan_position` is not three finite numbers within ±1000 m, its `plan_aim` is not
+  three finite numbers or is the zero vector, or it has a `plan_aim` without a `plan_position`;
 - a `directivity` block is malformed: not an object, `bands_hz` outside 1..32 entries or
   not ascending, `angles_deg` outside 2..37 entries, not starting at 0, not ascending, or
   past 180, a `loss_db` row count or length that does not match, an entry outside
@@ -561,7 +618,10 @@ reloads it.
 non-destructively. Every `calib_write_*` function (`src/calib/calib.c`) re-parses the
 original JSON, mutates only its target fields (`gain_db`/`delay_ms` for the trims,
 `eq`, `room_eq`, `room_eq_grid`, `position` for the survey), and re-serializes the
-whole root.
+whole root. The position writer also records the plan once, by the rule above
+(`layout_json_keep_plan` in `layout.c`, which `bwa_speaker_survey` calls too). Every writer
+finds a speaker's record by its `index`, not its place in the array, so the records can sit in
+any order.
 
 Everything else in the file survives: unknown fields, per-speaker annotations, the
 `reference` block, `note` strings. You can annotate a layout freely and recalibrate

@@ -630,8 +630,9 @@ BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* ho
  * whatever rate the two clocks drift apart, so re-run the sandwich periodically.
  *
  * Two backends stamp with a DRIVER-supplied host time rather than reading this clock, and both are
- * still the same OS clock: an ASIO driver's ASIOTime.systemTime comes from the system's
- * high-resolution counter (QPC), and the sink falls back to QPC itself when the driver omits it;
+ * still the same OS clock: an ASIO driver's ASIOTime.systemTime is used only when its own stamps
+ * show it is on QPC (the SDK documents it as timeGetTime, which is not), and otherwise the sink
+ * reads QPC itself at callback entry;
  * JACK's jack_get_cycle_times reports CLOCK_MONOTONIC microseconds through the server's DLL, so
  * the stamp is FILTERED (smoothed against the device clock) but on the same base. WASAPI (IAudioClock
  * reports its position paired with the QPC value at that instant), ALSA (CLOCK_MONOTONIC htstamp),
@@ -658,7 +659,7 @@ typedef struct bwa_clock_model {
                           * sub-ppm after a minute or two (watch ppm_sigma, not the clock) */
     double   jitter_ns;  /* rms residual of the stamps about the fit - driver stamp quality. A driver
                           * stamping from its own hardware reads ~microseconds; the QPC-synthesized
-                          * fallback (no kSystemTimeValid) carries callback-dispatch jitter on top. */
+                          * fallback (no systemTime on QPC) carries callback-dispatch jitter on top. */
     uint32_t stamps;     /* effective (exponentially weighted) stamp count in the fit */
 } bwa_clock_model;
 /* False with `out` untouched until the fit has ~1 s of stamps: before bwa_start, under a backend

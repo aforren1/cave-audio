@@ -211,7 +211,7 @@ What the SDK adds, and what you lose without it:
 - **Sound pathing** (routing around occluders). No equivalent.
 - **A real HRTF binaural monitor.** Without it the `binaural` profile falls back to a lateral pan:
   fine for routing checks, useless for timbre or front/back. This is a *developer-workstation*
-  dependency: the production CAVE render is the 26-speaker array, which never uses HRTF.
+  dependency: the production CAVE render is the speaker array, which never uses HRTF.
 - The Steam **reflection bed**, which the recommended configuration does not use anyway (see
   [materials.md](./materials.md) → "Choosing an acoustics path").
 
@@ -784,7 +784,7 @@ not the engine's.
 ### Reaching the array
 
 Audinate ships no Dante host driver for Linux, so the Digiface plays no part in a Linux rig. Two
-routes reach 26 speakers, and the sink sees an ordinary card either way:
+routes reach the array (24 speakers, possibly 36 later), and the sink sees an ordinary card either way:
 
 - **A multichannel card wired to the amps.** A MADI or ADAT card with an in-kernel ALSA driver, or
   a class-compliant USB interface. The Dante network is not involved.
@@ -978,7 +978,7 @@ is unchanged; what a hardware endpoint buys over a software one is in the clock 
 isolation bullets.
 
 - **Driver: ASIO.** The device must expose **enough output channels for your layout**:
-  26 for the CAVE array; fewer for a smaller install (the engine's channel count is the
+  24 for the CAVE array now, possibly 36 later (the engine's channel count is the
   layout's speaker count, 4..64). Use the ASIO driver, not the WDM/DirectSound one: WDM is
   a consumer path with its own mixing and resampling, and it is not the multichannel
   low-latency route the array needs.
@@ -986,8 +986,13 @@ isolation bullets.
   sample type via `ASIOGetChannelInfo` and convert rather than assuming: the engine renders
   float and the device may want Int32 or packed Int24.
 - **Channel count at rate.** Confirm the device still offers your channel count at the rate
-  you intend to run. Dante endpoints commonly **reduce channel count at 96 kHz**, and 26 out
-  plus 19 Zylia inputs is 45 channels. Calibrate and validate at 48 kHz.
+  you intend to run. Dante endpoints commonly **reduce channel count at 96 kHz**, and 24 out
+  (36 later) plus 19 Zylia inputs is 43 (55) channels. Calibrate and validate at 48 kHz.
+- **The ZM-1's inputs:** Dante Via presents the ZM-1 as 20 channels: the 19 capsules in order,
+  then one unused. Patch them to the Digiface's **first 20 inputs**, so the first capsule is
+  ASIO input 0. Every tool then takes `--input 0` (`--mic-in 0` for `bwa_validate`), and
+  `bwa_zylia_probe` reads inputs 0 to 18 only. See
+  [calibration.md: Getting the ZM-1 onto Dante](./calibration.md#getting-the-zm-1-onto-dante).
 - **Clock:** a Dante network needs one **leader clock**, and a hardware endpoint can *be* it.
   That is the practical gain over a software endpoint, which has to follow some other node on
   the net. Either let the Digiface lead, or point it at whichever hardware node you prefer as
@@ -1032,13 +1037,14 @@ once, the same on every box, before you calibrate:
 
 1. COM-load the driver (the SDK's `AsioDrivers`/`asiolist` helpers handle registry
    enumeration; the Digiface registers an ASIO driver). `CoInitialize` on the thread.
-2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out; 26 for the
-   CAVE) → `ASIOGetBufferSize`.
+2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out; 24 for the
+   CAVE now) → `ASIOGetBufferSize`.
 3. `ASIOGetChannelInfo` per output channel to learn the sample type.
 4. `ASIOCreateBuffers` with the `bufferSwitch` / `bufferSwitchTimeInfo` callbacks →
    `ASIOStart`.
 5. In `bufferSwitchTimeInfo`, capture `ASIOTime.timeInfo.systemTime` (ns) and
-   `samplePosition` for the timestamping path, then run the block (see
+   `samplePosition` for the timestamping path (`systemTime` only counts when it is on QPC;
+   see [backends.md: Timestamp](./backends.md#3-timestamp)), then run the block (see
    concurrency.md), convert the float speaker bus to the driver's sample type, and
    write into the driver buffers for `index`.
 
@@ -1053,7 +1059,7 @@ CMake auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Wit
 the SDK, the offline `null_sink.c` backend builds instead: the library always builds
 and the audio loop is testable with no hardware. Pick a backend with `bwa_desc.sink`
 (`null` | `asio`; default is ASIO with null fallback). The ASIO backend rejects any
-driver that exposes fewer output channels than the layout needs (26 for the CAVE array).
+driver that exposes fewer output channels than the layout needs (24 for the CAVE array now).
 
 ## Verify before shipping
 

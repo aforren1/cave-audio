@@ -262,6 +262,68 @@ int  zylia_comb_depth(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
 int  zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
                   float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out);
 
+/* The spread floor zylia_survey refuses below (spread_out above). */
+#define ZYLIA_SURVEY_MIN_SPREAD 0.05
+/* zylia_survey's spread for a set of source positions alone, so a caller can refuse a coplanar or
+ * clustered set BEFORE it sweeps anything: the same number zylia_survey reports, from the same code.
+ * src_m as for zylia_survey (relative to the array center). nobs is clamped to ZYLIA_SURVEY_MAX.
+ * Returns the spread in [0, 1], or -1 when nobs < 1 or a source sits closer than 0.2 m to the center
+ * (or is non-finite), which zylia_survey refuses too. */
+double zylia_survey_spread(const float src_m[][3], int nobs);
+
+/* ---- leave-one-out: which observation does not fit the rest? ----
+ *
+ * zylia_survey's residual cannot say WHICH observation is bad, and it is a weak detector of a small
+ * misplacement. A clap banked at the wrong place (an interferer heard while the clicker was held still,
+ * a mistyped position) is partly absorbed into the geometry: the fit bends millimeters to explain it.
+ * Held OUT of the fit, the same observation cannot be absorbed. So solve the survey nobs times, each
+ * time without one observation, and score that observation against the geometry the REST solve to:
+ *
+ *   heldout_us  its RMS misfit against the rest's geometry (exact model, its constant fitted out);
+ *   resid_us    the rest's own fit residual, what zylia_survey reports for them alone;
+ *   spread      the rest's spread.
+ *
+ * FLAGGED when heldout_us > ZYLIA_LOO_FLOOR_US AND heldout_us > ZYLIA_LOO_RATIO x resid_us: it misfits
+ * the rest by several times what the rest misfit themselves. The ratio is self-normalizing, so it
+ * holds whatever the timing noise is (a good observation's held-out error is 1.5 to 2.5 x the rest's
+ * in-sample residual: the in-sample fit spends degrees of freedom on its own noise). A median over
+ * every observation would not: each LOO fit but one still contains the bad observation, so the good
+ * observations' held-out errors rise with it and mask it. The floor keeps a clean set from flagging
+ * on noise ratios (0.1 us against 0.02 us). 3 us is about 2 deg of direction misfit on a 49 mm array.
+ *
+ * Read the limits. It finds ONE observation that disagrees with a consistent rest. A systematic error
+ * shared by every observation (a wrong tip offset, a wrong center) moves them all together and flags
+ * none. Two bad observations can mask each other: drop the worst flagged one, solve again, run it again.
+ *
+ * THE SPREAD FLOOR: leaving out the one observation that lifts a set off a plane makes the rest
+ * coplanar. Then the rest cannot be solved, that observation cannot be checked, and dropping it would
+ * leave no survey: ok = 0 for it, never a flag.
+ *
+ * src_m / arrival_s / c as for zylia_survey. out = [nobs]. nobs is clamped to ZYLIA_SURVEY_MAX.
+ * Returns the number of flagged observations, or -1 when nobs < 5 (the rest must have the 4 zylia_survey
+ * needs) or an argument is bad. Pure; control thread (nobs survey solves, a few milliseconds at 64). */
+#define ZYLIA_LOO_FLOOR_US 3.0
+#define ZYLIA_LOO_RATIO    5.0
+typedef struct {
+    int   ok;            /* 1 = the rest solved without this observation */
+    int   flagged;       /* 1 = it does not fit the rest (the rule above) */
+    float heldout_us;    /* its misfit against the rest's geometry */
+    float resid_us;      /* the rest's own residual */
+    float spread;        /* the rest's spread */
+} ZyliaLooObs;
+int  zylia_survey_loo(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
+                      ZyliaLooObs* out);
+
+/* zylia_doa against a GIVEN capsule table instead of the installed one: a provisional survey can check
+ * a new clap's direction without being installed. Same contract as zylia_doa; zylia_doa is this with
+ * zylia_capsules. */
+int  zylia_doa_caps(const float caps_m[ZYLIA_MICS][3], const double arrival_s[ZYLIA_MICS], float dir_out[3]);
+
+/* The BUILT-IN capsule table (radius x the dodecahedral directions, node order), whether or not a
+ * survey is installed. zylia_capsules returns the installed survey when there is one; this never does.
+ * For a simulator that needs the physical array independent of what the solves read. */
+void zylia_builtin_capsules(float caps_m[ZYLIA_MICS][3]);
+
 /* Install a surveyed capsule table (positions in m, array-centered, ASIO-channel-indexed). zylia_doa,
  * zylia_localize and zylia_geometry all follow it from here on. NULL reverts to the built-in table.
  * Control-thread only (these tools are single-threaded); not for the audio thread. */

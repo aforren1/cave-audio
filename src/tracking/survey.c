@@ -351,6 +351,71 @@ bool survey_fit_frame(const float (*opt)[3], const float (*lay)[3],
     return true;
 }
 
+bool survey_fit_depth(const float (*opt)[3], const float (*aim)[3], const float (*lay)[3], int n,
+                      SurveyDepthFit* out, float* depth_i, float* across_i) {
+    memset(out, 0, sizeof *out);
+    if (n < 3 || n > SURVEY_FIT_MAX) return false;
+    double o[SURVEY_FIT_MAX][3], u[SURVEY_FIT_MAX][3], p[SURVEY_FIT_MAX][3], a[SURVEY_FIT_MAX][3];   /* 6 KB of stack */
+    for (int i = 0; i < n; ++i) {
+        if (!finite3(opt[i]) || !finite3(aim[i]) || !finite3(lay[i])) return false;
+        for (int k = 0; k < 3; ++k) { o[i][k] = opt[i][k]; u[i][k] = aim[i][k]; p[i][k] = lay[i][k]; }
+    }
+    double c[3], l[3], e[3][3];
+    scatter_eigen((const double (*)[3])p, n, c, l, e);
+    if (sqrt(l[1] / n) < 0.01) return false;               /* colinear: the rotation about the line is free */
+
+    double R[3][3], t[3], q[4], d = 0.0, lev2 = 0.0;
+    int it;
+    for (it = 1; it <= 500; ++it) {
+        for (int i = 0; i < n; ++i) for (int k = 0; k < 3; ++k) a[i][k] = o[i][k] - d * u[i][k];
+        if (!horn_fit((const double (*)[3])a, (const double (*)[3])p, n, R, t, q)) return false;
+        /* rotation fixed: t - d b_i = p_i - R o_i =: v_i, so t = mean v + d mean b and d is the slope of
+         * (mean v - v_i) on (b_i - mean b) */
+        double b[SURVEY_FIT_MAX][3], v[SURVEY_FIT_MAX][3], bm[3] = { 0, 0, 0 }, vm[3] = { 0, 0, 0 };
+        for (int i = 0; i < n; ++i) {
+            double ro[3];
+            mat_vec(R, u[i], b[i]);
+            mat_vec(R, o[i], ro);
+            for (int k = 0; k < 3; ++k) { v[i][k] = p[i][k] - ro[k]; bm[k] += b[i][k] / n; vm[k] += v[i][k] / n; }
+        }
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < n; ++i)
+            for (int k = 0; k < 3; ++k) {
+                const double db = b[i][k] - bm[k];
+                num += db * (vm[k] - v[i][k]);
+                den += db * db;
+            }
+        if (!(den > 1e-6)) return false;                    /* every aim alike: depth = translation */
+        const double dn = num / den;
+        for (int k = 0; k < 3; ++k) t[k] = vm[k] + dn * bm[k];
+        lev2 = den;
+        const double step = fabs(dn - d);
+        d = dn;
+        if (step < 1e-9) break;
+    }
+    double s2 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double ro[3], b[3], diff[3];
+        mat_vec(R, o[i], ro);
+        mat_vec(R, u[i], b);
+        double di = 0.0, ac = 0.0;
+        for (int k = 0; k < 3; ++k) { diff[k] = ro[k] + t[k] - p[i][k]; di += diff[k] * b[k]; }
+        for (int k = 0; k < 3; ++k) { const double x = diff[k] - di * b[k], r = diff[k] - d * b[k]; ac += x * x; s2 += r * r; }
+        if (depth_i)  depth_i[i] = (float)di;
+        if (across_i) across_i[i] = (float)sqrt(ac);
+    }
+    out->n = n;
+    for (int i = 0; i < 3; ++i) { out->t[i] = (float)t[i]; for (int j = 0; j < 3; ++j) out->R[i][j] = (float)R[i][j]; }
+    const double sh = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    out->angle_deg = (float)(2.0 * atan2(sh, q[3]) * RAD2DEG);
+    out->t_m = (float)sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+    out->depth_m = (float)d;
+    out->leverage = (float)sqrt(lev2);
+    out->rms_m = (float)sqrt(s2 / n);
+    out->iters = it > 500 ? 500 : it;
+    return true;
+}
+
 float survey_pair_delta(const float o0[3], const float o1[3], const float l0[3], const float l1[3]) {
     double dO = 0.0, dL = 0.0;
     for (int k = 0; k < 3; ++k) {

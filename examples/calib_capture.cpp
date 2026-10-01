@@ -16,6 +16,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cstdarg>
 #include <thread>
 #include <vector>
 
@@ -194,6 +195,103 @@ const float* room_tail(const Layout* L, const SimRoom* r, double sos, int nsw, i
 }
 } /* namespace */
 
+/* ---- the simulated interferer (calib_sim_set_interferer) ---- */
+
+static int  g_intf_caps[CALIB_SIM_INTF_MAX];
+static int  g_intf_n, g_intf_count, g_intf_hits;
+static CalibSimInterferer g_intf;
+
+void calib_sim_set_interferer(const int* captures, int n, const CalibSimInterferer* it) {
+    g_intf_count = g_intf_hits = 0;
+    g_intf_n = 0;
+    if (!captures || !it || n <= 0) return;
+    if (n > CALIB_SIM_INTF_MAX) n = CALIB_SIM_INTF_MAX;
+    memcpy(g_intf_caps, captures, (size_t)n * sizeof *captures);
+    g_intf = *it;
+    g_intf_n = n;
+}
+int calib_sim_capture_count(void)   { return g_intf_count; }
+int calib_sim_interferer_hits(void) { return g_intf_hits; }
+
+int calib_sim_parse_interferer(const char* spec, int* captures, int cap, CalibSimInterferer* it, char* err, size_t errcap) {
+    if (err && errcap) err[0] = 0;
+    if (!spec || !captures || !it || cap <= 0) return 0;
+    it->t_s = 0.9f; it->level_db = 12.f; it->kind = CALIB_SIM_INTF_CLICK;
+    int n = 0;
+    const char* q = spec;
+    for (;;) {
+        char* end = NULL;
+        const long v = strtol(q, &end, 10);
+        if (end == q || v < 1 || v > 100000) { if (err) snprintf(err, errcap, "'%s': captures are 1-based numbers", spec); return 0; }
+        if (n >= cap) { if (err) snprintf(err, errcap, "'%s': more than %d captures", spec, cap); return 0; }
+        captures[n++] = (int)v;
+        q = end;
+        if (*q == ',') { ++q; continue; }
+        break;
+    }
+    if (*q == ':') {
+        char* end = NULL;
+        const double t = strtod(q + 1, &end);
+        if (end == q + 1 || !(t >= 0.0 && t < CAL_CAPLEN / CAL_FS)) {
+            if (err) snprintf(err, errcap, "'%s': the time is seconds into the capture, 0 to %.1f", spec, CAL_CAPLEN / CAL_FS); return 0; }
+        it->t_s = (float)t; q = end;
+        if (*q == ':') {
+            const double l = strtod(q + 1, &end);
+            if (end == q + 1 || !(l >= -60.0 && l <= 60.0)) {
+                if (err) snprintf(err, errcap, "'%s': the level is dB, -60 to 60", spec); return 0; }
+            it->level_db = (float)l; q = end;
+            if (*q == ':') {
+                ++q;
+                if      (!strcmp(q, "click")) it->kind = CALIB_SIM_INTF_CLICK;
+                else if (!strcmp(q, "noise")) it->kind = CALIB_SIM_INTF_NOISE;
+                else if (!strcmp(q, "sweep")) it->kind = CALIB_SIM_INTF_SWEEP;
+                else { if (err) snprintf(err, errcap, "'%s': the kind is click, noise or sweep", spec); return 0; }
+                q += strlen(q);
+            }
+        }
+    }
+    if (*q) { if (err) snprintf(err, errcap, "'%s': expected captures[:t_s[:level_db[:click|noise|sweep]]]", spec); return 0; }
+    return n;
+}
+
+/* Count one capture and say whether the interferer sounds in it. */
+static int intf_this_capture(void) {
+    const int k = ++g_intf_count;
+    for (int i = 0; i < g_intf_n; ++i) if (g_intf_caps[i] == k) { ++g_intf_hits; return 1; }
+    return 0;
+}
+
+/* Add the armed interferer to one row heard at `at`, the capture point being `center` (the source
+ * stands at center + CALIB_SIM_INTF_OFFSET). nsw: the capture's sweep length (the sweep kind plays it).
+ * The event's noise comes from a fixed seed, so a run is repeatable and every capsule hears the same
+ * event. */
+static void intf_add(float* row, int ncap, const float at[3], const float center[3], double sos, int nsw) {
+    const double src[3] = { center[0] + CALIB_SIM_INTF_OFFSET_X, center[1] + CALIB_SIM_INTF_OFFSET_Y, center[2] + CALIB_SIM_INTF_OFFSET_Z };
+    const double rc = sqrt((double)CALIB_SIM_INTF_OFFSET_X * CALIB_SIM_INTF_OFFSET_X + (double)CALIB_SIM_INTF_OFFSET_Y * CALIB_SIM_INTF_OFFSET_Y +
+                           (double)CALIB_SIM_INTF_OFFSET_Z * CALIB_SIM_INTF_OFFSET_Z);
+    const double dx = at[0] - src[0], dy = at[1] - src[1], dz = at[2] - src[2];
+    double r = sqrt(dx * dx + dy * dy + dz * dz);
+    if (r < 0.05) r = 0.05;
+    if (!(sos >= BWA_SOS_MIN_MPS && sos <= BWA_SOS_MAX_MPS)) sos = BWA_SOS_REF_MPS;
+    const double rms = pow(10.0, g_intf.level_db / 20.0) * rc / r;      /* level_db is at the capture point */
+    const double t0 = (double)g_intf.t_s * CAL_FS + r / sos * CAL_FS;
+    const int i0 = (int)t0;
+    if (g_intf.kind == CALIB_SIM_INTF_SWEEP) {
+        add_sweep(row, i0, t0 - i0, rms * sqrt(2.0), NULL, nsw, ncap);   /* the sweep's RMS is its peak / sqrt 2 */
+        return;
+    }
+    const int len = (int)((g_intf.kind == CALIB_SIM_INTF_CLICK ? 0.002 : 0.25) * CAL_FS);
+    uint32_t seed = 0x1f7e5eedu;
+    const double amp = rms * sqrt(3.0) / sqrt(0.375);              /* uniform noise (rms 1/sqrt3) under a Hann (mean w^2 3/8) */
+    for (int i = 0; i < len; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        if (i0 + i < 0 || i0 + i >= ncap) continue;
+        const double u = (double)(seed >> 8) / 8388608.0 - 1.0;
+        const double w = 0.5 - 0.5 * cos(2.0 * M_PI * (i + 0.5) / len);
+        row[i0 + i] += (float)(amp * u * w);
+    }
+}
+
 void calib_sim_room_describe(const Layout* L, char* buf, size_t cap) {
     if (!buf || cap == 0) return;
     if (!L || !(g_room_alpha > 0.f)) { snprintf(buf, cap, "anechoic"); return; }
@@ -217,17 +315,54 @@ void calib_sim_rotate(const float in[3], float deg, float out[3]) {
     }
 }
 
+/* calib_sim_set_truth: where the simulated speakers really stand, when that is not the layout's word */
+static const Layout* g_sim_truth = NULL;
+void calib_sim_set_truth(const Layout* T) { g_sim_truth = (T && T->count) ? T : NULL; }
+static const Speaker* sim_speaker(const Layout* L, int ch) {
+    return (g_sim_truth && (uint32_t)ch < g_sim_truth->count) ? &g_sim_truth->speakers[ch] : &L->speakers[ch];
+}
+
+/* calib_sim_set_speaker_latency: a per-speaker extra latency, in seconds, on top of the simulator's own */
+static double g_sim_spk_lat_s[BWA_MAX_CHANNELS];
+void calib_sim_set_speaker_latency(int ch, double seconds) {
+    if (ch < 0 || ch >= BWA_MAX_CHANNELS || !(seconds == seconds)) return;
+    g_sim_spk_lat_s[ch] = seconds;
+}
+double calib_sim_speaker_latency(int ch) {
+    return (ch >= 0 && ch < BWA_MAX_CHANNELS) ? g_sim_spk_lat_s[ch] : 0.0;
+}
+
 /* the rotated (simulated-error) acoustic axis of speaker ch */
 static void sim_aim(const Layout* L, int ch, float aim[3]) {
-    calib_sim_rotate(L->speakers[ch].aim, g_sim_aim_err_deg, aim);
+    calib_sim_rotate(sim_speaker(L, ch)->aim, g_sim_aim_err_deg, aim);
 }
+
+double calib_sim_sensitivity(int ch) { return 1.0 + 0.15 * sin(ch * 1.3); }
 
 void calib_sim_capture(int ch, const Layout* L, const float mic[3], double sos, const float* sweep, float* cap) {
     (void)sweep;
     calib_sim_capture_ex(ch, L, mic, sos, NULL, cap);
 }
 
+/* the capture's sweep and capture lengths under the options */
+static void sim_lengths(const CalibSimOpts* o, int* nsw, int* ncap) {
+    *nsw  = (o && o->nsweep > 0) ? o->nsweep : CAL_NSWEEP;
+    *ncap = (o && o->ncap > 0)   ? o->ncap   : CAL_CAPLEN;
+    if (*nsw > CAL_NSWEEP) *nsw = CAL_NSWEEP;
+    if (*ncap > CAL_CAPLEN) *ncap = CAL_CAPLEN;
+}
+
+static void sim_capture_core(int ch, const Layout* L, const float mic[3], double sos, const CalibSimOpts* o, float* cap);
+
 void calib_sim_capture_ex(int ch, const Layout* L, const float mic[3], double sos, const CalibSimOpts* o, float* cap) {
+    sim_capture_core(ch, L, mic, sos, o, cap);
+    if (intf_this_capture()) {
+        int nsw, ncap; sim_lengths(o, &nsw, &ncap);
+        intf_add(cap, ncap, mic, mic, sos, nsw);
+    }
+}
+
+static void sim_capture_core(int ch, const Layout* L, const float mic[3], double sos, const CalibSimOpts* o, float* cap) {
     int nsw  = (o && o->nsweep > 0) ? o->nsweep : CAL_NSWEEP;
     int ncap = (o && o->ncap > 0)   ? o->ncap   : CAL_CAPLEN;
     if (nsw > CAL_NSWEEP) nsw = CAL_NSWEEP;
@@ -236,7 +371,7 @@ void calib_sim_capture_ex(int ch, const Layout* L, const float mic[3], double so
     const float screen_db = (o && o->screen_db > 0.f && o->screen_db < 40.f) ? o->screen_db : 0.f;
     const int shaped = on_axis || screen_db != 0.f;     /* a response on every path besides the model's */
     memset(cap, 0, (size_t)ncap * sizeof(float));
-    const float* p = (o && o->true_pos) ? o->true_pos : L->speakers[ch].pos;
+    const float* p = (o && o->true_pos) ? o->true_pos : sim_speaker(L, ch)->pos;
     double dist = sqrt((p[0]-mic[0])*(p[0]-mic[0]) + (p[1]-mic[1])*(p[1]-mic[1]) + (p[2]-mic[2])*(p[2]-mic[2]));
     if (dist < 0.05) dist = 0.05;
     /* Directivity, when the layout carries a model: the mic's bearing off the speaker's TRUE axis
@@ -272,9 +407,11 @@ void calib_sim_capture_ex(int ch, const Layout* L, const float mic[3], double so
      * 343.0 while the analyzer follows the layout's recorded temperature splits the matched pair and
      * inflates every solved position by their ratio — silently, and --localize writes it back. */
     if (!(sos >= BWA_SOS_MIN_MPS && sos <= BWA_SOS_MAX_MPS)) sos = BWA_SOS_REF_MPS;
-    double delay_f = (double)CAL_SIM_LATENCY_SAMPLES + dist / sos * CAL_FS;   /* system latency + time of flight (fractional) */
+    /* system latency (plus this box's own extra, --sim-speaker-latency) + time of flight (fractional) */
+    const double lat_f = (double)CAL_SIM_LATENCY_SAMPLES + calib_sim_speaker_latency(ch) * CAL_FS;
+    double delay_f = lat_f + dist / sos * CAL_FS;
     int    di = (int)delay_f; float frac = (float)(delay_f - di);
-    double sens = 1.0 + 0.15 * sin(ch * 1.3);                     /* deterministic +/- ~1.4 dB wobble */
+    double sens = calib_sim_sensitivity(ch);                      /* deterministic +/- ~1.4 dB wobble */
     float  g    = (float)(sens / dist);                           /* 1/r at the mic */
     /* The fractional part of the delay is applied ANALYTICALLY: the capture is the sweep formula
      * (measure_sweep's, fades included) evaluated at i - frac, not the passed array interpolated.
@@ -331,7 +468,7 @@ void calib_sim_capture_ex(int ch, const Layout* L, const float mic[3], double so
             }
             kp = knots;
         }
-        const double d_img = (double)CAL_SIM_LATENCY_SAMPLES + ri / sos * CAL_FS;
+        const double d_img = lat_f + ri / sos * CAL_FS;
         const int dii = (int)d_img;
         add_sweep(cap, dii, d_img - dii, sens / ri * pow(R, order), kp, nsw, ncap);
     }
@@ -352,7 +489,65 @@ void calib_sim_capture_zylia_ex(int ch, const Layout* L, const float center[3], 
                                 double sos, const CalibSimOpts* o, float* cap19, int stride) {
     for (int j = 0; j < ncaps; ++j) {
         const float at[3] = { center[0] + caps[j][0], center[1] + caps[j][1], center[2] + caps[j][2] };
-        calib_sim_capture_ex(ch, L, at, sos, o, cap19 + (size_t)j * (size_t)stride);
+        sim_capture_core(ch, L, at, sos, o, cap19 + (size_t)j * (size_t)stride);
+    }
+    if (intf_this_capture()) {                          /* one capture: every capsule hears the one event */
+        int nsw, ncap; sim_lengths(o, &nsw, &ncap);
+        for (int j = 0; j < ncaps; ++j) {
+            const float at[3] = { center[0] + caps[j][0], center[1] + caps[j][1], center[2] + caps[j][2] };
+            intf_add(cap19 + (size_t)j * (size_t)stride, ncap, at, center, sos, nsw);
+        }
+    }
+}
+
+/* ---- the simulated physical ZM-1 (calib_sim_zm1_*) ----
+ * Its own rotation code, v' = v + 2w (u x v) + 2 u x (u x v) on a unit xyzw quaternion, written out here
+ * rather than borrowed from zylia_quat_to_matrix or mic_track: a truth built with the solve's own
+ * rotation could share its mistake. */
+static void zm1_qrot(const double q[4], const double v[3], double o[3]) {
+    const double u[3] = { q[0], q[1], q[2] }, w = q[3];
+    const double t[3] = { 2.0 * (u[1]*v[2] - u[2]*v[1]), 2.0 * (u[2]*v[0] - u[0]*v[2]), 2.0 * (u[0]*v[1] - u[1]*v[0]) };
+    o[0] = v[0] + w * t[0] + (u[1]*t[2] - u[2]*t[1]);
+    o[1] = v[1] + w * t[1] + (u[2]*t[0] - u[0]*t[2]);
+    o[2] = v[2] + w * t[2] + (u[0]*t[1] - u[1]*t[0]);
+}
+
+void calib_sim_zm1_body(float caps[ZYLIA_MICS][3]) {
+    float b[ZYLIA_MICS][3];
+    zylia_builtin_capsules(b);                           /* never the installed survey */
+    float r0 = 0.f;
+    for (int i = 0; i < ZYLIA_MICS; ++i) r0 += sqrtf(b[i][0]*b[i][0] + b[i][1]*b[i][1] + b[i][2]*b[i][2]) / ZYLIA_MICS;
+    const double sc = (double)CALIB_SIM_ZM1_RADIUS_M / (double)r0;
+    const double hy = 0.5 * CALIB_SIM_ZM1_MOUNT_YAW_DEG * M_PI / 180.0, hx = 0.5 * CALIB_SIM_ZM1_MOUNT_TILT_DEG * M_PI / 180.0;
+    const double qy[4] = { 0.0, sin(hy), 0.0, cos(hy) }, qx[4] = { sin(hx), 0.0, 0.0, cos(hx) };
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        const double v[3] = { b[i][0] * sc, b[i][1] * sc, b[i][2] * sc };
+        double t[3], o[3];
+        zm1_qrot(qx, v, t);                              /* tilted about the mount's x, then yawed */
+        zm1_qrot(qy, t, o);
+        for (int a = 0; a < 3; ++a) caps[i][a] = (float)o[a];
+    }
+}
+
+void calib_sim_zm1_room(const float q[4], float caps[ZYLIA_MICS][3]) {
+    double qq[4];
+    if (q) {
+        double n = 0.0;
+        for (int a = 0; a < 4; ++a) { qq[a] = q[a]; n += qq[a] * qq[a]; }
+        n = sqrt(n);
+        if (!(n > 1e-9)) { qq[0] = qq[1] = qq[2] = 0.0; qq[3] = 1.0; n = 1.0; }
+        for (int a = 0; a < 4; ++a) qq[a] /= n;
+    } else {
+        const double h = 0.5 * CALIB_SIM_ZM1_UNTRACKED_YAW_DEG * M_PI / 180.0;
+        qq[0] = 0.0; qq[1] = sin(h); qq[2] = 0.0; qq[3] = cos(h);
+    }
+    float b[ZYLIA_MICS][3];
+    calib_sim_zm1_body(b);
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        const double v[3] = { b[i][0], b[i][1], b[i][2] };
+        double o[3];
+        zm1_qrot(qq, v, o);
+        for (int a = 0; a < 3; ++a) caps[i][a] = (float)o[a];
     }
 }
 
@@ -373,7 +568,8 @@ void calib_measure_rows(const float* rows, int nrows, int stride, int ncap, cons
 }
 
 int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
-                             const double band_hz[2], MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]) {
+                             const double band_hz[2], int exp_lo, int exp_hi,
+                             MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]) {
     /* each capsule's IR window: from 64 samples before its own peak, 256 long, which holds the
      * reference taper (-ZYLIA_XC_PRE .. +ZYLIA_XC_POST around the strongest peak) plus the array's
      * aperture either side */
@@ -385,9 +581,9 @@ int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const floa
     std::atomic<int> next(0);
     auto work = [&]() {
         for (int j; (j = next.fetch_add(1)) < ZYLIA_MICS; )
-            ok[j] = measure_response_win(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
-                                         CAL_F1, CAL_F2, CAL_FS, band_hz, &res[j],
-                                         win[j], XW, XPRE, &start[j]);
+            ok[j] = measure_response_ex(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
+                                        CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, &res[j],
+                                        win[j], XW, XPRE, &start[j]);
     };
     std::vector<std::thread> pool;
     for (int w = 1; w < nw; ++w) pool.emplace_back(work);
@@ -407,8 +603,224 @@ int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const floa
     return 1;
 }
 
+void calib_pool_quality(const MeasureResult rj[ZYLIA_MICS], MeasureResult* out) {
+    int nout = 0, ns = 0;
+    float snr[ZYLIA_MICS];
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        nout += rj[j].outside != 0;
+        if (rj[j].noise_n > 0) {                             /* insertion sort for the median */
+            const float v = rj[j].snr_db; int b = ns;
+            while (b > 0 && snr[b-1] > v) { snr[b] = snr[b-1]; --b; } snr[b] = v; ++ns;
+        }
+    }
+    out->win_lo = rj[0].win_lo; out->win_hi = rj[0].win_hi;
+    out->outside = 2 * nout > ZYLIA_MICS;
+    /* the outside tap and its level, from the capsule that saw it strongest (the message's numbers) */
+    int w = 0;
+    for (int j = 1; j < ZYLIA_MICS; ++j) if (rj[j].outside_db > rj[w].outside_db) w = j;
+    out->peak_any = rj[w].peak_any; out->outside_db = rj[w].outside_db;
+    out->noise_n = ns ? rj[0].noise_n : 0;
+    out->snr_db  = ns ? snr[ns / 2] : 0.f;
+    out->floor_rms = 0.f;
+    for (int j = 0; j < ZYLIA_MICS; ++j) if (rj[j].floor_rms > out->floor_rms) out->floor_rms = rj[j].floor_rms;
+}
+
+double calib_window_pos_m(const Layout* L, int s) {
+    return (L && s >= 0 && (uint32_t)s < L->count && L->speakers[s].has_plan) ? CALIB_WIN_SURVEYED_M : CALIB_WIN_PLAN_M;
+}
+
+int calib_window_prior(int simulate, double known_latency_s, double pos_m, CalibWindow* w, char* desc, size_t cap) {
+    memset(w, 0, sizeof *w);
+    w->pos_m = pos_m;
+    char pm[96];
+    if (pos_m >= 0.0) snprintf(pm, sizeof pm, "+/- %.2f m", pos_m);
+    else snprintf(pm, sizeof pm, "+/- %.2f m for a surveyed speaker, %.2f m for one at its plan", CALIB_WIN_SURVEYED_M, CALIB_WIN_PLAN_M);
+    if (simulate) {
+        w->lat_s = CAL_SIM_LATENCY_SAMPLES / CAL_FS;
+        if (desc) snprintf(desc, cap, "the simulator's own latency (%d samples, exact), distance %s", CAL_SIM_LATENCY_SAMPLES, pm);
+        return 1;
+    }
+    if (known_latency_s >= 0.0) {
+        w->lat_s = known_latency_s; w->lat_early_s = w->lat_late_s = CALIB_WIN_LAT_KNOWN_S;
+        if (desc) snprintf(desc, cap, "latency %.3f ms +/- %.1f ms (measured), distance %s", known_latency_s * 1e3,
+                           CALIB_WIN_LAT_KNOWN_S * 1e3, pm);
+        return 1;
+    }
+#ifdef BWA_HAVE_ASIO
+    long il = 0, ol = 0;
+    if (calib_asio_latencies(&il, &ol)) {
+        w->lat_s = (double)(il + ol) / CAL_FS; w->lat_early_s = 0.0; w->lat_late_s = CALIB_WIN_LAT_DRIVER_S;
+        if (desc) snprintf(desc, cap, "the driver's loop %.2f ms, a lower bound, up to %.0f ms later (pass --latency to "
+                           "narrow it), distance %s", w->lat_s * 1e3, CALIB_WIN_LAT_DRIVER_S * 1e3, pm);
+        return 1;
+    }
+#endif
+    if (desc) snprintf(desc, cap, "none: no latency to time the arrival from (no --latency, no driver number); the whole IR is searched");
+    return 0;
+}
+
+/* The expected-arrival window of speaker s under P (0, 0 = none): the center's, widened by the
+ * capsules' radius for the ZM-1 */
+static void pass_window(const CalibPass* P, int s, int* lo, int* hi) {
+    *lo = *hi = 0;
+    if (!P->have_win) return;
+    CalibWindow w = P->win;
+    if (w.pos_m < 0.0) w.pos_m = calib_window_pos_m(P->L, s);
+    if (P->zylia) w.pos_m += CALIB_WIN_ZM1_M;
+    const float* m = P->mic ? P->mic : P->sim_at;
+    if (!calib_arrival_window(&w, P->L->speakers[s].pos, m, P->sos, CAL_FS, lo, hi)) *lo = *hi = 0;
+}
+
+/* The raw capture's power over [0, n) of each of `nrow` rows (stride CAL_CAPLEN), the median row, in
+ * dBFS; CALIB_BG_SILENT_DBFS for a silent capture or an empty span. Nothing of the sweep has arrived
+ * there: it is the room. */
+static float raw_background_dbfs(const float* rows, int nrow, int n) {
+    if (n < MEASURE_NOISE_MIN_N) return CALIB_BG_SILENT_DBFS;
+    if (n > CAL_CAPLEN) n = CAL_CAPLEN;
+    double p[ZYLIA_MICS];
+    for (int j = 0; j < nrow && j < ZYLIA_MICS; ++j) {
+        double acc = 0.0;
+        const float* r = rows + (size_t)j * CAL_CAPLEN;
+        for (int i = 0; i < n; ++i) acc += (double)r[i] * r[i];
+        int b = j; const double v = acc / n;              /* insertion sort for the median */
+        while (b > 0 && p[b-1] > v) { p[b] = p[b-1]; --b; } p[b] = v;
+    }
+    const double m = p[nrow / 2];
+    return m > 0.0 ? (float)(10.0 * log10(m)) : CALIB_BG_SILENT_DBFS;
+}
+
+/* One sweep of speaker s: the capture and measurement calib_measure_speaker made before the re-sweep. */
+static int measure_once(const CalibPass* P, int s, int through, MeasureResult* out, CalibMeasInfo* mi) {
+    const int nrow = P->zylia ? ZYLIA_MICS : 1;
+    float* rows = P->zylia ? P->cap19 : P->cap;
+    const double level_band[2] = { CAL_BAND_LO, CAL_BAND_HI };
+    const double* band = P->band_hz ? P->band_hz : level_band;
+    int lo, hi;
+    pass_window(P, s, &lo, &hi);
+    if (P->simulate) {
+        if (P->zylia) calib_sim_capture_zylia(s, P->L, P->sim_at, P->caps, ZYLIA_MICS, P->sos, P->sweep, P->cap19);
+        else          calib_sim_capture(s, P->L, P->sim_at, P->sos, P->sweep, P->cap);
+        if (through && !calib_stage_rows(P->L, s, rows, nrow, CAL_CAPLEN, P->tmp)) return CALIB_MEAS_FAILED;
+    }
+#ifdef BWA_HAVE_ASIO
+    else {
+        int ok;
+        if (through) {
+            if (!calib_stage_signal(P->L, s, P->sweep, CAL_NSWEEP, P->play, P->nplay)) return CALIB_MEAS_FAILED;
+            ok = calib_asio_capture_signal(s, P->play, P->nplay);
+        } else ok = calib_asio_capture(s);
+        if (!ok) return CALIB_MEAS_TIMEOUT;
+    }
+#else
+    else return CALIB_MEAS_FAILED;
+#endif
+    /* through the output stage the arrival carries the speaker's own delay trim: the window moves with it */
+    if (through && hi > lo) {
+        const int d = (int)P->L->speakers[s].delay_samples;     /* loaded at CAL_FS */
+        lo += d; hi += d;
+    }
+    if (!P->zylia) {
+        if (!measure_response_ex(P->cap, CAL_CAPLEN, P->sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS, band, lo, hi, out,
+                                 NULL, 0, 0, NULL)) return CALIB_MEAS_FAILED;
+        mi->bg_dbfs = raw_background_dbfs(P->cap, 1, (hi > lo ? lo : out->delay_samples) - (int)(MEASURE_NOISE_GUARD_S * CAL_FS));
+        return CALIB_MEAS_OK;
+    }
+    MeasureResult rj[ZYLIA_MICS];
+    int okj[ZYLIA_MICS] = { 0 };
+    /* 19 deconvolutions, threaded, the arrivals refined by cross-correlation */
+    mi->refined = calib_measure_zylia_rows(P->cap19, CAL_CAPLEN, CAL_CAPLEN, P->sweep, CAL_NSWEEP, band, lo, hi, rj, okj);
+    float lmin = 1e30f, lmax = 0.f;
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        if (!okj[j]) return CALIB_MEAS_FAILED;
+        if (rj[j].level < lmin) lmin = rj[j].level;
+        if (rj[j].level > lmax) lmax = rj[j].level;
+    }
+    mi->capsule_spread_db = (lmin > 0.f) ? (float)(20.0 * log10((double)lmax / (double)lmin)) : 99.f;
+    for (int j = 0; j < ZYLIA_MICS; ++j) mi->arrival_s[j] = ((double)rj[j].delay_samples + rj[j].delay_frac) / CAL_FS;
+    for (int i = 0; i < CAL_CAPLEN; ++i) {
+        double acc = 0.0;
+        for (int j = 0; j < ZYLIA_MICS; ++j) acc += P->cap19[(size_t)j * CAL_CAPLEN + i];
+        P->cap[i] = (float)(acc / ZYLIA_MICS);
+    }
+    int dead = -1;
+    const int pr = zylia_pressure_proxy(rj, CAL_FS, P->sos, out, &dead);
+    if (pr < 0) {
+        double lv[ZYLIA_MICS];
+        for (int j = 0; j < ZYLIA_MICS; ++j) {             /* sorted copy for the median (insertion sort) */
+            double v = std::isfinite(rj[j].level) ? rj[j].level : 0.0; int b = j;
+            while (b > 0 && lv[b-1] > v) { lv[b] = lv[b-1]; --b; } lv[b] = v;
+        }
+        mi->dead = dead;
+        mi->dead_level = dead >= 0 ? (double)rj[dead].level : 0.0;
+        mi->median_level = lv[ZYLIA_MICS / 2];
+        return CALIB_MEAS_DEAD;
+    }
+    if (pr != 1) return CALIB_MEAS_FAILED;
+    calib_pool_quality(rj, out);
+    mi->bg_dbfs = raw_background_dbfs(P->cap19, ZYLIA_MICS, (hi > lo ? lo : out->delay_samples) - (int)(MEASURE_NOISE_GUARD_S * CAL_FS));
+    return CALIB_MEAS_OK;
+}
+
+static void meas_log(CalibMeasInfo* mi, const char* fmt, ...) {
+    const size_t k = strlen(mi->log);
+    if (k + 2 >= sizeof mi->log) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(mi->log + k, sizeof mi->log - k, fmt, ap);
+    va_end(ap);
+}
+
+int calib_measure_speaker(const CalibPass* P, int s, int through, MeasureResult* out, CalibMeasInfo* info) {
+    CalibMeasInfo dummy;
+    CalibMeasInfo* mi = info ? info : &dummy;
+    memset(mi, 0, sizeof *mi);
+    mi->dead = -1;
+    /* Re-sweep until a sweep is clean (the window and the SNR floor), and with P->agree until two clean
+     * sweeps agree. Every clean sweep is kept, so a third one that agrees with the first settles it
+     * whatever the second was. The later sweep of the agreeing pair is the result: `cap` holds its
+     * capture for the IR consumers that read it next. */
+    MeasureResult clean[CALIB_SWEEP_MAX_TRIES];
+    int nclean = 0;
+    for (int k = 0; k < CALIB_SWEEP_MAX_TRIES; ++k) {
+        MeasureResult r;
+        const int rc = measure_once(P, s, through, &r, mi);
+        ++mi->sweeps;
+        if (rc != CALIB_MEAS_OK) return rc;
+        const int q = calib_sweep_check(&r, CALIB_SWEEP_MIN_SNR_DB);
+        if (q != CALIB_SWEEP_OK) {
+            char why[240];
+            calib_sweep_why(&r, q, CAL_FS, why, sizeof why);
+            if (q == CALIB_SWEEP_OUTSIDE) ++mi->rej_outside; else ++mi->rej_noisy;
+            meas_log(mi, "sweep %d: %s\n", k + 1, why);
+            continue;
+        }
+        if (P->agree) {
+            int hit = -1;
+            for (int j = nclean - 1; j >= 0 && hit < 0; --j)
+                if (calib_sweeps_agree(&clean[j], &r, NULL, NULL)) hit = j;
+            if (hit < 0) {
+                if (nclean > 0) {
+                    float ds = 0.f, ddb = 0.f;
+                    calib_sweeps_agree(&clean[nclean - 1], &r, &ds, &ddb);
+                    ++mi->rej_disagree;
+                    meas_log(mi, "sweep %d: %.2f samples and %.2f dB from the last clean sweep (agreeing takes %.0f sample, %.1f dB)\n",
+                             k + 1, ds, ddb, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB);
+                }
+                clean[nclean++] = r;
+                continue;
+            }
+        }
+        *out = r;
+        mi->snr_db = r.snr_db;
+        return CALIB_MEAS_OK;
+    }
+    meas_log(mi, "%d sweeps and no %s: nothing from this speaker is used\n", CALIB_SWEEP_MAX_TRIES,
+             P->agree ? "two clean sweeps that agree" : "clean sweep");
+    return CALIB_MEAS_UNCLEAN;
+}
+
 int calib_live_read(int spk, const Layout* L, const float center[3], double sos, int simulate,
-                    const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out) {
+                    const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out,
+                    const CalibWindow* win, const float* believed) {
     memset(out, 0, sizeof *out);
     out->dead = -1;
     if (simulate) {
@@ -423,15 +835,30 @@ int calib_live_read(int spk, const Layout* L, const float center[3], double sos,
 #else
     else return 0;
 #endif
+    /* the window: the union of the as-built's and the plan's, the box moving from one toward the other */
+    int lo = 0, hi = 0;
+    if (win) {
+        CalibWindow w = *win;
+        if (w.pos_m < 0.0) w.pos_m = CALIB_WIN_PLAN_M;
+        w.pos_m += CALIB_WIN_ZM1_M;
+        const float* m = believed ? believed : center;
+        int a0, a1, b0, b1;
+        const int ha = calib_arrival_window(&w, L->speakers[spk].pos, m, sos, CAL_FS, &a0, &a1);
+        const int hb = calib_arrival_window(&w, layout_plan_pos(L, (uint32_t)spk), m, sos, CAL_FS, &b0, &b1);
+        if (ha && hb) { lo = a0 < b0 ? a0 : b0; hi = a1 > b1 ? a1 : b1; }
+    }
     /* the LIVE tilt bands (calib.h CALIB_LIVE_*, steeper near on-axis than --check-aim's): only the
      * arrivals and the direct-sound tilt are read */
     const double band[2] = { CALIB_LIVE_MID_HZ, CALIB_LIVE_HIGH_HZ };
     MeasureResult rj[ZYLIA_MICS];
     int okj[ZYLIA_MICS] = { 0 };
-    calib_measure_zylia_rows(cap19, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, rj, okj);
+    calib_measure_zylia_rows(cap19, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, lo, hi, rj, okj);
     for (int j = 0; j < ZYLIA_MICS; ++j) if (!okj[j]) { out->dead = j; return 1; }
     int dead = -1;
     if (zylia_pressure_proxy(rj, CAL_FS, sos, &out->pooled, &dead) != 1) { out->dead = dead; return 1; }
+    calib_pool_quality(rj, &out->pooled);
+    out->quality = calib_sweep_check(&out->pooled, CALIB_SWEEP_MIN_SNR_DB);
+    if (out->quality != CALIB_SWEEP_OK) calib_sweep_why(&out->pooled, out->quality, CAL_FS, out->why, sizeof out->why);
     for (int j = 0; j < ZYLIA_MICS; ++j) out->arr[j] = ((double)rj[j].delay_samples + rj[j].delay_frac) / CAL_FS;
     out->have_tilt = calib_direct_tilt_db(&out->pooled, &out->tilt_db);
     out->ok = 1;

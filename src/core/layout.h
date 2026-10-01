@@ -31,6 +31,15 @@ typedef struct {
     float    eq[BWA_EQ_TAPS];/* minimum-phase speaker-correction taps (gated direct-sound inverse) */
     uint8_t  room_eq_count; /* LF modal cuts — STATIC-listener room correction only (docs/calibration.md) */
     RoomEqSection room_eq[BWA_ROOM_EQ_MAX];
+    /* The installer's PLAN for this speaker (docs/layout-schema.md, "Plan versus as-built"), for the
+     * tools only: the engine renders from pos/aim (as-built) and never reads these. A measuring writer
+     * that overwrites `position` or `aim` copies the old values into plan_position/plan_aim first
+     * (layout_json_keep_plan), so the intent survives a survey. Valid only when has_plan; read them
+     * through layout_plan_pos/layout_plan_aim, which fall back to pos/aim for a record with no plan
+     * (and for a hand-built Layout, which never sets has_plan). */
+    uint8_t  has_plan;      /* 1 = the record carries plan_position */
+    float    plan_pos[3];   /* plan_position, room meters */
+    float    plan_aim[3];   /* unit: plan_aim, else toward the listening point from plan_pos */
 } Speaker;
 
 /* Tracked room EQ (docs/calibration.md): the same LF modal cuts as room_eq, but measured at a GRID
@@ -126,6 +135,25 @@ void layout_compute_ref(Layout* L);
 /* Point every speaker's aim at `ref` (the schema's default when a record has no `aim`). Needs
  * `count` + `ref` set. A speaker sitting exactly on ref keeps (0,0,1). For hand-built layouts. */
 void layout_default_aims(Layout* L);
+
+/* Speaker k's plan: plan_position / plan_aim when the record has a plan, else its as-built pos/aim
+ * (a record with no plan is its own plan). k must be < L->count. */
+static inline const float* layout_plan_pos(const Layout* L, uint32_t k) {
+    return L->speakers[k].has_plan ? L->speakers[k].plan_pos : L->speakers[k].pos;
+}
+static inline const float* layout_plan_aim(const Layout* L, uint32_t k) {
+    return L->speakers[k].has_plan ? L->speakers[k].plan_aim : L->speakers[k].aim;
+}
+
+/* The plan rule for a WRITER (docs/layout-schema.md): call it on a speaker record (a cJSON object)
+ * right before overwriting its `position` or `aim` with a measurement. A record that has no
+ * `plan_position` yet gets one, a copy of its current `position`, plus `plan_aim`, a copy of its
+ * current `aim` when it has one (no `aim` = the plan aimed it at the listening point, which is what an
+ * absent plan_aim means). A record that already carries `plan_position` is never touched: the plan
+ * is recorded once, by the first survey. Returns 1 = recorded, 0 = already had a plan, -1 = not a
+ * speaker record (not an object, or no position[3] to keep). Control side only. */
+struct cJSON;
+int layout_json_keep_plan(struct cJSON* speaker);
 
 /* Degrees between speaker k's acoustic axis and the direction from it to `p` (0 = p is on axis,
  * 180 = directly behind). Pure, alloc-free, audio-thread safe; 0 when p sits on the speaker. */

@@ -2,7 +2,7 @@
  * survey_test.c - the optical speaker survey's math (src/tracking/survey.c): the baffle-plane aim
  * (sign, planarity, colinearity, recovery under a body rotation), pose averaging, the rigid frame
  * fit (an injected yaw + shift, mirror detection by positions and by aims, the coplanar blind
- * spot), the two-match check, and body-name matching. The end-to-end run through the NatNet
+ * spot), the two-match check, the baffle depth (a joint fit), and body-name matching. The end-to-end run through the NatNet
  * parsers is the speaker_survey_* ctests (bwa_speaker_survey --simulate).
  */
 #include "tracking/survey.h"
@@ -287,6 +287,74 @@ static void test_frame(void) {
     CHECK(fabsf(survey_pair_delta(opt[0], far1, LAY4[0], LAY4[1])) > 0.01f, "pair: a distance change shows");
 }
 
+/* The baffle depth. The layout points are acoustic centers, each box faces the listening point, and
+ * the markers' centroid sits D IN FRONT of the center along that aim; Motive sees it through a yaw and
+ * a shift. opt/oaim: what the survey reports (points and aims in Motive's frame). */
+static const float REF15[3] = { 0.f, 1.5f, 0.f };
+/* four dome_24 speakers (8, 13, 16, 21) on one side: their aims are alike, which is what makes the
+ * plain frame fit eat the depth */
+static const float LOP4[4][3] = { { 1.863f, 1.24f, 0.68f }, { 1.899f, 1.969f, -0.417f }, { 1.363f, 2.406f, 1.149f },
+                                  { 1.141f, 3.135f, 0.154f } };
+static void depth_view(const float (*lay)[3], float D, double yaw_deg, const float t[3], float (*opt)[3], float (*oaim)[3]) {
+    const float zero[3] = { 0.f, 0.f, 0.f };
+    float aim[4][3], front[4][3];
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 3; ++k) aim[i][k] = REF15[k] - lay[i][k];
+        unit(aim[i]);
+        for (int k = 0; k < 3; ++k) front[i][k] = lay[i][k] + D * aim[i][k];
+    }
+    motive_view((const float (*)[3])front, 4, yaw_deg, t, false, opt);
+    motive_view((const float (*)[3])aim, 4, yaw_deg, zero, false, oaim);    /* aims rotate, never shift */
+}
+/* The joint fit must return +60 mm (the sign: a center behind the baffle is positive), per speaker
+ * too, with nothing across the aims, and the frame it was seen through, on a spread set and on a
+ * lopsided one. The plain frame fit's reading of the lopsided set is the reason the depth is a fit
+ * unknown, so its error is demanded too: a check that cannot see the difference proves nothing. */
+static void test_depth(void) {
+    const float shift[3] = { 0.05f, 0.f, 0.f }, zero[3] = { 0.f, 0.f, 0.f }, D = 0.06f;
+    float opt[4][3], oaim[4][3], di[4], ac[4];
+    SurveyDepthFit f;
+    for (int set = 0; set < 2; ++set) {
+        const float (*lay)[3] = set ? LOP4 : LAY4;
+        const char* name = set ? "lopsided" : "spread";
+        depth_view(lay, D, 2.0, shift, opt, oaim);
+        CHECK(survey_fit_depth((const float (*)[3])opt, (const float (*)[3])oaim, lay, 4, &f, di, ac), "depth: fit");
+        float worst_d = 0.f, worst_a = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            if (fabsf(di[i] - D) > worst_d) worst_d = fabsf(di[i] - D);
+            if (ac[i] > worst_a) worst_a = ac[i];
+        }
+        /* the plain frame fit + a dot product: the translation eats part of the depth */
+        SurveyFrameFit pf;
+        CHECK(survey_fit_frame((const float (*)[3])opt, lay, NULL, NULL, NULL, 4, &pf), "depth: plain fit");
+        float plain = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            float r[3], b[3];
+            rot((const float (*)[3])pf.R, opt[i], r);
+            rot((const float (*)[3])pf.R, oaim[i], b);
+            for (int k = 0; k < 3; ++k) plain += (r[k] + pf.t[k] - lay[i][k]) * b[k] / 4.f;
+        }
+        printf("  depth fit, %s set: %.3f mm (true %.1f), per speaker within %.4f mm, across %.4f mm, %.3f deg, |t| %.2f mm,\n"
+               "    leverage %.2f, %d iterations; the plain frame fit reads %.1f mm\n", name, f.depth_m * 1e3f, D * 1e3f,
+               worst_d * 1e3f, worst_a * 1e3f, f.angle_deg, f.t_m * 1e3f, f.leverage, f.iters, plain * 1e3f);
+        CHECK(fabsf(f.depth_m - D) < 1e-4f, "depth: recovers +60 mm (positive = behind the baffle)");
+        CHECK(worst_d < 1e-4f && worst_a < 1e-4f, "depth: per speaker, nothing across the aims");
+        CHECK(fabsf(f.angle_deg - 2.0f) < 0.01f && fabsf(f.t_m - 0.05f) < 1e-4f, "depth: the frame it was seen through");
+        if (set) CHECK(fabsf(plain - D) > 0.02f, "depth: the plain fit cannot read the lopsided set (the power to tell)");
+    }
+
+    /* a center IN FRONT of the baffle reads negative */
+    depth_view(LAY4, -0.02f, 0.0, zero, opt, oaim);
+    CHECK(survey_fit_depth((const float (*)[3])opt, (const float (*)[3])oaim, LAY4, 4, &f, NULL, NULL) &&
+          fabsf(f.depth_m + 0.02f) < 1e-4f, "depth: a center in front of the baffle is negative");
+
+    /* every box facing one way: the depth is a translation, refused; and too few speakers */
+    float same[4][3];
+    for (int i = 0; i < 4; ++i) { same[i][0] = 0.f; same[i][1] = 0.f; same[i][2] = 1.f; }
+    CHECK(!survey_fit_depth(LAY4, (const float (*)[3])same, LAY4, 4, &f, NULL, NULL), "depth: parallel aims refused");
+    CHECK(!survey_fit_depth(LAY4, (const float (*)[3])oaim, LAY4, 2, &f, NULL, NULL), "depth: 2 speakers refused");
+}
+
 static void test_names(void) {
     struct { const char* s; int want; } cases[] = {
         { "spk07", 7 }, { "Speaker_7", 7 }, { "SPK-7", 7 }, { "speaker 12", 12 }, { "spk.3", 3 },
@@ -329,8 +397,9 @@ int main(void) {
     test_aim();
     test_avg();
     test_frame();
+    test_depth();
     test_names();
     if (fails) { printf("survey_test: %d FAILURES\n", fails); return 1; }
-    printf("survey_test OK (plane aim + sign + planarity + colinear + axis mode, averaging, frame fit + mirror + coplanar blind spot, pair check, names)\n");
+    printf("survey_test OK (plane aim + sign + planarity + colinear + axis mode, averaging, frame fit + mirror + coplanar blind spot, pair check, baffle depth, names)\n");
     return 0;
 }

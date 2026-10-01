@@ -1144,7 +1144,10 @@ it: `a = my_clock(); h = bwa_host_time_ns(); b = my_clock();` gives `offset = h 
 error bounded by `(b-a)/2`. See "Land a sound on a visual event" for the whole recipe, the
 per-platform clock table, and the decaying-max estimator that remains the fallback (it is what the
 Unity binding's `Engine.DspTimeFramesAt`/`RealtimeAt` use). It returns **false with the outputs untouched** until a host-stamped block has
-rendered: before `bwa_start`, or under a driver that reports no `systemTime` (FlexASIO is one).
+rendered, that is, before `bwa_start`.
+On ASIO the host time is on QPC whatever clock the driver's `systemTime` uses: the sink takes the
+driver's stamp only when the stamps show it is on QPC, and reads QPC at callback entry otherwise
+([backends.md: ASIO's systemTime](./backends.md#3-timestamp)).
 The **manual** sink is the deliberate exception: it stamps a *nominal* time derived from the
 sample position (`sample / rate`), so a fixed call sequence renders bit-identically; treat that
 pair as a sample-accurate fiction, exact for arithmetic and meaningless as wall time. Its first
@@ -1169,8 +1172,8 @@ dozen flops a block) and reports `ppm` with its own `ppm_sigma`; use `rate_hz` i
 nominal rate in `dsp_at(T)` and long extrapolations stop walking off. It returns false until the
 fit has ~1 s of stamps, and reseeds (going quiet ~1 s) after a restart re-bases the sample
 position. Two honest caveats: read `ppm_sigma` as a lower bound (it assumes independent stamp
-noise; real jitter is correlated), and `jitter_ns` reports *stamp* quality, so a driver without
-`kSystemTimeValid` reads worse from QPC dispatch noise. The manual sink fits `ppm = 0` exactly;
+noise; real jitter is correlated), and `jitter_ns` reports *stamp* quality, so an ASIO driver whose
+`systemTime` is absent or not on QPC reads worse from QPC dispatch noise. The manual sink fits `ppm = 0` exactly;
 that is true of the fiction, not of any hardware.
 
 Correcting drift is a different problem from measuring it, and the engine deliberately doesn't do
@@ -2478,8 +2481,8 @@ optimizer cost all go through them. See [`layout-schema.md`](./layout-schema.md)
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on);   // default ON when the layout carries a grid
 ```
 
-Layouts carrying a `room_eq_grid` (written by `bwa_calibrate --room-eq-grid`, one run per mic
-placement) get **listener-tracked LF room correction**: each block the engine re-interpolates the
+Layouts carrying a `room_eq_grid` (written by `bwa_calibrate --room-eq-grid`, one mic placement
+per row of a positions file) get **listener-tracked LF room correction**: each block the engine re-interpolates the
 grid's per-speaker modal-cut depths at the live listener position (inverse-distance weights over
 the measurement points). The align-stage biquads glide toward them at 24 dB/s, click-free by
 construction, fast enough to track a walking listener.

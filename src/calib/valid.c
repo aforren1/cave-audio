@@ -6,6 +6,7 @@
 #include "bw_audio.h"      /* bwa_panner enum only — valid.c calls the panner solves directly */
 #include "spatial/dbap.h"
 #include "core/rt.h"            /* the phantom arm renders through a real engine core (see valid.h) */
+#include "core/sane.h"
 #include "spatial/spcap.h"
 #include "spatial/vbap.h"
 
@@ -515,6 +516,15 @@ static int valid_propagate(const Layout* L, const float* feeds, uint32_t pre, ui
     return 1;
 }
 
+int valid_propagate_feeds(const Layout* L, const float* feeds, uint32_t pre, uint32_t n,
+                          const float mic[3], double fs, double c, float* cap19) {
+    if (!L || !feeds || !mic || !cap19) return 0;
+    if (fs <= 0.0 || c <= 0.0 || n < 64u) return 0;
+    if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
+    if (!bwa_finite3_bounded(mic, BWA_MAX_COORD)) return 0;
+    return valid_propagate(L, feeds, pre, n, mic, fs, c, cap19);
+}
+
 int valid_simulate(const Layout* L, int panner, const ValidRender* R, const float solve_pos[3],
                    const float mic[3], const float src_world[3], double fs, double c,
                    float* buf, uint32_t n) {
@@ -609,12 +619,20 @@ int valid_reference_cell(const Layout* L, int spk, const float mic[3],
     float* buf = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * n);
     if (!buf) return 0;
     if (!valid_field(L, gains, mic, fs, c, buf, n)) { free(buf); return 0; }
+    int r = valid_score_reference(L, spk, mic, buf, n, fs, c, NULL, out);
+    free(buf);
+    return r;
+}
 
+int valid_score_reference(const Layout* L, int spk, const float mic[3], const float* cap19,
+                          uint32_t n, double fs, double c, const unsigned char* exclude,
+                          ValidCell* out) {
+    if (!L || !mic || !cap19 || !out) return 0;
+    if (spk < 0 || (uint32_t)spk >= L->count) return 0;
     /* The speaker's own surveyed position IS the target. A reference miss therefore also prices in
      * survey error, which is correct: a layout that misplaces a speaker misaims every phantom too. */
     float src[3] = { L->speakers[spk].pos[0], L->speakers[spk].pos[1], L->speakers[spk].pos[2] };
-    int r = valid_score(L, 0, NULL, 0, mic, src, buf, n, fs, c, NULL, out);
-    free(buf);
+    int r = valid_score(L, 0, NULL, 0, mic, src, cap19, n, fs, c, exclude, out);
     /* No panner and no knob ran, so every render column is meaningless here — blank them rather than
      * report the array's defaults on a row that never used them. */
     if (r) { out->reference = 1; out->tgt = spk; memset(&out->render, 0, sizeof out->render); }
@@ -720,6 +738,25 @@ static int cmp_double(const void* a, const void* b) {
 
 static double median_sorted(const double* s, int n) {
     return (n & 1) ? s[n/2] : 0.5 * (s[n/2 - 1] + s[n/2]);
+}
+
+double valid_capture_power(const float* cap19, uint32_t n) {
+    if (!cap19 || n == 0) return 0.0;
+    double p[ZYLIA_MICS];
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        double acc = 0.0;
+        const float* r = cap19 + (size_t)j * n;
+        for (uint32_t i = 0; i < n; ++i) acc += (double)r[i] * r[i];
+        p[j] = acc / (double)n;
+    }
+    return valid_median(p, ZYLIA_MICS);
+}
+
+float valid_bg_ratio_db(double sig, double bg) {
+    if (!(sig > 0.0)) return 0.f;
+    if (!(bg > 0.0)) return VALID_BG_SILENT_DB;
+    const double r = 10.0 * log10(sig / bg);
+    return r > VALID_BG_SILENT_DB ? VALID_BG_SILENT_DB : (float)r;
 }
 
 double valid_median(const double* v, int n) {

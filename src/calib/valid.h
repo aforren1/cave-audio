@@ -141,7 +141,27 @@ typedef struct {
     ValidRender render;   /* the settings this cell was RENDERED at, RESOLVED (focus/density never
                            * carry the <= 0 sentinel). All zero on a reference cell, which ran no
                            * panner and no knob. */
+    float bg_db;          /* the capture's power over the placement's BACKGROUND capture (no stimulus),
+                           * dB (valid_bg_ratio_db); VALID_BG_SILENT_DB when the background was silent */
+    int   bg_low;         /* 1 = bg_db under VALID_BG_MIN_DB: the room was too loud for this cell */
 } ValidCell;
+
+/* ---- the background (bwa_validate; docs/validation.md "The background check") ----
+ * The stimulus is steady state, not a sweep, so nothing in the analysis separates it from whatever
+ * else the room is doing: a projector fan, a voice, an air handler. So each placement first takes ONE
+ * capture with no stimulus at all, and every cell is held against it: the ratio of the cell's capture
+ * power to the background's, each the MEDIAN over the 19 capsules of the capsule's mean square (one
+ * hot capsule moves neither; that is the capsule check's business). A cell under VALID_BG_MIN_DB is
+ * flagged, and the placement reports how many. A simulated background is silent unless
+ * bwa_validate --sim-background puts one there, so simulate reads VALID_BG_SILENT_DB. PROVISIONAL:
+ * nothing has been measured on the rig yet. 20 dB keeps the background's share of the intensity a
+ * hundredth of the stimulus's. */
+#define VALID_BG_MIN_DB    20.0f
+#define VALID_BG_SILENT_DB 300.0f
+/* The median over the 19 capsules of each capsule's mean square over n samples ([ZYLIA_MICS][n] flat). */
+double valid_capture_power(const float* cap19, uint32_t n);
+/* 10 log10(sig / bg); VALID_BG_SILENT_DB when bg is 0 and sig is not, 0 when both are. */
+float  valid_bg_ratio_db(double sig, double bg);
 
 /* ---- the measurement stimulus ----
  *
@@ -204,6 +224,19 @@ const char* valid_stimulus_name(void);
 int valid_simulate(const Layout* L, int panner, const ValidRender* R, const float solve_pos[3],
                    const float mic[3], const float src_world[3], double fs, double c,
                    float* buf, uint32_t n);
+
+/* The propagation half of valid_simulate on its own: ANY speaker feeds, anechoically, to the 19
+ * capsules at `mic`. feeds = [nspk][pre + n], row stride pre + n; capsule frame t reads feed frame
+ * pre + t - delay, so `pre` must cover the longest speaker-to-capsule path plus the cubic tap's
+ * reach (it refuses rather than read short). cap19 = [ZYLIA_MICS][n], peak-normalized like
+ * valid_simulate's.
+ *
+ * This is the simulated DEVICE. bwa_validate builds one feed buffer per capture, the same buffer
+ * its hardware path plays, and hands it either to the ASIO capture or to this. Passing the device's
+ * own layout (pre = the skipped head, n = the analysis window) makes simulate analyze the same
+ * window of the same feeds the rig analyzes. Returns 1 on success, 0 on bad arguments. */
+int valid_propagate_feeds(const Layout* L, const float* feeds, uint32_t pre, uint32_t n,
+                          const float mic[3], double fs, double c, float* cap19);
 
 /* Simulate one cell and score it: render, measure, fill `out`. `n` samples of capture (>= one
  * analysis frame; 8192 also buys the comb estimator, which needs ZYLIA_COMB_NFFT). Returns 1 if the
@@ -291,9 +324,25 @@ int valid_score(const Layout* L, int panner, const ValidRender* R, int tracked, 
  * The target is taken from the LAYOUT, so a reference miss also prices in survey error. That is
  * correct: a layout that misplaces a speaker misaims every phantom too.
  *
- * `valid_reference_feeds` is the hardware side (unit drive on one channel, still through its trim and
- * alignment delay, exactly as align.c would); `valid_reference_cell` is the offline equivalent. */
+ * A reference cell is a CAPTURE, exactly like a phantom cell: `valid_reference_feeds` builds the
+ * feeds (unit drive on one channel, still through its trim and alignment delay, exactly as align.c
+ * would), the caller plays them and records the 19 capsules, and `valid_score_reference` scores the
+ * capture against the layout's position for that speaker. bwa_validate runs that sequence on both
+ * backends: on the rig the room and the instrument are in the floor, and in simulate the feeds go
+ * through valid_propagate_feeds, the same propagation the phantom cells get.
+ *
+ * `valid_reference_cell` is the OFFLINE cell: no feeds, the exact phase-domain field of one speaker
+ * (valid_field). Nothing in the session uses it any more. It stays as the exact-model baseline the
+ * `valid` ctest pins the feed path against, and as a one-call reference for unit tests. Never use it
+ * where a measurement is meant: it cannot see a room, a capsule fault or a moved microphone. */
 int valid_reference_feeds(const Layout* L, int spk, double fs, float* feeds, uint32_t n);
+
+/* Score a captured reference (cap19 = [ZYLIA_MICS][n], as valid_score) against speaker `spk`'s
+ * layout position, and tag the cell: reference = 1, tgt = spk, render all zero. `exclude` is the
+ * session's capsule mask, as for valid_score. Returns 1 if scored (check out->ok). */
+int valid_score_reference(const Layout* L, int spk, const float mic[3], const float* cap19,
+                          uint32_t n, double fs, double c, const unsigned char* exclude,
+                          ValidCell* out);
 
 int valid_reference_cell(const Layout* L, int spk, const float mic[3],
                          double fs, double c, uint32_t n, ValidCell* out);

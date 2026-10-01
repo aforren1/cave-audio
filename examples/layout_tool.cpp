@@ -222,6 +222,18 @@ static void seed_default(void) {
 static int   g_lp_set;
 static float g_lp_x, g_lp_z;
 
+/* The plan versus the as-built (docs/layout-schema.md, "Plan versus as-built"). This tool IS the plan
+ * editor. A file with no `plan_position` anywhere is a plan file: the tool edits `position`/`aim` and
+ * writes the whole schema, as it always has. A file where any speaker carries `plan_position` is an
+ * AS-BUILT file (a survey has written it): the tool loads each speaker's plan (plan_position/plan_aim,
+ * or position/aim for a record with no plan) as the thing to edit, shows the as-built positions as
+ * ghosts, and saves by PATCHING the loaded file: only plan_position, plan_aim, pin, pin_slab_m and
+ * listening_point_m change, and the measured position, aim, trims, eq and grid pass through verbatim. */
+static int     g_asbuilt;                    /* the loaded file carries a plan */
+static char*   g_asbuilt_json = NULL;        /* the loaded file, verbatim, for the patch save */
+static int     g_asbuilt_n;                  /* its speaker count: the patch refuses another */
+static Vector3 g_built[NSPK];                /* the as-built `position` per speaker (the ghosts) */
+
 /* load positions/gain + dbap knobs from an existing cave_layout.json; returns #speakers read (0 = none).
  * The file's speaker COUNT becomes the edited layout's count (4..NSPK — the engine loader's range). */
 static int load_json(const char* path) {
@@ -235,6 +247,8 @@ static int load_json(const char* path) {
     cJSON* root = cJSON_Parse(buf); free(buf);
     if (!root) return 0;
     dir_reset();
+    g_asbuilt = 0; g_asbuilt_n = 0;
+    free(g_asbuilt_json); g_asbuilt_json = NULL;
 
     int loaded = 0;
     float lp_y_pending = 0.0f;
@@ -244,12 +258,24 @@ static int load_json(const char* path) {
         if (n < NSPK_MIN || n > NSPK) { cJSON_Delete(root); return 0; }   /* the engine would reject it too */
         g_nspk = n;
         cJSON* sp;
+        cJSON_ArrayForEach(sp, spks)
+            if (cJSON_GetObjectItemCaseSensitive(sp, "plan_position")) g_asbuilt = 1;
+        if (g_asbuilt) { g_asbuilt_json = cJSON_PrintUnformatted(root); g_asbuilt_n = n; }
         cJSON_ArrayForEach(sp, spks) {
             cJSON* idxj = cJSON_GetObjectItemCaseSensitive(sp, "index");
             cJSON* posj = cJSON_GetObjectItemCaseSensitive(sp, "position");
             if (!cJSON_IsNumber(idxj) || !cJSON_IsArray(posj) || cJSON_GetArraySize(posj) != 3) continue;
             int idx = idxj->valueint;
             if (idx < 0 || idx >= g_nspk) continue;   /* indices are a 0..count-1 permutation */
+            {   /* the as-built ghost, then switch to the plan: a record with plan_position edits that,
+                 * and its aim is plan_aim (absent = toward the ears, like a plan with no aim) */
+                cJSON* bx = cJSON_GetArrayItem(posj, 0); cJSON* by = cJSON_GetArrayItem(posj, 1); cJSON* bz = cJSON_GetArrayItem(posj, 2);
+                if (cJSON_IsNumber(bx) && cJSON_IsNumber(by) && cJSON_IsNumber(bz))
+                    g_built[idx] = Vector3{ (float)bx->valuedouble, (float)by->valuedouble, (float)bz->valuedouble };
+            }
+            cJSON* ppj = cJSON_GetObjectItemCaseSensitive(sp, "plan_position");
+            const int rec_plan = cJSON_IsArray(ppj) && cJSON_GetArraySize(ppj) == 3;
+            if (rec_plan) posj = ppj;
             cJSON* px = cJSON_GetArrayItem(posj, 0);
             cJSON* py = cJSON_GetArrayItem(posj, 1);
             cJSON* pz = cJSON_GetArrayItem(posj, 2);
@@ -262,7 +288,7 @@ static int load_json(const char* path) {
             cJSON* pj = cJSON_GetObjectItemCaseSensitive(sp, "pin");
             spk[idx].pin = (cJSON_IsString(pj) && strcmp(pj->valuestring, "plane") == 0) ? 1 : 0;
             spk[idx].has_aim = 0;                     /* optional acoustic axis (the directivity model reads it) */
-            cJSON* aj = cJSON_GetObjectItemCaseSensitive(sp, "aim");
+            cJSON* aj = cJSON_GetObjectItemCaseSensitive(sp, rec_plan ? "plan_aim" : "aim");
             if (cJSON_IsArray(aj) && cJSON_GetArraySize(aj) == 3) {
                 cJSON* ax = cJSON_GetArrayItem(aj, 0); cJSON* ay = cJSON_GetArrayItem(aj, 1); cJSON* az = cJSON_GetArrayItem(aj, 2);
                 if (cJSON_IsNumber(ax) && cJSON_IsNumber(ay) && cJSON_IsNumber(az)) {
@@ -326,6 +352,53 @@ static int load_json(const char* path) {
     return loaded;
 }
 
+/* The as-built file's save: patch the loaded file with the plan edits only (see g_asbuilt). 0 on a
+ * count change (the as-built records have nowhere to go) or a write failure. */
+static int save_plan_json(const char* path) {
+    if (!g_asbuilt_json) return 0;
+    if (g_nspk != g_asbuilt_n) {
+        fprintf(stderr, "save: this is an as-built layout (it carries plan_position): its speaker count (%d) cannot change\n"
+                        "      here, because each record holds a measured position. Edit the plan file instead.\n", g_asbuilt_n);
+        return 0;
+    }
+    cJSON* root = cJSON_Parse(g_asbuilt_json);
+    if (!root) return 0;
+    cJSON* spks = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    cJSON* sp;
+    int npin = 0;
+    cJSON_ArrayForEach(sp, spks) {
+        cJSON* idxj = cJSON_GetObjectItemCaseSensitive(sp, "index");
+        if (!cJSON_IsNumber(idxj) || idxj->valueint < 0 || idxj->valueint >= g_nspk) continue;
+        const Spk& k = spk[idxj->valueint];
+        const double r4 = 10000.0;
+        double v[3] = { round(k.pos.x * r4) / r4, round(k.pos.y * r4) / r4, round(k.pos.z * r4) / r4 };
+        cJSON_DeleteItemFromObjectCaseSensitive(sp, "plan_position");
+        cJSON_AddItemToObject(sp, "plan_position", cJSON_CreateDoubleArray(v, 3));
+        cJSON_DeleteItemFromObjectCaseSensitive(sp, "plan_aim");
+        if (k.has_aim) {
+            double a[3] = { round(k.aim.x * r4) / r4, round(k.aim.y * r4) / r4, round(k.aim.z * r4) / r4 };
+            cJSON_AddItemToObject(sp, "plan_aim", cJSON_CreateDoubleArray(a, 3));
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(sp, "pin");
+        if (k.pin) { cJSON_AddStringToObject(sp, "pin", "plane"); ++npin; }
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "pin_slab_m");
+    if (npin) cJSON_AddNumberToObject(root, "pin_slab_m", pin_slab_m);
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "listening_point_m");
+    if (g_lp_set) {
+        double lp[3] = { g_lp_x, obs_height, g_lp_z };
+        cJSON_AddItemToObject(root, "listening_point_m", cJSON_CreateDoubleArray(lp, 3));
+    }
+    char* out = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!out) return 0;
+    FILE* f = fopen(path, "wb");
+    int ok = 0;
+    if (f) { const size_t n = strlen(out); ok = fwrite(out, 1, n, f) == n && fwrite("\n", 1, 1, f) == 1; fclose(f); }
+    free(out);
+    return ok;
+}
+
 /* write the full schema; delay_ms is derived from positions (max-distance alignment) */
 static int save_json(const char* path) {
     FILE* f = fopen(path, "wb");
@@ -361,6 +434,13 @@ static int save_json(const char* path) {
     fprintf(f, "  ]\n}\n");
     fclose(f);
     return 1;
+}
+
+/* Every user-facing save (S, --export, --optimize): a plan file is rewritten whole, an as-built file is
+ * patched with the plan edits only. The preview's temp layout stays save_json: it renders the edited
+ * plan as positions, which is what a preview of the plan means. */
+static int save_layout(const char* path) {
+    return g_asbuilt ? save_plan_json(path) : save_json(path);
 }
 
 /* ---- placement constraints / barriers (constraints.json; see examples/constraints.json) ----
@@ -1058,7 +1138,7 @@ static float save_flash = 0.0f;
 static bool  show_te_ui = false;
 
 static void do_save(void) {
-    int ok = save_json(g_path);
+    int ok = save_layout(g_path);
     save_flash = ok ? 2.0f : -2.0f;
     if (ok) edited_unsaved = 0;
     else fprintf(stderr, "save failed: cannot write '%s' (working dir %s) - check the path / permissions\n",
@@ -1382,6 +1462,12 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
         else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
             DrawSphereWires(spk[i].pos, is_sel ? 0.22f : 0.18f, 6, 6, Color{ 245, 165, 70, 255 });
     }
+    if (g_asbuilt)                                   /* an as-built file: where the survey put each box, read-only */
+        for (int i = 0; i < g_nspk; ++i) {
+            DrawSphere(g_built[i], 0.06f, Color{ 150, 200, 235, 200 });
+            if (Vector3Distance(g_built[i], spk[i].pos) > 0.01f)
+                DrawLine3D(g_built[i], spk[i].pos, Color{ 150, 200, 235, 160 });
+        }
     if (!preview) draw_dir_cone();                   /* the selected speaker's beam, at the ears' distance */
     if (preview) {                                   /* the moving DBAP source */
         DrawLine3D(Vector3{ 0, 0, 0 }, src_pos, Color{ 90, 220, 90, 200 });
@@ -1632,7 +1718,14 @@ static void draw_panel(void) {
     bwTip("re-read the layout + constraints.json from disk - discards unsaved edits");
     ImGui::SameLine();
     if (ImGui::Button("Save [S]", ImVec2(half, 0))) do_save();
-    bwTip("write the layout; delay_ms is derived from the positions (max-distance alignment)");
+    bwTip(g_asbuilt ? "an as-built file: Save writes the PLAN only (plan_position, plan_aim, pins, the listening point); "
+                      "the measured positions, aims and trims pass through"
+                    : "write the layout; delay_ms is derived from the positions (max-distance alignment)");
+    if (g_asbuilt) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.59f, 0.78f, 0.92f, 1.0f));
+        ImGui::TextWrapped("as-built file: editing the PLAN (blue dots: where the survey put each box)");
+        ImGui::PopStyleColor();
+    }
 
     ImGui::SeparatorText("Speaker");                 /* the survey loop: pick an index, tone it, place it */
     { int n = g_nspk;                                /* the array's SIZE = the engine's channel count */
@@ -2018,6 +2111,74 @@ static void register_tests(ImGuiTestEngine* te) {
         float m = 0, w = 0;                                      /* the real panner solve, on 24 speakers */
         score_panner(BWA_PAN_DBAP, 4, 1, &m, &w, NULL);
         IM_CHECK_GT(w, 0.0f);
+        g_nspk = keep; seed_default(); layout_dirty = 1;
+    };
+
+    /* an AS-BUILT file (a survey wrote it, so it carries plan_position): the tool edits the PLAN, and its
+     * save patches plan_position/plan_aim into the file while the measured position, aim, trims and eq
+     * pass through untouched. The engine then renders the as-built. Expected values are typed here. */
+    t = IM_REGISTER_TEST(te, "logic", "plan_asbuilt");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const int keep = g_nspk;
+        FILE* f = fopen(TEST_OUT, "wb");
+        IM_CHECK(f != NULL);
+        if (!f) return;
+        fputs("{ \"speakers\": [\n"
+              "  {\"index\":0,\"position\":[1.5,1.2,0.1],\"aim\":[0,0,1],\"plan_position\":[1.4,1.2,0],\"gain_db\":-2.5,\"delay_ms\":1.25,\"eq\":[0.9,0.1]},\n"
+              "  {\"index\":1,\"position\":[-1.5,1.2,0],\"aim\":[1,0,0],\"gain_db\":-1,\"delay_ms\":0.5},\n"
+              "  {\"index\":2,\"position\":[0,1.2,1.5]},\n"
+              "  {\"index\":3,\"position\":[0,2.5,0]} ] }\n", f);
+        fclose(f);
+        IM_CHECK_EQ(load_json(TEST_OUT), 4);
+        IM_CHECK_EQ(g_asbuilt, 1);
+        IM_CHECK_LT(fabsf(spk[0].pos.x - 1.4f), 1e-5f);          /* the plan is what the tool edits */
+        IM_CHECK_EQ(spk[0].has_aim, 0);                          /* a plan with no plan_aim faces the ears */
+        IM_CHECK_LT(fabsf(g_built[0].x - 1.5f), 1e-5f);         /* the as-built ghost */
+        IM_CHECK(fabsf(spk[1].pos.x + 1.5f) < 1e-5f && spk[1].has_aim);   /* no plan: its own plan */
+        spk[0].pos.x = 1.3f; spk[2].pos.z = 1.6f;                /* edit the plan */
+        IM_CHECK(save_layout(TEST_OUT));
+        FILE* rf = fopen(TEST_OUT, "rb");
+        IM_CHECK(rf != NULL);
+        if (rf) {
+            char buf[8192]; size_t rd = fread(buf, 1, sizeof buf - 1, rf); buf[rd] = 0; fclose(rf);
+            cJSON* root = cJSON_Parse(buf);
+            IM_CHECK(root != NULL);
+            cJSON* sp = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+            cJSON* s0 = cJSON_GetArrayItem(sp, 0); cJSON* s1 = cJSON_GetArrayItem(sp, 1); cJSON* s2 = cJSON_GetArrayItem(sp, 2);
+            auto num = [](cJSON* o, const char* k, int i) -> double {
+                cJSON* a = cJSON_GetObjectItemCaseSensitive(o, k);
+                cJSON* v = i < 0 ? a : cJSON_GetArrayItem(a, i);
+                return cJSON_IsNumber(v) ? v->valuedouble : -999.0;
+            };
+            IM_CHECK_LT(fabs(num(s0, "position", 0) - 1.5), 1e-9);    /* measured: verbatim */
+            IM_CHECK_LT(fabs(num(s0, "plan_position", 0) - 1.3), 1e-6); /* the edit landed on the plan */
+            IM_CHECK_LT(fabs(num(s0, "gain_db", -1) + 2.5), 1e-9);
+            IM_CHECK_LT(fabs(num(s0, "delay_ms", -1) - 1.25), 1e-9);  /* never re-derived from geometry here */
+            IM_CHECK_EQ(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(s0, "eq")), 2);
+            IM_CHECK(cJSON_GetObjectItemCaseSensitive(s0, "aim") != NULL && cJSON_GetObjectItemCaseSensitive(s0, "plan_aim") == NULL);
+            IM_CHECK_LT(fabs(num(s1, "plan_aim", 0) - 1.0), 1e-6);    /* its own aim became its plan */
+            IM_CHECK_LT(fabs(num(s2, "position", 2) - 1.5), 1e-9);
+            IM_CHECK_LT(fabs(num(s2, "plan_position", 2) - 1.6), 1e-6);
+            cJSON_Delete(root);
+        }
+        {   /* the engine renders the as-built, not the plan */
+            bwa_desc cfg; memset(&cfg, 0, sizeof cfg);
+            cfg.profile = BWA_PROFILE_CAVE; cfg.sample_rate = SR; cfg.block_size = 256;
+            cfg.layout_path = TEST_OUT;
+            bwa_engine* te2 = bwa_create(&cfg);
+            IM_CHECK(te2 != NULL);
+            if (te2) {
+                IM_CHECK(bwa_last_error(te2) == NULL);
+                float xyz[4 * 3];
+                IM_CHECK_EQ(bwa_get_speakers(te2, xyz, 4), 4u);
+                IM_CHECK_LT(fabsf(xyz[0] - 1.5f), 1e-5f);
+                IM_CHECK_LT(fabsf(xyz[2 * 3 + 2] - 1.5f), 1e-5f);
+                bwa_destroy(te2);
+            }
+        }
+        g_nspk = 5;                                              /* the records hold measurements: no count change */
+        IM_CHECK(!save_layout(TEST_OUT));
+        g_asbuilt = 0; free(g_asbuilt_json); g_asbuilt_json = NULL;
         g_nspk = keep; seed_default(); layout_dirty = 1;
     };
 
@@ -2706,7 +2867,7 @@ int main(int argc, char** argv) {
         if (g_dir_nb && !g_lp_set)
             printf("export: WARNING the layout has a directivity model but no listening_point_m, so the engine aims\n"
                    "        every speaker without an `aim` at the array centroid. Add 'listen' to declare the point.\n");
-        if (!save_json(g_path)) { printf("export failed: %s\n", g_path); return 1; }
+        if (!save_layout(g_path)) { printf("export failed: %s\n", g_path); return 1; }
         printf("exported layout -> %s (from %s)\n", g_path, loaded ? "existing file" : "default grid");
         return 0;
     }
@@ -2927,7 +3088,7 @@ int main(int argc, char** argv) {
         }
         apply_condition(last, p);
         float m1, w1; score_panner(p, 1, panner_tracked(p), &m1, &w1, NULL);
-        if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
+        if (!save_layout(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
         printf("optimized %s for %-5s under '%s'%s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
                g_path, panner_names[p], opt_conditions[last].name,
                score_fixed_obs ? " [fixed observer]" : "", m0, m1, w0, w1, iters_total,

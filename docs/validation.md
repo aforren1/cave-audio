@@ -73,31 +73,36 @@ cell ran before it, and a cold engine renders the same cell as a warm one.
 
 **The physical reference arm does not go through the engine.** Driving one speaker alone involves
 no panner and no knob. It is the floor everything else is quoted against, so it must not acquire
-dependencies on engine runtime state. It still builds its feed the direct way. The ABI has a live
-counterpart, `bwa_source_set_channel`, and it is for listening rather than for measuring: see "The
-physical reference arm" below for why the two stay separate.
+dependencies on engine runtime state. It still builds its feed the direct way
+(`valid_reference_feeds`). It is still **captured** like every other cell: only the feed builder
+differs. The ABI has a live counterpart, `bwa_source_set_channel`, and it is for listening rather
+than for measuring: see "The physical reference arm" below for why the two stay separate.
 
 ## Two paths, one scorer
 
 ```
-valid_speaker_feeds  →  [ play + record ]  →  valid_score  →  statistics
-   (engine render)   ↘  valid_simulate    ↗
+valid_speaker_feeds    (phantom)    ↘                 ↗  ASIO play + record     (rig)       ↘
+                                       one capture's                                           valid_score  →  statistics
+valid_reference_feeds  (reference)  ↗     feeds       ↘  valid_propagate_feeds  (simulate)  ↗
 ```
 
-`valid_score` is the seam. The hardware path plays real feeds into a real room and hands back a
-capture; the simulated path propagates the same feeds to the capsules analytically. Both paths share
-everything above the seam (scoring, medians, bootstrap intervals, contrasts, the report), so they
-cannot drift.
+`valid_score` is the seam. Every cell, phantom or physical reference, is one feed buffer and one
+capture. The hardware path plays the feeds into a real room and hands back the 19 capsules; the
+simulated path propagates the same buffer to the capsules analytically and reads the same window the
+rig reads, the 8192 frames after the 200 ms head. Both paths share everything above the seam
+(scoring, medians, bootstrap intervals, contrasts, the report), so they cannot drift.
 
 Three pins hold the seam together, all in the `valid` ctest:
 
 - **Feed/analytic agreement.** Feeds propagated the long way (explicit per-speaker sum,
   interpolated fractional delay, 1/r) score against the harness's own propagation to a worst
   disagreement of 0.64°.
-- **The two arms' propagation models agree**, which matters because the physical-versus-phantom
-  table **subtracts** them: the phantom arm uses a cubic fractional tap, the reference arm keeps
-  the exact phase-domain model. One speaker driven through both agrees to 0.02° and 0.01 dB of
-  comb depth, so the matched contrast is a difference between renders, not between models.
+- **A captured reference lands where the exact model does.** In `bwa_validate` both arms reach the
+  capsules through the same propagation, the cubic fractional tap. The library keeps the exact
+  phase-domain model for one speaker (`valid_reference_cell`) as a baseline only, and the session
+  never uses it. One speaker captured the tool's way (feeds, `valid_propagate_feeds`,
+  `valid_score_reference`) agrees with it to 0.01° and 0.01 dB of comb depth, so the propagation
+  adds nothing to the matched contrast.
 - **The engine reroute is a plain gain.** With every knob off, the engine render reproduces the
   pre-engine feed builder (`valid_speaker_feeds_direct`, still exported for this) to about 1e-7
   of peak across all three panners: float rounding (float gain then float trim, versus one folded
@@ -105,14 +110,17 @@ Three pins hold the seam together, all in the `valid` ctest:
   plain gain.
 
 The same unification happens one level up: `bwa_validate` runs **one** session loop with two
-capture backends, so `--simulate` executes the same placement loop, capsule check, exclusion
-threading, and reporting the rig will run. Only the handful of lines that actually talk to ASIO
-go untested. That is the irreducible part.
+capture backends, and the session, not the backend, builds each capture's feeds. So `--simulate`
+executes the same feed build, analysis window, placement loop, capsule check, exclusion threading,
+bump check and reporting the rig will run, for the physical reference arm as much as for the
+phantoms. Only the handful of lines that actually talk to ASIO go untested. That is the irreducible
+part.
 
 ### What simulate does and does not include
 
-`valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: the real engine
-feeds plus 1/r spreading and the propagation delay to each of the 19 capsules, summed coherently.
+`valid_simulate` (and `valid_propagate_feeds`, its propagation half, which is what `bwa_validate`
+calls) builds the field a ZM-1 records in an **anechoic** free field: the real feeds plus 1/r
+spreading and the propagation delay to each of the 19 capsules, summed coherently.
 So it has the real phantom-source physics, inter-speaker interference included, which is where
 phantom error comes from. The fractional part of each delay is a 4-tap Lagrange (cubic)
 interpolation. At these frequencies (analysis band under 1200 Hz against 48 kHz) the interpolator
@@ -452,7 +460,7 @@ the default placements is real but placement-dependent, not structural.
 
 ```
 bwa_validate --simulate                                   the whole flow, no hardware
-bwa_validate --driver "ASIO MADIface USB" --mic-in 26     on the rig
+bwa_validate --driver "<the Digiface's ASIO driver>" --mic-in 0     on the rig
 bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 bwa_validate --simulate --tracked-align both --dual-band both --cap both
 ```
@@ -483,13 +491,14 @@ bwa_validate --simulate --tracked-align both --dual-band both --cap both
 | `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs a body-frame `--survey` |
 | `--survey <file>` | capsule survey. With `--track`: a body-frame survey the tracker rotates per placement. Without: a room-axes survey taken at the current mounting; a body-frame one is refused |
 | `--mount-offset x,y,z` or `ring` | the body origin to the array center, body axes, meters; only beside a body-frame survey that carries no offset. See below |
-| `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it |
+| `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it, and the turn limit is the same budget at `--radius` (0.41° at the defaults) |
 | `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
 | `--track-sim` | with `--simulate`: a scripted stand instead of Motive. See below |
 | `--track-sim-bump <n>` | knock the scripted stand 15 mm after the nth capture |
-| `--no-reference` | skip the physical reference arm (each speaker driven alone) |
+| `--track-sim-twist <n>` | turn the scripted stand 2° about the array center after the nth capture; no center moves |
+| `--no-reference` | skip the physical reference arm (each speaker driven alone and captured) and its matched phantoms; saves one capture per speaker, plus one per speaker per condition per solve mode, at every placement |
 | `--tone <hz>` | measure with a sustained tone instead of broadband; see below |
 | `--inject-fault <ch>` | self-check, see below |
 
@@ -554,7 +563,9 @@ bwa_validate --driver <name> --mic-in <n> --positions mics.txt --track zm1 --nat
 #### The gate: tolerance, not stillness alone
 
 The gate opens when the center has been within `--place-tol-mm` of the plan and still (every center
-of the last 0.5 s within 2 mm of their mean) for 1 s. The measured center is what the run uses, so the
+of the last 0.5 s within 2 mm of their mean) for 1 s, and the stand's orientation has held still too
+(every pose of the window within 0.3° of their mean). While only the orientation holds it, the readout
+says `HOLD turning`, and it shows the mount's yaw. The measured center is what the run uses, so the
 tolerance does not bound a measurement error. You could gate on stillness alone, the way
 `bwa_calibrate --localize` does. This tool does not, for two reasons:
 
@@ -586,11 +597,27 @@ with exit 4:
 - **The placements before it are kept.** Each was checked after every one of its own captures. The
   report and the CSV cover them, and the tool names the placements left to rerun.
 
-After each placement the tool prints the bump history: the number of checks, the largest move, and
-the captures that had no live pose to check.
+After each placement the tool prints the bump history: the number of checks, the largest move, the
+largest turn, and the captures that had no live pose to check.
 
-The check reads the center, not the orientation. A stand that turns about the array center moves
-nothing it can see, and a turn of 1° is 1° of direction error. Keep the coupling rigid (above).
+The check also reads the orientation. A stand that turns about the array center moves no center, and
+a turn of 1° is 1° of direction error in every cell after it. With a marker ring around the ZM-1's
+equator the center sits close to the body's axis, so that turn is an easy one to make. The tool
+compares each pose with the orientation the placement took (the gate window's mean) and stops on a
+turn past the same direction budget the move limit has: 10 mm at the 1.4 m source radius is 0.41°, so
+that is the turn limit. It scales with `--place-tol-mm` and `--radius`, and it never drops under 0.3°,
+the floor Motive's single-frame orientation jitter allows (a few hundredths of a degree RMS on a small
+body, peaks of 0.1° to 0.2°). The message names the turn, the capture and the limit:
+
+```
+validate: BUMP: the ZM-1 turned 2.01 deg during placement 2, after capture 6 (limit 0.41 deg),
+          its center 0.1 mm from where it was taken. ...
+```
+
+The limits are unverified against live Motive. If a stand you know is still trips the turn limit on
+the rig, the 0.3° floor is the number to revisit (`PLACE_TURN_MIN_DEG`, `placement.h`). The check does
+not replace a rigid coupling: it sees a turn of the whole stand, not a ZM-1 slipping on its collar,
+which turns the capsules and not the markers (above).
 
 #### The mount offset
 
@@ -621,14 +648,22 @@ into directions), so `--mount-offset` matters only for a survey that has no offs
   the session loop and never called. `--track` stayed inert while it announced the tracker was
   measuring. Asserting on the *result* would not have caught it: in simulate the field is
   synthesized from the same capsule table the estimator reads, so a wrong table cancels out and looks
-  healthy. `--track-sim-bump <n>` knocks the stand 15 mm after the nth capture.
+  healthy. `--track-sim-bump <n>` knocks the stand 15 mm after the nth capture. `--track-sim-twist <n>`
+  turns it 2° about the array center after the nth capture, which moves no center. Its orientation
+  also wobbles by 0.03°, so a check that demanded a perfectly still pose would fail on it.
 
 The ctests: `validate_track` checks that the hook fires. `validate_track_settle` checks that the gate
 waits and that every CSV cell carries the measured center, which sits within 1 mm of the scripted
 stand's truth and 5 mm off the plan. It runs at a 40 mm tolerance, so a center computed a few
 centimeters wrong fails the truth check instead of timing out at the gate. `validate_track_bump`
 knocks the stand during the second placement: exit 4, that placement dropped, the first one's cells
-kept.
+kept. It knocks it a second time inside the physical reference arm, which must be caught on the
+reference capture it lands on. `validate_track_twist` twists the stand during the second placement:
+exit 4 on a turn of about 2° with the center within 1 mm of the take, that placement dropped, the first
+one's cells kept and turn-checked on every capture. `validate_ref_capture` pins that the reference arm is captured at
+all: the counted captures per placement, an injected capsule fault reaching the reference cells
+(an offline reference would be bit-identical with and without it), and the exclusion holding them
+under 1°.
 
 Unverified against live Motive: the socket, the pose timing, the gate against real jitter, and the
 model definition the ring reads.
@@ -641,7 +676,23 @@ source measured through the same chain in the same room. That is why the publish
 moved a physical loudspeaker to each target across dozens of sessions. You do not have to move
 anything: **the array's own speakers are physical sources at known positions.** Drive speaker *i*
 alone, no panning, and the estimator's answer is a real-source measurement. On by default;
-`--no-reference` skips it. It buys two things:
+`--no-reference` skips it.
+
+**Every reference cell is a capture.** The tool builds the one-speaker feed (unit drive through that
+speaker's own trim and alignment delay), plays it and records the 19 capsules through the same
+capture function as the phantoms, then scores the capture against the layout's position for that
+speaker. So on the rig the floor is a measurement in your room through your instrument, the capsule
+exclusion applies to it, and the bump check runs after each reference capture like after any other.
+In simulate the same feed goes through the simulated device instead.
+
+It costs one capture per speaker per placement, 0.371 s of stimulus each: 26 captures and about
+10 s of playback per placement on 26 speakers, before the host's own time per capture (building the
+feed, scoring, the bump check). The matched phantoms that pair with it cost more: one capture per
+speaker per condition per solve mode, so 156 more captures (58 s) at three conditions. The tool
+prints both counts before it measures anything, on its `cost:` line, and the captures it actually
+made after each placement.
+
+It buys two things:
 
 **A floor.** The reported `physical floor` is what the chain costs before any panning happens:
 around 0.1° in anechoic simulate, 1 to 3° on hardware.
@@ -751,8 +802,9 @@ else.
 
 ### Proving the integrity layer on your own data
 
-`--inject-fault <ch>` corrupts that capsule in **every** capture, then requires
-`zylia_check_capsules` to catch it at every placement. Exit code 3 if it does not.
+`--inject-fault <ch>` corrupts that capsule in **every** capture, the physical references
+included, then requires `zylia_check_capsules` to catch it at every placement. Exit code 3 if it
+does not.
 
 Use it before trusting a session. It exercises the check, the reporting, and the exclusion threading
 end to end on the exact signals your rig produces. It costs one extra run. It works on hardware
@@ -766,8 +818,10 @@ not simply flagging everything.
 
 ```
 for each microphone placement (you move the ZM-1, the tool waits):
-    check the capsules once, report anything faulty, exclude it for the rest
-    for each condition × {tracked, fixed} × direction:  render → capture → score
+    for each speaker:                                    drive it alone → capture → score
+    check the capsules once (on the first capture), report anything faulty, exclude it
+    for each condition × {tracked, fixed} × speaker:     render at it → capture → score
+    for each condition × {tracked, fixed} × direction:   render → capture → score
 ```
 
 A **condition** is a panner plus one setting of every render knob. With no sweep flags there is one
@@ -778,6 +832,8 @@ The arithmetic for a realistic session: three panners, one baseline each is 3 co
 `--tracked-align both --dual-band both --cap both` and it is 3 + 3×3 = 12. Twelve conditions × 2
 solve modes × 36 directions is 864 grid cells per placement, plus 26 physical references and
 26 × 12 × 2 = 624 matched phantoms, so 1514 cells per placement and about 9000 over six placements.
+Every cell is one capture of 0.371 s of stimulus, so that placement is at least 9.4 minutes of
+playback on the rig, of which the 26 physical references are 10 s.
 The same three axes as a `--factorial` is 3 × 2 × 3 = 18 conditions, which is not the explosion,
 but add `--spread-mode all` and `--decorrelation both` and it is 108, six times the session.
 
@@ -799,6 +855,34 @@ arrived".
 
 The tool still logs `ASIOGetLatencies` at open, as a routing sanity check only. If it looks absurd,
 the routing is wrong, and that is worth knowing before you spend an afternoon collecting cells.
+
+### The background check
+
+The same steady state that frees the stimulus from latency also leaves nothing to separate it from
+whatever else the room is doing: a projector fan, an air handler, a voice. A sweep has a window to
+search in (`calibration.md`, "Sweep quality"); a steady stimulus does not. So each placement first
+takes **one capture with every feed silent**, the background, and every cell is held against it:
+its capture power over the background's, each the median over the 19 capsules of the capsule's mean
+square, so one hot capsule moves neither (that is the capsule check's business). A cell under
+**20 dB** (`VALID_BG_MIN_DB` in `src/calib/valid.h`) is flagged:
+
+```
+  background: -30.0 dBFS (median capsule power, no stimulus)
+  placement 1/1: 236 captures, 87.5 s of stimulus on the rig
+  background check: 236 of 236 cell(s) under 20 dB over the background (the lowest 12.9 dB)   <-- the room is too loud for them
+```
+
+The flag is a flag: the cell stays in the medians, and `--out` carries it as the `bg_db` and
+`bg_low` columns, so you decide whether a loud placement's cells count. 20 dB keeps the background's
+share of the measured intensity a hundredth of the stimulus's. It is **provisional**: nothing has
+been measured on the rig. The background capture costs one capture a placement. It is not one of
+the placement's cells, so the capture count, the plan's cost line and the bump check's count do not
+change.
+
+A simulated room is silent, and the background reads `silent`. `--sim-background <dBFS>` adds a
+steady noise floor to every simulated capsule, the silent capture included; the simulated stimulus
+sits near -17 dBFS at the capsules, so -60 dBFS flags nothing and -30 dBFS flags every cell. The
+`validate_background` ctest runs both.
 
 ### Getting the ZM-1 onto the same device
 
@@ -972,7 +1056,7 @@ through different capsules, which separates capsule error from field structure f
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the engine-versus-direct regression, determinism, the per-knob effects, the sweep |
 | - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep; `validate_track`: the placement hook fires |
 | `examples/mic_track.cpp` | the tracked ZM-1: NatNet, the mount offset, the capsule re-aim, the gate's console loop and the bump check, shared with `bwa_calibrate` |
-| `test/validate_cli_test.cmake` | the `validate_track_settle` and `validate_track_bump` ctests: the measured center against the scripted stand's truth and the CSV, and the bump |
+| `test/validate_cli_test.cmake` | the `validate_track_settle`, `validate_track_bump` and `validate_ref_capture` ctests: the measured center against the scripted stand's truth and the CSV, the bump (in the reference arm too), and the reference arm going through the capture path |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

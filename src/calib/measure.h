@@ -46,7 +46,35 @@ typedef struct {
     float energy;          /* whole-response ENERGY over the level band (sum of |H|^2): what direct_frac is
                             * a share of, so several captures' shares can be pooled energy-weighted
                             * (zylia_pressure_proxy) */
+    /* The capture's own quality (measure_response_ex). The arrival above is the strongest tap INSIDE
+     * the expected-arrival window when one was given, else over the whole positive-lag IR. */
+    int   win_lo, win_hi;  /* the window searched, capture samples [win_lo, win_hi); 0, 0 = none */
+    int   peak_any;        /* the strongest tap over the whole positive-lag IR [0, ncap) */
+    int   outside;         /* 1 = peak_any lies outside the window: something other than this speaker
+                            * was louder than its arrival. Never set without a window. */
+    float outside_db;      /* |ir[peak_any]| over |ir[arrival]|, dB (0 when the two are the same tap) */
+    float snr_db;          /* |ir[arrival]| over the noise floor (measure_noise_floor), dB; 0 = no region */
+    float floor_rms;       /* that floor: the RMS of the loudest MEASURE_NOISE_BLOCK_S block, linear */
+    int   noise_n;         /* samples the floor was read from (0 = the regions were empty: snr unknown) */
 } MeasureResult;
+
+/* The noise-floor regions (measure_response_ex). Both sit on the IR's positive lags, where the
+ * linear deconvolution (FFT length >= ncap + nref, so nothing wraps) puts the speaker's response:
+ *   before: [0, lo - MEASURE_NOISE_GUARD_S): earlier than this speaker's sound can arrive. The
+ *           window's low edge is the earliest physical arrival, and the guard keeps the arrival's
+ *           own band-edge ringing out.
+ *   after:  [hi + MEASURE_NOISE_SKIP_S, ncap): past the window's high edge plus a room's decay, so
+ *           the reflections and the reverberant tail have died. Lags past ncap - nref see only the
+ *           sweep's low end, so this region is a narrower band than the first; it is where a
+ *           transient late in the capture shows.
+ * The exponential sweep's harmonic-distortion products land at NEGATIVE lags, which this
+ * deconvolution puts at the END of its FFT buffer, past ncap, so neither region holds them. With
+ * no window, lo = hi = the found arrival. The floor is the RMS of the LOUDEST block, so one cough
+ * in an otherwise quiet capture reads as the cough. */
+#define MEASURE_NOISE_GUARD_S 0.002
+#define MEASURE_NOISE_SKIP_S  0.30
+#define MEASURE_NOISE_BLOCK_S 0.02
+#define MEASURE_NOISE_MIN_N   64       /* fewer samples than this in a region: the region is skipped */
 
 /* Room characterization from the captured impulse response — a treatment diagnostic, NOT a model to
  * match (matching would double-count: the engine renders the virtual room AND the real room adds its
@@ -85,6 +113,21 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
 int measure_response_win(const float* capture, int ncap, const float* ref, int nref,
                          double f1, double f2, double fs, const double band_hz[2], MeasureResult* out,
                          float* win, int win_len, int pre, int* win_start);
+
+/* measure_response_win with an EXPECTED-ARRIVAL window: the arrival peak is searched in
+ * [exp_lo, exp_hi) only (clamped to the capture), and out->outside says whether a stronger tap sits
+ * anywhere else in [0, ncap). exp_hi <= exp_lo = no window, exactly measure_response_win. The noise
+ * floor and snr_db are filled either way. A peak search inside a window returns the same tap the
+ * whole-IR search would whenever the strongest tap is inside it, so the window costs nothing on a
+ * clean capture; it changes the answer only for a capture it also flags. */
+int measure_response_ex(const float* capture, int ncap, const float* ref, int nref,
+                        double f1, double f2, double fs, const double band_hz[2],
+                        int exp_lo, int exp_hi, MeasureResult* out,
+                        float* win, int win_len, int pre, int* win_start);
+
+/* The noise floor of an IR (the regions above): the RMS of the loudest MEASURE_NOISE_BLOCK_S block in
+ * [0, lo - guard) and [hi + skip, ncap). *n receives the samples looked at (0 = no region). Pure. */
+double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs, int* n);
 
 /* Room report: deconvolve as measure_response, then characterize the room from the IR (Schroeder RT60
  * + early reflections). If `ir_out` is non-NULL, the deconvolved impulse response from the direct

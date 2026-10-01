@@ -121,7 +121,8 @@ static int ring_offset(MicTrack* T, const MicTrackCfg* c, char* err, size_t errc
 
 int mic_track_open(MicTrack* T, const MicTrackCfg* c, char* err, size_t errcap) {
     T->nn = NULL;
-    T->sim = c->sim; T->sim_bump_after = c->sim_bump_after; T->virtual_clock = c->virtual_clock && c->sim;
+    T->sim = c->sim; T->sim_bump_after = c->sim_bump_after; T->sim_twist_after = c->sim_twist_after;
+    T->virtual_clock = c->virtual_clock && c->sim;
     T->have_survey = 0; T->body_frame = 0; T->offset_src = MIC_OFFSET_ZERO;
     memset(&T->mount, 0, sizeof T->mount);
     memset(T->offset, 0, sizeof T->offset);
@@ -185,6 +186,14 @@ int mic_track_open(MicTrack* T, const MicTrackCfg* c, char* err, size_t errcap) 
         }
         const int rc = ring_offset(T, c, err, errcap);      /* ...the ring's, whose truth the sim knows */
         if (rc) return rc;
+    }
+    if (c->sim && c->sim_have_true_offset) {                /* ...or a deliberately different one */
+        for (int a = 0; a < 3; ++a)
+            if (!(c->sim_true_offset_m[a] >= -PLACE_MAX_OFFSET_M && c->sim_true_offset_m[a] <= PLACE_MAX_OFFSET_M)) {
+                set_err(err, errcap, "--track-sim-offset wants three finite numbers within 10 m (meters, body axes)");
+                return 2;
+            }
+        memcpy(T->sim_true_off, c->sim_true_offset_m, sizeof T->sim_true_off);
     }
 
     if (c->sim) return 0;
@@ -285,19 +294,31 @@ static void qrotv(const double q[4], const float v[3], double o[3]) {
     o[2] = v[2] + w * t[2] + (u[0]*t[1] - u[1]*t[0]);
 }
 
-/* the scripted stand's orientation: yawed 30 deg about +y, then 1.5 deg off level about x */
-static void sim_q(int kind, double q[4]) {
+int mic_track_sim_twisted(MicTrack* T) {
+    return T->sim == MIC_SIM_SCRIPT && T->sim_twist_after > 0 && T->ncap.load() >= T->sim_twist_after;
+}
+
+/* the scripted stand's orientation: yawed 30 deg about +y, then 1.5 deg off level about x. In front of
+ * that, in the ROOM frame (pre-multiplied), a wobble of MIC_SIM_WOBBLE_DEG about room vertical, and once
+ * twisted, MIC_SIM_TWIST_DEG more about the same axis. The stand's pose is derived from its center (see
+ * mic_track_read), so every turn here is about the array center and moves no center. */
+static void sim_q(MicTrack* T, double t, double q[4]) {
     const double D = 3.14159265358979323846 / 360.0;             /* half-angle per degree */
-    if (kind == MIC_SIM_FIXED) { q[0] = 0.0; q[1] = sin(45.0 * D); q[2] = 0.0; q[3] = cos(45.0 * D); return; }
+    if (T->sim == MIC_SIM_FIXED) { q[0] = 0.0; q[1] = sin(45.0 * D); q[2] = 0.0; q[3] = cos(45.0 * D); return; }
     const double qy[4] = { 0.0, sin(30.0 * D), 0.0, cos(30.0 * D) }, qx[4] = { sin(1.5 * D), 0.0, 0.0, cos(1.5 * D) };
-    qmul(qy, qx, q);
+    double base[4];
+    qmul(qy, qx, base);
+    const double turn = MIC_SIM_WOBBLE_DEG * sin(2.0 * 3.14159265358979 * 3.7 * t) +
+                        (mic_track_sim_twisted(T) ? MIC_SIM_TWIST_DEG : 0.0);
+    const double qt[4] = { 0.0, sin(turn * D), 0.0, cos(turn * D) };
+    qmul(qt, base, q);
 }
 
 static void sim_center(MicTrack* T, double t, float c[3]) {
     if (T->sim == MIC_SIM_FIXED) {                     /* bwa_validate's constant stand pose */
         const float p[3] = { 0.05f, 0.02f, -0.03f };
         double q[4], r[3];
-        sim_q(MIC_SIM_FIXED, q);
+        sim_q(T, t, q);
         qrotv(q, T->sim_true_off, r);
         for (int a = 0; a < 3; ++a) c[a] = (float)(p[a] + r[a]);
         return;
@@ -328,12 +349,21 @@ int mic_track_sim_truth(MicTrack* T, float center[3]) {
     return 1;
 }
 
+int mic_track_sim_orientation(MicTrack* T, float q[4]) {
+    if (!T->sim) return 0;
+    double d[4];
+    sim_q(T, mic_track_now(T), d);
+    for (int a = 0; a < 4; ++a) q[a] = (float)d[a];
+    return 1;
+}
+
 int mic_track_read(MicTrack* T, MicPose* out) {
     if (T->sim) {
         float c[3];
         double q[4], r[3];
-        sim_center(T, mic_track_now(T), c);
-        sim_q(T->sim, q);
+        const double t = mic_track_now(T);
+        sim_center(T, t, c);
+        sim_q(T, t, q);
         qrotv(q, T->sim_true_off, r);
         for (int a = 0; a < 3; ++a) out->p[a] = (float)(c[a] - r[a]);
         for (int a = 0; a < 4; ++a) out->q[a] = (float)q[a];
@@ -356,21 +386,6 @@ int mic_track_aim_capsules(const MicTrack* T, const float q[4]) {
     return 1;
 }
 
-void mic_track_move_words(const float delta[3], char* buf, size_t cap) {
-    /* the move is target - center = -delta */
-    const float mx = -delta[0] * 1000.f, my = -delta[1] * 1000.f, mz = -delta[2] * 1000.f;
-    size_t k = 0;
-    buf[0] = 0;
-    auto part = [&](float v, const char* pos, const char* neg) {
-        if (fabsf(v) < 0.5f || k >= cap) return;
-        k += (size_t)snprintf(buf + k, cap - k, "%s%.0f mm %s", k ? ", " : "move ", fabsf(v), v > 0.f ? pos : neg);
-    };
-    part(mz, "toward the front", "toward the back");
-    part(mx, "left", "right");                         /* +x is room-LEFT: room-right is -x */
-    part(my, "up", "down");
-    if (!k) snprintf(buf, cap, "on target");
-}
-
 /* ---- console ---- */
 
 static void sleep_poll(MicTrack* T) {
@@ -389,6 +404,7 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
                             int keys, const char* what, MicPlaced* out) {
     PlaceGate g;
     place_gate_init(&g, cfg);
+    const int dir = g.cfg.still_deg > 0.f;                    /* a direction mode: the orientation counts */
     mic_track_sim_target(T, target);
     const double t0 = mic_track_now(T);
     double last_print = -1.0;
@@ -396,22 +412,29 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
     char tol[48];
     if (g.cfg.tol_m > 0.f) snprintf(tol, sizeof tol, "%.1f mm", g.cfg.tol_m * 1e3);
     else                   snprintf(tol, sizeof tol, "none (accept on stillness)");
-    printf("placement: %s: target (%.3f %.3f %.3f), tolerance %s, still within %.1f mm for %.1f s, then hold %.1f s\n",
-           what, target[0], target[1], target[2], tol, g.cfg.still_m * 1e3, g.cfg.window_s, g.cfg.hold_s);
+    char turn[64] = "";
+    if (dir) snprintf(turn, sizeof turn, " and turning under %.2f deg", g.cfg.still_deg);
+    printf("placement: %s: target (%.3f %.3f %.3f), tolerance %s, still within %.1f mm%s for %.1f s, then hold %.1f s\n",
+           what, target[0], target[1], target[2], tol, g.cfg.still_m * 1e3, turn, g.cfg.window_s, g.cfg.hold_s);
     if (keys) printf("placement:   press a key to take the current reading anyway\n");
     for (;;) {
         const double t = mic_track_now(T);
         have = mic_track_read(T, &ps);
-        const PlaceState st = place_gate_update(&g, t, have ? ps.center : NULL, target);
+        const PlaceState st = place_gate_update_q(&g, t, have ? ps.center : NULL, have ? ps.q : NULL, target);
         if (last_print < 0.0 || t - last_print >= 0.1 || st == PLACE_OK) {
             last_print = t;
             if (st == PLACE_NO_POSE)
                 printf("\r  no live pose (occluded, wrong id, or Motive not streaming)  HOLD                                                ");
-            else
-                printf("\r  center (%+.3f %+.3f %+.3f)  target (%+.3f %+.3f %+.3f)  dx %+6.1f dy %+6.1f dz %+6.1f mm  |d| %5.1f mm  %s %-10s",
+            else {
+                /* a direction mode adds the mount's yaw: the one number a turn about the center changes */
+                char yaw[24] = "";
+                float y = 0.f;
+                if (dir && place_mount_angles(ps.q, &y, NULL)) snprintf(yaw, sizeof yaw, "  yaw %+6.1f", y);
+                printf("\r  center (%+.3f %+.3f %+.3f)  target (%+.3f %+.3f %+.3f)  dx %+6.1f dy %+6.1f dz %+6.1f mm  |d| %5.1f mm%s  %s %-10s",
                        g.center[0], g.center[1], g.center[2], target[0], target[1], target[2],
-                       g.delta[0] * 1e3, g.delta[1] * 1e3, g.delta[2] * 1e3, g.dist_m * 1e3,
-                       st == PLACE_OK ? "OK  " : "HOLD", st == PLACE_OK ? "" : place_state_name(st));
+                       g.delta[0] * 1e3, g.delta[1] * 1e3, g.delta[2] * 1e3, g.dist_m * 1e3, yaw,
+                       st == PLACE_OK ? "OK  " : "HOLD", st == PLACE_OK ? "" : place_gate_reason(&g));
+            }
             fflush(stdout);
         }
         int forced = 0;
@@ -426,18 +449,19 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             /* forced before the window filled: the latest center is all there is */
             const float* c = (g.n >= 3) ? g.mean : g.center;
             memcpy(out->center, c, sizeof out->center);
-            memcpy(out->q, ps.q, sizeof out->q);
+            /* the window's mean orientation: one pose carries Motive's single-frame jitter */
+            memcpy(out->q, g.have_q ? g.qmean : ps.q, sizeof out->q);
             double d2 = 0.0;
             for (int a = 0; a < 3; ++a) { const double d = (double)c[a] - target[a]; d2 += d * d; }
             out->dist_m = (float)sqrt(d2);
             out->forced = forced;
-            if (!place_mount_angles(ps.q, &out->yaw_deg, &out->tilt_deg)) out->yaw_deg = out->tilt_deg = 0.f;
+            if (!place_mount_angles(out->q, &out->yaw_deg, &out->tilt_deg)) out->yaw_deg = out->tilt_deg = 0.f;
             printf("\n");
             if (forced)
                 printf("placement: WARNING: taken by a key while the gate read %s (spread %.1f mm, %.1f mm off):\n"
                        "           the measurement uses this reading, not a settled one\n",
-                       place_state_name(st), g.spread_m * 1e3, out->dist_m * 1e3);
-            const int aimed = mic_track_aim_capsules(T, ps.q);
+                       place_gate_reason(&g), g.spread_m * 1e3, out->dist_m * 1e3);
+            const int aimed = mic_track_aim_capsules(T, out->q);
             printf("placement: measured center (%.4f %.4f %.4f), %.1f mm from the target; mount yaw %.1f deg, tilt %.1f deg%s\n",
                    out->center[0], out->center[1], out->center[2], out->dist_m * 1e3, out->yaw_deg, out->tilt_deg,
                    aimed ? "; capsule table re-aimed" : "");
@@ -457,14 +481,17 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
     }
 }
 
-int mic_track_bump_console(MicTrack* T, const float taken[3], float tol_m, double capture_s, float* moved_m,
-                           float now_center[3]) {
+int mic_track_bump_console(MicTrack* T, const float taken[3], const float q_taken[4], float tol_m, float turn_limit_deg,
+                           double capture_s, float* moved_m, float* turned_deg, float now_center[3]) {
     mic_track_note_capture(T, capture_s);
     MicPose ps;
     for (int tries = 0; tries < 50; ++tries) {          /* a live tracker: up to 0.5 s for a fresh pose */
         if (mic_track_read(T, &ps)) {
             if (now_center) memcpy(now_center, ps.center, sizeof ps.center);
-            return place_bump(taken, ps.center, tol_m, moved_m);
+            /* the turn is read in every mode (a report may show it); only a direction mode judges it */
+            if (q_taken && turned_deg) place_turn_deg(q_taken, ps.q, turned_deg);
+            return place_bump_pose(taken, q_taken, ps.center, ps.q, tol_m, q_taken ? turn_limit_deg : 0.f,
+                                   moved_m, turned_deg);
         }
         if (T->sim) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

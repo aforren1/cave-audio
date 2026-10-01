@@ -89,7 +89,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Lobe mode](#lobe-mode), [Loudness compensation](#loudness-compensation)
 
 **M** [Matched-cell contrast](#matched-cell-contrast), [max-rE](#max-re), [MDAP](#mdap),
-[Mode strength](#mode-strength), [Mount offset](#mount-offset)
+[Mode strength](#mode-strength), [Mount offset](#mount-offset),
+[Move in room words](#move-in-room-words)
 
 **N** [Near-field proximity boost](#near-field-proximity-boost),
 [Near-listener widening](#near-listener-widening), [NFC-HOA](#nfc-hoa)
@@ -102,14 +103,15 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Phantom collapse](#phantom-collapse), [Physical floor](#physical-floor),
 [Physical reference arm](#physical-reference-arm), [Pin](#pin),
 [Placement correction](#placement-correction), [Placement gate](#placement-gate),
+[Plan position](#plan-position),
 [Precisely wrong](#precisely-wrong), [Pressure proxy](#pressure-proxy)
 
-**R** [rE](#re), [rE error](#re-error), [rE magnitude](#re-magnitude),
-[Reflection bed](#reflection-bed), [Rendering term](#rendering-term), [Residual](#residual),
+**R** [Range check](#range-check), [rE](#re), [rE error](#re-error), [rE magnitude](#re-magnitude),
+[Reference speakers](#reference-speakers), [Reflection bed](#reflection-bed), [Rendering term](#rendering-term), [Residual](#residual),
 [Reverb send](#reverb-send), [Room EQ](#room-eq), [RT60](#rt60), [rV](#rv)
 
 **S** [Sampling decode](#sampling-decode), [Scattering](#scattering),
-[Schroeder frequency](#schroeder-frequency), [Simulate](#simulate), [Size](#size),
+[Schroeder frequency](#schroeder-frequency), [Session](#session), [Simulate](#simulate), [Size](#size),
 [SN3D and N3D](#sn3d-and-n3d), [SOFA](#sofa), [Solve position](#solve-position),
 [SPCAP](#spcap), [Spectral widening](#spectral-widening), [Speed of sound](#speed-of-sound),
 [Spread](#spread), [SRP-PHAT](#srp-phat), [Stimulus](#stimulus), [Survey spread](#survey-spread),
@@ -938,18 +940,33 @@ arrival do not change when the array rotates. See
 After every capture of a tracked run, the ZM-1's center is read again and compared with the center
 the run took. A move past half the [placement gate](#placement-gate)'s tolerance stops the run with
 exit 4 and writes nothing: a trim set measured from two points is wrong in a way no later pass can
-see. See [calibration.md](./calibration.md#the-bump-check).
+see. The direction modes (the `--zylia` position survey, `--capsule-survey`, the live-aim position
+readout, `bwa_validate`) also compare the orientation, because a stand turned about the array center moves no
+center and turns every direction they read. Their turn limit is the move limit's budget at the
+mode's range, atan(tolerance / 2 / range), floored at 0.3° for Motive's single-frame jitter
+(`place_bump_pose`, `placement.c`). The center-only modes do not check the turn. See
+[calibration.md](./calibration.md#the-bump-check).
 
 ### Capsule survey
 
 `zylia_survey`: recover the ZM-1's capsule positions **in room axes, indexed by the ASIO channel
-that fed them**, from claps at known positions. The result therefore *is* the
+that fed them**, from claps at known positions, or from the speakers' sweeps
+(`bwa_calibrate --capsule-survey`, see
+[calibration.md](./calibration.md#the-speaker-sweep-capsule-survey---capsule-survey)). The result therefore *is* the
 [channel order](#channel-order) and *is* the mounted orientation, so you have nothing left to pin.
 Read
-[survey spread](#survey-spread) and [residual](#residual) before believing a result. Taken with
+[survey spread](#survey-spread) and [residual](#residual) before believing a result. Clap positions are
+typed, or measured by a tracked clicker whose tip must hold still before each clap, against the tracked
+stand's center when there is one (see
+[calibration.md](./calibration.md#clap-positions-from-a-tracked-clicker)). Taken with
 the ZM-1 on a tracked stand, it can be saved in the stand's BODY frame, and the tools then re-aim
 it from every pose (see [mount offset](#mount-offset)). See
 [calibration.md](./calibration.md#the-capsule-self-survey-zylia_survey).
+
+A clap banks only inside an **armed window**, and only the first transient in it. From the sixth
+clap on, its direction must also agree with a provisional survey. After Solve, **leave-one-out**
+(`zylia_survey_loo`) scores each clap against the geometry the others solve to and flags one that
+does not fit. See [calibration.md](./calibration.md#which-transient-is-the-clap).
 
 ### Capsule cross-correlation
 
@@ -1012,6 +1029,15 @@ speakers cannot define the baseline. Flags anything beyond about 20 mm and exits
 is scriptable. It is **radial only**, so a purely tangential move does not change the distance; re-run
 `--localize` for a full re-survey. See [calibration.md](./calibration.md#modes).
 
+### Expected-arrival window
+
+The span of an impulse response where one speaker's sound can arrive: the system latency plus the
+layout distance over c, with a margin for each (`calib_arrival_window`, `src/calib/calib.h`). The
+arrival is searched only there, and a capture whose strongest tap lies outside it is flagged as
+something other than that speaker being louder. On a clean capture it returns the same arrival as
+the whole-IR search, to the bit. See [sweep quality](#sweep-quality) and
+[calibration.md](./calibration.md#the-expected-arrival-window).
+
 ### Exponential sweep
 
 A Farina exponential sine sweep, the excitation every calibration measurement uses. Its virtue here is
@@ -1038,7 +1064,8 @@ positions out and make them non-coplanar. The same failure in the capsule survey
 `bwa_calibrate --live N --zylia`, and `bwa_calib_view`'s Aim tab: sweep ONE speaker over and over,
 about one reading a second, while an installer turns the box. Each reading gives a peak-hold
 **tilt meter** (direct-sound 10 kHz up against 3 to 10 kHz: treble falls off axis, so the tilt
-peaks when the box points at the ZM-1) and the box's position against the layout. It also
+peaks when the box points at the ZM-1) and the box's position against its
+[plan position](#plan-position), with the [move in room words](#move-in-room-words). It also
 estimates the off-axis ANGLE by inverting the directivity model's tilt curve, from a stored
 reference speaker or the file's `on_axis_db`. One mic position gives a magnitude, never a
 direction: the tool cannot say "turn left". Near the axis the curve is flat, so a reading under
@@ -1056,6 +1083,15 @@ is what gives the body a stable yaw. The ring fit assumes the ring sits at the a
 height. With a zero offset the center does not depend on the body's orientation at all. See
 [calibration.md](./calibration.md#placing-the-zm-1-with-the-tracker---track).
 
+### Move in room words
+
+A position error turned into the instruction that undoes it: "move 12 mm toward room-left, 4 mm
+down, 30 mm toward the front wall". The error is where a thing is minus where it should be, so
+the move is the opposite, read on the room frame (room-right is -x, up is +y, the front wall is
++z). An axis under a dead band says nothing: 5 mm for a speaker box, 1 mm for the ZM-1 stand.
+`place_move_words` (`placement.c`) is the one implementation, printed by live aiming and by
+`bwa_calib_view`'s Placement panel. See [calibration.md](./calibration.md#the-move-in-room-words).
+
 ### Optical speaker check
 
 `bwa_speaker_survey`: the speakers the cameras can see, each a rigid body named `spk<N>` with its
@@ -1064,6 +1100,9 @@ through the markers, taken toward the listening point, so Motive's orientation o
 not matter. One rigid fit over all matched speakers then says whether Motive's frame IS the room
 frame: rotation under 0.5 degrees and translation under 10 mm read as agreement, and handedness is
 `OK`, `MIRRORED`, or `UNDETERMINED` when the speakers lie on one plane and their aims cannot decide.
+On a layout whose positions `--localize` measured, it also reads the **baffle depth**, the distance
+from the baffle back to the acoustic center, by refitting the frame with that depth as a fourth
+unknown (`survey_fit_depth`), and prints the `--baffle-offset-m` to pass.
 See [calibration.md](./calibration.md#optical-speaker-check-bwa_speaker_survey).
 
 ### Placement gate
@@ -1072,10 +1111,22 @@ What a tracked run waits for before it measures (`placement.h`): the ZM-1's cent
 (every center of the last 0.5 s within a quarter of the tolerance of their mean, clamped to 0.5 to
 2 mm), **within tolerance** (the window's mean within `--place-tol-mm` of the target, default 10 mm:
 1 cm is up to 29 µs of arrival error), and **held** both for 1 s, because a stand reads still the
-moment a hand pauses. Then the window's mean IS the mic position. For `--localize` the tolerance
-is a loose 100 mm: trilateration needs each position known, not hit, but a gate on stillness alone
-would open at the previous row. A pose counts only while
+moment a hand pauses. Then the window's mean IS the mic position. For `--localize` and the
+`--room-eq-grid` rows the tolerance is a loose 100 mm: trilateration and the grid key need each
+position known, not hit, but a gate on stillness alone would open at the previous row. In a direction mode (see [bump check](#bump-check)) still also means
+the orientation: every pose of the window within 0.3° of their mean, and the window's mean orientation
+is what the run takes. A pose counts only while
 NatNet reports the body live. See [calibration.md](./calibration.md#the-readout-and-the-gate).
+
+### Plan position
+
+Where the installer planned a speaker, as opposed to where it ended up. The layout's `position`
+and `aim` are the **as-built**: the engine renders from them and the surveys overwrite them. The
+optional `plan_position` and `plan_aim` are the **plan**: the first survey that overwrites a
+speaker's `position` copies the old value there, and nothing overwrites it again. Live aiming
+measures each box against its plan, and `bwa_layout_tool` edits the plan of a surveyed file. A
+speaker with no `plan_position` is its own plan. See
+[layout-schema.md](./layout-schema.md#plan-versus-as-built).
 
 ### Pressure proxy
 
@@ -1087,6 +1138,25 @@ arrival at the array center (`zylia_center_arrival`, corrected for the capsule c
 2.6 mm above it). About +/-0.25 dB of direction dependence is left. It refuses a dead capsule, and
 it does not change when the array rotates. See
 [calibration.md](./calibration.md#the-zm-1-as-the-trim-mic---zylia---trims---zylia---verify).
+
+### Range check
+
+The [capsule survey](#capsule-survey)'s second outlier check, beside leave-one-out. Each speaker's
+range residual from the acoustic center (its layout distance, plus the latency, minus its center
+arrival) is held against the MEDIAN residual, so an error every speaker shares, a latency that is off,
+flags nobody. Over 10 mm (`CSURVEY_RANGE_FLAG_MM`) refuses the survey with exit 6. It catches what
+leave-one-out cannot: a position error ALONG the line of sight, which moves no direction, and a box
+whose Dante latency differs from the rest. See
+[calibration.md](./calibration.md#the-speaker-sweep-capsule-survey---capsule-survey).
+
+### Reference speakers
+
+`bwa_calibrate --ref-speakers`: the system latency from 3 or more speakers whose positions are
+MEASURED, with no tape. Each one's latency is its pooled center arrival minus its layout distance from
+the array center over c; the median is used, and a speaker more than 0.1 ms off it is flagged, a
+different Dante latency setting or a wrong position. A planned position puts its placement error over
+c into the latency, 29 µs per centimeter. See
+[calibration.md](./calibration.md#the-latency-from-measured-speakers---ref-speakers).
 
 ### Residual
 
@@ -1105,6 +1175,16 @@ are position-dependent cancellations you cannot fill. `bwa_start` **refuses** a 
 in a moving-listener session. What no EQ fixes is **decay**. See
 [calibration.md](./calibration.md#modes).
 
+### Session
+
+`bwa_calib_view`'s Session tab: one rig day's Stage 2 in one folder. Each step runs the tested tool,
+writes a new file there and hands it to the next (`as_built.json`, `capsules.json`, `trims.json`,
+`grid.json`), so the plan is never written. A step is **blocked** while a step it needs failed, never
+ran or is stale. It is **stale** once a file it read was made again (its step ran again) or changed
+on disk, and everything that read a stale step's file is stale too. `session.json` holds every
+record, so a reopened session picks up where it was. See
+[calibration.md](./calibration.md#the-rig-day-session-bwa_calib_view-session-tab).
+
 ### Speed of sound
 
 Two different quantities wear this name and confusing them is a real error: **measurement `c`**
@@ -1113,6 +1193,15 @@ Two different quantities wear this name and confusing them is a real error: **me
 (`BWA_SPEED_OF_SOUND`, `src/core/rt.c:54`), a live medium and creative control for
 [Doppler](#doppler). `src/dsp/sos.h:12` states the separation explicitly. See
 [calibration.md](./calibration.md#air-temperature).
+
+### Sweep quality
+
+The checks every calibration sweep passes before its numbers count: the
+[expected-arrival window](#expected-arrival-window), the IR's peak over its own noise floor
+(`MeasureResult.snr_db`, at least 40 dB), and for the trims and the [verify pass](#verify-pass) two
+sweeps that agree (a sample, 0.2 dB). A rejected sweep is re-swept with the reason printed. The
+thresholds are provisional until rig data exists. See
+[calibration.md](./calibration.md#sweep-quality-the-window-the-snr-floor-the-re-sweep).
 
 ### Survey spread
 
@@ -1163,8 +1252,9 @@ room; only their strength varies with position, smoothly at LF wavelengths. **On
 `calib_trilaterate`: solving each speaker's 3D position **and** the unknown constant system
 latency jointly by least squares, from ranges captured at 5 or more known mic positions. It sees
 speakers optical trackers cannot (the sweep passes through the screens). The solved latency's
-residual against the driver's reported figures must be a small **positive** number; negative is
-physically impossible. See [calibration.md](./calibration.md#modes).
+residual against the driver's reported figures must be **positive**; negative is physically
+impossible. With the ZM-1 it is tens of ms on a correct run, the Dante Via leg the driver does not
+report (`calib_latency_check`). See [calibration.md](./calibration.md#modes).
 
 ### Verify pass
 
@@ -1195,6 +1285,13 @@ The great-circle angle between where a source was supposed to come from and wher
 it came from, `ValidCell.miss_deg` (`src/calib/valid.h:135`). It is the number nobody has, and the number
 every proxy in this repo is a proxy for. Read it as an **excess** over the [physical floor](#physical-floor),
 never as an absolute.
+
+### Background check
+
+`bwa_validate`'s guard against a loud room: one capture with no stimulus per placement, and every
+[cell](#cell) flagged (`bg_low`) when its capture is under 20 dB over it. The steady-state
+[stimulus](#stimulus) has no arrival window to hide behind, so this is its only one. See
+[validation.md](./validation.md#the-background-check).
 
 ### Capsule integrity
 

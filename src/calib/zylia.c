@@ -22,7 +22,7 @@
 static float g_caps[ZYLIA_MICS][3];
 static int   g_have_survey = 0;
 
-void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
+static void zy_geometry(float dirs[ZYLIA_MICS][3], float* radius_m, int builtin_only) {
     /* The ZM-1's 19 capsules are the 20 vertices of a regular DODECAHEDRON, vertex-up, minus the nadir
      * vertex. That is the whole geometry, and it self-checks: the rings come out 1 / 3 / 6 / 6 / 3 by
      * elevation (the missing 20th would be the 1 at -90), each ring's azimuths are exactly its opposite
@@ -72,6 +72,7 @@ void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
         dirs[i][2] = (float)(-ce * cos(az));
     }
     if (radius_m) *radius_m = ZYLIA_RADIUS_M;
+    if (builtin_only) return;
 
     if (g_have_survey) {                       /* a survey overrides the table: hand back its directions */
         double rsum = 0.0;
@@ -86,6 +87,16 @@ void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
         }
         if (radius_m) *radius_m = (float)(rsum / ZYLIA_MICS);
     }
+}
+
+void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) { zy_geometry(dirs, radius_m, 0); }
+
+void zylia_builtin_capsules(float caps_m[ZYLIA_MICS][3]) {
+    if (!caps_m) return;
+    float dirs[ZYLIA_MICS][3], R;
+    zy_geometry(dirs, &R, 1);
+    for (int i = 0; i < ZYLIA_MICS; ++i)
+        for (int a = 0; a < 3; ++a) caps_m[i][a] = R * dirs[i][a];
 }
 
 void zylia_set_capsules(const float caps_m[ZYLIA_MICS][3]) {
@@ -133,6 +144,11 @@ static int solve_lin(int n, double* A, double* b, double* x) {
 int zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]) {
     if (!arrival_s || !dir_out) return 0;
     float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
+    return zylia_doa_caps((const float(*)[3])caps, arrival_s, dir_out);
+}
+
+int zylia_doa_caps(const float caps[ZYLIA_MICS][3], const double arrival_s[ZYLIA_MICS], float dir_out[3]) {
+    if (!caps || !arrival_s || !dir_out) return 0;
     /* Far field: tau_i = A - (1/c)(m_i . d), m_i = capsule position relative to the center. Fit
      * tau_i = A + b.m_i (4 unknowns) by least squares; b = -d/c points AWAY from the source, so
      * d = -normalize(b). Latency folds into A and cancels. Fitting against POSITIONS rather than
@@ -859,17 +875,15 @@ int zylia_comb_depth(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
     return 1;
 }
 
-int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
-                 float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out) {
-    if (!src_m || !arrival_s || !caps_out || nobs < 4 || c <= 0.0) return 0;
-
-    double d[ZYLIA_SURVEY_MAX][3], D[ZYLIA_SURVEY_MAX];      /* unit direction + range, per observation */
-    if (nobs > ZYLIA_SURVEY_MAX) nobs = ZYLIA_SURVEY_MAX;
+/* Unit directions and ranges of a survey's source set, the normal matrix they share, and the spread
+ * (see zylia_survey); -1 for a source inside 0.2 m or non-finite. nobs <= ZYLIA_SURVEY_MAX. The one
+ * implementation behind zylia_survey and zylia_survey_spread, so a pre-check cannot disagree. */
+static double zy_survey_dirs(const float src_m[][3], int nobs, double d[][3], double* D, double A[9]) {
     for (int k = 0; k < nobs; ++k) {
         D[k] = sqrt((double)src_m[k][0]*src_m[k][0] + (double)src_m[k][1]*src_m[k][1] +
                     (double)src_m[k][2]*src_m[k][2]);
-        if (!(D[k] >= 0.2)) return 0;                        /* inside/at the array (or NaN from an unparsed
-                                                              * clap position): the model is nonsense */
+        if (!(D[k] >= 0.2) || !isfinite(D[k])) return -1.0;  /* inside/at the array (or NaN from an
+                                                              * unparsed clap position): the model is nonsense */
         d[k][0] = src_m[k][0] / D[k]; d[k][1] = src_m[k][1] / D[k]; d[k][2] = src_m[k][2] / D[k];
     }
 
@@ -879,7 +893,7 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
      * isotropic directions and 0 when they are coplanar. Coplanar is the realistic failure — clapping
      * in a horizontal ring around the array leaves the capsules' HEIGHTS unconstrained, and the solve
      * would happily return a flattened array rather than admit it. Refuse instead. */
-    double A[9] = {0};
+    memset(A, 0, 9 * sizeof(double));
     for (int k = 0; k < nobs; ++k)
         for (int a = 0; a < 3; ++a)
             for (int b = 0; b < 3; ++b) A[a*3+b] += d[k][a] * d[k][b];
@@ -888,9 +902,28 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
                - A[1]*s * (A[3]*s*A[8]*s - A[5]*s*A[6]*s)
                + A[2]*s * (A[3]*s*A[7]*s - A[4]*s*A[6]*s);
     double spread = 27.0 * det;
-    if (!(spread > 0.0)) spread = 0.0;         /* NaN-safe: a NaN spread must not defeat the refusal below */
+    if (!(spread > 0.0)) spread = 0.0;         /* NaN-safe: a NaN spread must not defeat the refusal */
+    return spread;
+}
+
+double zylia_survey_spread(const float src_m[][3], int nobs) {
+    if (!src_m || nobs < 1) return -1.0;
+    if (nobs > ZYLIA_SURVEY_MAX) nobs = ZYLIA_SURVEY_MAX;
+    double d[ZYLIA_SURVEY_MAX][3], D[ZYLIA_SURVEY_MAX], A[9];
+    return zy_survey_dirs(src_m, nobs, d, D, A);
+}
+
+int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
+                 float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out) {
+    if (!src_m || !arrival_s || !caps_out || nobs < 4 || c <= 0.0) return 0;
+
+    double d[ZYLIA_SURVEY_MAX][3], D[ZYLIA_SURVEY_MAX];      /* unit direction + range, per observation */
+    double A[9];
+    if (nobs > ZYLIA_SURVEY_MAX) nobs = ZYLIA_SURVEY_MAX;
+    const double spread = zy_survey_dirs(src_m, nobs, d, D, A);
+    if (spread < 0.0) return 0;
     if (spread_out) *spread_out = (float)spread;
-    if (spread < 0.05) return 0;               /* coplanar / clustered: the vertical is unrecoverable */
+    if (spread < ZYLIA_SURVEY_MIN_SPREAD) return 0;   /* coplanar / clustered: the vertical is unrecoverable */
 
     /* The linear model is a PLANE wave, but a clap 2.5 m away is a sphere, and across a 49 mm array
      * that curvature is a systematic ~1.4 us — worth 2-3 mm of capsule error if ignored. We know the
@@ -985,6 +1018,53 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
         *resid_us = (float)(sqrt(sse / (cnt ? cnt : 1)) * 1e6);
     }
     return 1;
+}
+
+/* One observation's RMS misfit (us) against a capsule table, on zylia_survey's exact model with its
+ * per-observation constant fitted out: the same per-k term zylia_survey's resid_us sums. */
+static double zy_obs_misfit_us(const float src[3], const double arr[ZYLIA_MICS], const float caps[ZYLIA_MICS][3], double c) {
+    double pred[ZYLIA_MICS], mean = 0.0, sse = 0.0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double ex = (double)src[0] - caps[i][0], ey = (double)src[1] - caps[i][1], ez = (double)src[2] - caps[i][2];
+        pred[i] = sqrt(ex*ex + ey*ey + ez*ez) / c - arr[i];
+        mean += pred[i];
+    }
+    mean /= (double)ZYLIA_MICS;
+    for (int i = 0; i < ZYLIA_MICS; ++i) { double e = pred[i] - mean; sse += e * e; }
+    return sqrt(sse / (double)ZYLIA_MICS) * 1e6;
+}
+
+int zylia_survey_loo(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
+                     ZyliaLooObs* out) {
+    if (!src_m || !arrival_s || !out || nobs < 5 || !(c > 0.0)) return -1;
+    if (nobs > ZYLIA_SURVEY_MAX) nobs = ZYLIA_SURVEY_MAX;
+    /* static: 10 KB of copies, control thread only (the survey tools are single-threaded) */
+    static float  rs[ZYLIA_SURVEY_MAX][3];
+    static double ra[ZYLIA_SURVEY_MAX][ZYLIA_MICS];
+    int nflag = 0;
+    for (int k = 0; k < nobs; ++k) {
+        ZyliaLooObs* o = &out[k];
+        memset(o, 0, sizeof *o);
+        int n = 0;
+        for (int j = 0; j < nobs; ++j) {
+            if (j == k) continue;
+            memcpy(rs[n], src_m[j], sizeof rs[n]);
+            memcpy(ra[n], arrival_s[j], sizeof ra[n]);
+            ++n;
+        }
+        float caps[ZYLIA_MICS][3], resid = 0.f, spread = 0.f;
+        /* zylia_survey reports the spread even when it refuses on it, which is the case to show */
+        o->spread = (float)zylia_survey_spread((const float(*)[3])rs, n);
+        if (!zylia_survey((const float(*)[3])rs, (const double(*)[ZYLIA_MICS])ra, n, c, caps, &resid, NULL, &spread))
+            continue;                                       /* the rest alone is degenerate: unchecked */
+        o->ok = 1;
+        o->resid_us = resid;
+        o->spread = spread;
+        o->heldout_us = (float)zy_obs_misfit_us(src_m[k], arrival_s[k], (const float(*)[3])caps, c);
+        o->flagged = o->heldout_us > ZYLIA_LOO_FLOOR_US && o->heldout_us > ZYLIA_LOO_RATIO * o->resid_us;
+        nflag += o->flagged;
+    }
+    return nflag;
 }
 
 static void zy_err(char* err, int cap, const char* msg) {

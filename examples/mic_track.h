@@ -24,8 +24,11 @@
  *
  * A SIMULATED source (--track-sim) stands in for Motive: MIC_SIM_FIXED is one constant pose (the
  * bwa_validate self-check), MIC_SIM_SCRIPT walks the stand in from about 8 cm off the target over 2 s,
- * settles about 5 mm off it, and optionally bumps it 15 mm after a set number of captures. Its truth
- * is computed by its own quaternion code (mic_track_sim_truth), not by placement.c, so a tool that
+ * settles about 5 mm off it, and optionally bumps it 15 mm after a set number of captures, or TWISTS
+ * it MIC_SIM_TWIST_DEG about the array center (room vertical through the center, so the center does not
+ * move and a center-only check cannot see it). Its orientation wobbles by MIC_SIM_WOBBLE_DEG, so a
+ * check that demanded a perfectly still orientation would fail on it. Its truth is computed by its own
+ * quaternion code (mic_track_sim_truth, mic_track_sim_twisted), not by placement.c, so a tool that
  * reports the truth beside what it measured is checking the measurement against something else.
  *
  * Unverified on hardware: everything that touches live Motive. The NatNet parser and lifecycle are
@@ -46,6 +49,10 @@ enum { MIC_SIM_OFF = 0, MIC_SIM_FIXED = 1, MIC_SIM_SCRIPT = 2 };
 enum { MIC_OFFSET_ZERO = 0, MIC_OFFSET_SURVEY = 1, MIC_OFFSET_FLAG = 2, MIC_OFFSET_RING = 3 };
 
 #define MIC_SIM_BUMP_M 0.015f          /* the scripted bump's size: past half of any sane tolerance */
+#define MIC_SIM_TWIST_DEG 2.0f         /* the scripted twist about the array center: 87 mm at 2.5 m, and
+                                        * past every turn limit (placement.h) by more than 4x */
+#define MIC_SIM_WOBBLE_DEG 0.03        /* the scripted orientation's jitter: inside Motive's, under every
+                                        * limit, and small enough that the 30.0 deg yaw still prints 30.0 */
 /* After a retarget the scripted stand stays where it was for this long before it walks in, the way an
  * operator takes a moment to carry it. Longer than the gate's 0.5 s window plus 1 s hold, so a gate
  * that accepts stillness anywhere opens at the PREVIOUS placement, which is the failure it exists to
@@ -65,14 +72,17 @@ struct MicTrackCfg {
     int         sim_builtin_body;  /* sim with no survey: install the built-in table AS the body frame
                                     * (bwa_validate's self-check, which is about wiring, not the loader) */
     int         sim_bump_after;    /* MIC_SIM_SCRIPT: bump after this many captures, 0 = never */
+    int         sim_twist_after;   /* MIC_SIM_SCRIPT: twist after this many captures, 0 = never */
     int         virtual_clock;     /* sim: time advances only through mic_track_advance/_note_capture */
+    int         sim_have_true_offset;  /* sim: the stand's TRUE mount offset differs from the one the tool */
+    float       sim_true_offset_m[3];  /* uses (--track-sim-offset): a wrong offset to be caught. Body axes. */
 };
 
 struct MicPose { float p[3], q[4], center[3]; };
 
 struct MicTrack {
     NatNet*    nn;
-    int        sim, sim_bump_after, virtual_clock;
+    int        sim, sim_bump_after, sim_twist_after, virtual_clock;
     int        have_survey, body_frame, offset_src;
     ZyliaMount mount;
     float      offset[3];                   /* the offset in use, body axes */
@@ -111,6 +121,11 @@ void   mic_track_sim_target(MicTrack* T, const float target[3]);
 /* The simulated source's TRUE center at its current time (independent quaternion code). 0 = not a
  * simulated source. */
 int    mic_track_sim_truth(MicTrack* T, float center[3]);
+/* MIC_SIM_SCRIPT: 1 once the scripted twist is in effect (its own capture count, not placement.c). */
+int    mic_track_sim_twisted(MicTrack* T);
+/* The simulated source's TRUE orientation at its current time (xyzw, v_room = R(q) v_body; its own
+ * quaternion code, wobble and twist included). 0 = not a simulated source. */
+int    mic_track_sim_orientation(MicTrack* T, float q[4]);
 
 /* One LIVE pose and its center. A live tracker must report NN_STATUS_LIVE (see the comment in
  * mic_track.cpp); a refused pose or offset reads as no pose. Returns 1 with out filled, else 0. */
@@ -120,30 +135,32 @@ int    mic_track_read(MicTrack* T, MicPose* out);
  * array as it is turned right now. Returns 1; 0 = no body-frame table, nothing installed. */
 int    mic_track_aim_capsules(const MicTrack* T, const float q[4]);
 
-/* "move 12 mm toward the front, 5 mm right, 3 mm down" for delta = center - target, in room words
- * (+z is the front, room-right is -x, +y is up); axes under 0.5 mm are left out, "on target" if all. */
-void   mic_track_move_words(const float delta[3], char* buf, size_t cap);
-
 /* ---- console helpers for bwa_calibrate ---- */
 
 struct MicPlaced {
     float center[3];               /* the window mean the gate accepted: THE mic position */
-    float q[4];                    /* the pose's orientation at acceptance */
+    float q[4];                    /* the window's mean orientation at acceptance (the last pose's when the
+                                    * window had none): what a direction mode's turn is measured from */
     float dist_m;                  /* |center - target| */
     float yaw_deg, tilt_deg;       /* the mount (place_mount_angles) */
     int   forced;                  /* a key took the reading before the gate opened */
 };
 
 /* Wait for the gate on a live single-line readout (console \r updates): the measured center, the
- * target, dx/dy/dz and the total in mm, and HOLD or OK. keys != 0 (the rig): a key takes the current
- * reading anyway, with a warning; with no pose at all it aborts. Returns 0 placed (out filled, the
- * capsule table re-aimed when it can be), 1 timed out or aborted (the reason printed). */
+ * target, dx/dy/dz and the total in mm, and HOLD or OK. A direction mode (cfg->still_deg > 0, see
+ * place_cfg_direction) also shows the mount's yaw and holds while the stand turns ("turning"). keys != 0
+ * (the rig): a key takes the current reading anyway, with a warning; with no pose at all it aborts.
+ * Returns 0 placed (out filled, the capsule table re-aimed when it can be), 1 timed out or aborted (the
+ * reason printed). */
 int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* cfg, double timeout_s,
                             int keys, const char* what, MicPlaced* out);
 
-/* The bump check after one capture: note it, read the center, place_bump against `taken`. A live
- * tracker gets up to half a second for a fresh pose. Returns 1 bumped, 0 in place, -1 no pose. */
-int mic_track_bump_console(MicTrack* T, const float taken[3], float tol_m, double capture_s, float* moved_m,
-                           float now_center[3]);
+/* The bump check after one capture: note it, read the pose, place_bump_pose against the center and the
+ * orientation the run took. turn_limit_deg <= 0 (or q_taken NULL) is center only, for the modes that
+ * read only the center; turned_deg is still filled whenever both orientations are usable. A live tracker
+ * gets up to half a second for a fresh pose. Returns a PLACE_BUMP_MOVED | PLACE_BUMP_TURNED mask, 0 in
+ * place, -1 no pose (or no usable orientation where one is needed). */
+int mic_track_bump_console(MicTrack* T, const float taken[3], const float q_taken[4], float tol_m, float turn_limit_deg,
+                           double capture_s, float* moved_m, float* turned_deg, float now_center[3]);
 
 #endif /* BWA_MIC_TRACK_H */

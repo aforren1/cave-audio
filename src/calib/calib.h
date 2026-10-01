@@ -169,16 +169,103 @@ int calib_direct_tilt_db(const MeasureResult* m, float* out);
  * on-axis response is flat enough (within 1.6 dB from 1 to 16 kHz) that the cross term is small. */
 int calib_on_axis_tilt_db(const Directivity* d, const double band_hz[2], double f2, float* out);
 
-/* Peak hold for the relative meter. Non-finite readings are ignored. update returns how far the
- * reading sits BELOW the peak, in dB (>= 0; 0 at a new peak). Pure. */
+/* Peak hold for the relative meter. One contaminated reading must not set the peak the installer then
+ * chases, so a reading only counts when `clean` (it passed the expected-arrival window and the SNR
+ * check, calib_sweep_check) and the peak is only raised once TWO CONSECUTIVE clean readings agree
+ * within tol_db, to the LOWER of the pair: the held peak is a level two readings in a row reached. A
+ * rejected reading breaks the run, so the pair around it is not consecutive. Non-finite readings
+ * are ignored. update returns how far the reading sits BELOW the peak, in dB (>= 0; 0 at or above
+ * it, and 0 before any peak). Pure. */
 typedef struct {
-    int   n;           /* readings taken since the last reset */
+    int   n;           /* finite readings taken since the last reset, clean or not */
     float last_db;
     float peak_db;
-    int   peak_index;  /* n at the reading that set the peak (1-based), 0 before any */
+    int   peak_index;  /* n at the reading that confirmed the peak (1-based), 0 before any */
+    int   prev_clean;  /* the previous finite reading was clean: the next one can pair with it */
+    float prev_db;
+    int   nrejected;   /* readings not held because they were not clean */
 } CalibPeakHold;
 void  calib_peak_reset(CalibPeakHold* p);
-float calib_peak_update(CalibPeakHold* p, float value_db);
+float calib_peak_update(CalibPeakHold* p, float value_db, int clean, float tol_db);
+
+/* ---- sweep quality: the expected-arrival window, the IR's SNR, the re-sweep and the agreement
+ * rule (docs/calibration.md, "Sweep quality") ----
+ * Every sweep is the tool's own: it knows when the sweep plays, and roughly when each speaker's sound
+ * must arrive, the system latency plus the distance over c. So the arrival is searched only there,
+ * a capture whose strongest tap lies elsewhere is flagged (something other than this speaker was
+ * louder), and the IR's peak is held against its noise floor (measure.h). The window:
+ *
+ *   lo = (lat - lat_early + max(0, d - pos_m) / c) * fs
+ *   hi = (lat + lat_late  + (d + pos_m) / c + CALIB_WIN_SPK_S) * fs + 1
+ *
+ * d the distance from the mic to where the layout says the speaker stands. The margins:
+ *   pos_m   CALIB_WIN_SURVEYED_M for a speaker a survey placed (it carries a plan_position: the survey
+ *           recorded the plan when it wrote the position), CALIB_WIN_PLAN_M for one at its plan, and
+ *           always CALIB_WIN_PLAN_M in the modes whose job is to find or move a position (--localize,
+ *           the --zylia survey, --check, live aiming). bwa_calibrate --window-m overrides it.
+ *   latency simulate: the simulator's own, exact. --latency (or --ref): +/- CALIB_WIN_LAT_KNOWN_S.
+ *           Else the ASIO driver's reported loop, a hard LOWER bound: lat_early 0 and lat_late
+ *           CALIB_WIN_LAT_DRIVER_S for what the driver does not report (converters, analog, the ZM-1's
+ *           Dante Via leg, about 60 ms on the rig). No driver number: no window, the whole IR.
+ * A window only restricts where the peak is searched, so on a capture whose strongest tap is inside
+ * it the arrival is the same sample as before, to the bit: it cannot bias a clean measurement. It
+ * changes the answer only on a capture it also flags, and a flagged capture is re-swept, never used.
+ * Every threshold here is PROVISIONAL: nothing has been measured on the rig yet. */
+typedef struct {
+    double lat_s;           /* the system latency prior, seconds */
+    double lat_early_s;     /* how much EARLIER the true latency can be */
+    double lat_late_s;      /* how much LATER */
+    double pos_m;           /* how far the speaker can stand from the position the window is read from */
+} CalibWindow;
+#define CALIB_WIN_SURVEYED_M   0.10     /* a surveyed position: survey error plus a 1% error in c at 4 m */
+#define CALIB_WIN_PLAN_M       0.50     /* a planned position: a box hung half a meter off is still found */
+#define CALIB_WIN_LAT_KNOWN_S  0.001    /* --latency / --ref: a measured loop, 34 cm of slack */
+#define CALIB_WIN_LAT_DRIVER_S 0.150    /* the unreported part over the driver's loop (the ZM-1 chain ~60 ms) */
+#define CALIB_WIN_SPK_S        0.002    /* the box's own delay: its crossover's group delay puts the peak
+                                         * after the onset; latency the box adds is in lat already */
+#define CALIB_WIN_ZM1_M        0.05     /* a ZM-1 capsule sits up to the array's radius from its center */
+/* [*lo, *hi) on the capture's sample axis, from the speaker at spk and the mic at mic. Returns 1, or
+ * 0 on non-finite or negative input (no window). Pure. */
+int calib_arrival_window(const CalibWindow* w, const float spk[3], const float mic[3], double sos, double fs,
+                         int* lo, int* hi);
+/* The IR's peak against its noise floor, below which a capture is re-swept. Simulated captures read
+ * 70 to 300 dB with and without --sim-room (the room's late tail is the floor there); a real rig
+ * will read less. PROVISIONAL until rig data exists. */
+#define CALIB_SWEEP_MIN_SNR_DB    40.0f
+/* Two sweeps of one speaker AGREE when their arrivals differ by at most a sample and their levels by
+ * at most 0.2 dB (the trims and --verify count a value only then). PROVISIONAL. */
+#define CALIB_SWEEP_AGREE_SAMPLES 1.0f
+#define CALIB_SWEEP_AGREE_DB      0.2f
+#define CALIB_SWEEP_MAX_TRIES     5       /* sweeps per speaker before the run gives up on it */
+enum { CALIB_SWEEP_OK = 0, CALIB_SWEEP_OUTSIDE = 1, CALIB_SWEEP_NOISY = 2 };
+/* CALIB_SWEEP_OUTSIDE when m->outside, else CALIB_SWEEP_NOISY when the SNR is known and under
+ * min_snr_db, else CALIB_SWEEP_OK. An unknown SNR (no noise region) passes. Pure. */
+int  calib_sweep_check(const MeasureResult* m, float min_snr_db);
+/* One ASCII line saying why (the arrival, the window, the outside tap and its level, or the SNR). */
+void calib_sweep_why(const MeasureResult* m, int code, double fs, char* buf, size_t cap);
+/* 1 when two sweeps of one speaker agree (the rule above). *d_samples and *d_db (either may be NULL)
+ * receive the differences. Pure. */
+int  calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float* d_samples, float* d_db);
+
+/* ---- the solved latency against the driver's own loop (--localize, the --zylia survey) ----
+ * The solve recovers the WHOLE loop; the ASIO driver reports only its digital half. The residual,
+ * solved minus reported, is what the driver cannot see, so it is never negative: below
+ * -CALIB_LAT_FLOOR_S is IMPOSSIBLE (wrong device, a sample-rate mismatch, clocking) for every mic. Its
+ * upper bound depends on the mic:
+ *   omni (an analog input): converters plus analog, a few ms. Past CALIB_LAT_OMNI_S an extra buffer
+ *     is in the loop (the Dante latency setting).
+ *   ZM-1 (Dante Via, the rig's only measurement mic): the Via leg and the converters, which the driver
+ *     does not report either, about 60 ms on the rig. The bound is CALIB_WIN_LAT_DRIVER_S, the same
+ *     allowance the arrival window grants past the driver's loop: a residual beyond it means the window
+ *     could not have held the arrival, so the latency is not what every sweep assumed.
+ * PROVISIONAL, like the window: nothing has been measured on the rig yet. */
+#define CALIB_LAT_FLOOR_S 0.0005   /* rounding slack below the driver's loop: 24 samples at 48 kHz */
+#define CALIB_LAT_OMNI_S  0.020    /* an omni's residual past this: an unexpected buffer */
+enum { CALIB_LAT_OK = 0, CALIB_LAT_WARN = 1, CALIB_LAT_IMPOSSIBLE = 2 };
+/* zylia: the mic is the ZM-1 on Dante Via. solved_s, driver_s: the solved and the driver's loop, in
+ * seconds. *resid_s (may be NULL) receives solved - driver. Non-finite input reads WARN. Pure. */
+int  calib_latency_check(int zylia, double solved_s, double driver_s, double* resid_s);
+double calib_latency_bound_s(int zylia);           /* the upper bound above, per mic */
 
 /* ---- the second pass (bwa_calibrate --verify; docs/calibration.md) ------------------------------
  * The trim run sweeps the RAW outputs and writes trims it never plays. --verify sweeps every speaker
@@ -287,9 +374,35 @@ int calib_write_sos(const char* in_path, const char* out_path, double mps, char*
  * This sees speakers OPTICAL trackers can't (the sweep passes through acoustically-transparent screens). */
 int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* pos_out, double* latency_out);
 
+/* calib_trilaterate with the latency KNOWN: the point x with |anchor_k - x| = range[k] - latency, by
+ * Gauss-Newton from the start in pos_io (written back). Three unknowns instead of four, which matters
+ * where the anchors all sit at about one distance from x (a dome around its listening point): there
+ * the latency and the radial coordinate trade off and calib_trilaterate's linear solve can put the
+ * latency tens of mm out while x barely moves. Take the latency from a run whose geometry DOES pin it
+ * (--localize: the mic rows move, the speakers do not). Needs K >= 4. Returns 1, or 0 on a degenerate
+ * or non-converging solve (pos_io untouched). */
+int calib_locate_known_latency(const double* range, const float (*anchor)[3], int K, double latency, float pos_io[3]);
+
+/* The least-squares refine of calib_trilaterate's answer, all four unknowns: alternate the
+ * known-latency solve for the point with the latency as the mean range residual, until both settle.
+ * calib_trilaterate subtracts equations to make the problem linear, and on a dome that step loses the
+ * latency almost entirely (2 m out on 3.5 mm of position error in calib_test), even where the geometry
+ * itself pins it to about calib_latency_dilution x the range noise. Start from calib_trilaterate's
+ * point; the latency start is ignored. Returns 1, or 0 with both untouched. */
+int calib_trilaterate_refine(const double* range, const float (*anchor)[3], int K, float pos_io[3], double* latency_io);
+
+/* How badly the anchors' geometry seen from x amplifies range noise into the latency calib_trilaterate
+ * solves: sqrt(K * [(J^T J)^-1]_33) for the 4-unknown Jacobian rows (-u_k, 1). 1 when the anchors
+ * surround x evenly; it grows as they bunch to one side, and past about 3 a solved latency is not worth
+ * quoting. Returns -1 when the geometry is degenerate. */
+double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3]);
+
 /* Write recovered speaker positions back into the layout JSON (sets each speaker's "position" [x,y,z],
- * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`. */
-int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap);
+ * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`.
+ * A measuring writer: a record with no plan yet first keeps its old position (and aim) as
+ * plan_position / plan_aim (layout_json_keep_plan); `plan_recorded` (NULL ok) gets how many did. */
+int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n,
+                          int* plan_recorded, char* err, size_t errcap);
 
 /* Per-speaker correction FIR with the calibration gate policy: `ir` starts at the direct arrival;
  * `first_refl` is the samples to the first reflection (0/unknown -> a default ~4 ms window). Gates so
@@ -339,6 +452,15 @@ int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int n
 int calib_write_room_eq_grid(const char* in_path, const char* out_path, const float mic[3],
                              const MeasureEqSection* cuts, const int* counts, int n,
                              int max_sections, char* err, size_t errcap);
+/* The same for `nmic` positions at once (the --room-eq-grid rows run): every mic is merged in order
+ * as if by one call each, but the file is read once and written once, so a grid that would overflow
+ * BWA_RQ_GRID_MAX part-way, or a NaN in any row, fails before anything is written. `cuts` is
+ * nmic * n * max_sections row-major (mic, then speaker), `counts` nmic * n. */
+int calib_write_room_eq_grid_n(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
+                               const MeasureEqSection* cuts, const int* counts, int n,
+                               int max_sections, char* err, size_t errcap);
+/* The radius within which a grid position replaces an existing entry instead of adding one. */
+#define CALIB_RQ_GRID_REPLACE_M 0.05f
 
 /* Drift check: given measured ranges (c*delay, meters, latency included) from ONE mic at `mic` to n
  * speakers at their STORED positions `pos`, report each speaker's RADIAL deviation (meters) from where

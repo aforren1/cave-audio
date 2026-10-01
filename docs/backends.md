@@ -267,12 +267,45 @@ Where each backend gets the pair:
 
 | backend   | position and time source                                                                |
 |-----------|-----------------------------------------------------------------------------------------|
+| ASIO      | `ASIOTime.timeInfo`: `samplePosition` when `kSamplePositionValid`, and for the time, the driver's `systemTime` ONLY when its stamps show it is on QPC, else QPC read at callback entry. See "ASIO's `systemTime`" below |
 | WASAPI    | `IAudioClock::GetPosition(&pos, &qpc)`, normalized by `GetFrequency()` to frames. Do not assume the units: `frames = pos * rate / freq`. `qpc` is in 100 ns units |
 | CoreAudio | the IOProc's `inOutputTime`: `mSampleTime` and `mHostTime` when both valid flags are set; `mach_timebase_info` converts host ticks to ns |
 | JACK      | `jack_get_cycle_times` at the top of the process callback: `current_frames` and `current_usecs`, the server's DLL-filtered pair in microseconds on `CLOCK_MONOTONIC`. Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
 | AAudio    | `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. Fails until the stream has run a little; keep the previous pair and set `measured` only after the first success |
 | Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat, and it is invisible: `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. Until 2026-09-23 `os_monotonic_ns` ignored that and returned uninitialized stack there (measured: one constant, so render times read 0 and the first one read a whole second). It now falls back to `emscripten_get_now`, which is `Date.now` in that scope: same epoch as the control thread's, a thousand times coarser, and not monotonic. That makes both of the adapter's backward-step rules load-bearing rather than defensive: a stamp never steps back, and a render time that would go negative books 0 |
+
+**ASIO's `systemTime`.** The ASIO SDK says `systemTime` is derived from `timeGetTime` on Windows
+(`asio.h`, `AsioTimeInfo`), and the SDK's sample driver does exactly that. `timeGetTime` ticks at
+1 to 15.6 ms and is not on QPC: on the development box it reads 27 ms off. Some drivers stamp from
+QPC instead, and the API does not say which. Passed through raw, a `timeGetTime` stamp puts every
+`bwa_get_clock` pair tens of milliseconds off `bwa_host_time_ns` and feeds the drift fit a 1 ms
+sawtooth. So the sink asks the stamps. `src/sink/sink_tsbase.h` holds the rule, and the ZM-1
+capture shell uses the same classifier:
+
+- Each block compares `systemTime` against QPC and `timeGetTime`, both read at callback entry, and
+  keeps the minimum of each difference over about 2 s. A callback can be late, never early, so the
+  minimum is the dispatch delay's floor. A QPC minimum inside [-0.5, +5] ms names the base QPC. A
+  `timeGetTime` minimum in range names it `timeGetTime`. Anything else is unknown. The first 16
+  blocks name nothing.
+- The block's `system_time_ns` is `systemTime` only when the base is QPC.
+- Otherwise it is QPC at callback entry, less the dispatch floor last measured on a QPC stamp (0 if
+  there never was one). Both sources then mean the buffer switch, so a driver whose valid flag comes
+  and goes moves the stamp by its jitter, not by its dispatch delay. With no QPC stamp ever, this is
+  the plain entry read, which is what the sink always did without `kSystemTimeValid`.
+- A stamp at or before the previous one becomes the previous one plus one nominal block, the
+  adapter's rule above. The one step left is the block a driver's first QPC stamp arrives on, when
+  the entry read moves back onto the switch by the measured dispatch delay.
+- A `timeGetTime` stamp is not mapped onto QPC through its measured offset. That offset is a
+  minimum over stamps quantized to the tick, so it is only known to the tick, and every mapped stamp
+  would carry the same 1 to 15.6 ms quantization. The entry read carries tens of microseconds of
+  dispatch jitter, which is better. The tick can also change mid-stream when any process calls
+  `timeBeginPeriod`.
+
+`bwa_sink_health` carries the result for ASIO only: `stamp_base` (`SINK_TS_*`) and
+`stamp_offset_ns`, the floor of QPC minus `systemTime`. Nothing public reads them yet. On the rig,
+read the Digiface driver's base from the Zylia tab: the ZM-1 arrives on the same driver. Which base
+the Digiface's driver uses is unverified.
 
 ### 4. Health
 

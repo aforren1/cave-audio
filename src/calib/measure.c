@@ -164,14 +164,52 @@ static int ir_peak(const float* ir, int from, int to) {        /* strongest |tap
     return best;
 }
 
+/* RMS of the loudest `blk`-sample block in ir[a, b) (a shorter tail block counts when it holds at
+ * least MEASURE_NOISE_MIN_N samples); 0 and *n untouched for a region under that */
+static double loudest_block_rms(const float* ir, int a, int b, int blk, int* n) {
+    if (b - a < MEASURE_NOISE_MIN_N) return 0.0;
+    double best = 0.0;
+    for (int s = a; s < b; s += blk) {
+        const int e = s + blk < b ? s + blk : b;
+        if (e - s < MEASURE_NOISE_MIN_N) break;
+        double acc = 0.0;
+        for (int i = s; i < e; ++i) acc += (double)ir[i] * ir[i];
+        const double r = sqrt(acc / (double)(e - s));
+        if (r > best) best = r;
+    }
+    *n += b - a;
+    return best;
+}
+
+double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs, int* n) {
+    int nn = 0;
+    if (n) *n = 0;
+    if (!ir || ncap <= 0 || !(fs > 0.0)) return 0.0;
+    int blk = (int)(MEASURE_NOISE_BLOCK_S * fs); if (blk < MEASURE_NOISE_MIN_N) blk = MEASURE_NOISE_MIN_N;
+    const int guard = (int)(MEASURE_NOISE_GUARD_S * fs), skip = (int)(MEASURE_NOISE_SKIP_S * fs);
+    int b1 = lo - guard; if (b1 > ncap) b1 = ncap;
+    int a2 = hi + skip;  if (a2 < 0) a2 = 0;
+    const double r1 = b1 > 0 ? loudest_block_rms(ir, 0, b1, blk, &nn) : 0.0;
+    const double r2 = a2 < ncap ? loudest_block_rms(ir, a2, ncap, blk, &nn) : 0.0;
+    if (n) *n = nn;
+    return r1 > r2 ? r1 : r2;
+}
+
 int measure_response(const float* capture, int ncap, const float* ref, int nref,
                      double f1, double f2, double fs, const double band_hz[2], MeasureResult* out) {
-    return measure_response_win(capture, ncap, ref, nref, f1, f2, fs, band_hz, out, NULL, 0, 0, NULL);
+    return measure_response_ex(capture, ncap, ref, nref, f1, f2, fs, band_hz, 0, 0, out, NULL, 0, 0, NULL);
 }
 
 int measure_response_win(const float* capture, int ncap, const float* ref, int nref,
                          double f1, double f2, double fs, const double band_hz[2], MeasureResult* out,
                          float* win, int win_len, int pre, int* win_start) {
+    return measure_response_ex(capture, ncap, ref, nref, f1, f2, fs, band_hz, 0, 0, out, win, win_len, pre, win_start);
+}
+
+int measure_response_ex(const float* capture, int ncap, const float* ref, int nref,
+                        double f1, double f2, double fs, const double band_hz[2],
+                        int exp_lo, int exp_hi, MeasureResult* out,
+                        float* win, int win_len, int pre, int* win_start) {
     if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
     if (win && (win_len <= 0 || pre < 0 || !win_start)) return 0;
     /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
@@ -182,8 +220,29 @@ int measure_response_win(const float* capture, int ncap, const float* ref, int n
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &e_full, &ir);
     if (!L) return 0;
     out->energy = (float)e_full;
-    int p = ir_peak(ir, 0, ncap < L ? ncap : L);                /* physical arrival = strongest tap */
+    const int npos = ncap < L ? ncap : L;                       /* the positive lags */
+    const int pany = ir_peak(ir, 0, npos);                      /* the strongest tap anywhere */
+    int lo = exp_lo < 0 ? 0 : exp_lo, hi = exp_hi > npos ? npos : exp_hi;
+    const int windowed = exp_hi > exp_lo && hi > lo;
+    /* physical arrival = the strongest tap where this speaker's sound can arrive. A window that the
+     * clamp emptied (it lies past the capture) falls back to the whole IR and flags it. */
+    int p = windowed ? ir_peak(ir, lo, hi) : pany;
     out->delay_samples = p;
+    out->peak_any = pany;
+    if (exp_hi > exp_lo) {
+        out->win_lo = exp_lo; out->win_hi = exp_hi;
+        out->outside = !windowed || pany < lo || pany >= hi;
+    }
+    {
+        const double a = fabs((double)ir[p]), b = fabs((double)ir[pany]);
+        out->outside_db = (a > 0.0 && b > 0.0) ? (float)(20.0 * log10(b / a)) : 0.f;
+        /* the floor around the window, or around the found arrival when there is none */
+        int nn = 0;
+        const double fl = measure_noise_floor(ir, npos, windowed ? lo : p, windowed ? hi : p + 1, fs, &nn);
+        out->floor_rms = (float)fl;
+        out->noise_n = nn;
+        out->snr_db = (nn > 0 && fl > 0.0 && a > 0.0) ? (float)(20.0 * log10(a / fl)) : (nn > 0 && a > 0.0 ? 300.f : 0.f);
+    }
     /* sub-sample refinement: fit a parabola to |IR| at the peak and its neighbors (true peak of a
      * band-limited arrival lands between samples). Lifts delay precision from ~7 mm to well under 1 mm. */
     out->delay_frac = 0.f;

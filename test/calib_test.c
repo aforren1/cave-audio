@@ -241,18 +241,88 @@ int main(void) {
             m.band_direct[2] = NAN;
             CHECK(!calib_direct_tilt_db(&m, &t), "live: a NaN band has no tilt");
         }
-        {   /* peak hold: tracks the maximum, ignores NaN, resets */
+        {   /* peak hold: holds only CLEAN readings, only once two in a row agree (to the lower of the
+             * pair), ignores NaN, resets. Broken on purpose (the old one-reading rule) this goes red on
+             * the latched outlier. */
+            const float tol = CALIB_LIVE_TILT_TOL_DB;
             CalibPeakHold pk; calib_peak_reset(&pk);
-            const float seq[6] = { -1.0f, -0.5f, -0.8f, NAN, -0.2f, -0.9f };
-            float below[6];
-            for (int i = 0; i < 6; ++i) below[i] = calib_peak_update(&pk, seq[i]);
-            CHECK(pk.n == 5 && pk.peak_db == -0.2f && pk.peak_index == 4, "live: peak hold keeps the maximum (NaN skipped)");
-            CHECK(below[0] == 0.f && below[1] == 0.f && fabsf(below[2] - 0.3f) < 1e-6f && below[4] == 0.f && fabsf(below[5] - 0.7f) < 1e-6f,
-                  "live: 'below' is the peak minus the reading, 0 at a new peak");
-            CHECK(fabsf(below[3] - 0.3f) < 1e-6f, "live: a NaN reading repeats the last 'below'");
+            /* -1.0, -0.9 agree (peak -1.0); NaN skipped; -0.2 alone; -0.25 agrees with it (peak -0.25);
+             * +3.0 is a clean outlier with no partner; -0.3 does not pair with +3.0 */
+            const float seq[7] = { -1.0f, -0.9f, NAN, -0.2f, -0.25f, 3.0f, -0.3f };
+            float below[7];
+            for (int i = 0; i < 7; ++i) below[i] = calib_peak_update(&pk, seq[i], 1, tol);
+            CHECK(pk.n == 6 && fabsf(pk.peak_db + 0.25f) < 1e-6f && pk.peak_index == 4,
+                  "live: the peak is the lower of the best agreeing pair; a lone outlier never latches");
+            CHECK(below[0] == 0.f && below[1] == 0.f, "live: 'below' is 0 before any peak");
+            CHECK(below[5] == 0.f && fabsf(below[6] - 0.05f) < 1e-5f, "live: 'below' is the peak minus the reading, 0 above it");
+            CHECK(fabsf(below[2] - 0.f) < 1e-6f, "live: a NaN reading repeats the last 'below'");
+            /* a contaminated reading (not clean) never pairs, even when its value agrees */
             calib_peak_reset(&pk);
-            CHECK(pk.n == 0 && pk.peak_index == 0, "live: reset clears the peak");
-            CHECK(calib_peak_update(&pk, -3.f) == 0.f && pk.peak_db == -3.f, "live: after a reset the next reading is the peak");
+            CHECK(pk.n == 0 && pk.peak_index == 0 && pk.nrejected == 0, "live: reset clears the peak");
+            calib_peak_update(&pk, -2.0f, 1, tol);
+            calib_peak_update(&pk, 5.0f, 0, tol);
+            calib_peak_update(&pk, 5.1f, 1, tol);
+            CHECK(pk.peak_index == 0 && pk.nrejected == 1, "live: a rejected reading breaks the pair and is not held");
+            calib_peak_update(&pk, 5.0f, 1, tol);
+            CHECK(pk.peak_index == 4 && fabsf(pk.peak_db - 5.0f) < 1e-6f, "live: two clean readings that agree set the peak");
+        }
+        {   /* the expected-arrival window and the sweep checks (calib.h) */
+            CalibWindow w; memset(&w, 0, sizeof w);
+            w.lat_s = 0.010; w.pos_m = 0.5;
+            const float spk[3] = { 3.43f, 0.f, 0.f }, mic[3] = { 0.f, 0.f, 0.f };
+            int lo = 0, hi = 0;
+            CHECK(calib_arrival_window(&w, spk, mic, 343.0, 48000.0, &lo, &hi), "window: made");
+            /* 10 ms + 2.93 m / 343 = 18.542 ms -> 890.03; 10 ms + 3.93 m / 343 + 2 ms = 23.458 ms -> 1125.97, ceil + 1 */
+            CHECK(lo == 890 && hi == 1127, "window: lo/hi from latency, distance and margin");
+            printf("window: [%d, %d) for 3.43 m +/- 0.5 m at 10 ms\n", lo, hi);
+            w.lat_late_s = 0.150;
+            CHECK(calib_arrival_window(&w, spk, mic, 343.0, 48000.0, &lo, &hi) && lo == 890 && hi == 1127 + 7200,
+                  "window: the driver-loop slack only moves the high edge");
+            const float bad[3] = { NAN, 0.f, 0.f }, huge[3] = { 3e38f, 0.f, 0.f };
+            CHECK(!calib_arrival_window(&w, bad, mic, 343.0, 48000.0, &lo, &hi), "window: NaN refused");
+            CHECK(!calib_arrival_window(&w, huge, mic, 343.0, 48000.0, &lo, &hi), "window: an absurd coordinate refused");
+            MeasureResult a; memset(&a, 0, sizeof a);
+            a.noise_n = 1000; a.snr_db = 60.f; a.level = 1.f; a.delay_samples = 100; a.delay_frac = 0.2f;
+            CHECK(calib_sweep_check(&a, 40.f) == CALIB_SWEEP_OK, "sweep: clean");
+            a.snr_db = 30.f;
+            CHECK(calib_sweep_check(&a, 40.f) == CALIB_SWEEP_NOISY, "sweep: under the SNR floor");
+            a.noise_n = 0;
+            CHECK(calib_sweep_check(&a, 40.f) == CALIB_SWEEP_OK, "sweep: an unknown SNR passes");
+            a.outside = 1;
+            CHECK(calib_sweep_check(&a, 40.f) == CALIB_SWEEP_OUTSIDE, "sweep: outside the window");
+            MeasureResult b = a;
+            b.delay_samples = 101; b.delay_frac = 0.1f; b.level = 1.02f;       /* 0.9 sample, 0.17 dB */
+            float ds = 0.f, ddb = 0.f;
+            CHECK(calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: within a sample and 0.2 dB");
+            b.level = 1.03f;                                                    /* 0.26 dB */
+            CHECK(!calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: 0.26 dB apart does not");
+            b.level = 1.f; b.delay_frac = 0.3f;                                 /* 1.1 samples */
+            CHECK(!calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: 1.1 samples apart does not");
+        }
+    }
+
+    /* the solved latency against the driver's loop (calib_latency_check), per mic. The driver's loop
+     * here is 10 ms. A ZM-1 run on Dante Via reads about 60 ms more on the rig: a CORRECT run, so no
+     * warning for it, where the same residual from an omni is an unexpected buffer. The ZM-1's bound IS
+     * the arrival window's allowance, so a residual the window could not have held still warns. Below the
+     * driver's loop is impossible for both. */
+    {
+        const double drv = 0.010;
+        double r = 0.0;
+        CHECK(calib_latency_check(1, drv + 0.060, drv, &r) == CALIB_LAT_OK && fabs(r - 0.060) < 1e-12,
+              "latency: ZM-1, a 60 ms Via leg is ok");
+        CHECK(calib_latency_check(0, drv + 0.060, drv, NULL) == CALIB_LAT_WARN, "latency: omni, 60 ms warns");
+        CHECK(calib_latency_check(0, drv + 0.003, drv, NULL) == CALIB_LAT_OK, "latency: omni, 3 ms of converters is ok");
+        CHECK(calib_latency_check(0, drv + 0.021, drv, NULL) == CALIB_LAT_WARN, "latency: omni, past 20 ms warns");
+        CHECK(calib_latency_bound_s(1) == CALIB_WIN_LAT_DRIVER_S, "latency: the ZM-1 bound is the window's allowance");
+        CHECK(calib_latency_check(1, drv + CALIB_WIN_LAT_DRIVER_S * 0.99, drv, NULL) == CALIB_LAT_OK,
+              "latency: ZM-1, just inside the window's allowance");
+        CHECK(calib_latency_check(1, drv + CALIB_WIN_LAT_DRIVER_S * 1.01, drv, NULL) == CALIB_LAT_WARN,
+              "latency: ZM-1, past the window's allowance warns");
+        for (int z = 0; z < 2; ++z) {
+            CHECK(calib_latency_check(z, drv - 0.002, drv, NULL) == CALIB_LAT_IMPOSSIBLE, "latency: below the driver's loop");
+            CHECK(calib_latency_check(z, drv - 0.0004, drv, NULL) == CALIB_LAT_OK, "latency: within the rounding slack");
+            CHECK(calib_latency_check(z, NAN, drv, NULL) == CALIB_LAT_WARN, "latency: NaN is not ok");
         }
     }
 
@@ -321,6 +391,87 @@ int main(void) {
             CHECK(cf[0] == r[0], "dilution: a NaN direct share reads as 1 (the free-field factor)");
         }
         free(sw); free(cap);
+    }
+
+    {   /* the writers key on "index", not array order: records written out of order (the loader accepts
+         * any order) must still get speaker k's values. Measurement i used to land on ARRAY element i,
+         * so here speaker 0's trim and position went to speaker 2. */
+        const char* RI = "bwa_calib_reorder.json";
+        FILE* rf0 = fopen(RI, "wb");
+        CHECK(rf0 != NULL, "reorder: open fixture");
+        if (rf0) {
+            fputs("{ \"speakers\": [\n"
+                  "  { \"index\": 2, \"position\": [3,0,0] },\n"
+                  "  { \"index\": 0, \"position\": [1,0,0] },\n"
+                  "  { \"index\": 3, \"position\": [4,0,0] },\n"
+                  "  { \"index\": 1, \"position\": [2,0,0] } ] }\n", rf0);
+            fclose(rf0);
+            float wg[4] = { -6.f, -3.f, -1.f, -2.f }, wd[4] = { 4.f, 2.f, 0.f, 1.f };
+            float np[4][3] = { { 1.1f, 0.f, 0.f }, { 2.2f, 0.f, 0.f }, { 3.3f, 0.f, 0.f }, { 4.4f, 0.f, 0.f } };
+            char e[256] = { 0 };
+            CHECK(calib_write_layout(RI, RI, wg, wd, 4, e, sizeof e), e[0] ? e : "reorder: trims writer");
+            CHECK(calib_write_positions(RI, RI, (const float (*)[3])np, 4, NULL, e, sizeof e), e[0] ? e : "reorder: positions writer");
+            static Layout RL;                                  /* never a stack local (layout.h) */
+            CHECK(layout_load(RI, 48000, &RL, e, sizeof e), e[0] ? e : "reorder: reload");
+            int ok = 1;
+            for (int k = 0; k < 4; ++k) {
+                const float want_g = powf(10.f, wg[k] / 20.f);
+                if (fabsf(RL.speakers[k].gain_lin - want_g) > 1e-4f || fabsf(RL.speakers[k].pos[0] - np[k][0]) > 1e-4f) {
+                    printf("  reorder: speaker %d got gain %.4f (want %.4f), x %.3f (want %.3f)\n",
+                           k, RL.speakers[k].gain_lin, want_g, RL.speakers[k].pos[0], np[k][0]);
+                    ok = 0;
+                }
+            }
+            CHECK(ok, "reorder: every writer puts speaker k's value on the record whose index is k");
+            CHECK(RL.speakers[0].has_plan && fabsf(RL.speakers[0].plan_pos[0] - 1.f) < 1e-6f &&
+                  fabsf(RL.speakers[2].plan_pos[0] - 3.f) < 1e-6f, "reorder: and keeps each speaker's OWN plan");
+            remove(RI);
+        }
+    }
+
+    {   /* a dome ABOVE the listening point: the four-unknown solve's latency is poorly pinned there, the
+         * known-latency solve is not, and the dilution says which is which */
+        enum { ND = 16 };
+        float dome[ND][3], sphere[ND][3];
+        const float x0[3] = { 0.1f, 1.448f, -0.05f };
+        for (int k = 0; k < ND; ++k) {
+            const double az = 2.0 * M_PI * k / ND, el = (k & 1) ? 0.35 : 0.9;    /* 20 and 52 deg up */
+            dome[k][0] = x0[0] + (float)(2.0 * cos(el) * cos(az));
+            dome[k][1] = x0[1] + (float)(2.0 * sin(el));
+            dome[k][2] = x0[2] + (float)(2.0 * cos(el) * sin(az));
+            const double es = (k & 1) ? 0.6 : -0.6;                               /* half above, half below */
+            sphere[k][0] = x0[0] + (float)(2.0 * cos(es) * cos(az));
+            sphere[k][1] = x0[1] + (float)(2.0 * sin(es));
+            sphere[k][2] = x0[2] + (float)(2.0 * cos(es) * sin(az));
+        }
+        const double dd = calib_latency_dilution((const float (*)[3])dome, ND, x0);
+        const double ds = calib_latency_dilution((const float (*)[3])sphere, ND, x0);
+        printf("latency dilution: dome above %.2f, surrounding %.2f\n", dd, ds);
+        CHECK(ds > 0.0 && ds < 1.5, "dilution: speakers surrounding the point pin the latency (about 1)");
+        CHECK(dd > 2.0 * ds, "dilution: a dome above the point pins it far worse");
+        /* ranges = distance + 0.5 m of latency, with +/-3.5 mm of alternating position error */
+        const double LAT = 0.5;
+        double rng[ND];
+        for (int k = 0; k < ND; ++k) {
+            const double dx = dome[k][0] - x0[0], dy = dome[k][1] - x0[1], dz = dome[k][2] - x0[2];
+            rng[k] = sqrt(dx*dx + dy*dy + dz*dz) + LAT + ((k % 3) ? 0.0035 : -0.0035);
+        }
+        float p4[3] = { 0.f, 0.f, 0.f }; double l4 = 0.0;
+        const int ok4 = calib_trilaterate(rng, (const float (*)[3])dome, ND, p4, &l4);
+        const double l4lin = l4;
+        const int okr = ok4 && calib_trilaterate_refine(rng, (const float (*)[3])dome, ND, p4, &l4);
+        float p3[3] = { 0.f, 1.2f, 0.f };
+        const int ok3 = calib_locate_known_latency(rng, (const float (*)[3])dome, ND, LAT, p3);
+        const float e3 = sqrtf((p3[0]-x0[0])*(p3[0]-x0[0]) + (p3[1]-x0[1])*(p3[1]-x0[1]) + (p3[2]-x0[2])*(p3[2]-x0[2]));
+        printf("dome: four unknowns: latency off %.1f mm linear, %.1f mm refined; latency known: center off %.2f mm\n",
+               fabs(l4lin - LAT) * 1e3, fabs(l4 - LAT) * 1e3, e3 * 1e3);
+        CHECK(ok4 && okr && ok3, "dome: the solves run");
+        CHECK(fabs(l4lin - LAT) > 0.1, "dome: the LINEAR solve's latency is lost (why the refine exists)");
+        CHECK(fabs(l4 - LAT) < 2.0 * dd * 0.0035, "dome: refined, the latency is within twice dilution x the range error");
+        CHECK(e3 < 0.004f, "dome: with the latency known the center lands within the position error");
+        float bad[3] = { 0.f, 1.2f, 0.f };
+        CHECK(!calib_locate_known_latency(rng, (const float (*)[3])dome, 3, LAT, bad) && bad[1] == 1.2f,
+              "dome: fewer than 4 anchors is refused and the start is untouched");
     }
 
     /* writeback round-trip: write a layout, apply trims, reload, confirm fields updated + dbap kept */
@@ -582,7 +733,7 @@ int main(void) {
             fclose(f);
             float pp[3][3] = { {1.25f, -0.5f, 0.8f}, {2.f, 0.f, 0.f}, {0.f, 2.f, 0.f} };
             char e[256] = {0};
-            CHECK(calib_write_positions(IN, OUT, pp, 3, e, sizeof e), e[0] ? e : "calib_write_positions");
+            CHECK(calib_write_positions(IN, OUT, pp, 3, NULL, e, sizeof e), e[0] ? e : "calib_write_positions");
             FILE* rf = fopen(OUT, "rb");
             if (rf) {
                 fseek(rf, 0, SEEK_END); long len = ftell(rf); fseek(rf, 0, SEEK_SET);
@@ -600,6 +751,161 @@ int main(void) {
                 free(buf);
             }
             remove(IN); remove(OUT);
+        }
+    }
+
+    /* ---- the plan (plan_position / plan_aim, docs/layout-schema.md "Plan versus as-built") ----
+     * The loader keeps it apart from position (the engine renders the as-built), every writer carries it
+     * through, and a POSITION writer records it once: the first survey keeps what it replaces, a second
+     * survey leaves it alone. The expected numbers are typed here, never read back from a writer. */
+    {
+        const char* PIN = "bwa_plan_in.json", *POUT = "bwa_plan_out.json";
+        FILE* f = fopen(PIN, "wb");
+        CHECK(f != NULL, "open plan in.json");
+        if (f) {
+            fputs("{ \"listening_point_m\": [0, 1.5, 0], \"note\": \"kept\", \"speakers\": [\n"
+                  "  {\"index\":0,\"position\":[1.5,0,0],\"aim\":[0,1,0],\"plan_position\":[1.4,0.1,0],\"plan_aim\":[-2,2,0],"
+                  "\"gain_db\":-1,\"delay_ms\":0.5},\n"
+                  "  {\"index\":1,\"position\":[-1.5,0,0],\"plan_position\":[-1.5,0.2,0]},\n"
+                  "  {\"index\":2,\"position\":[0,0,1.5]},\n"
+                  "  {\"index\":3,\"position\":[0,3,0],\"aim\":[0,-1,0]} ] }\n", f);
+            fclose(f);
+            static Layout PL;                                  /* never a stack local (layout.h) */
+            char e[256] = {0};
+            CHECK(layout_load(PIN, 48000, &PL, e, sizeof e), e[0] ? e : "load the plan fixture");
+            const float r2 = 0.70710678f;
+            CHECK(PL.speakers[0].pos[0] == 1.5f && PL.speakers[0].aim[1] == 1.f, "plan: the engine's position and aim are the as-built ones");
+            CHECK(PL.speakers[0].has_plan && fabsf(PL.speakers[0].plan_pos[0] - 1.4f) < 1e-6f && fabsf(PL.speakers[0].plan_pos[1] - 0.1f) < 1e-6f,
+                  "plan: plan_position loads");
+            CHECK(fabsf(PL.speakers[0].plan_aim[0] + r2) < 1e-5f && fabsf(PL.speakers[0].plan_aim[1] - r2) < 1e-5f,
+                  "plan: plan_aim loads, normalized");
+            {   /* speaker 1: a plan with no plan_aim faces the listening point FROM the plan position */
+                const float dx = 1.5f, dy = 1.3f, inv = 1.f / sqrtf(dx * dx + dy * dy);
+                CHECK(PL.speakers[1].has_plan && fabsf(PL.speakers[1].plan_aim[0] - dx * inv) < 1e-5f &&
+                      fabsf(PL.speakers[1].plan_aim[1] - dy * inv) < 1e-5f, "plan: no plan_aim = toward the listening point from plan_position");
+            }
+            CHECK(!PL.speakers[2].has_plan && layout_plan_pos(&PL, 2) == PL.speakers[2].pos && layout_plan_aim(&PL, 2) == PL.speakers[2].aim,
+                  "plan: a record with no plan is its own plan");
+            CHECK(layout_plan_pos(&PL, 0) == PL.speakers[0].plan_pos, "plan: the accessor returns the plan when there is one");
+
+            /* every non-position writer carries it through untouched */
+            float wg[4] = { -1.f, 0.f, -2.f, 0.f }, wd[4] = { 0.5f, 0.f, 0.1f, 0.f };
+            CHECK(calib_write_layout(PIN, POUT, wg, wd, 4, e, sizeof e), e[0] ? e : "plan: trims writer");
+            CHECK(calib_write_sos(POUT, POUT, 344.0, e, sizeof e), e[0] ? e : "plan: sos writer");
+            float taps[4 * 2] = { 1.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, 0.f };
+            uint16_t lens[4] = { 2, 2, 2, 2 };
+            CHECK(calib_write_eq(POUT, POUT, taps, lens, 4, 2, e, sizeof e), e[0] ? e : "plan: eq writer");
+            MeasureEqSection gc[4 * BWA_ROOM_EQ_MAX]; int gn[4] = { 1, 0, 0, 0 };
+            memset(gc, 0, sizeof gc); gc[0].fc = 50.f; gc[0].gain_db = -4.f; gc[0].q = 5.f;
+            const float gm[3] = { 0.f, 1.5f, 0.f };
+            CHECK(calib_write_room_eq_grid(POUT, POUT, gm, gc, gn, 4, BWA_ROOM_EQ_MAX, e, sizeof e), e[0] ? e : "plan: grid writer");
+            CHECK(layout_load(POUT, 48000, &PL, e, sizeof e), e[0] ? e : "plan: reload after the writers");
+            CHECK(PL.speakers[0].has_plan && fabsf(PL.speakers[0].plan_pos[0] - 1.4f) < 1e-6f &&
+                  fabsf(PL.speakers[0].plan_aim[0] + r2) < 1e-5f && PL.speakers[1].has_plan &&
+                  !PL.speakers[2].has_plan && !PL.speakers[3].has_plan, "plan: survives the trims, sos, eq and grid writers");
+            CHECK(PL.speakers[0].pos[0] == 1.5f, "plan: those writers leave the position alone");
+
+            /* the FIRST survey: speakers 2 and 3 had no plan and get one (their old position, and 3's old
+             * aim); 0 and 1 keep theirs */
+            float s1[4][3] = { { 1.52f, 0.01f, 0.f }, { -1.48f, 0.02f, 0.f }, { 0.03f, 0.f, 1.47f }, { 0.f, 2.96f, 0.02f } };
+            int nrec = -1;
+            CHECK(calib_write_positions(POUT, POUT, (const float (*)[3])s1, 4, &nrec, e, sizeof e), e[0] ? e : "plan: first survey");
+            CHECK(nrec == 2, "plan: the first survey records a plan for the two speakers that had none");
+            CHECK(layout_load(POUT, 48000, &PL, e, sizeof e), e[0] ? e : "plan: reload after the first survey");
+            CHECK(fabsf(PL.speakers[2].pos[2] - 1.47f) < 1e-6f, "plan: the survey wrote the position");
+            CHECK(PL.speakers[2].has_plan && PL.speakers[2].plan_pos[0] == 0.f && fabsf(PL.speakers[2].plan_pos[2] - 1.5f) < 1e-6f,
+                  "plan: the first survey kept the old position as plan_position");
+            CHECK(PL.speakers[3].has_plan && fabsf(PL.speakers[3].plan_pos[1] - 3.f) < 1e-6f && fabsf(PL.speakers[3].plan_aim[1] + 1.f) < 1e-6f,
+                  "plan: ...and the old explicit aim as plan_aim");
+            CHECK(fabsf(PL.speakers[0].plan_pos[0] - 1.4f) < 1e-6f && fabsf(PL.speakers[0].plan_pos[1] - 0.1f) < 1e-6f,
+                  "plan: an existing plan is not touched by the first survey");
+            /* the SECOND survey: nothing recorded, the plan still the pre-survey values */
+            float s2[4][3] = { { 1.6f, 0.f, 0.f }, { -1.6f, 0.f, 0.f }, { 0.1f, 0.f, 1.6f }, { 0.f, 2.9f, 0.1f } };
+            CHECK(calib_write_positions(POUT, POUT, (const float (*)[3])s2, 4, &nrec, e, sizeof e), e[0] ? e : "plan: second survey");
+            CHECK(nrec == 0, "plan: the second survey records nothing");
+            CHECK(layout_load(POUT, 48000, &PL, e, sizeof e), e[0] ? e : "plan: reload after the second survey");
+            CHECK(fabsf(PL.speakers[2].pos[0] - 0.1f) < 1e-6f, "plan: the second survey wrote its positions");
+            CHECK(PL.speakers[2].plan_pos[0] == 0.f && fabsf(PL.speakers[2].plan_pos[2] - 1.5f) < 1e-6f,
+                  "plan: the second survey did not overwrite the plan with the first survey's positions");
+            {   /* the free text survives it all */
+                FILE* rf = fopen(POUT, "rb");
+                if (rf) {
+                    char buf[8192]; size_t rd = fread(buf, 1, sizeof buf - 1, rf); buf[rd] = 0; fclose(rf);
+                    CHECK(strstr(buf, "\"note\":") != NULL, "plan: unknown fields survive every writer");
+                }
+            }
+
+            /* malformed plans are load errors with a reason, like position's */
+            const char* bad[][2] = {
+                { "\"plan_position\":[1,2]",                      "plan_position" },
+                { "\"plan_position\":[1e400,0,0]",                "plan_position" },   /* parses to inf */
+                { "\"plan_position\":[2000,0,0]",                 "plan_position" },   /* position's +/-1000 m */
+                { "\"plan_position\":[0,\"a\",0]",                "plan_position" },
+                { "\"plan_position\":[1,0,0],\"plan_aim\":[0,0,0]", "plan_aim" },
+                { "\"plan_position\":[1,0,0],\"plan_aim\":[0,1]",   "plan_aim" },
+                { "\"plan_aim\":[0,1,0]",                         "plan_aim needs plan_position" },
+            };
+            for (size_t b = 0; b < sizeof bad / sizeof bad[0]; ++b) {
+                FILE* bf = fopen(PIN, "wb");
+                if (!bf) continue;
+                fprintf(bf, "{ \"speakers\": [ {\"index\":0,\"position\":[1,0,0],%s}, {\"index\":1,\"position\":[-1,0,0]},"
+                            " {\"index\":2,\"position\":[0,0,1]}, {\"index\":3,\"position\":[0,1,0]} ] }\n", bad[b][0]);
+                fclose(bf);
+                e[0] = 0;
+                const int ok = layout_load(PIN, 48000, &PL, e, sizeof e);
+                if (ok || !strstr(e, bad[b][1])) printf("  plan refusal %d: ok=%d err='%s'\n", (int)b, ok, e);
+                CHECK(!ok && strstr(e, bad[b][1]) != NULL, "plan: a malformed plan is a load error naming the field");
+            }
+            remove(PIN); remove(POUT);
+        }
+    }
+
+    /* calib_write_room_eq_grid_n: several positions in one write. Two within the 5 cm replace radius
+     * collapse to one entry (the later wins, as with one call each); a set that overflows the 16-position
+     * grid fails BEFORE the file is written. */
+    {
+        const char* GN = "bwa_gridn_in.json", *GO = "bwa_gridn_out.json";
+        FILE* f = fopen(GN, "wb");
+        CHECK(f != NULL, "open gridn in.json");
+        if (f) {
+            fputs("{ \"speakers\": [ {\"index\":0,\"position\":[1,0,0]}, {\"index\":1,\"position\":[2,0,0]}, "
+                  "{\"index\":2,\"position\":[0,0,1]}, {\"index\":3,\"position\":[0,1,0]} ] }\n", f);
+            fclose(f);
+            char e[256] = {0};
+            float mics[17][3];
+            for (int k = 0; k < 17; ++k) { mics[k][0] = 0.3f * k; mics[k][1] = 1.5f; mics[k][2] = 0.f; }
+            mics[2][0] = mics[1][0] + 0.02f;                   /* 2 cm from mic 1: replaces it */
+            MeasureEqSection* c = (MeasureEqSection*)calloc((size_t)17 * 4 * BWA_ROOM_EQ_MAX, sizeof *c);
+            int* cn = (int*)calloc((size_t)17 * 4, sizeof(int));
+            for (int k = 0; k < 17 && c && cn; ++k) {           /* speaker 0 sees a 50 Hz mode, depth by row */
+                c[((size_t)k * 4) * BWA_ROOM_EQ_MAX].fc = 50.f;
+                c[((size_t)k * 4) * BWA_ROOM_EQ_MAX].gain_db = -1.f - 0.5f * k;
+                c[((size_t)k * 4) * BWA_ROOM_EQ_MAX].q = 5.f;
+                cn[k * 4] = 1;
+            }
+            if (c && cn) {
+                remove(GO);
+                CHECK(calib_write_room_eq_grid_n(GN, GO, 3, (const float (*)[3])mics, c, cn, 4, BWA_ROOM_EQ_MAX, e, sizeof e),
+                      e[0] ? e : "grid_n: three positions");
+                static Layout GL;
+                CHECK(layout_load(GO, 48000, &GL, e, sizeof e), e[0] ? e : "grid_n: reload");
+                CHECK(GL.rq_grid.npos == 2, "grid_n: two positions within 5 cm collapse into one entry");
+                CHECK(fabsf(GL.rq_grid.pos[1][0] - mics[2][0]) < 1e-3f && fabsf(GL.rq_grid.gain_db[1][0][0] + 2.f) < 0.011f,
+                      "grid_n: the later of the two wins, key and depth");
+                remove(GO);
+                e[0] = 0;
+                mics[2][0] = 0.3f * 2;                          /* 17 distinct positions: one too many */
+                CHECK(!calib_write_room_eq_grid_n(GN, GO, 17, (const float (*)[3])mics, c, cn, 4, BWA_ROOM_EQ_MAX, e, sizeof e) &&
+                      strstr(e, "full") != NULL, "grid_n: 17 positions are refused");
+                FILE* g = fopen(GO, "rb");
+                CHECK(g == NULL, "grid_n: a refused set writes nothing");
+                if (g) fclose(g);
+                CHECK(calib_write_room_eq_grid_n(GN, GO, 16, (const float (*)[3])mics, c, cn, 4, BWA_ROOM_EQ_MAX, e, sizeof e),
+                      e[0] ? e : "grid_n: 16 positions fit");
+                CHECK(layout_load(GO, 48000, &GL, e, sizeof e) && GL.rq_grid.npos == 16, "grid_n: 16 positions load");
+            }
+            free(c); free(cn);
+            remove(GN); remove(GO);
         }
     }
 
@@ -806,6 +1112,14 @@ int main(void) {
               fabsf(r.layout_down_tilt_deg + 90.f) < 0.01f,
               "aim row: the mis-aimed speaker's error is the angle between up and the listening point");
         CHECK(!calib_aim_row(&AL, 4, &r) && !calib_aim_row(NULL, 0, &r), "aim row: out of range is refused");
+        /* with a plan, the sheet is the PLAN: speaker 0 measured ahead (+z, so it faces back, 180) but
+         * planned behind the listener (-z, facing room-ahead, 0) must read 0 */
+        AL.speakers[0].has_plan = 1;
+        AL.speakers[0].plan_pos[0] = 0.f; AL.speakers[0].plan_pos[1] = 1.448f; AL.speakers[0].plan_pos[2] = -2.f;
+        AL.speakers[0].plan_aim[0] = 0.f; AL.speakers[0].plan_aim[1] = 0.f;    AL.speakers[0].plan_aim[2] = 1.f;
+        CHECK(calib_aim_row(&AL, 0, &r) && fabsf(r.bearing_deg) < 0.01f && fabsf(r.pos[2] + 2.f) < 1e-6f && r.off_deg < 0.01f,
+              "aim row: a planned speaker's row is its plan, not where the survey found it");
+        AL.speakers[0].has_plan = 0;
         /* with a model the loss columns are the model's at that error */
         AL.dir.nband = 2; AL.dir.nang = 2;
         AL.dir.band_hz[0] = 1000.f; AL.dir.band_hz[1] = 10000.f;

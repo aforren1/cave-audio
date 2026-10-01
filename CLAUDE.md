@@ -90,7 +90,12 @@ src/
                          finished asset and gains no new branch. The loader BLOCKS on an os_event
                          (signalled after every job push and at stop) rather than sleep-polling, so
                          idle costs zero wakeups. [assets]
-    layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
+    layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4] Plus the
+                         PLAN: optional per-speaker plan_position / plan_aim, tools only, engine-ignored,
+                         read through layout_plan_pos / layout_plan_aim (which fall back to the as-built).
+                         layout_json_keep_plan is the one rule every measuring writer calls before it
+                         overwrites position/aim: record once, never overwrite. Live aiming and the aiming
+                         sheet read the plan; the engine renders `position`. [plan]
     stream.h / stream.c  background file streaming for long sounds (music / ambience), so
                          they never decode the whole file into RAM: a streaming thread fills
                          a per-stream SPSC ring from disk. [streaming]
@@ -125,6 +130,14 @@ src/
     sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
                          interleaved. Moved out of asio_sink.cpp so every backend shares one set of
                          clamp + NaN rules. [backends]
+    sink_tsbase.h        which clock a driver-supplied host stamp is on (ASIO's systemTime is documented as
+                         timeGetTime: 1 ms coarse, 27 ms off QPC on the dev box), and the block-stamp rule:
+                         the driver's stamp ONLY when its own stamps classify it as QPC, else QPC at callback
+                         entry less the dispatch floor last measured on a QPC stamp; never backward or equal
+                         (previous + one block); a timeGetTime stamp is NOT mapped through its offset (known
+                         only to the tick). Header-only, pure; shared by asio_sink.cpp and the ZM-1 capture
+                         shell, tested offline in test_audio_sink. bwa_sink_health (internal) carries
+                         stamp_base / stamp_offset_ns for ASIO.
     sink_quant.h/.c      the FIXED-QUANTUM adapter. render() must always see the engine block, but no
                          device API past ASIO promises a fixed callback size, so this renders whole
                          blocks into a ring of block-sized SLOTS (the stride render() already wants,
@@ -285,7 +298,11 @@ src/
                          natnet_resolve_name uses the same walk below 4.1: it used to assume the size
                          field from 4.0 and so never resolved a name on a Motive 3.0 (NatNet 4.0)
                          stream. [survey]
-    survey.h / survey.c  the optical speaker survey's math: aim = the normal of the best-fit plane through a
+    survey.h / survey.c  (survey_fit_depth: the baffle-to-acoustic-center depth as a FOURTH unknown of a frame
+                         refit over the speakers --localize MEASURED, layout = R (optical - depth aim) + t; a plain
+                         rigid fit absorbs a push along the aims into its translation, so a 60 mm depth read back
+                         as 14 to 61 mm. bwa_speaker_survey prints the suggested --baffle-offset-m from it.
+                         Layout positions are ACOUSTIC CENTERS, decided 2026-10-02.) The optical speaker survey's math: aim = the normal of the best-fit plane through a
                          body's markers (stuck flat on the baffle; sign toward the listening point, so
                          Motive's orientation convention is moot; flatness + colinearity rejection, or a
                          configured body axis), pose averaging, a Horn frame fit + a mirrored twin fit,
@@ -311,7 +328,14 @@ src/
                          capsule's parabola-fitted |IR| peak; calib_measure_zylia_rows is the one helper
                          that writes the refined arrivals back into each MeasureResult), and
                          calib_capture.cpp's calib_stage_signal is the engine's own align stage applied to
-                         one channel, which is what --verify plays. `bwa_calibrate --zylia` names the MIC;
+                         one channel, which is what --verify plays. calib_capture.cpp's calib_measure_speaker is
+                         THE one-speaker capture + measurement for the trims and --verify (omni, or the ZM-1's
+                         19 rows -> calib_measure_zylia_rows -> zylia_pressure_proxy); bwa_calibrate and
+                         calib_view's Capture tab both call it. The tab runs trims AND verify with either mic,
+                         installs the capsule table a ZM-1 run needs (its own room-axes survey, or the
+                         Placement panel's by mic_track's rules) and restores the previous one afterwards.
+                         `calib_view --tests` runs bwa_calibrate (BWA_CALIBRATE_EXE, set by CMake) on the same
+                         simulated room and requires identical trims. `bwa_calibrate --zylia` names the MIC;
                          --trims / --verify pick the mode (bare --zylia is still the position survey). The
                          trims align delays AT THE MIC and the engine assumes the listening point, so the
                          trim run warns when the mic is more than 5 cm from Layout.ref. [calib]
@@ -332,15 +356,61 @@ src/
                          and screen are opt-in (CalibSimOpts); turned on globally they would shift every
                          pinned simulated figure, and its static scratch makes the Capture and Aim tabs
                          mutually exclusive. [live aiming]
+    zylia (bootstrap)    THE CAPSULE SURVEY BOOTSTRAP (no tape measure, no prior orientation): `bwa_calibrate
+                         --localize rows --zylia [--track]` ranges each speaker from the pooled CENTER arrival
+                         (rotation-invariant, so no survey needed); then `--capsule-survey out.json --zylia`
+                         sweeps those speakers from one placement into zylia_survey, and solves the ACOUSTIC
+                         array center by trilaterating the center arrivals against the speaker positions
+                         (zylia_survey's own origin is NOT a measurement, see Traps); tracked, it writes a
+                         BODY-FRAME survey with offset = offset_in_use + R^T (center_acoustic - center_tracked).
+                         Then leave-one-out on the final solve (zylia_survey_loo): a flag refuses with exit 6
+                         (calibrate uses 1-4 and bwa_validate 5; the Session tab reads every tool's codes through
+                         one table), naming the speaker and a --speakers list without it; --drop-outliers drops
+                         the worst one, re-solves EVERYTHING (table, center, latency), re-checks, and stops on a
+                         second flag. A RANGE CHECK beside it scores each speaker's range residual from the
+                         acoustic center against the MEDIAN residual (flag over 10 mm, CSURVEY_RANGE_FLAG_MM),
+                         refuses with the same exit 6 and joins the one-drop rule.
+                         `--ref-speakers <list>` (live aiming and the --zylia survey; the capsule survey refuses
+                         it) takes the system latency from 3+ speakers' MEASURED positions: each one's center
+                         arrival minus |position - center|/c, the MEDIAN used, one more than 0.1 ms off FLAGGED
+                         (a different Dante latency setting, or a wrong position), no majority = exit 6.
+                         --sim-speaker-latency spk,ms is its simulated outlier. `--ref` outside the two modes
+                         that read it is refused (it used to be ignored silently).
+                         calib_sim_zm1_* (calib_capture) is the simulated physical ZM-1, turned in its mount.
+                         The tracked CLICKER (examples/clicker_track.*, calib_view's Zylia tab) makes clap
+                         positions measured: a second thread-free NatNet session on the same multicast port
+                         (SO_REUSEADDR; unicast would break it), clap = mean tip over the 300 ms ending 50 ms
+                         before the onset, refused unless still within 4 mm. The tab saves a body-frame survey
+                         when every clap was against the tracked stand, and Load re-aims one at the live pose.
     zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
                          validation-grade estimators — active-intensity DOA, capsule integrity,
                          SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
                          copies cost in timbre, the measurable side of SPCAP focus). [calib]
     placement.h/.c       the tracked ZM-1's placement math: center = p + R(q).offset, the gate (still within
                          clamp(tol/4, 0.5..2 mm) over 0.5 s, within tolerance on the MEAN, held 1 s), the bump check
-                         (half the tolerance), mount yaw/tilt, and place_ring_fit (plane + algebraic circle through a
+                         (half the tolerance), the ORIENTATION half for the direction modes (the --zylia survey,
+                         the live position readout, bwa_validate: place_turn_deg, place_turn_limit_deg =
+                         atan(tol/2/range) floored at 0.3 deg for Motive's single-frame jitter and capped at 5,
+                         the gate's window turn spread, place_bump_pose's MOVED|TURNED mask; limit 0 = center
+                         only; a turn about the array center moves no center, so only this sees it), mount
+                         yaw/tilt, and place_ring_fit (plane + algebraic circle through a
                          marker ring: the offset for --mount-offset ring, because Motive's centroid pivot sits off an
-                         UNEVEN ring's axis). Pure, sane.h-guarded, test_placement. [placement]
+                         UNEVEN ring's axis), and place_move_words (an error as the installer's move in
+                         room words, room-right is -x, 5 mm box / 1 mm stand dead band; the Placement panel
+                         and live aiming share it). Pure, sane.h-guarded, test_placement. [placement]
+    (sweep quality)      EVERY calibration sweep passes calib_measure_speaker's quality loop: an EXPECTED-
+                         ARRIVAL WINDOW (calib_arrival_window: latency + distance/c with per-mode margins, 0.10 m
+                         after a survey placed the speaker, 0.50 m before; the peak is searched only inside it and
+                         a stronger tap outside flags the capture), the IR SNR against a POSITIVE-lag floor
+                         (measure_noise_floor: before the window and after the tail, never the negative lags where
+                         the sweep's harmonics sit; 40 dB, provisional), a re-sweep on either, and for the trims and
+                         verify TWO AGREEING SWEEPS (1 sample, 0.2 dB). Live aiming's peak hold takes only clean
+                         readings that two in a row agree on. bwa_validate holds every cell against one silent
+                         capture per placement (VALID_BG_MIN_DB 20). --sim-interferer is the simulator's truth.
+                         The CLAP path is ARM, THEN ACCEPT (the first transient in a 2 s armed window; the clicker
+                         arms on stillness and must leave 5 cm after a taken window), then DIRECTION from 6 claps
+                         (DOA within 10 deg of a provisional survey that leaves out its own outliers), then
+                         zylia_survey_loo on Solve (held-out misfit > max(3 us, 5 x the rest's residual), Drop).
     valid.h / valid.c    phantom-localization validation: render a source, measure where the array
                          actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
                          contrasts). The PHANTOM arm renders through a REAL ENGINE CORE (a cached
@@ -351,7 +421,12 @@ src/
                          propagates those feeds to the 19 capsules. The PHYSICAL REFERENCE arm (drive
                          one speaker alone = a real source, so a phantom miss reads against a floor --
                          also the comb-depth floor) deliberately does NOT: no panner, no knob, no
-                         engine state. valid_speaker_feeds_direct is the pre-engine builder, kept as
+                         engine state. It IS captured like a phantom on both backends
+                         (valid_reference_feeds -> the session's CaptureFn -> valid_score_reference;
+                         simulate's device is valid_propagate_feeds over the same feed buffer and
+                         window the rig plays). Until 2026-10-01 the tool scored it OFFLINE even on
+                         the rig, so the "floor" was the model's; valid_reference_cell, the exact
+                         offline field, now survives only as the ctest baseline. valid_speaker_feeds_direct is the pre-engine builder, kept as
                          the regression baseline the ctest pins the engine render against. Also
                          stimulus selection (broadband or a tone, analysis band follows). Drives
                          bwa_validate. [validation]
@@ -523,9 +598,19 @@ examples/              mic_track.h/.cpp: the tracked ZM-1 shared by bwa_calibrat
                        calib_view's Placement panel: NatNet open (gated on NN_STATUS_LIVE), the offset source
                        (body-frame survey, --mount-offset x,y,z, ring, or 0), capsule re-aim, the scripted
                        --track-sim stand (its truth from its own quaternion code, never placement.c), and the
-                       console gate/bump loop. Only DIRECTION modes (the --zylia survey, the live position
+                       console gate/bump loop. --track-sim-twist N turns the scripted stand 2 deg about the
+                       array center (no center moves); calib_view's poller runs a center gate and a direction
+                       gate on the same poses, and only the Aim tab's position readout uses the second. Only DIRECTION modes (the --zylia survey, the live position
                        readout, bwa_validate) need a body-frame survey: the pressure proxy and
                        zylia_center_arrival do not change when the array rotates.
+                       calib_session.h/.cpp: the Session tab's model and runner (calib_view's FIRST tab): rig
+                       day Stage 2 as subprocesses of the tested tools (frame -> localize -> capsules -> [aim in
+                       the Aim tab] -> trims -> verify -> grid -> validate) in one session folder; each step
+                       writes a NEW file (as_built.json, capsules.json, trims.json, grid.json) and the plan is
+                       never written. session.json records each step's consumed and produced files with the
+                       producer's run number and an FNV-1a hash, which is what makes a later step stale or
+                       blocked; one session.log. bwa_calibrate --sim-truth and bwa_speaker_survey
+                       --require-frame exist for it. Its UI tests are their own ctest, calib_view_session.
                        speaker_survey.c = bwa_speaker_survey: the camera-visible speakers' rigid bodies
                        (named spk<N>) -> aim, position, and whether Motive's frame IS the layout's room
                        frame (--write copies aims into a layout copy; --simulate is the rehearsal and the
@@ -598,32 +683,33 @@ engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manyl
 release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
 phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
 everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
-tree registers 68 on Windows at full options and 47 off it, and each job's bindings tree registers
+tree registers 81 on Windows at full options and 51 off it, and each job's bindings tree registers
 the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 68 tests with the Steam Audio SDK, 63 without (the 5 SDK-gated ones are `reflect`,
-`bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`), the six `validate_*` runs (four plus `validate_track_settle`/`_bump`), the seven calibrate CLI runs
+suite — 81 tests with the Steam Audio SDK, 76 without (the 5 SDK-gated ones are `reflect`,
+`bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the four GUI-tool suites
+(`calib_view`, `calib_view_session`, `layout_tool`, `playground`), the nine `validate_*` runs (four plus `validate_track_settle`/`_bump`/`_twist`/`_ref_capture`/`_background`), the ten calibrate CLI runs
 (`calibrate_sim_room_aim`/`_trim`, `calibrate_verify_omni`/`_zylia`, `calibrate_zylia_trims`,
-`calibrate_aim_sheet`, `calibrate_live_zylia`), the five tracked-placement runs (`calibrate_track_settle`/
-`_ring`/`_bump`/`_refuse`/`_survey`), the eight optical-survey tests (`survey` plus seven `speaker_survey_*`),
+`calibrate_aim_sheet`, `calibrate_live_zylia`, `calibrate_zylia_localize`, `calibrate_capsule_survey`,
+`calibrate_sweep_quality`), the six tracked-placement runs (`calibrate_track_settle`/
+`_ring`/`_bump`/`_refuse`/`_survey`/`_twist`) plus `calibrate_grid_rows`, the twelve optical-survey tests (`survey` plus eleven `speaker_survey_*`),
 and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux or macOS at the DEFAULT options it is 42: `calib_view`
+under their build flags. On Linux or macOS at the DEFAULT options it is 46: `calib_view`
 and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
-`validate_*` and twelve calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
-`BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 35 at the defaults: the seven
+`validate_*` and seventeen calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
+`BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 35 at the defaults: the eleven
 `speaker_survey_*` runs need a host CMake to drive them (`if(NOT CMAKE_CROSSCOMPILING)`), so only
 `survey` comes along. Those two GUI tools are NOT Windows-bound (raylib + rlImGui +
 imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
-back, for 49 with phonon and 44 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
+back, for 53 with phonon and 48 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
 survey's eight). They need a DISPLAY:
 a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs its 35
 through `tools/android/run-tests.ps1` rather
 than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
 too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
-`lib/android-arm64` + `lib/android-x64`), so the count there is **47** on Linux and macOS and
+`lib/android-arm64` + `lib/android-x64`), so the count there is **51** on Linux and macOS and
 **40** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
 the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
@@ -632,8 +718,8 @@ sleep-lateness bound, which a no-SDK library of the same commit misses identical
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
-`python_example_live_onset`), so the full-options Windows tree is 72 and the default Windows tree
-51; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
+`python_example_live_onset`), so the full-options Windows tree is 85 and the default Windows tree
+55; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
 example"), so a change to the stimulus is a change to five files plus the web page.
@@ -649,8 +735,8 @@ after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
-78 (68 + 10) and 82 at full options (82 registered, 2026-09-30); a Linux or macOS box with Octave
-alone reaches 52 (47 + 5) and with both 57 (47 + 10). Each suite exits 77
+91 (81 + 10) and 95 at full options (95 registered, 2026-10-02); a Linux or macOS box with Octave
+alone reaches 56 (51 + 5) and with both 61 (51 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
@@ -659,7 +745,7 @@ into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's
 engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
-that is the 51 the linux and macos jobs report, and on Windows 72 registered with 69 run (the three
+that is the 55 the linux and macos jobs report, and on Windows 85 registered with 81 run (the four
 GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is
@@ -1008,6 +1094,95 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   thing under test was caught. The `calibrate_track_*` settle and ring runs widen the tolerance so the
   truth assertion is what fires. Related: a CMake `function()` that calls `run()` must re-export
   `${name}_OUT` with `PARENT_SCOPE`, or the caller's `expect` silently matches an empty string.
+- **A cross-check between two tools that share the code under test cannot catch a break in that
+  code.** The Capture tab's ZM-1 trims match `bwa_calibrate`'s bit for bit even with the pooling
+  broken (one capsule instead of the proxy), because both call `calib_measure_speaker`. The match
+  catches GUI wiring (wrong mic, room, c, capsule table); the comparison against the simulator's own
+  truth (`calib_sim_sensitivity`, geometry) is what catches the shared DSP. Likewise the capsule
+  cross-correlation refine is invisible to trims and verify (whole-sample delays, 19 biases
+  averaged), so "break the refine" cannot go red there; the `zylia` ctest pins it through the DOA.
+- **An arm computed offline is indistinguishable from a captured one in simulate.** `bwa_validate`'s
+  physical reference arm was scored from the model even on the rig, and every simulate test stayed
+  green, because in simulate both land on the model. Discriminate on what ONLY the capture path
+  carries: an injected capsule fault (the reference rows were bit-identical with and without
+  `--inject-fault`), the counted captures, the bump hook. `validate_ref_capture` pins all three.
+- **A rigid fit absorbs a systematic offset along the point normals.** Reading the speakers' baffle
+  depth as (optical - acoustic) . aim AFTER a frame fit gave 14 to 61 mm for a true 60 mm, and the
+  lopsided subsets then failed the frame check on the depth alone. Solve such an offset INSIDE the
+  fit (`survey_fit_depth`), never after it. Also: the localize latency warning is mic-aware
+  (`calib_latency_check`): the ZM-1's Dante Via path is tens of ms, so its bound IS
+  `CALIB_WIN_LAT_DRIVER_S` (150 ms), the same allowance the sweep window uses.
+- **A layout writer finds a speaker by its `index`, never by array position.** The loader accepts
+  records in any order and files record k at `L.speakers[index]`, but four `calib_write_*` functions
+  wrote measurement i into ARRAY element i, so a reordered file got speaker 0's trim and position on
+  another speaker (found 2026-10-01; `spk_by_index` in calib.c, pinned by calib_test's reorder case).
+  Related: a writer that overwrites `position` or `aim` calls `layout_json_keep_plan` first, or the
+  installer's intent is gone on the first survey; and a failed solve keeps the old value rather than
+  writing a confident (0,0,0).
+- **A center read from `zylia_survey`'s origin is the center you gave it.** The survey subtracts each
+  observation's mean arrival, so a translation of the whole capsule cloud is a gauge it fixes at the
+  source frame's origin, and its sphere-fit center lands exactly on the point the positions were given
+  from. "Acoustic offset = R^T (survey center - p)" therefore returns the offset the run was handed
+  (a break returned (0.0200 -0.1100 0.0400) to the digit). The position is in the MEANS it throws away:
+  the center arrivals, trilaterated against the speakers (`capsule_survey` in calibrate.cpp).
+- **A survey's residual is a weak detector of clap-position errors.** Claps 11.6 cm off (a clicker tip
+  offset left at 0) raised the residual from 0.035 us to only 3.2 us while the capsules moved 3.2 mm:
+  most of the error is absorbed into the geometry. Treat a few microseconds as a warning, not a pass.
+- **A linear trilateration loses the latency on a dome.** `calib_trilaterate` subtracts each range from
+  the first, so with every speaker at about one distance from the point (a dome around the listening
+  point) the latency column is noise: 2 m out on 3.5 mm of position error in calib_test, while the
+  geometry itself pins it to dilution x the range error (2.75 there). The capsule survey refines with
+  `calib_trilaterate_refine` and prints `calib_latency_dilution`, and with `--latency` (the Session tab
+  passes localize's, whose moving mic rows pin it) it solves only the center
+  (`calib_locate_known_latency`). `--localize` itself still uses the linear solve alone.
+- **A test that depends on an earlier test's in-memory state passes vacuously when run alone**
+  (`session/resume` returned early under `--tests resume`), and an exit code shared by two failures
+  hides one of them (`speaker_survey_mirror`'s exit 3 came from the write refusal, so
+  `--require-frame` needed its own pin). Each test sets up what it needs.
+- **CMake `string(REGEX REPLACE "^0+...")` re-anchors `^` after each match:** `0505` -> `55`. It sat in
+  three test converters and read 1.0505 m as 1.0055. `math(EXPR)` reads leading zeros as decimal, so
+  never strip them.
+- **An IR SNR does not bound a level error, and two agreeing sweeps do not catch a steady one.** A
+  250 ms burst at the sweep's level moved one sweep's level 3.4 dB while its IR SNR stayed 47 dB (the
+  level averages |H| over every bin; the IR peak gathers the whole sweep). The two-sweep agreement is
+  what catches that, and an identical disturbance in both sweeps (steady background) passes agreement:
+  there the floor check is the only defense, and it is weak on level.
+- **A provisional fit used as a gate must exclude its own outliers.** A slipped clap interferer among
+  the first 6 bent the provisional capsule table enough to refuse 2 good clicks; leaving out the
+  leave-one-out flags fixed it. Corollary on the survey residual: a FAR interferer does raise it
+  (23 us at 59 deg); it is small position errors it hides.
+- **A clipped ImGui item cannot be found by label.** The test engine records an item only when
+  `ItemAdd` succeeds, so a button scrolled below the visible area is "Unable to locate item". Two
+  status lines above the Zylia tab's Solve broke `clicker_survey`; scroll first (`zy_reach`).
+- **Leave-one-out is blind ALONG the line of sight.** A speaker 40 mm out radially held out at 0.02 us
+  against the 3 us floor, yet bent the acoustic center 4.8 mm; a box with a different Dante latency is
+  the same (it delays every capsule alike). The range check catches both, and it compares against the
+  MEDIAN residual: against zero, a `--latency` 20 mm off flagged all 14 clean speakers.
+- **A simulator must not be timed against a clock its consumer reads separately.** The tracked-clicker
+  sim fired a click at one wall-clock reading and started the next walk there, a free-running pose
+  thread kept writing that walk, and the arm judged the click at a LATER reading in the same frame:
+  under load 25-60 ms of preemption fit between the reads and still clicks were refused as moving
+  (14 of 18 runs under heavy load). Fixed with a virtual clock (`clicker_now`) the UI steps once per
+  frame, writing poses up to the new time before the script may fire at it, capped so a stalled frame
+  slows the script instead of skipping it. Rule: what a simulated event's consumer reads must be
+  complete up to the event's time and frozen while the frame judges it. The rig-side cousin is
+  closed: the ZM-1 capture callback stamps each snapshot's onset on `os_monotonic_ns` (the clock
+  `clicker_clock_s` now calls), from the trigger's sample in its block and the block's switch time,
+  and the tab judges the arm and the take at that stamp. The simulated tab notices each scripted clap
+  80 ms past its post-roll on purpose (`ZY_SIM_HITCH_S`); `clicker_late_notice_estimate` shows the old
+  estimate losing every click there.
+- **An ASIO `systemTime` is not on QPC unless the stamps say so.** The SDK documents it as
+  timeGetTime-derived (1 ms resolution; 27 ms off QPC on the development box), and the ENGINE's ASIO
+  sink passed it straight through as `system_time_ns` until 2026-10-02, against `bw_audio.h`'s promise
+  that `bwa_get_clock`'s host time is on `bwa_host_time_ns` (QPC): every pair tens of ms off and a 1 ms
+  sawtooth into the drift fit. `src/sink/sink_tsbase.h` classifies the base per block (the smallest
+  QPC - systemTime over ~2 s inside [-0.5, +5] ms means QPC) for both the sink and `zylia_capture`,
+  and uses the stamp only then, else the QPC read at callback entry.
+- **A dropped observation must leave EVERY solve that used it.** With a capsule-survey speaker dropped
+  from the table but left in the center's trilateration, the table stayed within 14 um of the truth
+  while the center moved 4.9 mm, and only the center check saw it. Corollary: leave-one-out sees a
+  position error mostly ACROSS the line of sight (an 80 mm move cleared the 3 us floor only because
+  70 mm of it was lateral); an error along it shows in the per-speaker range residual instead.
 - **A handedness check on coplanar points is blind.** Three points, or any set on one plane, fit a
   mirror exactly as well as the truth (reflect across their own plane). `survey.c` therefore lets
   positions decide handedness only when the mirrored fit is clearly worse, falls back to the aims,

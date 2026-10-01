@@ -165,13 +165,16 @@ leaves the tail `speakers[]` entries unused (harmless: `count` gates every consu
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */
 
 typedef struct {
-    float    pos[3];               /* room space, right-handed, meters */
+    float    pos[3];               /* room space, right-handed, meters (the as-built) */
+    float    aim[3];               /* unit acoustic axis (`aim`, else toward ref) */
     float    gain_lin;             /* per-speaker level trim (linear) */
     uint32_t delay_samples;        /* per-speaker arrival-time alignment */
     uint16_t eq_len;               /* correction-FIR length (0 = none) */
     float    eq[BWA_EQ_TAPS];       /* 512 taps max; minimum-phase speaker correction */
     uint8_t  room_eq_count;        /* LF modal cuts (static-listener installs only) */
     RoomEqSection room_eq[BWA_ROOM_EQ_MAX];   /* 8 sections max */
+    uint8_t  has_plan;             /* the record carries plan_position (tools only; the engine never reads these) */
+    float    plan_pos[3], plan_aim[3];   /* read through layout_plan_pos / layout_plan_aim */
 } Speaker;
 
 typedef struct {

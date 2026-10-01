@@ -1064,21 +1064,46 @@ if(BWA_BUILD_TESTS)
   set(_dome "${CMAKE_SOURCE_DIR}/examples/dome_24.json")
   set(_inj "@@--simulate@@--sim-yaw@@2@@--sim-offset@@0.05,0,0@@--sim-aim-error@@3@@--sim-noise-mm@@0.1@@--baffle-offset-m@@0.08")
   bwa_survey_test(speaker_survey_sim 0 "${_dome}${_inj}@@--write@@speaker_survey_out.json@@--fields@@aim,position"
-    "summary: matched 4, accepted 4, aims 4, rotation (1\\.9[89]|2\\.0[0-2]) deg, translation (49|50)\\.[0-9] mm, rms 0\\.[0-9] mm, handedness OK, simulate PASS, wrote 4 aims, 4 positions \\(reload OK\\)@@speaker  0  position +[0-9.]+ mm  aim +(2\\.9[0-9]|3\\.0[0-9]) deg@@\"Speaker_6\" \\(id 102\\) -> speaker 6@@\"spkr0\" \\(id 8\\): ignored, not spk<N>@@frame is OFF the room frame by (1\\.9[89]|2\\.0[0-2]) deg")
+    "summary: matched 4, accepted 4, aims 4, rotation (1\\.9[89]|2\\.0[0-2]) deg, translation (49|50)\\.[0-9] mm, rms 0\\.[0-9] mm, handedness OK, simulate PASS, wrote 4 aims, 4 positions \\(reload OK\\), plan 4 new 0 kept@@speaker  0  position +[0-9.]+ mm  aim +(2\\.9[0-9]|3\\.0[0-9]) deg@@\"Speaker_6\" \\(id 102\\) -> speaker 6@@\"spkr0\" \\(id 8\\): ignored, not spk<N>@@frame is OFF the room frame by (1\\.9[89]|2\\.0[0-2]) deg")
   set_tests_properties(speaker_survey_sim PROPERTIES FIXTURES_SETUP survey_out)
-  bwa_survey_test(speaker_survey_rerun 0 "speaker_survey_out.json@@--simulate"
-    "\\(layout aim explicit\\)@@frame agrees with the room frame@@handedness OK, simulate PASS")
+  # --require-frame turns the verdict into the exit code (the Session tab reads only that): an agreeing
+  # frame passes here, and the three-speaker mirror below exits 3 for the MIRROR alone (it writes nothing,
+  # so no write refusal can supply the 3)
+  bwa_survey_test(speaker_survey_rerun 0 "speaker_survey_out.json@@--simulate@@--require-frame"
+    "\\(layout aim explicit\\)@@frame agrees with the room frame@@handedness OK, simulate PASS, frame check PASS")
   set_tests_properties(speaker_survey_rerun PROPERTIES FIXTURES_REQUIRED survey_out)
+  # a SECOND survey over the first one's output: the plan the first one recorded ("plan 4 new" above)
+  # stays put, so this one records none and keeps four
+  bwa_survey_test(speaker_survey_replan 0 "speaker_survey_out.json@@--simulate@@--write@@speaker_survey_replan_out.json"
+    "wrote 4 aims, 0 positions \\(reload OK\\), plan 0 new 4 kept")
+  set_tests_properties(speaker_survey_replan PROPERTIES FIXTURES_REQUIRED survey_out)
   bwa_survey_test(speaker_survey_mirror 3 "${_dome}${_inj}@@--sim-mirror@@--write@@speaker_survey_mirror_out.json"
     "handedness   MIRRORED \\(decided by positions\\)@@handedness MIRRORED, simulate PASS, write refused")
-  bwa_survey_test(speaker_survey_three 0 "${_dome}${_inj}@@--sim-mirror@@--sim-speakers@@2,8,14"
-    "handedness   MIRRORED \\(decided by aims\\)@@matched 3, accepted 3, aims 3")
+  bwa_survey_test(speaker_survey_three 3 "${_dome}${_inj}@@--sim-mirror@@--sim-speakers@@2,8,14@@--require-frame"
+    "handedness   MIRRORED \\(decided by aims\\)@@matched 3, accepted 3, aims 3@@simulate PASS, frame check FAIL \\(mirrored\\)")
   bwa_survey_test(speaker_survey_natnet31 0 "${_dome}${_inj}@@--sim-natnet@@3.1"
     "\\(NatNet 3\\.1\\)@@model: 6 rigid bodies described, every description read@@handedness OK, simulate PASS")
   bwa_survey_test(speaker_survey_map 0 "${_dome}${_inj}@@--sim-natnet@@4.2@@--map@@SPK00=0@@--map@@nobody=3"
     "-> speaker 0 \\(--map\\)@@--map nobody=3: no rigid body has that name@@handedness OK, simulate PASS")
   bwa_survey_test(speaker_survey_pair 0 "${_dome}${_inj}@@--sim-speakers@@3,9"
     "two speakers: their optical distance differs from the layout's by -?0\\.[0-9] mm@@no frame fit, simulate PASS")
+  # The baffle depth on an AS-BUILT layout (test/survey_depth_layout.json: speakers 0-3 measured, 4 has
+  # no plan_position, 5 one equal to its position). The sim builds every baffle 60 mm in front of the
+  # acoustic center and the tool is told nothing (--baffle-offset-m 0). The injected frame is small but
+  # NOT zero (0.45 deg, 9 mm down, inside the frame check's tolerance), so a depth read before the frame
+  # fit misses: its median by 1.8 mm, its per-speaker spread by 17 mm (the spread and across-the-aim
+  # regexes hold both under 1 mm). The plain frame fit also fails here on the depth alone, which is why
+  # the depth is a fit unknown. The tool's own check holds the depth to the injected one within 1.45 mm.
+  set(_dep "${CMAKE_SOURCE_DIR}/test/survey_depth_layout.json@@--simulate@@--sim-speakers@@0,1,2,3,4,5@@--sim-depth-m@@0.06@@--sim-noise-mm@@0.1")
+  bwa_survey_test(speaker_survey_depth 0 "${_dep}@@--sim-yaw@@0.45@@--sim-offset@@0,-0.009,0"
+    "speaker  4  skipped, no plan_position@@speaker  5  skipped, its position equals its plan_position@@median \\+(59\\.[5-9]|60\\.[0-4]) mm over 4 speakers, spread 0\\.[0-9] mm \\([^)]*\\), across the aim 0\\.[0-9] mm at worst@@suggested --baffle-offset-m 0\\.(059[5-9]|060[0-4])@@baffle depth 60\\.[0-9]+ mm, injected 60\\.00@@simulate PASS, baffle depth \\+(59\\.[5-9]|60\\.[0-4]) mm over 4")
+  # --baffle-offset-m given: the report is the RESIDUAL beyond it, and with 50 of the 60 mm applied the
+  # plain frame check passes
+  bwa_survey_test(speaker_survey_depth_residual 0 "${_dep}@@--baffle-offset-m@@0.05@@--require-frame"
+    "RESIDUAL beyond --baffle-offset-m 0\\.0500: the depth itself is \\+(59\\.[5-9]|60\\.[0-4]) mm@@suggested --baffle-offset-m 0\\.(059[5-9]|060[0-4])@@frame check PASS, baffle depth residual \\+(9\\.[5-9]|10\\.[0-4]) mm over 4")
+  # an unaligned frame (2 deg, 5 cm): the depth refuses, and the tool's check fails a depth read through it
+  bwa_survey_test(speaker_survey_depth_gate 0 "${_dep}@@--sim-yaw@@2@@--sim-offset@@0.05,0,0"
+    "not measured: with the depth solved, Motive's frame is still off the room frame by (1\\.9[89]|2\\.0[0-2]) deg@@simulate PASS, baffle depth not measured")
   endif()
 
   add_executable(test_ambi test/ambi_test.c)
@@ -1413,12 +1438,16 @@ if(BWA_BUILD_CALIBVIEW)
   # between them (they'd otherwise tear each other down).
   target_sources(bwa_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
                                        examples/asio_session.cpp
-                                       examples/mic_track.cpp)   # the Placement panel's tracked ZM-1
+                                       examples/mic_track.cpp    # the Placement panel's tracked ZM-1
+                                       examples/clicker_track.cpp    # the capsule survey's tracked clicker
+                                       examples/calib_session.cpp)   # the Session tab: the rig-day steps as subprocesses
   if(BWA_WITH_ASIO)
     bwa_add_asio_host(bwa_calib_view)
   endif()
   if(BWA_BUILD_TESTS)
-    add_test(NAME calib_view COMMAND bwa_calib_view --tests)      # the GUI itself, driven by fake inputs
+    # the GUI itself, driven by fake inputs. The Session tab's suite runs whole simulated sessions through
+    # the CLI tools, so it is its own test (calib_view_session, with bwa_calibrate below) and kept out of this one.
+    add_test(NAME calib_view COMMAND bwa_calib_view --tests tests,-session)
   endif()
 endif()
 
@@ -1471,7 +1500,12 @@ if(BWA_BUILD_CALIBRATE)
     # ...and the placement itself, as bwa_calibrate --track has it (test/validate_cli_test.cmake): the
     # gate waits and every cell is scored from the MEASURED center, checked against the scripted stand's
     # truth and the CSV; a bump mid-placement exits 4, drops that placement and keeps the one before.
-    foreach(_bwa_vcli track_settle track_bump)
+    # track_twist turns the stand about the array center (no center moves) and requires the session to
+    # stop on the TURN, since it reads directions. ref_capture pins that the physical reference arm is
+    # CAPTURED like the phantoms, never computed offline: on the rig an offline reference would put the
+    # model's number under every contrast.
+    # background: one silent capture per placement, every cell held against it (--sim-background).
+    foreach(_bwa_vcli track_settle track_bump track_twist ref_capture background)
       add_test(NAME validate_${_bwa_vcli}
                COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_validate> -DMODE=${_bwa_vcli}
                        -DWORK=${CMAKE_BINARY_DIR}/validate_cli_${_bwa_vcli}
@@ -1519,7 +1553,8 @@ if(BWA_BUILD_CALIBRATE)
     # by --sweeps / --sim-aim-steps). Multi-step, so each drives bwa_calibrate from a CMake script
     # that checks exit codes and the report; scratch lands in calib_cli_<mode>/ in the build tree.
     # --track (the tracked ZM-1 stand, simulated by --track-sim): a settled placement with a flag offset,
-    # the marker-ring offset, a bump mid-run, the refusals, and a body-frame survey. The survey fixture
+    # the marker-ring offset, a bump mid-run, the refusals, a body-frame survey, and a twist about the
+    # array center that stops the direction modes and not the center-only ones. The survey fixture
     # is a ZM-1-shaped table (a 49 mm dodecahedron minus its nadir vertex) in the stand's body frame,
     # with a probed offset, written HERE in the build tree like the layout above.
     file(WRITE "${CMAKE_BINARY_DIR}/calib_cli_track_survey_fixture.json"
@@ -1532,14 +1567,32 @@ if(BWA_BUILD_CALIBRATE)
          "  [0.023463,-0.016333,-0.039796],[-0.011957,-0.016333,0.044623],[0.044623,-0.016333,-0.011957],\n"
          "  [0.022733,-0.016333,0.040217],[-0.004116,-0.036522,-0.032406],[-0.026007,-0.036522,0.019768],\n"
          "  [0.030123,-0.036522,0.012638] ] }\n")
+    # grid_rows: --room-eq-grid rows.txt stepped through on the tracked stand, one grid written, keyed at the
+    # measured centers, plus the capacity, spacing and bump refusals. zylia_localize: --localize with the
+    # ZM-1's center arrival on a turned stand. capsule_survey: the capsule table swept from the speakers,
+    # tracked (body frame, acoustic mount offset) and untracked (room axes), plus its refusals.
     foreach(_bwa_cli verify_omni verify_zylia zylia_trims aim_sheet live_zylia
-                     track_settle track_ring track_bump track_refuse track_survey)
+                     track_settle track_ring track_bump track_refuse track_survey track_twist grid_rows
+                     zylia_localize capsule_survey sweep_quality)
       add_test(NAME calibrate_${_bwa_cli}
                COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DMODE=${_bwa_cli}
                        -DLAYOUT=${CMAKE_BINARY_DIR}/calib_sim_room_layout.json
                        -DWORK=${CMAKE_BINARY_DIR}/calib_cli_${_bwa_cli}
                        -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
     endforeach()
+    # calib_view's capture/zylia_matches_cli runs this tool on the setup the Capture tab just ran and
+    # requires the same trims, so the tab and the CLI cannot drift. Without it that test says it did not run.
+    if(TARGET bwa_calib_view)
+      set_property(TEST calib_view APPEND PROPERTY ENVIRONMENT "BWA_CALIBRATE_EXE=$<TARGET_FILE:bwa_calibrate>")
+      # The Session tab end to end: a whole simulated rig day (frame check, localize, capsule survey, live aiming,
+      # trims, verify, grid, validate) through the tools as subprocesses, the resume, and a failure that blocks
+      # what comes after it. The tools come from the build, never from PATH.
+      add_test(NAME calib_view_session COMMAND bwa_calib_view --tests session)
+      set_property(TEST calib_view_session APPEND PROPERTY ENVIRONMENT
+                   "BWA_CALIBRATE_EXE=$<TARGET_FILE:bwa_calibrate>"
+                   "BWA_VALIDATE_EXE=$<TARGET_FILE:bwa_validate>"
+                   "BWA_SPEAKER_SURVEY_EXE=$<TARGET_FILE:bwa_speaker_survey>")
+    endif()
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

@@ -15,13 +15,17 @@
  * direction for free.
  *
  *   for each microphone placement (you move the ZM-1, the tool waits):
+ *       for each speaker:  drive it alone -> capture -> score     (the physical reference arm)
  *       check the capsules once, report anything faulty, exclude it for the rest of the placement
+ *       for each condition x {tracked, fixed} x speaker:    render at it -> capture -> score
  *       for each condition x {tracked, fixed} x direction:  render -> capture -> score
  *
  * ONE session loop, two capture backends. The simulated path is not a shortcut around the hardware
- * path — it is the same loop with the analytic field substituted for the device, so --simulate
- * exercises the capsule check, the exclusion threading and the reporting exactly as the rig will run
- * them. Only the ~20 lines that actually talk to ASIO go untested, which is the irreducible part.
+ * path: the session builds the SAME feed buffer for every capture, phantom or physical reference, and
+ * the backend only plays it. Simulate propagates it to the capsules (valid_propagate_feeds) where the
+ * rig plays it out the array, so --simulate exercises the feed build, the analysis window, the capsule
+ * check, the exclusion threading, the bump check and the reporting exactly as the rig will run them.
+ * Only the ~20 lines that actually talk to ASIO go untested, which is the irreducible part.
  *
  * Usage:
  *   bwa_validate --simulate                          the whole flow, no hardware
@@ -128,14 +132,19 @@ static int cell_in_cond(const ValidCell* c, const Cond* q) {
 
 typedef struct {
     const Layout* L;
-    float*        feeds;        /* scratch for the hardware path: [nspk][VAL_CAPLEN] */
+    float*        feeds;        /* the capture's feeds, both backends: [nspk][VAL_CAPLEN] */
     int           inject;       /* capsule to corrupt, or -1 — a self-check, see --inject-fault */
     unsigned int  rng;
     const float*  sim_at;       /* --track-sim: synthesize at the stand's TRUE center, not at `mic` */
+    double        sim_bg_rms;   /* --sim-background: a steady noise floor on every simulated capsule
+                                 * (linear RMS, full scale 1), the background check's truth; 0 = silent */
+    unsigned int  bg_rng;
 } CapCtx;
 
-typedef int (*CaptureFn)(CapCtx*, const Cond* q, const float solve[3], const float mic[3],
-                         const float src[3], float* cap19);
+/* Play `feeds` ([nspk][VAL_CAPLEN]) and hand back the 19 capsules' analysis window. The backend does
+ * not know which arm built the feeds, and that is the point: a physical reference and a phantom are
+ * the same capture. */
+typedef int (*CaptureFn)(CapCtx*, const float* feeds, const float mic[3], float* cap19);
 
 /* Corrupt one capsule the way a real fault does: broadband self-noise, well above the array's own
  * level, at a capsule that is otherwise fine. Total array power still looks healthy, which is the
@@ -155,25 +164,31 @@ static void inject_fault(CapCtx* ctx, float* cap19, int ch) {
     }
 }
 
-static int cap_simulate(CapCtx* ctx, const Cond* q, const float solve[3], const float mic[3],
-                        const float src[3], float* cap19) {
+/* The simulated device: the anechoic field of `feeds` at the capsules. It reads the window the rig
+ * reads, the VAL_ANALYZE frames after the VAL_SKIP head, so the head doubles as the propagation
+ * pre-roll (200 ms is 68 m of path; valid_propagate_feeds refuses anything longer). */
+static int cap_simulate(CapCtx* ctx, const float* feeds, const float mic[3], float* cap19) {
     /* The field comes from where the mic IS. Untracked that is the typed position; with --track-sim it
      * is the simulated stand's truth, so the scoring (which reads `mic`, the measured center) is
      * checked against a position it did not produce. */
     const float* at = ctx->sim_at ? ctx->sim_at : mic;
-    if (!valid_simulate(ctx->L, q->panner, &q->r, solve, at, src, VAL_FS, 343.0,
-                        cap19, VAL_ANALYZE)) return 0;
+    if (!valid_propagate_feeds(ctx->L, feeds, VAL_SKIP, VAL_ANALYZE, at, VAL_FS, 343.0, cap19))
+        return 0;
+    if (ctx->sim_bg_rms > 0.0) {                          /* uniform noise, independent per capsule */
+        const double amp = ctx->sim_bg_rms * 1.7320508;   /* uniform on [-a, a] has RMS a / sqrt 3 */
+        for (size_t i = 0; i < (size_t)ZYLIA_MICS * VAL_ANALYZE; ++i) {
+            ctx->bg_rng = ctx->bg_rng * 1664525u + 1013904223u;
+            cap19[i] += (float)(((double)(ctx->bg_rng >> 8) / 8388608.0 - 1.0) * amp);
+        }
+    }
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
 }
 
 #ifdef BWA_HAVE_ASIO
-static int cap_asio(CapCtx* ctx, const Cond* q, const float solve[3], const float mic[3],
-                    const float src[3], float* cap19) {
+static int cap_asio(CapCtx* ctx, const float* feeds, const float mic[3], float* cap19) {
     (void)mic;                                            /* the room decides what the mic hears */
-    if (!valid_speaker_feeds(ctx->L, q->panner, &q->r, solve, src, VAL_FS,
-                             ctx->feeds, VAL_CAPLEN)) return 0;
-    if (!valid_asio_capture(ctx->feeds, cap19)) return 0;
+    if (!valid_asio_capture(feeds, cap19)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
 }
@@ -258,7 +273,11 @@ static int load_positions(const char* path, float (*out)[3], char (*names)[LBL],
  * a live readout against the PLANNED position, a gate that opens once the center is within the
  * tolerance and still, and that settled center, not the plan, is the mic position every cell of the
  * placement is scored from. After every capture the bump check reads the center again: a placement
- * measured across a moved mic is wrong, so it is dropped and the session stops (exit 4).
+ * measured across a moved mic is wrong, so it is dropped and the session stops (exit 4). This tool reads
+ * DIRECTIONS, so the gate also waits for the orientation to hold still and the bump check also stops on
+ * a turn: a stand turned about the array center moves no center, and a turn of 1 deg is 1 deg of
+ * direction error. The limit is the position limit's own direction budget at the source radius
+ * (place_turn_limit_deg: 10 mm at 1.4 m is 0.41 deg).
  *
  * With --track-sim the simulated captures come from the scripted stand's TRUE center
  * (mic_track_sim_truth, its own quaternion code), not from lis[li], so a run that scored from the
@@ -270,13 +289,14 @@ typedef struct {
      * writing it would compare the measured position against itself. */
     float      planned[MAX_LIS][3];
     float      tol_m;                       /* the gate's tolerance; the bump limit is half of it */
+    float      turn_limit_deg;              /* the bump check's turn limit (place_turn_limit_deg) */
     double     timeout_s;
     int        keys;                        /* on the rig a key takes the current reading anyway */
     int        sim;                         /* --track-sim: sync the true center after every read */
     MicPlaced  placed;
     float      taken[3];                    /* the center the current placement took */
     float      sim_at[3];                   /* --track-sim: the true center the next capture comes from */
-    float      max_move;
+    float      max_move, max_turn;
     int        nchecks, nunchecked;
 } TrackCtx;
 static MicTrack g_mt;                       /* static: it carries an atomic, and main is not reentrant */
@@ -292,6 +312,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
     TrackCtx* T = (TrackCtx*)user;
     PlaceCfg cfg;
     place_cfg_default(&cfg, T->tol_m);
+    place_cfg_direction(&cfg, T->turn_limit_deg);           /* a direction mode: the orientation must hold too */
     char what[48];
     snprintf(what, sizeof what, "position %d", li + 1);
     if (mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, what, &T->placed)) {
@@ -304,7 +325,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
     /* only a key-forced reading can land here: the gate itself never opens past the tolerance */
     if (T->placed.dist_m > 0.5f)
         printf("  WARNING: half a meter from the plan - right rigid body? right frame?\n");
-    T->max_move = 0.f; T->nchecks = 0; T->nunchecked = 0;
+    T->max_move = 0.f; T->max_turn = 0.f; T->nchecks = 0; T->nunchecked = 0;
     track_sim_sync(T);
     return 1;
 }
@@ -313,28 +334,40 @@ static int track_place(void* user, int li, float mic_out[3]) {
  * printed; the session drops this placement and stops). k counts the placement's captures from 1. */
 static int track_after_capture(void* user, int li, int k) {
     TrackCtx* T = (TrackCtx*)user;
-    float moved = 0.f, now[3] = { 0.f, 0.f, 0.f };
-    const int b = mic_track_bump_console(T->mt, T->taken, T->tol_m, VAL_CAPTURE_S, &moved, now);
+    float moved = 0.f, turned = 0.f, now[3] = { 0.f, 0.f, 0.f };
+    const int b = mic_track_bump_console(T->mt, T->taken, T->placed.q, T->tol_m, T->turn_limit_deg, VAL_CAPTURE_S,
+                                         &moved, &turned, now);
     if (b < 0) { ++T->nunchecked; return 0; }
     ++T->nchecks;
     if (moved > T->max_move) T->max_move = moved;
+    if (turned > T->max_turn) T->max_turn = turned;
     track_sim_sync(T);
     if (b == 0) return 0;
-    fprintf(stderr, "\nvalidate: BUMP: the ZM-1 moved %.1f mm during placement %d, after capture %d (limit %.1f mm,\n"
-                    "          half the tolerance). Center taken (%.4f %.4f %.4f), now (%.4f %.4f %.4f). What was\n"
-                    "          measured across a moved mic is wrong, so this placement's cells are dropped and the\n"
-                    "          session stops: re-place the ZM-1 and rerun from this placement.\n",
-            moved * 1e3, li + 1, k, 0.5f * T->tol_m * 1e3f,
-            T->taken[0], T->taken[1], T->taken[2], now[0], now[1], now[2]);
+    if (b & PLACE_BUMP_MOVED) {
+        fprintf(stderr, "\nvalidate: BUMP: the ZM-1 moved %.1f mm during placement %d, after capture %d (limit %.1f mm,\n"
+                        "          half the tolerance). Center taken (%.4f %.4f %.4f), now (%.4f %.4f %.4f). What was\n"
+                        "          measured across a moved mic is wrong, so this placement's cells are dropped and the\n"
+                        "          session stops: re-place the ZM-1 and rerun from this placement.\n",
+                moved * 1e3, li + 1, k, 0.5f * T->tol_m * 1e3f,
+                T->taken[0], T->taken[1], T->taken[2], now[0], now[1], now[2]);
+        if (b & PLACE_BUMP_TURNED)
+            fprintf(stderr, "          It also turned %.2f deg (limit %.2f deg).\n", turned, T->turn_limit_deg);
+    } else
+        fprintf(stderr, "\nvalidate: BUMP: the ZM-1 turned %.2f deg during placement %d, after capture %d (limit %.2f deg),\n"
+                        "          its center %.1f mm from where it was taken. Every direction measured after the turn\n"
+                        "          is off by it, so this placement's cells are dropped and the session stops: re-place\n"
+                        "          the ZM-1 and rerun from this placement.\n",
+                turned, li + 1, k, T->turn_limit_deg, moved * 1e3);
     return 4;
 }
 
 static void track_report(void* user, int li) {
     TrackCtx* T = (TrackCtx*)user;
     printf("  placement %d measured at (%.4f %.4f %.4f), mount yaw %.1f deg, tilt %.1f deg;\n"
-           "    %d bump check(s), the largest move %.1f mm (limit %.1f mm); %d capture(s) had no live pose to check\n",
+           "    %d bump check(s), the largest move %.1f mm (limit %.1f mm), the largest turn %.2f deg (limit %.2f deg);\n"
+           "    %d capture(s) had no live pose to check\n",
            li + 1, T->taken[0], T->taken[1], T->taken[2], T->placed.yaw_deg, T->placed.tilt_deg,
-           T->nchecks, T->max_move * 1e3, 0.5f * T->tol_m * 1e3f, T->nunchecked);
+           T->nchecks, T->max_move * 1e3, 0.5f * T->tol_m * 1e3f, T->max_turn, T->turn_limit_deg, T->nunchecked);
 }
 
 /* The tracked session's hooks. NULL in run_session = an untracked run (the typed position is the
@@ -353,10 +386,11 @@ typedef struct {
  *
  * It has to run BEFORE the first valid_score, and that is why this is a function rather than a block
  * inside the grid loop where it used to live. valid_score takes `flags` as its EXCLUSION MASK, and
- * the matched-phantom arm captures first — so with the check downstream of it, every matched cell
- * was scored against an all-zero mask and a dead capsule silently entered the reference pair. The
- * physical/phantom difference is the headline number here, so that is the one place it could do the
- * most damage. Reproduce the old behavior with `--simulate --inject-fault`. */
+ * the grid arm is not the first to capture: the physical reference arm is, then the matched phantoms.
+ * With the check downstream of them, every reference and matched cell would be scored against an
+ * all-zero mask and a dead capsule would silently enter the reference pair. The physical/phantom
+ * difference is the headline number here, so that is the one place it could do the most damage.
+ * Reproduce that with `--simulate --inject-fault`. */
 static void capsule_check_once(int* checked, const float* cap19, unsigned char* flags,
                                const CapCtx* ctx, int* nchecked, int* nflagged) {
     if (*checked) return;
@@ -391,7 +425,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                        float (*lis)[3], char (*lisname)[LBL], int nlis,
                        float (*tg)[3], int ntgt, int ngrid, float radius, int do_ref,
                        int prompt, const PlaceHooks* hooks,
-                       ValidCell* cells, int* nchecked, int* nflagged, int* nplaced, int* bumped) {
+                       ValidCell* cells, int* nchecked, int* nflagged, int* nplaced, int* bumped, int* nbg_low) {
     float* cap19 = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * VAL_ANALYZE);
     if (!cap19) { fprintf(stderr, "out of memory\n"); return 0; }
     int w = 0;
@@ -421,28 +455,63 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             }
             if (nplaced) ++(*nplaced);            /* counts INVOCATIONS: 0 means the hook is unwired */
         }
-        /* One capture, then the bump check. A bump stops every loop below, and the capture that
-         * noticed it is not scored: the mic had already moved when it was taken. */
-        auto capture = [&](const Cond* q, const float* solve, const float* src) -> int {
-            const int got = cap(ctx, q, solve, lis[li], src, cap19);
+        /* One capture of the feeds that `built` says are in ctx->feeds, then the bump check. EVERY
+         * arm captures through here, the physical reference included, so the capture count, an
+         * injected capsule fault and the bump check cover all of them. A bump stops every loop below,
+         * and the capture that noticed it is not scored: the mic had already moved when it was taken. */
+        auto capture = [&](int built) -> int {
+            const int got = built && cap(ctx, ctx->feeds, lis[li], cap19);
             ++ncap;
             if (hooks && hooks->after_capture(hooks->user, li, ncap)) bump = 1;
             return got && !bump;
         };
+        auto phantom_feeds = [&](const Cond* q, const float* solve, const float* src) -> int {
+            return valid_speaker_feeds(L, q->panner, &q->r, solve, src, VAL_FS, ctx->feeds, VAL_CAPLEN);
+        };
 
-        /* The physical baseline: drive each speaker alone. No panner, so this is measured once per
-         * placement rather than per panner/mode. It is also the fastest possible sanity check on the
-         * whole chain — if a directly driven speaker does not land on its surveyed position, nothing
-         * measured afterwards at this placement means anything. */
+        /* The BACKGROUND (valid.h): one capture with every feed silent, before any cell. It is not one
+         * of the placement's cells (not counted, not bump-checked: the next capture's bump check covers
+         * the same stand), and every cell below is held against it. */
+        double bg_pow = 0.0;
+        {
+            memset(ctx->feeds, 0, sizeof(float) * (size_t)L->count * VAL_CAPLEN);
+            if (!cap(ctx, ctx->feeds, lis[li], cap19)) {
+                fprintf(stderr, "  placement %d/%d: the background capture failed\n", li + 1, nlis);
+                break;
+            }
+            bg_pow = valid_capture_power(cap19, VAL_ANALYZE);
+            if (bg_pow > 0.0) printf("  background: %.1f dBFS (median capsule power, no stimulus)\n", 10.0 * log10(bg_pow));
+            else              printf("  background: silent (no stimulus, no noise)\n");
+        }
+        /* a scored cell's ratio to it, from the capture it was scored on */
+        auto mark_bg = [&](ValidCell* c) {
+            c->bg_db  = valid_bg_ratio_db(valid_capture_power(cap19, VAL_ANALYZE), bg_pow);
+            c->bg_low = c->bg_db < VALID_BG_MIN_DB;
+        };
+
+        /* The physical baseline: drive each speaker alone, CAPTURED like every other cell. On the rig
+         * that makes it a real source in the real room through the real instrument, which is the
+         * whole point of a floor: an offline cell here would put the model's number under every
+         * hardware contrast. No panner, so this is measured once per placement rather than per
+         * panner/mode. It is also the fastest possible sanity check on the whole chain: if a directly
+         * driven speaker does not land on its surveyed position, nothing measured afterwards at this
+         * placement means anything. It captures FIRST, so the capsule check runs on its first cell. */
         if (do_ref) {
-            for (uint32_t sp = 0; sp < L->count; ++sp) {
+            for (uint32_t sp = 0; sp < L->count && !bump; ++sp) {
                 ValidCell* c = &cells[w];
-                if (!valid_reference_cell(L, (int)sp, lis[li], VAL_FS, 343.0, VAL_ANALYZE, c)) {
-                    memset(c, 0, sizeof *c); c->reference = 1; c->tgt = (int)sp;
+                int got = 0;
+                if (capture(valid_reference_feeds(L, (int)sp, VAL_FS, ctx->feeds, VAL_CAPLEN))) {
+                    capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
+                    got = valid_score_reference(L, (int)sp, lis[li], cap19, VAL_ANALYZE, VAL_FS, 343.0,
+                                                flags, c);
+                    if (got) mark_bg(c);
                 }
+                if (!got) { memset(c, 0, sizeof *c); c->reference = 1; c->tgt = (int)sp; }
                 c->lis = li;
                 ++w;
             }
+        }
+        if (do_ref && !bump) {
             double rm[BWA_MAX_CHANNELS]; int nr = 0;
             for (int i = 0; i < w; ++i)
                 if (cells[i].lis == li && cells[i].reference == 1 && cells[i].ok) rm[nr++] = cells[i].miss_deg;
@@ -475,11 +544,12 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                         const float* solve = tracked ? lis[li] : L->ref;
                         ValidCell* c = &cells[w];
                         int got = 0;
-                        if (capture(&cond[ci], solve, src)) {
-                            /* first capture of the placement lands here, so the check runs here */
+                        if (capture(phantom_feeds(&cond[ci], solve, src))) {
+                            /* a no-op once a reference capture has run it */
                             capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                             got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
                                               cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
+                            if (got) mark_bg(c);
                         }
                         if (!got) {
                             memset(c, 0, sizeof *c);
@@ -501,11 +571,12 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     ValidCell* c = &cells[w];
                     int got = 0;
 
-                    if (capture(&cond[ci], solve, src)) {
+                    if (capture(phantom_feeds(&cond[ci], solve, src))) {
                         /* still needed: with --no-reference this grid arm captures first */
                         capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                         got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
                                           cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
+                        if (got) mark_bg(c);
                     }
                     if (!got) {
                         memset(c, 0, sizeof *c);
@@ -524,6 +595,25 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             break;
         }
         if (hooks) hooks->report(hooks->user, li);
+        /* COUNTED, not derived from the plan: a test compares it against its own arithmetic, so an arm
+         * that stops capturing shows up here. */
+        printf("  placement %d/%d: %d captures, %.1f s of stimulus on the rig\n",
+               li + 1, nlis, ncap, ncap * VAL_CAPTURE_S);
+        {   /* the background check, per placement (valid.h) */
+            int nlow = 0, nsc = 0; double lo = 1e30;
+            for (int i = w0; i < w; ++i) {
+                if (!cells[i].ok && !cells[i].comb_ok) continue;     /* never scored: no capture to judge */
+                ++nsc; nlow += cells[i].bg_low;
+                if (cells[i].bg_db < lo) lo = cells[i].bg_db;
+            }
+            if (!nsc) {}
+            else if (lo >= VALID_BG_SILENT_DB)
+                printf("  background check: silent background, %d cell(s) clear of it\n", nsc);
+            else
+                printf("  background check: %d of %d cell(s) under %.0f dB over the background (the lowest %.1f dB)%s\n",
+                       nlow, nsc, VALID_BG_MIN_DB, lo, nlow ? "   <-- the room is too loud for them" : "");
+            if (nbg_low) *nbg_low += nlow;
+        }
 
         /* per-placement summary, so a bad placement is visible before you move the mic again.
          * Comb depth sits beside the angular miss because they are different failures: a render can
@@ -579,9 +669,13 @@ static int parse_flist(const char* s, float* out, int cap, int* n, int allow_zer
 }
 
 int main(int argc, char** argv) {
+    /* unbuffered through a pipe, so a caller streaming the output (calib_view's Session tab) sees each
+     * placement as it happens rather than 4 KB at a time */
+    setvbuf(stdout, NULL, _IONBF, 0);
     const char* layout_path = NULL;
     const char* driver = NULL;
     const char* csv = NULL;
+    double sim_bg_dbfs = 0.0; int sim_bg_set = 0;   /* --sim-background: a steady noise floor, simulate only */
     const char* posfile = NULL;
     int simulate = 0, mic_in = 0, naz = 12, inject = -1, no_prompt = 0;
     const char* track_body = NULL;   /* rigid-body id or name for the ZM-1's stand */
@@ -590,6 +684,7 @@ int main(int argc, char** argv) {
     const char* nn_multicast = "239.255.42.99";
     int track_sim = 0;               /* the scripted stand: exercises the tracked path, no rig */
     int track_sim_bump = 0;          /* --track-sim-bump N: knock it after the Nth capture */
+    int track_sim_twist = 0;         /* --track-sim-twist N: turn it about the array center after the Nth */
     float place_tol_m = VAL_PLACE_TOL_M;
     double place_timeout = 300.0;
     int tol_set = 0, timeout_set = 0;
@@ -625,6 +720,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mic-in")    && i+1 < argc)     mic_in = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--azimuths")  && i+1 < argc)     naz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--inject-fault") && i+1 < argc)  inject = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sim-background") && i+1 < argc) {
+            char* end = NULL; const double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= -120.0 && v <= 0.0)) {
+                fprintf(stderr, "--sim-background wants a level in dBFS, -120 to 0 (got %s)\n", argv[i]); return 2; }
+            sim_bg_dbfs = v; sim_bg_set = 1;
+        }
         else if (!strcmp(argv[i], "--radius")    && i+1 < argc)     radius = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--track")     && i+1 < argc)     track_body = argv[++i];
         else if (!strcmp(argv[i], "--survey")    && i+1 < argc)     survey_path = argv[++i];
@@ -636,6 +737,12 @@ int main(int argc, char** argv) {
             if (end == argv[i] || *end || v < 1 || v > 1000000) {
                 fprintf(stderr, "--track-sim-bump wants a capture count >= 1 (got %s)\n", argv[i]); return 2; }
             track_sim_bump = (int)v;
+        }
+        else if (!strcmp(argv[i], "--track-sim-twist") && i+1 < argc) {
+            char* end = NULL; long v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || v < 1 || v > 1000000) {
+                fprintf(stderr, "--track-sim-twist wants a capture count >= 1 (got %s)\n", argv[i]); return 2; }
+            track_sim_twist = (int)v;
         }
         else if (!strcmp(argv[i], "--place-tol-mm") && i+1 < argc) {
             char* end = NULL; double v = strtod(argv[++i], &end);
@@ -779,6 +886,9 @@ int main(int argc, char** argv) {
                    "                        a time. Cells explode; the count is printed either way.\n"
                    "\n"
                    "  --out <file.csv>      write every cell\n"
+                   "  --sim-background <dBFS>  (simulate) a steady noise floor on every capsule. Each placement\n"
+                   "                        first takes one capture with no stimulus, and a cell under 20 dB\n"
+                   "                        over it is flagged (the background check)\n"
                    "  --no-prompt           don't wait for ENTER between placements (untracked, unattended\n"
                    "                        runs; a tracked run waits for its gate instead)\n"
                    "  --track <id|name>     follow the ZM-1's stand as a tracked rigid body: the pose\n"
@@ -810,16 +920,21 @@ int main(int argc, char** argv) {
                    "                        driven speaker stays content-independent either way, so\n"
                    "                        the reference arm is the control.\n"
                    "  --no-reference        skip the physical reference arm (each speaker driven\n"
-                   "                        alone). That arm is what makes a phantom miss a CONTRAST\n"
-                   "                        against a real source rather than an absolute number, and\n"
-                   "                        it is the fastest check that the chain is sane at all  - \n"
-                   "                        only skip it to save rig time.\n"
+                   "                        alone, captured like any other cell). That arm is what\n"
+                   "                        makes a phantom miss a CONTRAST against a real source\n"
+                   "                        rather than an absolute number, and it is the fastest\n"
+                   "                        check that the chain is sane at all. It costs one capture\n"
+                   "                        per speaker per placement, plus the matched phantoms (one\n"
+                   "                        per speaker per condition per mode). Only skip it to save\n"
+                   "                        rig time.\n"
                    "  --track-sim           SELF-CHECK (with --simulate): a scripted stand walks in\n"
                    "                        from 8 cm off each plan, settles 5 mm off it, and the\n"
                    "                        captures come from its TRUE center. With no --survey the\n"
                    "                        built-in capsule table stands in as the body frame. Exit 5\n"
                    "                        if the placement hook does not fire for every placement.\n"
                    "  --track-sim-bump <n>  knock the scripted stand 15 mm after the nth capture\n"
+                   "  --track-sim-twist <n> turn the scripted stand 2 deg about the array center after\n"
+                   "                        the nth capture: no center moves, every direction turns\n"
                    "  --inject-fault <ch>   SELF-CHECK: corrupt capsule <ch> in every capture and\n"
                    "                        require the integrity layer to catch it (nonzero exit if\n"
                    "                        it doesn't). Proves the check + exclusion chain on YOUR\n"
@@ -831,10 +946,12 @@ int main(int argc, char** argv) {
     const int tracked_run = track_body != NULL || track_sim;
     if (track_body && track_sim) {
         fprintf(stderr, "--track and --track-sim are alternatives: a real stand or the simulated one\n"); return 2; }
+    if (sim_bg_set && !simulate) {
+        fprintf(stderr, "--sim-background is a --simulate knob: a real room brings its own background\n"); return 2; }
     if (track_sim && !simulate) {
         fprintf(stderr, "--track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
-    if (track_sim_bump && !track_sim) {
-        fprintf(stderr, "--track-sim-bump knocks the SIMULATED stand; pass --track-sim\n"); return 2; }
+    if ((track_sim_bump || track_sim_twist) && !track_sim) {
+        fprintf(stderr, "--track-sim-bump/--track-sim-twist act on the SIMULATED stand; pass --track-sim\n"); return 2; }
     if (!tracked_run && (tol_set || timeout_set || mount_off_set || nn_server)) {
         fprintf(stderr, "--place-tol-mm/--place-timeout/--mount-offset/--natnet-server are --track options\n"); return 2; }
     if (inject != -1 && (inject < 0 || inject >= ZYLIA_MICS)) {
@@ -984,19 +1101,26 @@ int main(int argc, char** argv) {
         printf("  %2d  %s\n", ci + 1, cond_label(&cond[ci], cl, sizeof cl));
     }
 
-    /* NOT a matched-cell design, deliberately. Rendering a phantom at a speaker's own position is
-     * degenerate — the panner puts essentially all the gain on that one speaker, so the "phantom"
-     * IS the speaker and the difference measures nothing (tried it: ~0.02 deg). A true matched
-     * physical/phantom pair needs a real source at a direction BETWEEN the speakers, which is why
-     * the published protocol had to physically move a loudspeaker. What the reference arm gives us
-     * instead is the FLOOR: what the instrument, the layout survey and the room cost before any
-     * panning happens. Phantom misses are then quoted above that floor rather than as absolutes. */
+    /* Two things come out of the reference arm. The FLOOR: what the instrument, the layout survey and
+     * the room cost before any panning happens, so phantom misses are quoted above it rather than as
+     * absolutes. And a MATCHED pair per speaker: a phantom rendered at that speaker's own position,
+     * same direction, room and placement, measured both ways (run_session). That pair is not
+     * degenerate for a distance-blurred panner, which still spreads a source sitting on a speaker;
+     * it says nothing about directions BETWEEN speakers, which only a moved real source could. */
     const int ngrid = ntgt;
     const int ncell = ncond * 2 * nlis * ntgt
                     + (do_ref ? nlis * (int)L.count * (1 + ncond * 2) : 0);
     printf("plan: %d directions x %d conditions x 2 modes x %d placements%s = %d cells\n",
            ntgt, ncond, nlis,
            do_ref ? ", plus one physical reference per speaker" : "", ncell);
+    /* Every cell is one capture, the physical references included: VAL_CAPLEN of stimulus each, plus
+     * what the host adds (rendering the feeds, scoring, the bump check). */
+    {
+        const int per = ncond * 2 * ntgt + (do_ref ? (int)L.count * (1 + ncond * 2) : 0);
+        printf("cost: %d captures per placement (%d of them physical references), %.3f s of stimulus\n"
+               "      each, so at least %.1f min of playback per placement on the rig\n",
+               per, do_ref ? (int)L.count : 0, VAL_CAPTURE_S, per * VAL_CAPTURE_S / 60.0);
+    }
     if (inject >= 0) printf("SELF-CHECK: capsule %d will be corrupted in every capture\n", inject);
 
     /* ---- optional tracked mount ---- */
@@ -1024,12 +1148,14 @@ int main(int argc, char** argv) {
         mc.sim = track_sim ? MIC_SIM_SCRIPT : MIC_SIM_OFF;
         mc.sim_builtin_body = track_sim;
         mc.sim_bump_after = track_sim_bump;
+        mc.sim_twist_after = track_sim_twist;
         mc.virtual_clock = 1;                     /* simulated time: no waiting on the wall clock */
         char e[400] = { 0 };
         const int rc = mic_track_open(&g_mt, &mc, e, sizeof e);
         if (rc) { fprintf(stderr, "%s\n", e); return rc; }
         trk.mt = &g_mt;
         trk.tol_m = place_tol_m;
+        trk.turn_limit_deg = place_turn_limit_deg(place_tol_m, radius);   /* the directions are read at the radius */
         trk.timeout_s = place_timeout;
         trk.keys = !track_sim;
         trk.sim = track_sim;
@@ -1042,12 +1168,14 @@ int main(int argc, char** argv) {
         for (int i = 0; i < nlis && i < MAX_LIS; ++i) memcpy(trk.planned[i], lis[i], sizeof lis[i]);
         hooks_in = &hooks;
         if (track_sim)
-            printf("track: SIMULATED stand (--track-sim), tolerance %.1f mm, bump limit %.1f mm%s\n",
-                   place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f,
-                   track_sim_bump ? ", knocked 15 mm mid-run (--track-sim-bump)" : "");
+            printf("track: SIMULATED stand (--track-sim), tolerance %.1f mm, bump limit %.1f mm, turn limit %.2f deg%s%s\n",
+                   place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f, trk.turn_limit_deg,
+                   track_sim_bump ? ", knocked 15 mm mid-run (--track-sim-bump)" : "",
+                   track_sim_twist ? ", twisted 2 deg about the center mid-run (--track-sim-twist)" : "");
         else
-            printf("track: rigid body '%s', tolerance %.1f mm, bump limit %.1f mm (unverified against live Motive)\n",
-                   track_body, place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f);
+            printf("track: rigid body '%s', tolerance %.1f mm, bump limit %.1f mm, turn limit %.2f deg (unverified\n"
+                   "       against live Motive)\n",
+                   track_body, place_tol_m * 1e3f, 0.5f * place_tol_m * 1e3f, trk.turn_limit_deg);
         printf("track: placements are PLANS; each one's settled, measured center is the mic position\n");
     } else if (survey_path) {
         /* untracked: a ROOM-AXES survey pins the channel order and the orientation of the CURRENT
@@ -1072,17 +1200,24 @@ int main(int argc, char** argv) {
     memset(&ctx, 0, sizeof ctx);
     ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu;
     ctx.sim_at = track_sim ? trk.sim_at : NULL;
+    ctx.bg_rng = 0xB6B6u;
+    if (sim_bg_set) {
+        ctx.sim_bg_rms = pow(10.0, sim_bg_dbfs / 20.0);
+        printf("simulate: a steady background on every capsule, %.1f dBFS RMS (--sim-background)\n", sim_bg_dbfs);
+    }
     CaptureFn cap = &cap_simulate;
     int prompt = 0;
+    /* Both backends: run_session builds every capture's feeds into this, and the backend only plays them. */
+    ctx.feeds = (float*)malloc(sizeof(float) * (size_t)L.count * VAL_CAPLEN);
+    if (!ctx.feeds) { fprintf(stderr, "out of memory\n"); return 1; }
 
 #ifdef BWA_HAVE_ASIO
     int have_hw = 0;
     if (!simulate) {
-        ctx.feeds = (float*)malloc(sizeof(float) * (size_t)BWA_MAX_CHANNELS * VAL_CAPLEN);
-        if (!ctx.feeds) { fprintf(stderr, "out of memory\n"); return 1; }
         if (valid_asio_open(driver, mic_in, (int)L.count) != 0) {
             fprintf(stderr, "\nNo capture device. Re-run with --simulate to exercise the flow "
                             "without hardware.\n");
+            free(ctx.feeds);
             return 1;
         }
         have_hw = 1;
@@ -1101,15 +1236,22 @@ int main(int argc, char** argv) {
     if (!cells) { fprintf(stderr, "out of memory\n"); return 1; }
 
     int nflagged = 0, nchecked = 0, nplaced = 0, bumped = -1;
+    int nbg_low = 0;
     int w = run_session(&L, cap, &ctx, cond, ncond, lis, lisname, nlis,
                         tg, ntgt, ngrid, radius, do_ref, prompt, hooks_in,
-                        cells, &nchecked, &nflagged, &nplaced, &bumped);
+                        cells, &nchecked, &nflagged, &nplaced, &bumped, &nbg_low);
 
 #ifdef BWA_HAVE_ASIO
     if (have_hw) valid_asio_close();
 #endif
     free(ctx.feeds);
     if (trk.mt) mic_track_close(trk.mt);
+
+    if (nbg_low)
+        printf("\nbackground check: %d cell(s) under %.0f dB over their placement's background; read their numbers\n"
+               "as the room's, not the render's (the bg_low column of --out)\n", nbg_low, VALID_BG_MIN_DB);
+    else
+        printf("\nbackground check: every scored cell at least %.0f dB over its placement's background\n", VALID_BG_MIN_DB);
 
     /* ---- matched-cell contrasts, the claim worth making ---- */
     printf("\nmatched-cell contrast (fixed - tracked), median of paired differences\n");
@@ -1279,11 +1421,11 @@ int main(int argc, char** argv) {
             fprintf(f, "panner,focus,density,dual_band,cap,hole_spread,tracked_align,spread_mode,"
                        "decorrelation,near_spread,spread,reference,tracked,lis,lis_name,tgt,"
                        "mic_x,mic_y,mic_z,tgt_x,tgt_y,tgt_z,meas_x,meas_y,meas_z,miss_deg,"
-                       "diffuseness,ok,comb_db,comb_q,comb_ok\n");
+                       "diffuseness,ok,comb_db,comb_q,comb_ok,bg_db,bg_low\n");
             for (int i = 0; i < w; ++i) {
                 ValidCell* c = &cells[i];
                 fprintf(f, "%s,%.4f,%.4f,%d,%d,%.4f,%d,%d,%d,%.4f,%.4f,%d,%d,%d,%s,%d,"
-                           "%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d,%.3f,%.3f,%d\n",
+                           "%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d,%.3f,%.3f,%d,%.1f,%d\n",
                         c->reference == 1 ? "-" : pan_name(c->panner),
                         c->render.focus, c->render.density, c->render.dual_band, c->render.cap,
                         c->render.hole_spread, c->render.tracked_align, c->render.spread_mode,
@@ -1293,7 +1435,7 @@ int main(int argc, char** argv) {
                         c->target[0], c->target[1], c->target[2],
                         c->measured[0], c->measured[1], c->measured[2],
                         c->miss_deg, c->diffuseness, c->ok,
-                        c->comb_db, c->comb_q, c->comb_ok);
+                        c->comb_db, c->comb_q, c->comb_ok, c->bg_db, c->bg_low);
             }
             fclose(f);
             printf("wrote %d cells to %s\n", w, csv);

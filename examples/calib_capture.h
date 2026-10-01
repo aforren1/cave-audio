@@ -17,6 +17,7 @@ extern "C" {
 #endif
 #include "core/layout.h"
 #include "calib/zylia.h"                 /* ZYLIA_MICS, the pressure proxy (the live reading) */
+#include "calib/calib.h"                 /* CalibWindow: the expected-arrival window (sweep quality) */
 #ifdef __cplusplus
 }
 #endif
@@ -52,6 +53,9 @@ extern "C" {
  * analyzer will divide back out, or the survey inflates every position by their ratio. Out-of-range
  * falls back to BWA_SOS_REF_MPS (sos.h). */
 void calib_sim_capture(int ch, const Layout* L, const float mic[3], double sos, const float* sweep, float* cap);
+/* The simulated speaker `ch`'s sensitivity (linear amplitude): the wobble every simulated capture
+ * carries, so a test can hold a solved gain trim against the truth (20 log10(min / this)). */
+double calib_sim_sensitivity(int ch);
 /* calib_sim_capture with options; NULL = exactly calib_sim_capture. The live aiming mode uses all of
  * them: its shorter sweep and capture, a speaker whose TRUE position and aim differ from the layout's
  * (the installer is moving it), and the speaker's own on-axis response from the model's on_axis_db,
@@ -78,6 +82,22 @@ void calib_sim_rotate(const float in[3], float deg, float out[3]);
  * its capture, so --check-aim has a known error to recover (the self-check of the check). 0 = off. */
 void calib_sim_set_aim_error(float deg);
 
+/* Simulate only: the speakers really stand where `T` says (its `position` and `aim` per index), not where
+ * the layout each capture is given says. bwa_calibrate --sim-truth: a simulated rig whose as-built differs
+ * from the plan, so a session that measured the plan's positions back, or trimmed against them, lands off
+ * the truth. The room's shoebox and the directivity model stay the given layout's. NULL = off. `T` must
+ * outlive the captures. */
+void calib_sim_set_truth(const Layout* T);
+
+/* Simulate only: speaker `ch` plays `seconds` later than the others (bwa_calibrate --sim-speaker-latency),
+ * on top of CAL_SIM_LATENCY_SAMPLES: a box whose Dante receive latency is set differently, so
+ * --ref-speakers has a known outlier to flag. Every path out of that speaker carries it (direct, images,
+ * tail). 0 clears it. Out-of-range channels and non-finite values are ignored. */
+void   calib_sim_set_speaker_latency(int ch, double seconds);
+/* ... and the extra latency speaker `ch` carries now (0 = none), for a synthetic path that does not go
+ * through calib_sim_capture_ex (the --zylia position survey's exact wavefronts). */
+double calib_sim_speaker_latency(int ch);
+
 /* Simulate only: a ROOM around the array (bwa_calibrate --sim-room), so the direct-sound gate and
  * the reverberant dilution it exists for have something to act on. `absorption` is every wall's
  * energy absorption coefficient in (0, 1]; 0 = off, the anechoic capture (the default).
@@ -98,6 +118,38 @@ void calib_sim_set_room(float absorption);
  * count), or "anechoic". Control thread. */
 void calib_sim_room_describe(const Layout* L, char* buf, size_t cap);
 
+/* Simulate only: an INTERFERER (bwa_calibrate --sim-interferer), something other than the speaker
+ * under test that sounds during chosen captures, so the sweep-quality checks (calib.h) have something
+ * to catch. Its truth is the simulator's: the captures it lands on are counted HERE, one per capture
+ * (a ZM-1 capture's 19 rows are one), never by the code under test. It stands at the capture point
+ * plus CALIB_SIM_INTF_OFFSET (room m, about 1.5 m off, not a speaker's position), so each capsule
+ * hears it at its own time and 1/r.
+ *   click  a 2 ms broadband transient (a door, a dropped tool)
+ *   noise  a 250 ms noise burst (a cough, a voice)
+ *   sweep  the capture's own sweep, played from that point (a second speaker on a mis-patched output):
+ *          a strong arrival where this speaker's cannot be
+ * `t_s` is when it sounds at its source, seconds into the capture; `level_db` its RMS over its own
+ * duration at the capture point, dB re 1 (a unit-sensitivity speaker's sweep at 1 m peaks at 1). */
+enum { CALIB_SIM_INTF_CLICK = 0, CALIB_SIM_INTF_NOISE = 1, CALIB_SIM_INTF_SWEEP = 2 };
+typedef struct {
+    float t_s;
+    float level_db;
+    int   kind;
+} CalibSimInterferer;
+#define CALIB_SIM_INTF_MAX 64
+#define CALIB_SIM_INTF_OFFSET_X 1.1f
+#define CALIB_SIM_INTF_OFFSET_Y (-0.6f)
+#define CALIB_SIM_INTF_OFFSET_Z 0.9f
+/* Arm it on the 1-based capture numbers in `captures` (up to CALIB_SIM_INTF_MAX), counting from the
+ * next capture; n 0 or it NULL = off. Resets the count. Control thread. */
+void calib_sim_set_interferer(const int* captures, int n, const CalibSimInterferer* it);
+/* Captures synthesized since calib_sim_set_interferer, and how many of them carried the interferer. */
+int  calib_sim_capture_count(void);
+int  calib_sim_interferer_hits(void);
+/* "3,9,20:0.9:12:noise" -> the capture list and the event (t 0.9 s, 12 dB, noise; t, level and kind
+ * default to 0.9 s, 12 dB and click). Returns the capture count, 0 on a malformed spec (err says why). */
+int  calib_sim_parse_interferer(const char* spec, int* captures, int cap, CalibSimInterferer* it, char* err, size_t errcap);
+
 /* Simulate the ZM-1 (bwa_calibrate --zylia --simulate): calib_sim_capture once per capsule, each at
  * its OWN position (center + caps[j]), so every capsule gets its own time of flight, 1/r, directivity
  * bearing and simulated room. Free-field capsules: the rigid sphere's scattering (shadowing above
@@ -109,6 +161,24 @@ void calib_sim_capture_zylia(int ch, const Layout* L, const float center[3], con
  * CAL_CAPLEN whatever the capture length, so the live mode passes that). */
 void calib_sim_capture_zylia_ex(int ch, const Layout* L, const float center[3], const float (*caps)[3], int ncaps,
                                 double sos, const CalibSimOpts* o, float* cap19, int stride);
+
+/* The simulated PHYSICAL ZM-1, for the modes that must not be simulated from the table they solve with
+ * (bwa_calibrate --localize --zylia and --capsule-survey): the built-in table scaled to
+ * CALIB_SIM_ZM1_RADIUS_M and turned inside its mount by CALIB_SIM_ZM1_MOUNT_YAW_DEG about the mount's
+ * +y and then CALIB_SIM_ZM1_MOUNT_TILT_DEG about its +x. So the array the captures come from is never the
+ * table a solve reads, the built-in or a survey: a survey has to MEASURE it to match it, and an
+ * orientation-free reading has to be orientation-free to land on the truth. Channel order is the
+ * built-in one (Dante Via carries the capsules in node order; bwa_zylia_probe checks it on the rig).
+ *   calib_sim_zm1_body: the capsules about the array center in the stand's BODY axes.
+ *   calib_sim_zm1_room: the same rotated by the stand's orientation q (xyzw, v_room = R(q) v_body), by
+ *                       this file's own quaternion code; q NULL = the untracked simulation's fixed pose,
+ *                       CALIB_SIM_ZM1_UNTRACKED_YAW_DEG about room +y. Room axes, about the center. */
+#define CALIB_SIM_ZM1_RADIUS_M        0.0495f
+#define CALIB_SIM_ZM1_MOUNT_YAW_DEG   40.0f
+#define CALIB_SIM_ZM1_MOUNT_TILT_DEG  3.0f
+#define CALIB_SIM_ZM1_UNTRACKED_YAW_DEG (-25.0f)
+void calib_sim_zm1_body(float caps[ZYLIA_MICS][3]);
+void calib_sim_zm1_room(const float q[4], float caps[ZYLIA_MICS][3]);
 
 /* The engine's own per-speaker output stage (align.c: gain_db, delay_ms, the `eq` FIR, static
  * room_eq, and room_eq_grid at its flat start; the listener-tracked stages sit at identity) applied to
@@ -138,9 +208,94 @@ void calib_measure_rows(const float* rows, int nrows, int stride, int ncap, cons
  * res[j].delay_samples / delay_frac, so every consumer of those fields (the pressure proxy's center
  * arrival, zylia_doa, zylia_localize, the live position) reads the refined value. When the refine
  * cannot run (a dead capsule, no interior peak) the |IR|-peak arrivals stand. Returns 1 when the
- * refine ran, 0 when it fell back. */
+ * refine ran, 0 when it fell back. [exp_lo, exp_hi) is every row's expected-arrival window
+ * (measure_response_ex; the center's window widened by CALIB_WIN_ZM1_M), exp_hi <= exp_lo = none. */
 int  calib_measure_zylia_rows(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
-                              const double band_hz[2], MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]);
+                              const double band_hz[2], int exp_lo, int exp_hi,
+                              MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]);
+/* The ZM-1 capture's quality from its 19 rows, onto the pooled `out` (after zylia_pressure_proxy,
+ * which clears it): the window, `outside` when a majority of the capsules saw a stronger tap outside
+ * it (an interferer reaches every capsule; one hot capsule is the dead-capsule check's business), and
+ * the MEDIAN capsule's SNR. */
+void calib_pool_quality(const MeasureResult rj[ZYLIA_MICS], MeasureResult* out);
+
+/* The latency prior for the expected-arrival windows (calib.h, CalibWindow): simulate knows its own
+ * latency exactly; known_latency_s >= 0 (--latency, --ref) is a measured loop, +/-
+ * CALIB_WIN_LAT_KNOWN_S; else the ASIO driver's reported loop from the last open, a lower bound with
+ * CALIB_WIN_LAT_DRIVER_S of slack above it. pos_m goes into w->pos_m as given (< 0: decided per
+ * speaker, calib_window_pos_m). Returns 1 with *w filled and `desc` saying which, or 0 (no window:
+ * nothing to time the arrival from) with `desc` saying so. */
+int  calib_window_prior(int simulate, double known_latency_s, double pos_m, CalibWindow* w, char* desc, size_t cap);
+/* The position margin for speaker s: CALIB_WIN_SURVEYED_M when a survey placed it (it carries a
+ * plan_position), CALIB_WIN_PLAN_M when it still stands at its plan. */
+double calib_window_pos_m(const Layout* L, int s);
+
+/* One speaker's capture and measurement for the trim run and the verify pass: bwa_calibrate's trims and
+ * --verify, and calib_view's Capture tab, all go through this, so the CLI and the GUI cannot measure
+ * differently. The mic is the omni (one capture into `cap`) or the ZM-1 (zylia != 0: 19 capsule rows in
+ * `cap19`, each deconvolved on its own, the arrivals refined by cross-correlation
+ * (calib_measure_zylia_rows) and pooled by zylia_pressure_proxy; `cap` then receives the rows' MEAN,
+ * the center pressure below about 2 kHz, for the IR consumers that read low frequencies). `through`
+ * = play through the layout's output stage (the verify pass): on the rig the sweep itself is staged and
+ * played (calib_asio_capture_signal); in simulate the RAW capture is staged instead, which is the same
+ * thing because the stage is linear and time-invariant. Either way the measurement deconvolves against
+ * the RAW sweep, so it carries the trims. Not reentrant (the simulator's and the refine's static
+ * scratch). The ASIO shell must already be open with 1 or 19 inputs to match. */
+typedef struct {
+    const Layout* L;
+    const float*  sim_at;              /* simulate: where the capture is synthesized (the mic, or a
+                                        * tracked stand's TRUE center); unused on the rig */
+    double        sos;                 /* the speed of sound the simulator generates at */
+    int           simulate;
+    int           zylia;
+    const float*  sweep;               /* CAL_NSWEEP */
+    float*        cap;                 /* CAL_CAPLEN */
+    float*        cap19;               /* ZYLIA_MICS x CAL_CAPLEN, the ZM-1 only */
+    float         caps[ZYLIA_MICS][3]; /* simulate: capsule positions about the center (zylia_capsules,
+                                        * read AFTER the run has settled its capsule table) */
+    float*        play;                /* CAL_CAPLEN: the verify pass on the rig, the staged sweep */
+    int           nplay;               /* CAL_NSWEEP + calib_stage_pad(L) */
+    float*        tmp;                 /* CAL_CAPLEN scratch */
+    const double* band_hz;             /* the measurement's two band edges (measure_response); NULL = the
+                                        * level band, CAL_BAND_LO..CAL_BAND_HI. --localize passes the
+                                        * --check-aim tilt bands. */
+    /* Sweep quality (calib.h): the expected-arrival window, the SNR floor, the re-sweep and the
+     * agreement rule. have_win 0 = no window (the whole IR, as before); the SNR check and the
+     * re-sweep still run. */
+    const float*  mic;                 /* where the run BELIEVES the mic is (the windows are read from
+                                        * it); NULL = sim_at. Never the simulator's truth. */
+    int           have_win;
+    CalibWindow   win;                 /* win.pos_m < 0: per speaker, calib_window_pos_m */
+    int           agree;               /* 1 = a value counts only once two sweeps agree (trims, verify) */
+} CalibPass;
+#define CALIB_BG_SILENT_DBFS (-300.0f)
+enum { CALIB_MEAS_OK = 1, CALIB_MEAS_FAILED = 0, CALIB_MEAS_TIMEOUT = -1, CALIB_MEAS_DEAD = -2,
+       CALIB_MEAS_UNCLEAN = -3 };
+typedef struct {
+    float  capsule_spread_db;          /* the ZM-1: max over min capsule level, dB */
+    int    dead;                       /* CALIB_MEAS_DEAD: the dead capsule's index, else -1 */
+    double dead_level, median_level;   /* ... its level and the capsules' median, for the message */
+    int    refined;                    /* the ZM-1: 1 = the cross-correlation refine ran */
+    double arrival_s[ZYLIA_MICS];      /* the ZM-1: each capsule's arrival (s), refined when `refined`,
+                                        * as the pool read them; the capsule survey's input */
+    int    sweeps;                     /* sweeps this speaker took */
+    int    rej_outside, rej_noisy, rej_disagree;   /* ... and why the extra ones were taken */
+    float  snr_db;                     /* the accepted sweep's IR SNR (0 = unknown) */
+    float  bg_dbfs;                    /* the accepted sweep's BACKGROUND: the raw capture's power before
+                                        * this speaker's sound can arrive (up to MEASURE_NOISE_GUARD_S
+                                        * before the window, or the arrival with none), dBFS, the median
+                                        * over the ZM-1's capsules; CALIB_BG_SILENT_DBFS = silent (simulate) */
+    char   log[1400];                  /* one ASCII line per re-sweep, "sweep N: <why>", or empty */
+} CalibMeasInfo;
+/* Captures and measures speaker s, re-sweeping (up to CALIB_SWEEP_MAX_TRIES) any sweep the window or
+ * the SNR floor rejects (calib_sweep_check), and with P->agree until two clean sweeps agree
+ * (calib_sweeps_agree): the later of the pair is the result, and `cap` / `cap19` hold its capture.
+ * Returns CALIB_MEAS_OK with `out` filled; CALIB_MEAS_FAILED (a stage or deconvolution failure);
+ * CALIB_MEAS_TIMEOUT (the rig's capture timed out); CALIB_MEAS_DEAD (a ZM-1 capsule is dead: its level
+ * is non-finite or more than ZYLIA_PROXY_DEAD_DB under the median, and its arrival would throw the
+ * center arrival off by milliseconds); CALIB_MEAS_UNCLEAN (every sweep was rejected, or none agreed:
+ * info->log says why; nothing for this speaker may be used). `info` may be NULL. */
+int calib_measure_speaker(const CalibPass* P, int s, int through, MeasureResult* out, CalibMeasInfo* info);
 
 /* One live aiming reading (bwa_calibrate --live N --zylia, calib_view's Aim tab): sweep speaker `spk`
  * with the live sweep (`lsweep`, CAL_LIVE_NSWEEP samples), capture the 19 capsules into cap19
@@ -153,12 +308,21 @@ typedef struct {
     int    ok;
     int    dead;                   /* -1, or the dead capsule's index */
     double arr[ZYLIA_MICS];        /* per-capsule arrivals (s), for zylia_live_position */
-    MeasureResult pooled;          /* the pressure proxy over the tilt bands */
+    MeasureResult pooled;          /* the pressure proxy over the tilt bands, with calib_pool_quality's
+                                    * window, outside flag and SNR */
     int    have_tilt;
     float  tilt_db;                /* calib_direct_tilt_db of the pool */
+    int    quality;                /* calib_sweep_check of the pool: CALIB_SWEEP_OK is a CLEAN reading,
+                                    * the only kind the peak hold may hold (calib_peak_update) */
+    char   why[200];               /* calib_sweep_why, when quality is not OK */
 } CalibLiveReading;
+/* `win` (NULL = no window): the expected-arrival window for the live speaker, from the ZM-1's center
+ * (`believed`, where the run thinks the array is; NULL = center) to wherever the box may be: the
+ * window is the union of the ones read from its as-built position and its plan, with win->pos_m of
+ * margin around each, since the installer is moving it from one toward the other. */
 int calib_live_read(int spk, const Layout* L, const float center[3], double sos, int simulate,
-                    const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out);
+                    const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out,
+                    const CalibWindow* win, const float* believed);
 
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);

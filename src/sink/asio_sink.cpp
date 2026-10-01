@@ -11,6 +11,10 @@
  * -> ASIOCreateBuffers -> ASIOStart, then convert the planar float bus to the driver's
  * sample type in bufferSwitchTimeInfo and capture the sample-position/systemTime stamp.
  *
+ * THE HOST STAMP. ASIOTime.systemTime is documented as timeGetTime-derived, NOT on QPC, so it is used
+ * as the block's system_time_ns only when sink_tsbase.h's classifier says the stamps themselves are on
+ * QPC; otherwise the stamp is QPC read at callback entry (sink_ts_select has the whole rule).
+ *
  * NOTE: ASIO callbacks carry no user pointer and only one ASIO driver is active at a
  * time, so the live sink is held in a single file-scope pointer (g_sink).
  *
@@ -24,6 +28,7 @@ extern "C" {
 /* Outside the extern "C" block on purpose: it is all static inline, so it has no linkage to
  * declare, and it pulls in <string.h>, whose C++ overloads cannot be given C linkage. */
 #include "sink/sink_convert.h"
+#include "sink/sink_tsbase.h"       /* the systemTime base classifier + the block stamp rule */
 
 #include "asiosys.h"
 #include "asio.h"
@@ -31,6 +36,7 @@ extern "C" {
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>               /* timeGetTime: the base the SDK says systemTime is on */
 #include <atomic>
 #include <new>
 #include <cstdio>
@@ -49,7 +55,7 @@ struct AsioSink {
     uint32_t        channels;        /* requested (the layout's count, 26 on the rig) */
     long            buffer_size;     /* frames per block, chosen from ASIOGetBufferSize */
     long            output_latency;  /* driver-reported render->DAC frames (ASIOGetLatencies); 0 = unknown */
-    uint64_t        qpc_freq;        /* QueryPerformanceFrequency, for the synthesized host stamp */
+    SinkTsSel       ts_sel;          /* the systemTime base + the stamp rule; audio thread after open */
     bwa_render_fn      render;
     void*           user;
     ASIOBufferInfo  bufferInfos[BWA_CHANNELS];
@@ -78,6 +84,8 @@ struct AsioSink {
     std::atomic<uint64_t> h_late{0};
     SinkPeakWindow        h_peak{};   /* recent render peak: one writer, packed words (sink.h) */
     std::atomic<bool>     pos_measured{false};
+    std::atomic<int>      h_ts_base{SINK_TS_ABSENT};  /* the systemTime base the last block classified */
+    std::atomic<int64_t>  h_ts_off{0};                /* floor of (QPC - systemTime), ns; 0 = none yet */
     uint64_t        predicted_pos;   /* where the NEXT valid callback should land; 0 = nothing to compare yet */
 };
 
@@ -108,7 +116,9 @@ inline sink_fmt asio_fmt(long type) {
     }
 }
 
-ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*processNow*/) {
+/* One block. host_ns is the host clock (os_monotonic_ns, the bwa_host_time_ns clock) read FIRST in the
+ * callback, before anything else spends time: the fallback stamp is late by exactly what runs before it. */
+ASIOTime* asio_block(ASIOTime* timeInfo, long index, uint64_t host_ns) {
     AsioSink* s = g_sink;
     if (!s) return timeInfo;
     static bool named = false;
@@ -145,35 +155,34 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     }
     s->predicted_pos  = ts.sample_pos + (uint64_t)s->buffer_size;
     s->fallback_pos   = ts.sample_pos + (uint64_t)s->buffer_size;
-    if (timeInfo->timeInfo.flags & kSystemTimeValid)
-        ts.system_time_ns = timestamp_ns(timeInfo->timeInfo.systemTime);
-    else {
-        /* No driver stamp (FlexASIO omits systemTime on the TimeInfo path; the Digiface unknown until rig
-         * day): synthesize one from QPC at callback entry so bwa_get_clock still has a live pair —
-         * a hair noisier than a driver stamp (it includes callback-dispatch jitter, tens of µs)
-         * but a true correspondence. QPC is a userspace counter read (no kernel transition) — the
-         * same clock the null sink paces with; the split scale avoids overflow (see null_sink.c). */
-        LARGE_INTEGER qc; QueryPerformanceCounter(&qc);
-        const uint64_t t = (uint64_t)qc.QuadPart, f = s->qpc_freq;
-        ts.system_time_ns = f ? (t / f) * 1000000000ull + (t % f) * 1000000000ull / f : 0;
+
+    /* THE HOST STAMP (sink_tsbase.h). The driver's systemTime only when its own stamps say it is on QPC,
+     * the clock bwa_get_clock promises; the SDK documents it as timeGetTime, 1 ms coarse and tens of ms
+     * off QPC. Otherwise QPC at callback entry, a little noisier (callback-dispatch jitter, tens of us)
+     * but a true correspondence on the right clock. FlexASIO omits systemTime on the TimeInfo path; the
+     * Digiface is unverified until rig day. timeGetTime is a shared-page read, no kernel transition, and
+     * is only needed to NAME a non-QPC base for health. */
+    const bool     sys_valid = (timeInfo->timeInfo.flags & kSystemTimeValid) != 0;
+    const uint64_t sys_ns    = sys_valid ? timestamp_ns(timeInfo->timeInfo.systemTime) : 0;
+    const uint64_t tgt_ns    = sys_valid ? (uint64_t)timeGetTime() * 1000000ull : 0;
+    ts.system_time_ns = sink_ts_select(&s->ts_sel, host_ns, tgt_ns, sys_valid, sys_ns);
+    {
+        const int64_t off = sink_ts_lag_ns(&s->ts_sel.cls);
+        s->h_ts_base.store(s->ts_sel.base, std::memory_order_relaxed);
+        s->h_ts_off.store(off == INT64_MAX ? 0 : off, std::memory_order_relaxed);
     }
 
     /* The other half of "is the device being starved": whether WE are the ones starving it. The
      * budget is one block period; a render that overruns it hands the driver its buffer late, and
      * enough of those become the dropouts counted above. Two QPC reads, no kernel transition. */
-    LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+    const uint64_t t0 = os_monotonic_ns();
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
-    LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-    if (s->qpc_freq) {
-        const uint64_t ticks = (uint64_t)(t1.QuadPart - t0.QuadPart);
-        const uint64_t ns    = (ticks / s->qpc_freq) * 1000000000ull
-                             + (ticks % s->qpc_freq) * 1000000000ull / s->qpc_freq;
-        const uint64_t budget_ns = (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate;
-        if (ns > budget_ns) s->h_late.fetch_add(1, std::memory_order_relaxed);
-        /* Bucketed by blocks rendered, which is stream time at the driver's fixed buffer size. */
-        sink_peak_note(&s->h_peak, s->h_blocks.load(std::memory_order_relaxed) * (uint64_t)s->buffer_size,
-                       s->sample_rate, ns);
-    }
+    const uint64_t ns = os_monotonic_ns() - t0;                  /* QPC never steps back */
+    const uint64_t budget_ns = (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate;
+    if (ns > budget_ns) s->h_late.fetch_add(1, std::memory_order_relaxed);
+    /* Bucketed by blocks rendered, which is stream time at the driver's fixed buffer size. */
+    sink_peak_note(&s->h_peak, s->h_blocks.load(std::memory_order_relaxed) * (uint64_t)s->buffer_size,
+                   s->sample_rate, ns);
     s->h_blocks.fetch_add(1, std::memory_order_relaxed);
 
     BWA_ZONE_BEGIN(zcv, "convert_out");
@@ -189,11 +198,16 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     return timeInfo;
 }
 
-void bufferSwitch(long index, ASIOBool processNow) {
+ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*processNow*/) {
+    return asio_block(timeInfo, index, os_monotonic_ns());
+}
+
+void bufferSwitch(long index, ASIOBool /*processNow*/) {
+    const uint64_t host_ns = os_monotonic_ns();   /* before the position query, like the TimeInfo path */
     ASIOTime t; memset(&t, 0, sizeof t);
     if (ASIOGetSamplePosition(&t.timeInfo.samplePosition, &t.timeInfo.systemTime) == ASE_OK)
         t.timeInfo.flags = kSystemTimeValid | kSamplePositionValid;
-    bufferSwitchTimeInfo(&t, index, processNow);
+    asio_block(&t, index, host_ns);
 }
 
 void sampleRateDidChange(ASIOSampleRate /*rate*/) {}
@@ -273,6 +287,8 @@ void asio_health(bwa_sink* base, bwa_sink_health* out) {
      * turn "cannot know" into a clean bill of health. The resync and late-block counts are real
      * either way, but the headline number is not. */
     out->measured       = s->pos_measured.load(std::memory_order_relaxed);
+    out->stamp_base      = s->h_ts_base.load(std::memory_order_relaxed);
+    out->stamp_offset_ns = s->h_ts_off.load(std::memory_order_relaxed);
 }
 
 const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
@@ -467,6 +483,11 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
         s->fmt[c] = asio_fmt(s->channelInfos[c].type);
     }
 
+    /* The stamp rule's state, and the host clock's one-time frequency read, both before any callback
+     * can run (a driver may pre-roll one inside ASIOCreateBuffers, below). */
+    sink_ts_sel_init(&s->ts_sel, sample_rate, (uint32_t)bufsize);
+    (void)os_monotonic_ns();
+
     /* Allocate the bus and publish g_sink BEFORE ASIOCreateBuffers: a driver may pre-roll
      * a bufferSwitch during CreateBuffers, and that callback reads g_sink->bus and the
      * channel sample types — both must already be valid, or it dereferences a null bus. */
@@ -491,6 +512,5 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
      * network buffering — surfaced as bwa_get_output_latency_frames for AV-latency alignment. */
     long ilat = 0, olat = 0;
     s->output_latency = (ASIOGetLatencies(&ilat, &olat) == ASE_OK && olat > 0) ? olat : 0;
-    { LARGE_INTEGER qf; s->qpc_freq = QueryPerformanceFrequency(&qf) ? (uint64_t)qf.QuadPart : 0; }
     return &s->base;
 }

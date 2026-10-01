@@ -10,9 +10,13 @@
  *   - the marker count and how flat they are, and how steady the body was;
  * then fits one rigid transform from the optical positions onto the layout's. That fit answers
  * whether Motive's frame (ground plane, axes, handedness) IS the room frame the layout is written
- * in. It reports only by default; --write copies the aim and/or position of the MATCHED speakers
- * into a copy of the layout. --simulate runs the whole pipeline on synthesized packets, through the
- * same parsers, with no Motive: the rig-day rehearsal and the end-to-end ctest.
+ * in. Layout positions are ACOUSTIC CENTERS, behind the baffle the markers sit on, so --baffle-offset-m
+ * moves each optical point back along its aim. On a layout whose positions --localize MEASURED (each
+ * differs from its plan_position), the tool then reads that depth itself: the baffle depth section
+ * refits the frame with the depth as a fourth unknown (survey.h) and prints the value to pass. It
+ * reports only by default; --write copies the aim and/or position of the MATCHED speakers into a copy
+ * of the layout. --simulate runs the whole pipeline on synthesized packets, through the same parsers,
+ * with no Motive: the rig-day rehearsal and the end-to-end ctest.
  *
  *   bwa_speaker_survey <layout.json> --server <motive-ip> [--local <ip>] [--multicast <ip>]
  *                      [--natnet M.m] [--data-port N] [--command-port N]
@@ -21,7 +25,7 @@
  *                      [--csv out.csv] [--write out.json [--fields aim|position|aim,position]]
  *   bwa_speaker_survey <layout.json> --simulate [--sim-speakers i,j,k,...] [--sim-aim-error deg]
  *                      [--sim-yaw deg] [--sim-offset x,y,z] [--sim-mirror] [--sim-noise-mm x]
- *                      [--sim-jitter-mm x] [--sim-natnet M.m] [the report/write options above]
+ *                      [--sim-jitter-mm x] [--sim-natnet M.m] [--sim-depth-m x] [the report/write options above]
  *
  * A tool, not ABI client code: it links the engine's internals (the layout loader, the NatNet
  * parsers, survey.c) the way bwa_calibrate does, so it reads the layout exactly as the engine does.
@@ -43,6 +47,8 @@
 #define MAX_BODIES   256
 #define MAX_MAP      64
 #define PI           3.14159265358979323846
+#define FRAME_MAX_DEG 0.5f          /* Motive's frame agrees with the room frame within this rotation */
+#define FRAME_MAX_M   0.01f         /* and this translation */
 
 /* ---- arguments ---------------------------------------------------------------------------------- */
 
@@ -57,6 +63,7 @@ typedef struct {
     const char*    csv_path;
     const char*    write_path;
     bool           write_aim, write_pos;
+    bool           require_frame;         /* --require-frame: exit 3 unless the frame agrees */
     /* simulate */
     bool           simulate;
     int            sim_idx[64];
@@ -65,6 +72,8 @@ typedef struct {
     bool           sim_mirror;
     float          sim_noise_mm, sim_jitter_mm;
     int            sim_major, sim_minor;
+    float          sim_depth_m;           /* --sim-depth-m: the TRUE baffle-to-acoustic-center depth */
+    bool           sim_depth_set;         /* unset: the sim builds the baffle at --baffle-offset-m */
 } Args;
 
 static void usage(void) {
@@ -77,9 +86,12 @@ static void usage(void) {
            "            axis instead of the baffle plane)  --max-plane-mm (3)  --max-spread-mm (2)\n"
            "            --max-spread-deg (0.5)\n"
            "output:     --csv out.csv  --write out.json  --fields aim|position|aim,position (aim)\n"
+           "verdict:    --require-frame (exit 3 unless Motive's frame agrees with the room frame: a right-\n"
+           "            handed fit of 3 or more speakers within 0.5 deg and 10 mm)\n"
            "simulate:   --sim-speakers i,j,...  --sim-aim-error deg (on the first)  --sim-yaw deg\n"
            "            --sim-offset x,y,z  --sim-mirror  --sim-noise-mm x (marker placement)\n"
-           "            --sim-jitter-mm x (per frame, 0.05)  --sim-natnet M.m (4.1)\n");
+           "            --sim-jitter-mm x (per frame, 0.05)  --sim-natnet M.m (4.1)\n"
+           "            --sim-depth-m x (the true baffle-to-acoustic-center depth; default --baffle-offset-m)\n");
 }
 
 static bool parse_vec3(const char* s, float v[3]) {
@@ -138,6 +150,7 @@ static bool parse_args(int argc, char** argv, Args* a) {
             a->map[a->nmap].index = (int)idx;
             ++a->nmap;
         }
+        else if (!strcmp(s, "--require-frame"))  a->require_frame = true;
         else if (!strcmp(s, "--simulate"))       a->simulate = true;
         else if (!strcmp(s, "--sim-mirror"))     a->sim_mirror = true;
         else if (!strcmp(s, "--sim-aim-error"))  { NEED(); a->sim_aim_error_deg = (float)atof(v); }
@@ -145,6 +158,7 @@ static bool parse_args(int argc, char** argv, Args* a) {
         else if (!strcmp(s, "--sim-offset"))     { NEED(); if (!parse_vec3(v, a->sim_offset)) { printf("error: --sim-offset wants x,y,z\n"); return false; } }
         else if (!strcmp(s, "--sim-noise-mm"))   { NEED(); a->sim_noise_mm = (float)atof(v); }
         else if (!strcmp(s, "--sim-jitter-mm"))  { NEED(); a->sim_jitter_mm = (float)atof(v); }
+        else if (!strcmp(s, "--sim-depth-m"))    { NEED(); a->sim_depth_m = (float)atof(v); a->sim_depth_set = true; }
         else if (!strcmp(s, "--sim-natnet"))     { NEED(); if (!parse_ver(v, &a->sim_major, &a->sim_minor)) { printf("error: --sim-natnet wants M.m\n"); return false; } }
         else if (!strcmp(s, "--sim-speakers")) {
             NEED();
@@ -209,10 +223,15 @@ static void read_aim_flags(const char* path) {
 }
 
 /* --write: re-parse the input JSON so every field this tool does not own survives, and set only
- * `aim` / `position` on the matched speakers' records (found by their `index`, not array order). */
+ * `aim` / `position` on the matched speakers' records (found by their `index`, not array order). A
+ * measuring writer: a record it overwrites first keeps its old position and aim as the plan
+ * (layout_json_keep_plan), once; *nplan_new / *nplan_kept count the records that got one now and the
+ * ones that already had one. */
 static bool write_layout(const char* in, const char* out, const bool* do_aim, const float (*aim)[3],
-                         const bool* do_pos, const float (*pos)[3], int count, char* err, size_t cap) {
+                         const bool* do_pos, const float (*pos)[3], int count, int* nplan_new, int* nplan_kept,
+                         char* err, size_t cap) {
     bool ok = false;
+    *nplan_new = *nplan_kept = 0;
     char* text = read_text(in);
     cJSON* root = text ? cJSON_Parse(text) : NULL;
     char* outtext = NULL;
@@ -235,6 +254,11 @@ static bool write_layout(const char* in, const char* out, const bool* do_aim, co
         const int i = ix->valueint;
         const char* key[2] = { "aim", "position" };
         const float* v[2]  = { do_aim[i] ? aim[i] : NULL, do_pos[i] ? pos[i] : NULL };
+        if (v[0] || v[1]) {
+            const int kp = layout_json_keep_plan(sp);
+            *nplan_new += kp == 1;
+            *nplan_kept += kp == 0;
+        }
         for (int f = 0; f < 2; ++f) {
             if (!v[f]) continue;
             cJSON* arr = cJSON_CreateArray();
@@ -380,7 +404,7 @@ static void sim_build(Sim* s, const Args* a, const Layout* L) {
         snprintf(b->name, sizeof b->name, (k & 1) ? "Speaker_%d" : "spk%02d", a->sim_idx[k]);   /* both spellings */
         b->id = 101 + k;
         sim_speaker_body(s, b, L, a->sim_idx[k], k == 0 ? a->sim_aim_error_deg : 0.f,
-                         a->opts.baffle_offset_m, a->sim_noise_mm * 0.001f, k);
+                         a->sim_depth_set ? a->sim_depth_m : a->opts.baffle_offset_m, a->sim_noise_mm * 0.001f, k);
     }
     /* two decoys: a wand, and a speaker body with a typo in its name */
     for (int d = 0; d < 2; ++d) {
@@ -516,6 +540,8 @@ static const char* match_why(int st) {
 }
 
 int main(int argc, char** argv) {
+    /* unbuffered through a pipe: a caller streaming the report (calib_view's Session tab) sees it live */
+    setvbuf(stdout, NULL, _IONBF, 0);
     Args a;
     if (!parse_args(argc, argv, &a)) { usage(); return 1; }
 
@@ -753,7 +779,7 @@ int main(int argc, char** argv) {
             printf("  verdict      MIRRORED: Motive's frame has the opposite handedness to the layout's. Fix the axis\n"
                    "               convention in Motive (or the layout's source), then re-run. --write refuses.\n"
                    "               The rotation and translation above are the best PROPER fit and mean nothing here.\n");
-        else if (fit.angle_deg <= 0.5f && tlen <= 0.01f)
+        else if (fit.angle_deg <= FRAME_MAX_DEG && tlen <= FRAME_MAX_M)
             printf("  verdict      Motive's frame agrees with the room frame (within 0.5 deg and 10 mm)\n");
         else
             printf("  verdict      Motive's frame is OFF the room frame by %.2f deg and %.1f mm. Fix the ground plane\n"
@@ -767,8 +793,113 @@ int main(int argc, char** argv) {
     } else {
         printf("  needs 2 or more accepted speakers\n");
     }
+
+    /* ---- baffle depth: the optical points against MEASURED acoustic positions ----
+     * Layout positions are acoustic centers. Where --localize measured them, each optical point sits in
+     * front of its center by the baffle-to-acoustic-center depth, along the box's aim. Only after the
+     * frame is known does that difference mean anything, and a plain frame fit absorbs much of the depth
+     * into its translation, so the depth is solved INSIDE a refit of the frame (survey_fit_depth), over
+     * the measured speakers only. A plan position was never measured: comparing against it would read
+     * the installer's tape, not the acoustic center. */
+    enum { DEPTH_NO_DATA = 0, DEPTH_NO_FRAME, DEPTH_FEW, DEPTH_BAD_GEOMETRY, DEPTH_FRAME_OFF, DEPTH_OK };
+    int   depth_state = DEPTH_NO_DATA, nd = 0, ndisagree = 0;
+    float depth_med = 0.f, depth_worst_across = 0.f;
+    SurveyDepthFit dfit;
+    memset(&dfit, 0, sizeof dfit);
+    {
+        static float dopt[BWA_MAX_CHANNELS][3], daim[BWA_MAX_CHANNELS][3], dlay[BWA_MAX_CHANNELS][3];
+        static float ddep[BWA_MAX_CHANNELS], dacr[BWA_MAX_CHANNELS], dsort[BWA_MAX_CHANNELS];
+        static int   dli[BWA_MAX_CHANNELS];
+        const float b = a.opts.baffle_offset_m;
+        printf("\nbaffle depth: each optical point against its MEASURED acoustic position, along the box's optical aim,\n"
+               "              the depth solved inside a refit of the frame (positive = the center is behind the baffle)\n");
+        for (int i = 0; i < nf; ++i) {
+            const int li = g_rows[who[i]].layout_idx;
+            const Speaker* S = &L->speakers[li];
+            const char* skip = NULL;
+            if (!aok[i])           skip = "no optical aim, so no \"along the aim\"";
+            else if (!S->has_plan) skip = "no plan_position: its position was never measured";
+            else if (fabsf(S->pos[0] - S->plan_pos[0]) <= 1e-6f && fabsf(S->pos[1] - S->plan_pos[1]) <= 1e-6f &&
+                     fabsf(S->pos[2] - S->plan_pos[2]) <= 1e-6f)
+                                   skip = "its position equals its plan_position: never measured";
+            if (skip) { printf("    speaker %2d  skipped, %s\n", li, skip); continue; }
+            memcpy(dopt[nd], opt[i], sizeof dopt[nd]);
+            memcpy(daim[nd], oaim[i], sizeof daim[nd]);
+            memcpy(dlay[nd], S->pos, sizeof dlay[nd]);
+            dli[nd++] = li;
+        }
+        if (nd == 0) {
+            printf("  not measured: no matched speaker has a measured position. Run this on --localize's output\n"
+                   "  (as_built.json), not on the plan.\n");
+        } else if (!have_fit || fit.hand != SURVEY_HAND_OK) {
+            depth_state = DEPTH_NO_FRAME;
+            printf("  not measured: the frame check has no right-handed fit (above). Fix the frame first.\n");
+        } else if (nd < 3) {
+            depth_state = DEPTH_FEW;
+            printf("  not measured: %d measured speaker%s with an aim; the refit needs 3 or more\n", nd, nd == 1 ? "" : "s");
+        } else if (!survey_fit_depth((const float (*)[3])dopt, (const float (*)[3])daim, (const float (*)[3])dlay, nd,
+                                     &dfit, ddep, dacr)) {
+            depth_state = DEPTH_BAD_GEOMETRY;
+            printf("  not measured: the measured speakers face too nearly one way (the depth is then a translation),\n"
+                   "  or stand on one line\n");
+        } else if (!(dfit.angle_deg <= FRAME_MAX_DEG && dfit.t_m <= FRAME_MAX_M)) {
+            depth_state = DEPTH_FRAME_OFF;
+            printf("  not measured: with the depth solved, Motive's frame is still off the room frame by %.2f deg and\n"
+                   "  %.1f mm. An unaligned frame makes the difference meaningless: fix the frame first.\n",
+                   dfit.angle_deg, dfit.t_m * 1000.f);
+        } else {
+            depth_state = DEPTH_OK;
+            for (int k = 0; k < nd; ++k) dsort[k] = ddep[k];
+            for (int x = 1; x < nd; ++x) { const float v = dsort[x]; int y = x;           /* insertion sort */
+                while (y > 0 && dsort[y - 1] > v) { dsort[y] = dsort[y - 1]; --y; } dsort[y] = v; }
+            depth_med = (nd & 1) ? dsort[nd / 2] : 0.5f * (dsort[nd / 2 - 1] + dsort[nd / 2]);
+            for (int k = 0; k < nd; ++k) {
+                const bool off = fabsf(ddep[k] - depth_med) > SURVEY_DEPTH_AGREE_M || dacr[k] > SURVEY_DEPTH_AGREE_M;
+                if (dacr[k] > depth_worst_across) depth_worst_across = dacr[k];
+                ndisagree += off;
+                printf("    speaker %2d  depth %+7.1f mm  across the aim %5.1f mm%s\n", dli[k], ddep[k] * 1000.f,
+                       dacr[k] * 1000.f, off ? "  <-- DISAGREES" : "");
+            }
+            printf("  median %+.1f mm over %d speakers, spread %.1f mm (%+.1f to %+.1f), across the aim %.1f mm at worst\n",
+                   depth_med * 1000.f, nd, (dsort[nd - 1] - dsort[0]) * 1000.f, dsort[0] * 1000.f, dsort[nd - 1] * 1000.f,
+                   depth_worst_across * 1000.f);
+            printf("  the refit: depth %+.1f mm, the frame %.2f deg and %.1f mm with it solved, rms %.1f mm; the depth moves\n"
+                   "  %.2f mm per mm of position error (aim leverage %.2f)\n", dfit.depth_m * 1000.f, dfit.angle_deg,
+                   dfit.t_m * 1000.f, dfit.rms_m * 1000.f, 1.f / dfit.leverage, dfit.leverage);
+            if (b != 0.f)
+                printf("  these are the RESIDUAL beyond --baffle-offset-m %.4f: the depth itself is %+.1f mm\n", b,
+                       (b + depth_med) * 1000.f);
+            if (dfit.leverage < SURVEY_DEPTH_MIN_LEVERAGE)
+                printf("  WARNING: the measured speakers face nearly one way, so position error moves the depth a lot.\n"
+                       "           Add a visible speaker that faces another way.\n");
+            if (ndisagree)
+                printf("  WARNING: %d speaker%s off the median depth, or across the aim, by more than %.0f mm: the optical\n"
+                       "           and acoustic surveys disagree there. Check that speaker's body, aim and measured position.\n",
+                       ndisagree, ndisagree == 1 ? " is" : "s are", SURVEY_DEPTH_AGREE_M * 1000.f);
+            const float tl = sqrtf(fit.t[0] * fit.t[0] + fit.t[1] * fit.t[1] + fit.t[2] * fit.t[2]);
+            if (!(fit.angle_deg <= FRAME_MAX_DEG && tl <= FRAME_MAX_M))
+                printf("  note: the frame check above failed with --baffle-offset-m %.4f, and the refit agrees once the\n"
+                       "        depth is solved. Rerun with the value below.\n", b);
+            const float sug = fabsf(b + depth_med) < 0.00005f ? 0.f : b + depth_med;    /* no "-0.0000" */
+            printf("  suggested --baffle-offset-m %.4f\n", sug);
+        }
+    }
     int rc = 0;
     const char* sim_verdict = NULL;         /* the summary line's tail, so ONE line says everything */
+    /* --require-frame: the report is the instrument, and its exit code says nothing about the frame
+     * unless asked. A caller that reads only the exit code (the Session tab) asks, so a mirrored or
+     * rotated Motive frame stops the run instead of reading as a pass. */
+    const char* frame_verdict = NULL;
+    if (a.require_frame) {
+        const float tl = have_fit ? sqrtf(fit.t[0] * fit.t[0] + fit.t[1] * fit.t[1] + fit.t[2] * fit.t[2]) : 0.f;
+        if (!have_fit)                                frame_verdict = "frame check FAIL (no fit: 3 or more accepted speakers off one line)";
+        else if (fit.hand == SURVEY_HAND_MIRRORED)     frame_verdict = "frame check FAIL (mirrored)";
+        else if (fit.hand == SURVEY_HAND_UNDETERMINED) frame_verdict = "frame check FAIL (handedness undetermined)";
+        else if (!(fit.angle_deg <= FRAME_MAX_DEG && tl <= FRAME_MAX_M)) frame_verdict = "frame check FAIL (off the room frame)";
+        else                                           frame_verdict = "frame check PASS";
+        printf("\n%s\n", frame_verdict);
+        if (strstr(frame_verdict, "FAIL")) rc = 3;
+    }
     char write_verdict[160] = { 0 };
 
     /* ---- simulate: check the answer against what was injected ---- */
@@ -784,15 +915,28 @@ int main(int argc, char** argv) {
                 if (fit.hand == SURVEY_HAND_OK) { printf("simulate check: an injected mirror read as right-handed\n"); ++bad; }
             } else {
                 if (fit.hand == SURVEY_HAND_MIRRORED) { printf("simulate check: a right-handed frame read as MIRRORED\n"); ++bad; }
-                if (fabsf(fit.angle_deg - fabsf(a.sim_yaw_deg)) > 0.05f + tol_deg * 0.2f) {
-                    printf("simulate check: rotation %.3f deg, injected %.3f\n", fit.angle_deg, fabsf(a.sim_yaw_deg)); ++bad;
+                /* With a baffle depth unlike --baffle-offset-m every point is pushed along its aim, and the
+                 * plain fit absorbs part of the push (survey.h): the frame to hold to the truth is then the
+                 * depth refit's, when there is one */
+                const bool depth_wrong = a.sim_depth_set && a.sim_depth_m != a.opts.baffle_offset_m;
+                const bool use_refit = depth_wrong && depth_state == DEPTH_OK;
+                const float  ang = use_refit ? dfit.angle_deg : fit.angle_deg;
+                const float* ft  = use_refit ? dfit.t : fit.t;
+                if (depth_wrong && !use_refit)
+                    printf("simulate check: the baffle depth differs from --baffle-offset-m and was not measured, so the\n"
+                           "                frame's rotation and translation are not checked\n");
+                else {
+                    if (fabsf(ang - fabsf(a.sim_yaw_deg)) > 0.05f + tol_deg * 0.2f) {
+                        printf("simulate check: rotation %.3f deg, injected %.3f\n", ang, fabsf(a.sim_yaw_deg)); ++bad;
+                    }
+                    /* truth: layout = Rinj^T (optical - tinj), so t = -Rinj^T tinj */
+                    float tt[3];
+                    m3tv(g_sim.Rinj, g_sim.tinj, tt);
+                    float e = 0.f;
+                    for (int k = 0; k < 3; ++k) e += (ft[k] + tt[k]) * (ft[k] + tt[k]);
+                    if (sqrtf(e) > tol_m) { printf("simulate check: translation off the injected one by %.2f mm%s\n", sqrtf(e) * 1000.f,
+                                                   use_refit ? " (the depth refit)" : ""); ++bad; }
                 }
-                /* truth: layout = Rinj^T (optical - tinj), so t = -Rinj^T tinj */
-                float tt[3];
-                m3tv(g_sim.Rinj, g_sim.tinj, tt);
-                float e = 0.f;
-                for (int k = 0; k < 3; ++k) e += (fit.t[k] + tt[k]) * (fit.t[k] + tt[k]);
-                if (sqrtf(e) > tol_m) { printf("simulate check: translation off the injected one by %.2f mm\n", sqrtf(e) * 1000.f); ++bad; }
                 /* each aim, after the frame fit, against the aim the sim built */
                 for (int i = 0; i < nf; ++i) {
                     if (!aok[i]) continue;
@@ -804,6 +948,28 @@ int main(int argc, char** argv) {
                     m3v(fit.R, oaim[i], v);
                     float e_deg = survey_angle_deg(v, sb->true_aim_room);
                     if (e_deg > tol_deg) { printf("simulate check: speaker %d aim %.3f deg off the truth\n", li, e_deg); ++bad; }
+                }
+            }
+        }
+        /* the baffle depth, against the depth the sim built the baffles at: measured exactly when the
+         * injected frame is within the frame check's tolerance, and then right */
+        if (a.sim_depth_set) {
+            const float off = sqrtf(a.sim_offset[0] * a.sim_offset[0] + a.sim_offset[1] * a.sim_offset[1] +
+                                    a.sim_offset[2] * a.sim_offset[2]);
+            const bool frame_in = !a.sim_mirror && fabsf(a.sim_yaw_deg) <= FRAME_MAX_DEG && off <= FRAME_MAX_M;
+            if (frame_in && depth_state != DEPTH_OK) {
+                printf("simulate check: the injected frame is within tolerance, but no baffle depth was measured\n"); ++bad;
+            }
+            if (!frame_in && depth_state == DEPTH_OK) {
+                printf("simulate check: a baffle depth was measured through an injected frame that is off\n"); ++bad;
+            }
+            if (depth_state == DEPTH_OK) {
+                const float got = a.opts.baffle_offset_m + depth_med, err = fabsf(got - a.sim_depth_m);
+                printf("simulate check: baffle depth %.2f mm, injected %.2f (off by %.3f mm, tolerance %.2f)\n",
+                       got * 1000.f, a.sim_depth_m * 1000.f, err * 1000.f, tol_m * 1000.f);
+                if (err > tol_m) { printf("simulate check: the baffle depth is off the injected one\n"); ++bad; }
+                if (depth_worst_across > tol_m) {
+                    printf("simulate check: %.2f mm across the aim, the surveys agree exactly here\n", depth_worst_across * 1000.f); ++bad;
                 }
             }
         }
@@ -830,10 +996,11 @@ int main(int argc, char** argv) {
             if (a.write_aim && w->sp.aim_ok) { do_aim[i] = true; memcpy(waim[i], w->sp.aim, sizeof waim[i]); ++na; }
             if (a.write_pos)                 { do_pos[i] = true; memcpy(wpos[i], w->sp.pos, sizeof wpos[i]); ++np; }
         }
-        if (have_fit && !(fit.angle_deg <= 0.5f && sqrtf(fit.t[0] * fit.t[0] + fit.t[1] * fit.t[1] + fit.t[2] * fit.t[2]) <= 0.01f))
+        if (have_fit && !(fit.angle_deg <= FRAME_MAX_DEG && sqrtf(fit.t[0] * fit.t[0] + fit.t[1] * fit.t[1] + fit.t[2] * fit.t[2]) <= FRAME_MAX_M))
             printf("write: WARNING, Motive's frame disagrees with the layout's; these values are in Motive's frame\n");
+        int npn = 0, npk = 0;
         if (!write_layout(a.layout_path, a.write_path, do_aim, (const float (*)[3])waim, do_pos,
-                          (const float (*)[3])wpos, count, err, sizeof err)) {
+                          (const float (*)[3])wpos, count, &npn, &npk, err, sizeof err)) {
             printf("write: FAILED, %s\n", err);
             snprintf(write_verdict, sizeof write_verdict, "write FAILED");
             rc = 3;
@@ -843,7 +1010,10 @@ int main(int argc, char** argv) {
         const bool reload = layout_load(a.write_path, 48000, &check, err, sizeof err);
         printf("write: %s, %d aim%s and %d position%s; reload %s%s%s\n", a.write_path, na, na == 1 ? "" : "s",
                np, np == 1 ? "" : "s", reload ? "OK" : "FAILED (", reload ? "" : err, reload ? "" : ")");
-        snprintf(write_verdict, sizeof write_verdict, "wrote %d aims, %d positions (reload %s)", na, np, reload ? "OK" : "FAILED");
+        printf("write: plan recorded for %d speaker(s) (the position and aim this run replaced are now their\n"
+               "       plan_position and plan_aim), left alone on %d that already had one\n", npn, npk);
+        snprintf(write_verdict, sizeof write_verdict, "wrote %d aims, %d positions (reload %s), plan %d new %d kept",
+                 na, np, reload ? "OK" : "FAILED", npn, npk);
         if (!reload) rc = 3;
     } while (0);
 
@@ -855,7 +1025,12 @@ int main(int argc, char** argv) {
     else
         printf("\nsummary: matched %d, accepted %d, aims %d, no frame fit", nrows, naccepted, naims);
     if (sim_verdict)      printf(", %s", sim_verdict);
+    if (frame_verdict)    printf(", %s", frame_verdict);
     if (write_verdict[0]) printf(", %s", write_verdict);
+    if (depth_state == DEPTH_OK)
+        printf(", baffle depth%s %+.1f mm over %d", a.opts.baffle_offset_m != 0.f ? " residual" : "", depth_med * 1000.f, nd);
+    else if (depth_state != DEPTH_NO_DATA)
+        printf(", baffle depth not measured");
     printf("\n");
     return rc;
 }

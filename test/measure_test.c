@@ -146,6 +146,59 @@ int main(void) {
         free(dry); free(wet);
     }
 
+    /* --- the expected-arrival window and the IR's SNR (measure_response_ex) ---
+     * The speaker's sweep lands at D; an IMPOSTOR (the same sweep, 2x louder: a second speaker on a
+     * mis-patched output) lands at D + 600. Searched over the whole IR the arrival is the impostor's;
+     * inside a window around D it is the speaker's, and the capture is flagged. On a clean capture the
+     * windowed and the whole-IR results are bit-identical. With the window and the outside flag gone
+     * (exp_lo = exp_hi = 0) the first two checks go red. */
+    {
+        const int Dw = 900, ncw = nref + 24000;
+        float* cw = (float*)calloc((size_t)ncw, sizeof(float));
+        CHECK(cw != NULL, "alloc (window)");
+        if (cw) {
+            for (int i = 0; i < nref; ++i) cw[i + Dw] = 0.4f * sweep[i];
+            MeasureResult a, b;
+            CHECK(measure_response(cw, ncw, sweep, nref, f1, f2, fs, band_hz, &a), "clean, whole IR");
+            CHECK(measure_response_ex(cw, ncw, sweep, nref, f1, f2, fs, band_hz, Dw - 70, Dw + 70, &b, NULL, 0, 0, NULL),
+                  "clean, windowed");
+            CHECK(a.delay_samples == b.delay_samples && a.delay_frac == b.delay_frac && a.level == b.level && !b.outside,
+                  "window: a clean capture reads the same arrival and level to the bit, not flagged");
+            CHECK(a.noise_n > 0 && a.snr_db > 60.f, "snr: a noise-free capture reads far over its floor");
+            const float snr_clean = b.snr_db;
+            for (int i = 0; i < nref; ++i) cw[i + Dw + 600] += 0.8f * sweep[i];
+            CHECK(measure_response(cw, ncw, sweep, nref, f1, f2, fs, band_hz, &a), "impostor, whole IR");
+            CHECK(measure_response_ex(cw, ncw, sweep, nref, f1, f2, fs, band_hz, Dw - 70, Dw + 70, &b, NULL, 0, 0, NULL),
+                  "impostor, windowed");
+            printf("window: whole-IR arrival %d, windowed %d (truth %d), outside %d by %.1f dB; clean snr %.1f dB\n",
+                   a.delay_samples, b.delay_samples, Dw, b.outside, b.outside_db, snr_clean);
+            CHECK(a.delay_samples == Dw + 600 && !a.outside, "no window: the louder impostor is taken, unflagged");
+            CHECK(b.delay_samples == Dw && b.outside && b.peak_any == Dw + 600 && fabsf(b.outside_db - 6.02f) < 0.3f,
+                  "window: the speaker's own arrival, flagged: a stronger tap 6 dB up outside the window");
+            /* a steady noise floor: the SNR falls with it, about 20 dB per decade of noise */
+            for (int i = 0; i < nref; ++i) cw[i + Dw + 600] -= 0.8f * sweep[i];
+            uint32_t sd = 12345u;
+            MeasureResult n1, n2;
+            float* cn = (float*)malloc((size_t)ncw * sizeof(float));
+            CHECK(cn != NULL, "alloc (noise)");
+            if (cn) {
+                for (int k = 0; k < 2; ++k) {
+                    const float amp = k ? 0.01f : 0.001f;
+                    for (int i = 0; i < ncw; ++i) {
+                        sd = sd * 1664525u + 1013904223u;
+                        cn[i] = cw[i] + amp * ((float)(sd >> 8) / 8388608.f - 1.f);
+                    }
+                    measure_response_ex(cn, ncw, sweep, nref, f1, f2, fs, band_hz, Dw - 70, Dw + 70, k ? &n2 : &n1, NULL, 0, 0, NULL);
+                }
+                printf("snr: noise at 0.001 -> %.1f dB, at 0.01 -> %.1f dB\n", n1.snr_db, n2.snr_db);
+                CHECK(n1.snr_db < snr_clean && fabsf((n1.snr_db - n2.snr_db) - 20.f) < 2.f,
+                      "snr: ten times the noise is 20 dB less SNR");
+                free(cn);
+            }
+            free(cw);
+        }
+    }
+
     free(sweep);
 
     /* --- RT60: a synthetic exponential-decay tail with a known reverberation time --- */
@@ -264,6 +317,6 @@ int main(void) {
     }
 
     if (fails) { printf("measure_test: %d FAILURES\n", fails); return 1; }
-    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, direct-sound gate, RT60, early reflections, speaker EQ, room EQ verified)\n");
+    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, direct-sound gate, RT60, early reflections, speaker EQ, room EQ, arrival window, IR SNR verified)\n");
     return 0;
 }

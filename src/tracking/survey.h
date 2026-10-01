@@ -121,6 +121,45 @@ bool survey_fit_frame(const float (*opt)[3], const float (*lay)[3],
  * two layout points (m). A rigid frame change leaves it 0; a scale or a gross mismatch does not. */
 float survey_pair_delta(const float opt0[3], const float opt1[3], const float lay0[3], const float lay1[3]);
 
+/* ---- the baffle depth: the optical points against ACOUSTIC ones ----
+ * Layout positions are acoustic centers. Once --localize has MEASURED them, an optical point (the
+ * marker centroid on the baffle, less any baffle offset already applied) sits in front of its acoustic
+ * center by the baffle-to-acoustic-center depth, along the box's aim. A plain frame fit cannot read
+ * that depth off afterward: a rigid fit of points all pushed along their aims absorbs much of the push
+ * into its translation (a 60 mm depth read back as anywhere from 14 to 61 mm on four dome_24 subsets
+ * of 4 and 6 speakers, and the lopsided subsets then failed the 10 mm frame check on the depth alone).
+ * So the depth is a FOURTH unknown of the fit:
+ *
+ *   layout_i = R (optical_i - depth aim_i) + t
+ *
+ * solved by alternating Horn's rotation (depth fixed) with the closed-form (t, depth) least squares
+ * (rotation fixed) until the depth moves less than a nanometer. depth > 0 = the acoustic center sits
+ * BEHIND the baffle. The depth is separable from the translation only through the spread of the aims
+ * (b_i = R aim_i): its standard error is the position noise over `leverage`, so boxes that all face
+ * one way cannot measure it. */
+#define SURVEY_DEPTH_AGREE_M     0.020f  /* PROVISIONAL: a speaker whose depth is this far off the median,
+                                          * or whose difference has this much ACROSS its aim, says the two
+                                          * surveys disagree (the acoustic survey's simulated worst is
+                                          * about 12 mm, the optical one's about 1 mm) */
+#define SURVEY_DEPTH_MIN_LEVERAGE 0.5f   /* PROVISIONAL: below this the depth moves more than 2 mm per mm
+                                          * of position error; the report warns */
+typedef struct {
+    int   n;
+    float R[3][3], t[3];     /* layout = R * (optical - depth * aim) + t */
+    float angle_deg, t_m;    /* the rotation's angle and |t|: the frame check's two numbers, depth solved */
+    float depth_m;           /* the common depth, least squares */
+    float leverage;          /* sqrt(sum |b_i - mean b|^2): the depth's standard error is noise / this */
+    float rms_m;             /* the joint fit's position residual */
+    int   iters;
+} SurveyDepthFit;
+/* Fit with 3 <= n <= 64 speakers. opt: the optical points; aim: their unit OPTICAL aims, same frame;
+ * lay: the acoustic positions. depth_i / across_i (n each, NULL ok) receive, per speaker,
+ * (R opt_i + t - lay_i) . (R aim_i), and the length of what is left across the aim. False with n out of
+ * range, a non-finite input, layout points on (nearly) one line, or aims too alike to separate the depth
+ * from the translation. */
+bool survey_fit_depth(const float (*opt)[3], const float (*aim)[3], const float (*lay)[3], int n,
+                      SurveyDepthFit* out, float* depth_i, float* across_i);
+
 /* ---- rigid-body name -> layout index ---- */
 
 /* The default rule: `spk` or `speaker`, any case, then at most one separator (`_`, `-`, `.` or a

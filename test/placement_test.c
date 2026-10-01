@@ -4,7 +4,10 @@
  * (uneven spacing, noise, and the collinear and off-plane refusals), the mount angles, the default
  * thresholds, the stillness spread, the gate holding until the stand has settled (and dropping on a
  * jolt), the tolerance edges, accept-on-stillness, the bump check, and the refusal of every
- * non-finite or absurd input. The tools on top (bwa_calibrate --track, calib_view's Placement panel)
+ * non-finite or absurd input. The orientation half: the turn between two poses (sign-safe, small
+ * angles exact), the per-mode turn limits, the orientation-aware bump (a twist about the center that
+ * place_bump cannot see), and the gate's orientation term (jitter passes, a turn about the center
+ * holds it shut). The tools on top (bwa_calibrate --track, calib_view's Placement panel)
  * are covered end to end by the calibrate_track_* ctests and calib_view --tests placement.
  */
 #include "calib/placement.h"
@@ -264,6 +267,194 @@ static void test_bump(void) {
     CHECK(place_bump(taken, a, NAN, NULL) == -1, "a NaN tolerance cannot be judged");
 }
 
+/* ---- the orientation half ----
+ * The test builds its quaternions from axis-angle and a product written out here, never through
+ * placement.c, so a turn it reads back is checked against a rotation it made itself. */
+static void qaa(double ax, double ay, double az, double deg, double q[4]) {
+    const double n = sqrt(ax * ax + ay * ay + az * az), h = deg * 3.14159265358979323846 / 360.0;
+    q[0] = ax / n * sin(h); q[1] = ay / n * sin(h); q[2] = az / n * sin(h); q[3] = cos(h);
+}
+static void qmulx(const double a[4], const double b[4], double o[4]) {          /* xyzw, o = a b */
+    o[0] = a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1];
+    o[1] = a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0];
+    o[2] = a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3];
+    o[3] = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];
+}
+static void qf(const double q[4], float o[4]) { for (int a = 0; a < 4; ++a) o[a] = (float)q[a]; }
+/* the stand the simulator uses: yawed 30 deg about +y, then 1.5 deg off level about x */
+static void stand_q(double q[4]) {
+    double qy[4], qx[4];
+    qaa(0, 1, 0, 30.0, qy); qaa(1, 0, 0, 1.5, qx);
+    qmulx(qy, qx, q);
+}
+/* the stand turned `deg` about a room axis (pre-multiplied: a rotation in the room frame) */
+static void stand_turned(double ax, double ay, double az, double deg, float out[4]) {
+    double b[4], t[4], r[4];
+    stand_q(b); qaa(ax, ay, az, deg, t); qmulx(t, b, r); qf(r, out);
+}
+
+static void test_turn(void) {
+    float base[4], d = -1.f;
+    double b[4]; stand_q(b); qf(b, base);
+    CHECK(place_turn_deg(base, base, &d) && NEAR(d, 0.0, 1e-3), "no turn reads 0");
+    /* q and -q are one rotation: without the |w| the angle reads 360 */
+    const float neg[4] = { -base[0], -base[1], -base[2], -base[3] };
+    CHECK(place_turn_deg(base, neg, &d) && NEAR(d, 0.0, 1e-3), "q and -q: no turn (sign-safe)");
+    float t2[4];
+    stand_turned(0, 1, 0, 2.0, t2);
+    CHECK(place_turn_deg(base, t2, &d) && NEAR(d, 2.0, 1e-3), "2 deg about room vertical reads 2 deg");
+    const float t2n[4] = { -t2[0], -t2[1], -t2[2], -t2[3] };
+    CHECK(place_turn_deg(base, t2n, &d) && NEAR(d, 2.0, 1e-3), "... and against the negated quaternion");
+    CHECK(place_turn_deg(t2, base, &d) && NEAR(d, 2.0, 1e-3), "... and in the other order");
+    stand_turned(0.3, -0.5, 0.8, 7.5, t2);
+    CHECK(place_turn_deg(base, t2, &d) && NEAR(d, 7.5, 1e-3), "7.5 deg about an arbitrary axis");
+    stand_turned(1, 0, 0, 0.01, t2);
+    CHECK(place_turn_deg(base, t2, &d) && NEAR(d, 0.01, 2e-3), "a hundredth of a degree survives (no acos of ~1)");
+    stand_turned(0, 0, 1, 180.0, t2);
+    CHECK(place_turn_deg(base, t2, &d) && NEAR(d, 180.0, 1e-2), "a half turn reads 180");
+    const float big[4] = { 1.5f * base[0], 1.5f * base[1], 1.5f * base[2], 1.5f * base[3] };
+    CHECK(place_turn_deg(base, big, &d) && NEAR(d, 0.0, 1e-3), "a 1.5x quaternion is normalized first");
+    /* refusals: the same rules as place_center's q */
+    const float qnan[4] = { 0, NAN, 0, 1 }, qinf[4] = { INFINITY, 0, 0, 1 }, qzero[4] = { 0, 0, 0, 0 };
+    const float qsmall[4] = { 0, 0, 0, 0.1f }, qbig[4] = { 0, 0, 0, 3.f };
+    d = 7.f;
+    CHECK(!place_turn_deg(base, qnan, &d) && !place_turn_deg(qinf, base, &d) && !place_turn_deg(base, qzero, &d) &&
+          !place_turn_deg(qsmall, base, &d) && !place_turn_deg(base, qbig, &d) && !place_turn_deg(NULL, base, &d),
+          "a non-finite, zero, short, long or missing quaternion is refused");
+    CHECK(d == 7.f, "a refused turn leaves out untouched");
+}
+
+static void test_turn_limits(void) {
+    /* bwa_validate: 20 mm at the 1.4 m source radius is atan(10 / 1400) = 0.409 deg */
+    CHECK(NEAR(place_turn_limit_deg(0.020f, 1.4f), 0.40925, 1e-4), "validate: 0.41 deg");
+    /* the --zylia survey at 2.5 m wants 0.115 deg, under what one Motive frame resolves: the floor */
+    CHECK(NEAR(place_turn_limit_deg(0.010f, 2.5f), PLACE_TURN_MIN_DEG, 1e-7), "survey at 2.5 m: the floor");
+    CHECK(NEAR(place_turn_limit_deg(0.050f, 1.4f), 1.0230, 1e-3), "a wide tolerance widens it");
+    CHECK(NEAR(place_turn_limit_deg(1.0f, 0.05f), PLACE_TURN_MAX_DEG, 1e-7), "capped: never off by size");
+    CHECK(NEAR(place_turn_limit_deg(NAN, 1.4f), PLACE_TURN_MIN_DEG, 1e-7) &&
+          NEAR(place_turn_limit_deg(0.02f, NAN), PLACE_TURN_MIN_DEG, 1e-7) &&
+          NEAR(place_turn_limit_deg(0.02f, 0.f), PLACE_TURN_MIN_DEG, 1e-7) &&
+          NEAR(place_turn_limit_deg(0.02f, 3e30f), PLACE_TURN_MIN_DEG, 1e-7) &&
+          NEAR(place_turn_limit_deg(-1.f, 1.4f), PLACE_TURN_MIN_DEG, 1e-7), "a broken input gives the strictest limit");
+    PlaceCfg c;
+    place_cfg_default(&c, 0.020f);
+    CHECK(c.still_deg == 0.f, "the default gate is center only");
+    place_cfg_direction(&c, place_turn_limit_deg(0.020f, 1.4f));
+    CHECK(NEAR(c.still_deg, PLACE_TURN_MIN_DEG, 1e-7), "validate's stillness term floors at 0.3 deg");
+    place_cfg_direction(&c, 2.0f);
+    CHECK(NEAR(c.still_deg, 1.0, 1e-7), "a 2 deg limit stills at half of it");
+    place_cfg_direction(&c, NAN);
+    CHECK(NEAR(c.still_deg, PLACE_TURN_MIN_DEG, 1e-7), "a NaN limit stills at the floor");
+    /* a hand-filled config gets the same floor */
+    PlaceGate g;
+    c.still_deg = 0.01f;
+    place_gate_init(&g, &c);
+    CHECK(NEAR(g.cfg.still_deg, PLACE_TURN_MIN_DEG, 1e-7), "a hand-filled 0.01 deg is floored");
+    c.still_deg = NAN;
+    place_gate_init(&g, &c);
+    CHECK(g.cfg.still_deg == 0.f, "a NaN still_deg is center only, never a NaN comparison");
+}
+
+static void test_bump_pose(void) {
+    const float c0[3] = { 0.f, 1.448f, 0.f };
+    float q0[4], qa[4], qb[4], m = -1.f, tr = -1.f;
+    double b[4]; stand_q(b); qf(b, q0);
+    stand_turned(0, 1, 0, 0.29, qa);
+    stand_turned(0, 1, 0, 0.31, qb);
+    const float lim = PLACE_TURN_MIN_DEG;
+    CHECK(place_bump_pose(c0, q0, c0, qa, 0.010f, lim, &m, &tr) == 0 && NEAR(tr, 0.29, 2e-3), "0.29 deg on a 0.3 limit: in place");
+    CHECK(place_bump_pose(c0, q0, c0, qb, 0.010f, lim, &m, &tr) == PLACE_BUMP_TURNED && NEAR(tr, 0.31, 2e-3),
+          "0.31 deg on a 0.3 limit: TURNED, with the center where it was");
+    CHECK(m == 0.f, "... and the center did not move");
+    /* the twist the simulator uses: 2 deg about the array center. A center-only check cannot see it. */
+    float tw[4];
+    stand_turned(0, 1, 0, 2.0, tw);
+    CHECK(place_bump(c0, c0, 0.010f, NULL) == 0, "a turn about the center: place_bump sees nothing");
+    CHECK(place_bump_pose(c0, q0, c0, tw, 0.010f, 0.f, NULL, NULL) == 0, "limit 0 is center only: the twist passes");
+    CHECK(place_bump_pose(c0, q0, c0, tw, 0.010f, lim, NULL, &tr) == PLACE_BUMP_TURNED && NEAR(tr, 2.0, 2e-3),
+          "a direction check catches the twist");
+    const float c6[3] = { 0.006f, 1.448f, 0.f };
+    CHECK(place_bump_pose(c0, q0, c6, q0, 0.010f, lim, &m, NULL) == PLACE_BUMP_MOVED, "a 6 mm move: MOVED only");
+    CHECK(place_bump_pose(c0, q0, c6, tw, 0.010f, lim, NULL, NULL) == (PLACE_BUMP_MOVED | PLACE_BUMP_TURNED), "both");
+    const float qnan[4] = { NAN, 0, 0, 1 };
+    CHECK(place_bump_pose(c0, q0, c0, qnan, 0.010f, lim, NULL, NULL) == -1, "a NaN q with a limit cannot be judged");
+    CHECK(place_bump_pose(c0, q0, c0, qnan, 0.010f, 0.f, NULL, NULL) == 0, "... and is ignored center only");
+    CHECK(place_bump_pose(c0, q0, c6, qnan, 0.010f, lim, NULL, NULL) == PLACE_BUMP_MOVED, "a definite move stands without a q");
+    CHECK(place_bump_pose(c0, q0, c0, tw, 0.010f, NAN, NULL, NULL) == -1, "a NaN limit is not center only");
+    CHECK(place_bump_pose(c0, q0, c0, tw, 0.010f, 1e30f, NULL, NULL) == 0, "a huge limit caps at 5 deg: 2 deg passes");
+    stand_turned(0, 1, 0, 6.0, tw);
+    CHECK(place_bump_pose(c0, q0, c0, tw, 0.010f, 1e30f, NULL, NULL) == PLACE_BUMP_TURNED, "... and 6 deg does not");
+}
+
+/* the gate's orientation term: a stand still in position but turning about its center */
+static void test_gate_turn(void) {
+    const float tgt[3] = { 0.f, 1.448f, 0.f };
+    PlaceCfg cc, cd;
+    place_cfg_default(&cc, 0.010f);
+    cd = cc;
+    place_cfg_direction(&cd, PLACE_TURN_MIN_DEG);
+    PlaceGate gc, gd;
+    /* 1. still, with Motive-sized jitter (+/-0.15 deg about two axes) and the quaternion's sign flipping
+     *    every other frame: both gates open, and the mean is the stand */
+    place_gate_init(&gc, &cc); place_gate_init(&gd, &cd);
+    for (int i = 0; i <= 300; ++i) {
+        float q[4], qx[4];
+        stand_turned(0, 1, 0, 0.15 * sin(0.9 * i), q);
+        double t[4], r[4], b[4];
+        for (int a = 0; a < 4; ++a) b[a] = q[a];
+        qaa(1, 0, 0, 0.15 * cos(1.3 * i), t); qmulx(t, b, r); qf(r, qx);
+        if (i & 1) for (int a = 0; a < 4; ++a) qx[a] = -qx[a];
+        place_gate_update_q(&gc, i * 0.01, tgt, qx, tgt);
+        place_gate_update_q(&gd, i * 0.01, tgt, qx, tgt);
+    }
+    float base[4], d = 99.f;
+    double b[4]; stand_q(b); qf(b, base);
+    CHECK(gc.state == PLACE_OK && gd.state == PLACE_OK, "a still stand with jitter opens both gates");
+    CHECK(gd.have_q && gd.turn_spread_deg < 0.25f, "the jitter's spread is under the floor");
+    CHECK(place_turn_deg(gd.qmean, base, &d) && d < 0.05f, "the window mean is the stand, signs flipping or not");
+    printf("placement: jittered stand: spread %.3f deg, mean %.4f deg off the truth\n", gd.turn_spread_deg, d);
+
+    /* 2. the center fixed, the stand turning 2 deg/s about it (a 1 deg sweep across the window, 0.5 deg
+     *    of spread): center only opens, a direction gate never */
+    place_gate_init(&gc, &cc); place_gate_init(&gd, &cd);
+    int ever_d = 0, saw_turning = 0;
+    for (int i = 0; i <= 500; ++i) {
+        float q[4];
+        stand_turned(0, 1, 0, 0.02 * i, q);
+        place_gate_update_q(&gc, i * 0.01, tgt, q, tgt);
+        if (place_gate_update_q(&gd, i * 0.01, tgt, q, tgt) == PLACE_OK) ever_d = 1;
+        if (gd.state == PLACE_MOVING && gd.turning && !strcmp(place_gate_reason(&gd), "turning")) saw_turning = 1;
+    }
+    CHECK(gc.state == PLACE_OK, "center only: a stand turning about its center opens the gate");
+    CHECK(!ever_d && gd.state == PLACE_MOVING, "a direction gate stays shut while the stand turns");
+    CHECK(saw_turning, "... and says why: turning");
+    CHECK(!strcmp(place_gate_reason(&gc), "OK"), "the center gate's reason is its state");
+
+    /* 3. open, then a 0.5 deg step: shut, and the full window plus the hold again before it reopens */
+    place_gate_init(&gd, &cd);
+    float q0[4], q1[4];
+    stand_turned(0, 1, 0, 0.0, q0);
+    stand_turned(0, 1, 0, 0.5, q1);
+    for (int i = 0; i <= 200; ++i) place_gate_update_q(&gd, i * 0.01, tgt, q0, tgt);
+    CHECK(gd.state == PLACE_OK, "settled");
+    CHECK(place_gate_update_q(&gd, 2.01, tgt, q1, tgt) == PLACE_MOVING && gd.turning, "a 0.5 deg step shuts it");
+    double reopen = -1.0;
+    for (int i = 2; i <= 300; ++i)
+        if (place_gate_update_q(&gd, 2.0 + i * 0.01, tgt, q1, tgt) == PLACE_OK && reopen < 0.0) reopen = 2.0 + i * 0.01;
+    CHECK(reopen >= 2.01 + PLACE_WINDOW_S + PLACE_HOLD_S - 0.02, "after a turn the gate waits a window plus the hold");
+    CHECK(place_turn_deg(gd.qmean, q1, &d) && d < 1e-3f, "and then takes the new orientation");
+
+    /* 4. a direction gate cannot judge a pose with no orientation; a center gate does not need one */
+    const float qnan[4] = { 0, NAN, 0, 1 };
+    CHECK(place_gate_update_q(&gd, 9.0, tgt, NULL, tgt) == PLACE_NO_POSE && gd.n == 0, "direction: no q is no pose");
+    CHECK(place_gate_update_q(&gd, 9.1, tgt, qnan, tgt) == PLACE_NO_POSE, "direction: a NaN q is no pose");
+    place_gate_init(&gc, &cc);
+    CHECK(run_static(&gc, tgt, tgt, 0.0, 2.0, 100.0) == PLACE_OK && !gc.have_q, "center only: no q, opens, no qmean");
+    /* a window with one q-less sample reports no mean rather than a mean of part of it */
+    place_gate_update_q(&gc, 2.01, tgt, q0, tgt);
+    CHECK(gc.state == PLACE_OK && !gc.have_q, "a partly oriented window has no mean");
+}
+
 /* markers on a ring of radius r about `c`, in the plane with normal n (unit), at these angles */
 static void ring_markers(const double c[3], const double n[3], double r, const double* deg, int k, float out[][3]) {
     double t[3] = { 1, 0, 0 };
@@ -331,7 +522,52 @@ static void test_ring(void) {
     CHECK(!place_ring_fit(NULL, 3, &r), "NULL markers are refused");
 }
 
+/* place_move_words: err = where it IS minus where it SHOULD be, and the words are the opposite move.
+ * The expectations are spelled from the room frame by hand (room-right is -x, up is +y, the front wall
+ * is +z), never derived from BWA_ROOM_*, so a sign flip in the function cannot cancel out here. */
+static void test_move_words(void) {
+    char b[160];
+    const float dead = PLACE_MOVE_DEAD_BOX_M;                /* 5 mm */
+    struct { float e[3]; const char* want; } one[] = {
+        { { +0.012f, 0, 0 }, "move 12 mm toward room-right" },  /* sits 12 mm toward +x = room-LEFT of the plan */
+        { { -0.012f, 0, 0 }, "move 12 mm toward room-left" },
+        { { 0, +0.020f, 0 }, "move 20 mm down" },               /* too high */
+        { { 0, -0.020f, 0 }, "move 20 mm up" },
+        { { 0, 0, +0.030f }, "move 30 mm toward the back wall" }, /* too far toward the front */
+        { { 0, 0, -0.030f }, "move 30 mm toward the front wall" },
+    };
+    for (int i = 0; i < 6; ++i) {
+        const int n = place_move_words(one[i].e, dead, b, sizeof b);
+        if (n != 1 || strcmp(b, one[i].want) != 0) printf("  move words %d: got '%s', want '%s'\n", i, b, one[i].want);
+        CHECK(n == 1 && strcmp(b, one[i].want) == 0, "move words: each of the six directions alone");
+    }
+    /* the task's own example, axis order right/left, up/down, front/back */
+    const float ex[3] = { -0.012f, +0.004f, -0.030f };
+    CHECK(place_move_words(ex, 0.001f, b, sizeof b) == 3 &&
+          strcmp(b, "move 12 mm toward room-left, 4 mm down, 30 mm toward the front wall") == 0, "move words: all three axes");
+    if (strcmp(b, "move 12 mm toward room-left, 4 mm down, 30 mm toward the front wall") != 0) printf("  got '%s'\n", b);
+    /* the dead band: the 4 mm axis drops out at 5 mm, an axis exactly at the band still speaks */
+    CHECK(place_move_words(ex, dead, b, sizeof b) == 2 &&
+          strcmp(b, "move 12 mm toward room-left, 30 mm toward the front wall") == 0, "move words: the dead band drops a small axis");
+    const float at[3] = { 0.005f, 0.f, 0.f };
+    CHECK(place_move_words(at, dead, b, sizeof b) == 1 && strcmp(b, "move 5 mm toward room-right") == 0,
+          "move words: an axis at the dead band is named");
+    const float small[3] = { 0.0049f, -0.003f, 0.001f };
+    CHECK(place_move_words(small, dead, b, sizeof b) == 0 && strcmp(b, "no move: every axis within 5 mm") == 0,
+          "move words: everything inside the dead band says so");
+    /* the Placement panel's fine band: under half a millimeter never prints as 0 mm */
+    const float tiny[3] = { 0.0004f, 0.f, 0.f };
+    CHECK(place_move_words(tiny, 0.f, b, sizeof b) == 0, "move words: a move that rounds to 0 mm is not named");
+    /* refusals and truncation */
+    const float bad[3] = { NAN, 0.f, 0.f };
+    CHECK(place_move_words(bad, dead, b, sizeof b) == -1 && strcmp(b, "n/a") == 0, "move words: NaN is refused");
+    char s8[8];
+    place_move_words(ex, 0.001f, s8, sizeof s8);
+    CHECK(strlen(s8) == 7, "move words: a short buffer truncates and stays terminated");
+}
+
 int main(void) {
+    test_move_words();
     test_center();
     test_ring();
     test_refusals();
@@ -342,10 +578,15 @@ int main(void) {
     test_tolerance_edges();
     test_nan_gate();
     test_bump();
+    test_turn();
+    test_turn_limits();
+    test_bump_pose();
+    test_gate_turn();
     CHECK(strcmp(place_state_name(PLACE_OK), "OK") == 0 && strcmp(place_state_name((PlaceState)99), "no pose") == 0,
           "state names");
     if (fails) { printf("placement_test: %d FAILURES\n", fails); return 1; }
     printf("placement_test OK (center under rotation + offset, ring fit, refusals, mount angles, defaults, stillness, "
-           "gate settle + jolt, tolerance edges, NaN gate, bump)\n");
+           "gate settle + jolt, tolerance edges, NaN gate, bump, turn angle, turn limits, orientation bump, "
+           "orientation gate, move words)\n");
     return 0;
 }

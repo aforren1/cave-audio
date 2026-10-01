@@ -444,6 +444,118 @@ static void test_survey(void) {
     zylia_set_capsules(NULL);                            /* leave the global default installed */
 }
 
+/* ---- leave-one-out: find the clap that was not where it was banked ----
+ *
+ * An interferer heard while the clicker was held still is banked at the clicker's tip with arrivals
+ * from somewhere else. Synthesize exactly that: twelve claps off the built-in table with +-1 us of
+ * timing noise, one of them (index BAD) carrying the arrivals of a source 40 deg away from its banked
+ * position. The truth here is this test's own synthesis; nothing below shares a line with the solver. */
+static void loo_synth(const float caps[ZYLIA_MICS][3], const double src[3], double C, unsigned* rng, double arr[ZYLIA_MICS]) {
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double dx = caps[i][0] - src[0], dy = caps[i][1] - src[1], dz = caps[i][2] - src[2];
+        *rng = *rng * 1664525u + 1013904223u;
+        double nz = ((double)(int)(*rng >> 9) / (double)(1 << 22) - 1.0) * 1e-6;
+        arr[i] = sqrt(dx*dx + dy*dy + dz*dz) / C + 0.004 + nz;
+    }
+}
+
+static void test_survey_loo(void) {
+    const double C = 343.0, PI = 3.14159265358979;
+    enum { N = 12, BAD = 4 };
+    float caps[ZYLIA_MICS][3];
+    zylia_builtin_capsules(caps);
+    float src[N][3];
+    double arr[N][ZYLIA_MICS];
+    unsigned rng = 77u;
+    for (int k = 0; k < N; ++k) {
+        double yy = 0.85 - 1.7 * ((double)k + 0.5) / (double)N;
+        double rr = sqrt(1.0 - yy * yy), th = 2.399963229728653 * (double)k, D = 1.8 + 0.05 * k;
+        double s[3] = { D * rr * cos(th), D * yy, D * rr * sin(th) };
+        for (int a = 0; a < 3; ++a) src[k][a] = (float)s[a];
+        if (k == BAD) {                                  /* the interferer: 40 deg of azimuth away */
+            const double A = 40.0 * PI / 180.0;
+            const double t[3] = { s[0] * cos(A) + s[2] * sin(A), s[1], -s[0] * sin(A) + s[2] * cos(A) };
+            loo_synth((const float(*)[3])caps, t, C, &rng, arr[k]);
+        } else loo_synth((const float(*)[3])caps, s, C, &rng, arr[k]);
+    }
+
+    float sc[ZYLIA_MICS][3], resid = 0.f;
+    CHECK(zylia_survey(src, arr, N, C, sc, &resid, NULL, NULL), "survey with one interferer still solves");
+    double bent = 0.0;
+    for (int i = 0; i < ZYLIA_MICS; ++i)
+        for (int a = 0; a < 3; ++a) bent = fmax(bent, fabs((double)sc[i][a] - caps[i][a]));
+
+    ZyliaLooObs lo[N];
+    const int nf = zylia_survey_loo(src, arr, N, C, lo);
+    int worst_good = -1;
+    for (int k = 0; k < N; ++k) if (k != BAD && (worst_good < 0 || lo[k].heldout_us > lo[worst_good].heldout_us)) worst_good = k;
+    printf("[survey loo  ] with an interferer: resid %.2f us, capsules bent %.2f mm; LOO flags %d: interferer held-out "
+           "%.1f us vs the rest's %.2f; worst good %.2f us vs %.2f\n", resid, bent * 1e3, nf,
+           lo[BAD].heldout_us, lo[BAD].resid_us, lo[worst_good].heldout_us, lo[worst_good].resid_us);
+    CHECK(nf == 1 && lo[BAD].flagged, "leave-one-out flags the interferer, and only it");
+    CHECK(lo[BAD].heldout_us > 10.0f * ZYLIA_LOO_FLOOR_US, "...by a margin over the floor");
+    /* the masking a median rule would suffer: every LOO fit but one still holds the interferer, so the good
+     * claps' held-out errors rise with it. Against the rest's OWN residual they stay near 1 */
+    CHECK(lo[worst_good].heldout_us < 2.0f * lo[worst_good].resid_us, "a good clap's held-out error tracks the rest's residual");
+
+    /* drop it: the rest recovers the table */
+    {
+        float rs[N][3]; double ra[N][ZYLIA_MICS]; int n = 0;
+        for (int k = 0; k < N; ++k) if (k != BAD) { memcpy(rs[n], src[k], sizeof rs[n]); memcpy(ra[n], arr[k], sizeof ra[n]); ++n; }
+        float c2[ZYLIA_MICS][3], r2 = 0.f;
+        CHECK(zylia_survey(rs, ra, n, C, c2, &r2, NULL, NULL), "the rest solves");
+        double w = 0.0;
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            for (int a = 0; a < 3; ++a) w = fmax(w, fabs((double)c2[i][a] - caps[i][a]));
+        printf("[survey loo  ] dropped: resid %.2f us, worst capsule %.3f mm (bent %.2f mm with it)\n", r2, w * 1e3, bent * 1e3);
+        CHECK(w < 0.1 * bent && w < 5e-4, "dropping it restores the geometry");
+        ZyliaLooObs l2[N];
+        CHECK(zylia_survey_loo(rs, ra, n, C, l2) == 0, "a clean set flags nothing");
+    }
+
+    /* a clap 2 cm off its banked position (0.6 deg at 1.9 m) is noise-level, under the floor */
+    {
+        float s2[N][3]; double a2[N][ZYLIA_MICS];
+        memcpy(s2, src, sizeof s2); memcpy(a2, arr, sizeof a2);
+        rng = 77u;
+        for (int k = 0; k < N; ++k) {
+            double s[3] = { src[k][0], src[k][1], src[k][2] };
+            if (k == BAD) { double yy = 0.85 - 1.7 * ((double)k + 0.5) / (double)N, rr = sqrt(1.0 - yy * yy),
+                                   th = 2.399963229728653 * (double)k, D = 1.8 + 0.05 * k;
+                            s[0] = D * rr * cos(th); s[1] = D * yy; s[2] = D * rr * sin(th); }
+            if (k == 7) s[0] += 0.02;
+            loo_synth((const float(*)[3])caps, s, C, &rng, a2[k]);
+        }
+        ZyliaLooObs l3[N];
+        CHECK(zylia_survey_loo(s2, a2, N, C, l3) == 0, "a 2 cm position error is not flagged");
+    }
+
+    /* the spread floor: a ring of 8 at the array's height plus ONE clap overhead. Without the overhead
+     * clap the rest is coplanar, so it cannot be checked, and it is never flagged */
+    {
+        float s4[9][3]; double a4[9][ZYLIA_MICS];
+        for (int k = 0; k < 8; ++k) { double th = 2.0 * PI * k / 8.0; s4[k][0] = (float)(2.0 * cos(th)); s4[k][1] = 0.f; s4[k][2] = (float)(2.0 * sin(th)); }
+        s4[8][0] = 0.3f; s4[8][1] = 1.9f; s4[8][2] = -0.2f;
+        for (int k = 0; k < 9; ++k) { double s[3] = { s4[k][0], s4[k][1], s4[k][2] }; loo_synth((const float(*)[3])caps, s, C, &rng, a4[k]); }
+        a4[8][3] += 30e-6;                               /* and give it a fault the rule would otherwise flag */
+        ZyliaLooObs l4[9];
+        const int f4 = zylia_survey_loo(s4, a4, 9, C, l4);
+        printf("[survey loo  ] ring + one overhead: overhead ok %d (rest's spread %.4f), flags %d\n", l4[8].ok, l4[8].spread, f4);
+        CHECK(!l4[8].ok && !l4[8].flagged, "leaving out the only non-coplanar clap is unchecked, never flagged");
+        CHECK(l4[8].spread < ZYLIA_SURVEY_MIN_SPREAD, "...and the rest's spread says why");
+        CHECK(l4[0].ok, "the ring claps can each be left out");
+    }
+    CHECK(zylia_survey_loo(src, arr, 4, C, lo) == -1, "fewer than 5 observations is refused");
+
+    /* zylia_doa_caps is zylia_doa against a given table, whatever is installed */
+    {
+        float d1[3], d2[3];
+        zylia_set_capsules(NULL);
+        CHECK(zylia_doa(arr[0], d1) && zylia_doa_caps((const float(*)[3])caps, arr[0], d2), "both DOAs solve");
+        CHECK(fabsf(d1[0] - d2[0]) + fabsf(d1[1] - d2[1]) + fabsf(d1[2] - d2[2]) < 1e-6f, "doa_caps on the built-in table is zylia_doa");
+    }
+}
+
 /* ---- the ZM-1 as a pressure mic (zylia_pressure_proxy / zylia_center_arrival) ---- */
 
 /* |p| on the surface of a RIGID sphere under a unit plane wave, at the point `cosg` = cos of its
@@ -789,6 +901,7 @@ int main(void) {
 
     test_geometry();
     test_survey();
+    test_survey_loo();
     test_comb();
     test_pressure_proxy();
     test_ir_tdoa();

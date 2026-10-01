@@ -957,7 +957,8 @@ bool bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_
 
 /* Engine-free too, and for the same reason: the host clock is a property of the PROCESS, not of an
  * engine. Every backend that stamps bwa_timestamp.system_time_ns itself reads this same counter
- * (the two that take a driver-supplied stamp read the same OS clock underneath - see bw_audio.h),
+ * (the two that take a driver-supplied stamp are on the same OS clock too: JACK's by construction,
+ * ASIO's because the sink uses systemTime only when it is on QPC - see bw_audio.h),
  * so a caller can measure its own clock against it before bwa_create and reuse the offset. */
 uint64_t bwa_host_time_ns(void) {
     return os_monotonic_ns();

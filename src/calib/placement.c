@@ -2,9 +2,11 @@
  * placement.c - the tracked ZM-1's placement math (placement.h). Pure: no clock, no tracker, no I/O.
  */
 #include "calib/placement.h"
+#include "core/frame.h"     /* BWA_ROOM_RIGHT / UP / AHEAD: the words follow the one frame definition */
 #include "core/sane.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 /* a quaternion in, a unit quaternion out; refuse anything a tracker would not send */
@@ -51,6 +53,45 @@ int place_mount_angles(const float q[4], float* yaw_deg, float* tilt_deg) {
     return 1;
 }
 
+static const double RAD2DEG = 57.29577951308232;
+
+/* the angle of a^-1 b from two UNIT quaternions, degrees. The vector part's length against |w| through
+ * atan2 keeps a hundredth of a degree exact, where acos of a dot product near 1 would round it away;
+ * |w| is the sign-safety (q and -q). */
+static double turn_u(const double a[4], const double b[4]) {
+    /* r = conj(a) * b, xyzw */
+    const double ax = -a[0], ay = -a[1], az = -a[2], aw = a[3];
+    const double rx = aw*b[0] + ax*b[3] + ay*b[2] - az*b[1];
+    const double ry = aw*b[1] - ax*b[2] + ay*b[3] + az*b[0];
+    const double rz = aw*b[2] + ax*b[1] - ay*b[0] + az*b[3];
+    const double rw = aw*b[3] - ax*b[0] - ay*b[1] - az*b[2];
+    return 2.0 * atan2(sqrt(rx*rx + ry*ry + rz*rz), fabs(rw)) * RAD2DEG;
+}
+
+int place_turn_deg(const float a[4], const float b[4], float* deg) {
+    double ua[4], ub[4];
+    if (!unit_q(a, ua) || !unit_q(b, ub)) return 0;
+    if (deg) *deg = (float)turn_u(ua, ub);
+    return 1;
+}
+
+float place_turn_limit_deg(float tol_m, float range_m) {
+    if (!(tol_m > 0.f && tol_m <= PLACE_TOL_MAX_M) || !(range_m > 0.f && range_m <= PLACE_MAX_COORD_M))
+        return PLACE_TURN_MIN_DEG;
+    double d = atan(0.5 * (double)tol_m / (double)range_m) * RAD2DEG;
+    if (d < PLACE_TURN_MIN_DEG) d = PLACE_TURN_MIN_DEG;
+    if (d > PLACE_TURN_MAX_DEG) d = PLACE_TURN_MAX_DEG;
+    return (float)d;
+}
+
+void place_cfg_direction(PlaceCfg* c, float turn_limit_deg) {
+    if (!c) return;
+    float s = isfinite(turn_limit_deg) ? 0.5f * turn_limit_deg : 0.f;
+    if (s < PLACE_TURN_MIN_DEG) s = PLACE_TURN_MIN_DEG;
+    if (s > PLACE_TURN_MAX_DEG) s = PLACE_TURN_MAX_DEG;
+    c->still_deg = s;
+}
+
 void place_cfg_default(PlaceCfg* c, float tol_m) {
     if (!c) return;
     if (!isfinite(tol_m)) tol_m = PLACE_TOL_DEFAULT_M;
@@ -63,6 +104,7 @@ void place_cfg_default(PlaceCfg* c, float tol_m) {
     c->still_m  = s;
     c->window_s = PLACE_WINDOW_S;
     c->hold_s   = PLACE_HOLD_S;
+    c->still_deg = 0.f;
 }
 
 void place_gate_reset(PlaceGate* g) {
@@ -83,17 +125,28 @@ void place_gate_init(PlaceGate* g, const PlaceCfg* cfg) {
     if (!bwa_finite_clamp(&g->cfg.still_m, PLACE_STILL_MIN_M, PLACE_TOL_MAX_M)) g->cfg.still_m = PLACE_STILL_MAX_M;
     if (!(g->cfg.window_s > 0.0 && g->cfg.window_s <= 60.0)) g->cfg.window_s = PLACE_WINDOW_S;
     if (!(g->cfg.hold_s >= 0.0 && g->cfg.hold_s <= 600.0))   g->cfg.hold_s   = PLACE_HOLD_S;
+    /* 0 = center only; anything else is a direction mode and gets the floor and the cap */
+    if (!isfinite(g->cfg.still_deg) || g->cfg.still_deg < 0.f) g->cfg.still_deg = 0.f;
+    else if (g->cfg.still_deg > 0.f) place_cfg_direction(&g->cfg, 2.f * g->cfg.still_deg);
     g->state = PLACE_NO_POSE;
 }
 
 static void drop(PlaceGate* g) {
     g->n = 0; g->head = 0; g->ok_run = 0; g->held_s = 0.0; g->span_s = 0.0; g->spread_m = 0.f;
+    g->have_q = 0; g->turn_spread_deg = 0.f; g->turning = 0;
 }
 
 PlaceState place_gate_update(PlaceGate* g, double t, const float center[3], const float target[3]) {
+    return place_gate_update_q(g, t, center, NULL, target);
+}
+
+PlaceState place_gate_update_q(PlaceGate* g, double t, const float center[3], const float q[4], const float target[3]) {
     if (!g) return PLACE_NO_POSE;
+    double uq[4];
+    const int qok = q && unit_q(q, uq);
     if (!isfinite(t) || !center || !target ||
-        !bwa_finite3_bounded(center, PLACE_MAX_COORD_M) || !bwa_finite3_bounded(target, PLACE_MAX_COORD_M)) {
+        !bwa_finite3_bounded(center, PLACE_MAX_COORD_M) || !bwa_finite3_bounded(target, PLACE_MAX_COORD_M) ||
+        (g->cfg.still_deg > 0.f && !qok)) {             /* a direction mode cannot judge a pose with no orientation */
         drop(g);
         g->state = PLACE_NO_POSE;
         return g->state;
@@ -108,6 +161,8 @@ PlaceState place_gate_update(PlaceGate* g, double t, const float center[3], cons
     if (g->n == 0 || t - g->t[newest] >= min_dt) {
         g->t[g->head] = t;
         memcpy(g->c[g->head], center, sizeof g->c[0]);
+        g->hq[g->head] = (unsigned char)qok;
+        for (int a = 0; a < 4; ++a) g->q[g->head][a] = qok ? (float)uq[a] : 0.f;
         g->head = (g->head + 1) % PLACE_HIST;
         if (g->n < PLACE_HIST) ++g->n;
         newest = (g->head + PLACE_HIST - 1) % PLACE_HIST;
@@ -145,7 +200,40 @@ PlaceState place_gate_update(PlaceGate* g, double t, const float center[3], cons
     g->dist_m = (float)sqrt(dd);
     g->mean_dist_m = (float)sqrt(md);
 
-    const int still = g->n >= 3 && g->span_s >= 0.9 * g->cfg.window_s && g->spread_m <= g->cfg.still_m;
+    /* The orientation: the mean of the window's quaternions, each sign-aligned to the oldest first (q
+     * and -q are one rotation, and a tracker may send either), then the largest turn of a sample from
+     * it. The chordal mean is exact to well under a hundredth of a degree for spreads of a few degrees. */
+    g->have_q = 0; g->turn_spread_deg = 0.f;
+    int allq = 1;
+    for (int k = 0; k < g->n && allq; ++k) allq = g->hq[(oldest + k) % PLACE_HIST];
+    if (allq) {
+        double s[4] = { 0.0, 0.0, 0.0, 0.0 };
+        const float* r0 = g->q[oldest];
+        for (int k = 0; k < g->n; ++k) {
+            const float* qi = g->q[(oldest + k) % PLACE_HIST];
+            const double dot = (double)qi[0]*r0[0] + (double)qi[1]*r0[1] + (double)qi[2]*r0[2] + (double)qi[3]*r0[3];
+            const double sg = dot < 0.0 ? -1.0 : 1.0;
+            for (int a = 0; a < 4; ++a) s[a] += sg * qi[a];
+        }
+        const double sn = sqrt(s[0]*s[0] + s[1]*s[1] + s[2]*s[2] + s[3]*s[3]);
+        if (sn > 1e-9) {
+            double um[4], ui[4], worst = 0.0;
+            for (int a = 0; a < 4; ++a) { um[a] = s[a] / sn; g->qmean[a] = (float)um[a]; }
+            for (int k = 0; k < g->n; ++k) {
+                const float* qi = g->q[(oldest + k) % PLACE_HIST];
+                for (int a = 0; a < 4; ++a) ui[a] = qi[a];
+                const double d = turn_u(um, ui);
+                if (d > worst) worst = d;
+            }
+            g->have_q = 1;
+            g->turn_spread_deg = (float)worst;
+        }
+    }
+
+    const int pos_still = g->n >= 3 && g->span_s >= 0.9 * g->cfg.window_s && g->spread_m <= g->cfg.still_m;
+    const int turn_still = g->cfg.still_deg <= 0.f || (g->have_q && g->turn_spread_deg <= g->cfg.still_deg);
+    const int still = pos_still && turn_still;
+    g->turning = pos_still && !turn_still;
     const int in_tol = g->cfg.tol_m <= 0.f || g->mean_dist_m <= g->cfg.tol_m;
     if (!still)       { g->ok_run = 0; g->held_s = 0.0; g->state = PLACE_MOVING; }
     else if (!in_tol) { g->ok_run = 0; g->held_s = 0.0; g->state = PLACE_OFF_TARGET; }
@@ -166,6 +254,20 @@ int place_bump(const float taken[3], const float now[3], float tol_m, float* mov
     const double d = sqrt(d2);
     if (moved_m) *moved_m = (float)d;
     return d > 0.5 * tol_m ? 1 : 0;
+}
+
+int place_bump_pose(const float c_taken[3], const float q_taken[4], const float c_now[3], const float q_now[4],
+                    float tol_m, float turn_limit_deg, float* moved_m, float* turned_deg) {
+    const int b = place_bump(c_taken, c_now, tol_m, moved_m);
+    if (isnan(turn_limit_deg)) return -1;               /* a broken limit is not "center only" */
+    if (turn_limit_deg <= 0.f) return b;                /* center only */
+    if (turn_limit_deg > PLACE_TURN_MAX_DEG) turn_limit_deg = PLACE_TURN_MAX_DEG;   /* never off by size */
+    float d = 0.f;
+    const int have = place_turn_deg(q_taken, q_now, &d);
+    if (have && turned_deg) *turned_deg = d;
+    if (b == 1) return PLACE_BUMP_MOVED | (have && d > turn_limit_deg ? PLACE_BUMP_TURNED : 0);
+    if (b < 0 || !have) return -1;
+    return d > turn_limit_deg ? PLACE_BUMP_TURNED : 0;
 }
 
 /* eigen-decompose a symmetric 3x3 (cyclic Jacobi): A is destroyed, V's COLUMNS are the vectors */
@@ -272,6 +374,42 @@ int place_ring_fit(const float (*mk)[3], int n, PlaceRing* r) {
     if (r->circle_rms_m > PLACE_RING_MAX_RMS_M) return ring_refuse(r, "the markers are more than 3 mm RMS off one circle");
     r->ok = 1;
     return 1;
+}
+
+const char* place_gate_reason(const PlaceGate* g) {
+    if (!g) return place_state_name(PLACE_NO_POSE);
+    if (g->state == PLACE_MOVING && g->turning) return "turning";
+    return place_state_name(g->state);
+}
+
+int place_move_words(const float err_m[3], float dead_m, char* buf, size_t cap) {
+    if (!buf || cap < 1) return -1;
+    buf[0] = 0;
+    if (!err_m || !isfinite(err_m[0]) || !isfinite(err_m[1]) || !isfinite(err_m[2]) || !(dead_m >= 0.f)) {
+        snprintf(buf, cap, "n/a");
+        return -1;
+    }
+    /* the move is the opposite of the error, read on the room basis rather than off x/y/z, so the
+     * words follow the frame convention from the one place that defines it (room-right is -x) */
+    const float* basis[3] = { BWA_ROOM_RIGHT, BWA_ROOM_UP, BWA_ROOM_AHEAD };
+    static const char* const pos_word[3] = { "toward room-right", "up",   "toward the front wall" };
+    static const char* const neg_word[3] = { "toward room-left",  "down", "toward the back wall" };
+    size_t k = 0;
+    int named = 0;
+    for (int a = 0; a < 3; ++a) {
+        const double mv = -((double)err_m[0] * basis[a][0] + (double)err_m[1] * basis[a][1] + (double)err_m[2] * basis[a][2]);
+        const long mm = lround(fabs(mv) * 1e3);
+        if (!(fabs(mv) >= (double)dead_m) || mm < 1) continue;          /* the dead band, and never "0 mm" */
+        if (k >= cap) break;
+        const int w = snprintf(buf + k, cap - k, "%s%ld mm %s", named ? ", " : "move ", mm,
+                               mv > 0.0 ? pos_word[a] : neg_word[a]);
+        if (w < 0) break;
+        k += (size_t)w;
+        if (k >= cap) k = cap - 1;                                      /* truncated, still terminated */
+        ++named;
+    }
+    if (!named) snprintf(buf, cap, "no move: every axis within %g mm", (double)dead_m * 1e3);
+    return named;
 }
 
 const char* place_state_name(PlaceState s) {

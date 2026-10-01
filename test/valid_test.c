@@ -206,13 +206,13 @@ static void test_feed_path(const Layout* L, double FS, double C) {
     }
     printf("[feed path    ] worst feeds-vs-analytic disagreement %.2f deg\n", worst);
 
-    /* THE TWO ARMS NOW USE DIFFERENT PROPAGATION MODELS, and the physical-versus-phantom table
-     * SUBTRACTS them, so any systematic difference between the models would land in that contrast
-     * wearing the phantom's name. The phantom arm propagates real engine feeds with a cubic
-     * fractional tap (a feed is no longer a scaled copy of one stimulus, so the exact phase-domain
-     * model cannot apply); the reference arm keeps the exact model. Pin the pair: drive one speaker
-     * alone, propagate its feed the explicit way, and require the answer to match the analytic
-     * reference cell it will be differenced against. */
+    /* The offline reference cell (valid_reference_cell) keeps the EXACT phase-domain model, while
+     * every captured cell reaches the capsules through real feeds and an interpolated delay (a feed is
+     * no longer a scaled copy of one stimulus once the engine has rendered it). The tests below use the
+     * offline cell as the physical side of contrasts, so pin it against the feed path: drive one
+     * speaker alone, propagate its feed the explicit way, and require the same answer. (bwa_validate
+     * itself captures its references, so both arms of ITS contrast share one propagation; the block
+     * after this one pins that path.) */
     {
         double worst_ref = 0.0, worst_comb = 0.0;
         int n = 0;
@@ -242,6 +242,48 @@ static void test_feed_path(const Layout* L, double FS, double C) {
         CHECK(n >= 4, "the reference-arm model check runs on several speakers");
         CHECK(worst_ref < 1.0 && worst_comb < 0.5,
               "the two arms' propagation models agree, so the matched contrast between them is real");
+    }
+
+    /* The sequence bwa_validate runs for a physical reference cell, on both backends: build the
+     * one-speaker feeds, CAPTURE them (here the simulated device, valid_propagate_feeds, reading the
+     * window after a skipped head exactly as the tool does), score with valid_score_reference. It must
+     * land where the exact offline cell does, and it must come back tagged as a reference. */
+    {
+        double worst = 0.0, worst_comb = 0.0;
+        int n = 0;
+        for (uint32_t sp = 2; sp < L->count; sp += 5) {
+            ValidCell viaCap, viaField;
+            if (!valid_reference_feeds(L, (int)sp, FS, feeds, NN + PRE) ||
+                !valid_propagate_feeds(L, feeds, PRE, NN, mic, FS, C, cap) ||
+                !valid_score_reference(L, (int)sp, mic, cap, NN, FS, C, NULL, &viaCap) ||
+                !valid_reference_cell(L, (int)sp, mic, FS, C, NN, &viaField)) {
+                CHECK(0, "the captured reference path runs"); continue;
+            }
+            CHECK(viaCap.reference == 1 && viaCap.tgt == (int)sp, "a captured reference is tagged with its speaker");
+            CHECK(viaCap.render.focus == 0.f && viaCap.render.density == 0.f, "a captured reference carries no panner tuning");
+            if (!viaCap.ok || !viaField.ok) { CHECK(0, "both reference cells resolve"); continue; }
+            double d = (double)viaCap.measured[0]*viaField.measured[0]
+                     + (double)viaCap.measured[1]*viaField.measured[1]
+                     + (double)viaCap.measured[2]*viaField.measured[2];
+            double deg = acos(fmax(-1.0, fmin(1.0, d))) * 180.0 / 3.14159265358979;
+            if (deg > worst) worst = deg;
+            if (viaCap.comb_ok && viaField.comb_ok) {
+                double dk = fabs((double)viaCap.comb_db - viaField.comb_db);
+                if (dk > worst_comb) worst_comb = dk;
+            }
+            ++n;
+        }
+        printf("[feed path    ] captured reference (feeds -> valid_propagate_feeds -> valid_score_reference)\n"
+               "                vs the offline cell: worst %.2f deg, %.2f dB comb over %d speakers\n",
+               worst, worst_comb, n);
+        CHECK(n >= 4, "the captured-reference check runs on several speakers");
+        CHECK(worst < 1.0 && worst_comb < 0.5, "a captured reference lands where the offline cell does");
+        /* the pre-roll has to cover the path: a head shorter than the propagation delay is refused,
+         * never read short */
+        CHECK(!valid_propagate_feeds(L, feeds, 8u, NN, mic, FS, C, cap), "a pre-roll shorter than the path is refused");
+        ValidCell bad;
+        CHECK(!valid_score_reference(L, (int)L->count, mic, cap, NN, FS, C, NULL, &bad),
+              "a bad speaker index is refused");
     }
     free(feeds); free(wide); free(cap);
 }

@@ -162,7 +162,7 @@ The calibration commands behind the last row are under
 **Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
 follows you instead of degrading away from a center. Leave dual-band and VBAP off:
 both sharpen the image *at a sweet spot*, and there isn't one. Use the grid for room
-correction (`bwa_calibrate --room-eq-grid`, one run per mic position). The engine
+correction (`bwa_calibrate --room-eq-grid rows.txt`, one placement per row). The engine
 interpolates the LF cuts at your live position and glides the biquads.
 `bwa_set_pose_prediction` (start at 20 to 40 ms, your measured motion-to-ears latency) hides
 the panning lag. `bwa_set_decorrelation` keeps wide sources from comb-filtering as you
@@ -353,10 +353,18 @@ Headless: `--export`, `--score`, `--optimize`.
 
 ![bwa_calib_view: layout diff](docs/img/calib_view_diff.png)
 
+The Session tab walks a rig day in order: the Motive frame check, speaker positions, the
+capsule survey, live aiming, trims, verify, the room-EQ grid and validation. Each step runs the
+tested tool, writes a new file in one session folder and hands it to the next, so the plan is
+never written. It keeps one log, reopens where you left off, and marks every later step stale
+when you run an earlier one again. **simulate** rehearses the whole day with no hardware. It has
+not met the rig yet.
+
 The Capture tab runs sweep, measure, solve, and writeback (simulated, or full-duplex
-ASIO with an omni mic), then loads the result into a layout diff: A the
+ASIO), then loads the result into a layout diff: A the
 input, B what was written. You catch a swapped channel or a bad mic placement
-before you trust the file.
+before you trust the file. The mic is an omni or the ZM-1, and the tab runs the
+verify pass too, through the same measurement code as `bwa_calibrate`.
 
 Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IRs.
 The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere: a
@@ -366,15 +374,17 @@ The Aim tab is live aiming for the speakers you cannot see (below).
 ![bwa_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
 
 `bwa_calibrate` is the whole pipeline headless, and `--simulate` runs every mode with
-no hardware. On the rig the ZM-1 is the only mic, and `--zylia` says so:
+no hardware. On the rig the ZM-1 is the only mic, and `--zylia` says so. The trims and
+verify rows also run in the Capture tab, with its ZM-1 mic:
 
 | Step | Command | What it does |
 | --- | --- | --- |
 | Aiming sheet | `--aim-sheet aim.csv` | the bearing and down-tilt each mount needs, before the boxes go up |
-| Positions | `--zylia` | every speaker from one ZM-1 placement: direction plus range |
+| Positions | `--localize rows.txt --zylia` | every speaker, trilaterated from the ZM-1 at several placements; the first survey keeps the plan |
+| Capsule table | `--capsule-survey s.json --zylia` | the ZM-1's channel order and orientation, swept from the speakers |
 | Trims | `--zylia --trims` | delay and gain per speaker, the 19 capsules pooled into one omni-like reading |
 | Verify | `--zylia --verify` | play the trims back through the engine's output stage and flag what is off |
-| Live aiming | `--live N --zylia` | sweep one speaker over and over while someone turns it |
+| Live aiming | `--live N --zylia` | sweep one speaker over and over while someone turns and moves it to its plan |
 | Aim check | `--localize f --check-aim` | fit each box's real axis from several mic placements |
 
 `bwa_zylia_probe` is a console level meter. See
@@ -390,7 +400,9 @@ ZM-1's equator works: `--mount-offset ring` finds the array center from them.
 **Aim the boxes you cannot see.** Most of the array hangs behind the screens or
 overhead. Live aiming turns the ZM-1 into an aiming instrument: the treble tilt peaks
 when a box points at the mic, so an installer turns the box until the meter reads 0 dB
-below its peak. For the few speakers the cameras can see, `bwa_speaker_survey` measures
+below its peak. It measures each box against its plan, which the first survey keeps in the
+layout (`plan_position`, `plan_aim`), and says how to move it in room words: "move 12 mm
+toward room-left, 30 mm toward the front wall". For the few speakers the cameras can see, `bwa_speaker_survey` measures
 the aim and position optically from rigid bodies named `spk<N>`, and checks that
 Motive's frame is the room frame. One of those makes a good reference for aiming the
 rest.
@@ -403,7 +415,7 @@ variants of the same geometry and pick one per session
 ```
 bwa_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
 bwa_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
-bwa_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   # then rerun per mic spot
+bwa_calibrate --layout cave_layout.roaming.json --room-eq-grid grid_rows.txt    # one placement per row
 ```
 
 - **Seated** (SPCAP/VBAP, fixed listener pose): trims and room correction both at the
@@ -411,8 +423,9 @@ bwa_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   
 - **Roaming** (DBAP + tracking): trims aligned at the working-volume center at
   standing ear height, speaker-only EQ; one point can't room-correct a roam.
 - **Roaming + tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic
-  placement at a time (the `--mic` position is the grid key). The engine interpolates
-  them at the live tracked position, so the correction survives a walk.
+  placement at a time, every row of a positions file in one run (with `--track`, each
+  row's measured position is its grid key; `--mic` still works for one placement). The
+  engine interpolates them at the live tracked position, so the correction survives a walk.
 
 Diff the variants in calib_view: identical positions, only trim and EQ differences.
 Unknown JSON fields survive recalibration, so a variant can carry its own annotation.

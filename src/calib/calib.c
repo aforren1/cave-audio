@@ -239,16 +239,94 @@ int calib_on_axis_tilt_db(const Directivity* d, const double band_hz[2], double 
 
 void calib_peak_reset(CalibPeakHold* p) {
     if (!p) return;
-    p->n = 0; p->last_db = 0.f; p->peak_db = 0.f; p->peak_index = 0;
+    memset(p, 0, sizeof *p);
 }
 
-float calib_peak_update(CalibPeakHold* p, float value_db) {
+static float peak_below(const CalibPeakHold* p, float v) {
+    const float b = p->peak_index ? p->peak_db - v : 0.f;
+    return b > 0.f ? b : 0.f;
+}
+
+float calib_peak_update(CalibPeakHold* p, float value_db, int clean, float tol_db) {
     if (!p) return 0.f;
-    if (!isfinite(value_db)) return p->peak_index ? p->peak_db - p->last_db : 0.f;
+    if (!isfinite(value_db)) return peak_below(p, p->last_db);
+    if (!(tol_db >= 0.f)) tol_db = 0.f;
     ++p->n;
     p->last_db = value_db;
-    if (!p->peak_index || value_db > p->peak_db) { p->peak_db = value_db; p->peak_index = p->n; }
-    return p->peak_db - value_db;
+    if (!clean) { ++p->nrejected; p->prev_clean = 0; return peak_below(p, value_db); }
+    if (p->prev_clean && fabsf(value_db - p->prev_db) <= tol_db) {
+        const float pair = value_db < p->prev_db ? value_db : p->prev_db;   /* the level BOTH reached */
+        if (!p->peak_index || pair > p->peak_db) { p->peak_db = pair; p->peak_index = p->n; }
+    }
+    p->prev_clean = 1;
+    p->prev_db = value_db;
+    return peak_below(p, value_db);
+}
+
+/* ---- sweep quality ---- */
+
+int calib_arrival_window(const CalibWindow* w, const float spk[3], const float mic[3], double sos, double fs,
+                         int* lo, int* hi) {
+    if (!w || !spk || !mic || !lo || !hi) return 0;
+    if (!isfinite(w->lat_s) || !(w->lat_early_s >= 0.0) || !(w->lat_late_s >= 0.0) || !(w->pos_m >= 0.0)) return 0;
+    if (!(sos > 1.0) || !(fs > 0.0)) return 0;
+    for (int a = 0; a < 3; ++a)       /* finite AND bounded: a 3e38 coordinate squares to Inf */
+        if (!(fabsf(spk[a]) <= 1e4f) || !(fabsf(mic[a]) <= 1e4f)) return 0;
+    if (w->lat_early_s > 10.0 || w->lat_late_s > 10.0 || w->pos_m > 100.0 || fabs(w->lat_s) > 10.0) return 0;
+    const double dx = (double)spk[0] - mic[0], dy = (double)spk[1] - mic[1], dz = (double)spk[2] - mic[2];
+    const double d = sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > 1000.0) return 0;
+    const double dn = d - w->pos_m > 0.0 ? d - w->pos_m : 0.0;
+    const double t0 = w->lat_s - w->lat_early_s + dn / sos;
+    const double t1 = w->lat_s + w->lat_late_s + (d + w->pos_m) / sos + CALIB_WIN_SPK_S;
+    *lo = (int)floor(t0 * fs);
+    *hi = (int)ceil(t1 * fs) + 1;
+    if (*lo < 0) *lo = 0;
+    return *hi > *lo;
+}
+
+int calib_sweep_check(const MeasureResult* m, float min_snr_db) {
+    if (!m) return CALIB_SWEEP_NOISY;
+    if (m->outside) return CALIB_SWEEP_OUTSIDE;
+    if (m->noise_n > 0 && !(m->snr_db >= min_snr_db)) return CALIB_SWEEP_NOISY;
+    return CALIB_SWEEP_OK;
+}
+
+void calib_sweep_why(const MeasureResult* m, int code, double fs, char* buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    if (!m || !(fs > 0.0)) { snprintf(buf, cap, "no measurement"); return; }
+    const double ms = 1e3 / fs;
+    if (code == CALIB_SWEEP_OUTSIDE)
+        snprintf(buf, cap, "the strongest tap (%.2f ms) is %.1f dB above the arrival and outside the expected window "
+                 "%.2f-%.2f ms: something other than this speaker was louder",
+                 m->peak_any * ms, m->outside_db, m->win_lo * ms, m->win_hi * ms);
+    else if (code == CALIB_SWEEP_NOISY)
+        snprintf(buf, cap, "IR peak %.1f dB over its noise floor, under the %.0f dB the sweep needs",
+                 m->snr_db, CALIB_SWEEP_MIN_SNR_DB);
+    else
+        snprintf(buf, cap, "clean: arrival %.2f ms, IR peak %.1f dB over its noise floor",
+                 (m->delay_samples + m->delay_frac) * ms, m->snr_db);
+}
+
+int calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float* d_samples, float* d_db) {
+    if (!a || !b) return 0;
+    const double ta = (double)a->delay_samples + a->delay_frac, tb = (double)b->delay_samples + b->delay_frac;
+    const double ds = fabs(ta - tb);
+    const double db = (a->level > 0.f && b->level > 0.f) ? fabs(20.0 * log10((double)a->level / (double)b->level)) : 1e9;
+    if (d_samples) *d_samples = (float)ds;
+    if (d_db) *d_db = (float)(db < 1e9 ? db : 999.0);
+    return ds <= CALIB_SWEEP_AGREE_SAMPLES && db <= CALIB_SWEEP_AGREE_DB;
+}
+
+double calib_latency_bound_s(int zylia) { return zylia ? CALIB_WIN_LAT_DRIVER_S : CALIB_LAT_OMNI_S; }
+
+int calib_latency_check(int zylia, double solved_s, double driver_s, double* resid_s) {
+    const double r = solved_s - driver_s;
+    if (resid_s) *resid_s = r;
+    if (!isfinite(r)) return CALIB_LAT_WARN;
+    if (r < -CALIB_LAT_FLOOR_S) return CALIB_LAT_IMPOSSIBLE;
+    if (r > calib_latency_bound_s(zylia)) return CALIB_LAT_WARN;
+    return CALIB_LAT_OK;
 }
 
 /* Gaussian elimination with partial pivoting on a 4x4 system A*x = b. Returns 0 if singular. */
@@ -300,6 +378,82 @@ int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* 
     return 1;
 }
 
+int calib_locate_known_latency(const double* range, const float (*anchor)[3], int K, double latency, float pos_io[3]) {
+    if (!range || !anchor || !pos_io || K < 4 || !isfinite(latency)) return 0;
+    double x[3] = { pos_io[0], pos_io[1], pos_io[2] };
+    if (!isfinite(x[0]) || !isfinite(x[1]) || !isfinite(x[2])) return 0;
+    for (int it = 0; it < 50; ++it) {
+        double JtJ[3][3] = {{0}}, Jtr[3] = {0};
+        for (int k = 0; k < K; ++k) {
+            const double d[3] = { x[0] - anchor[k][0], x[1] - anchor[k][1], x[2] - anchor[k][2] };
+            const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+            if (!(r > 1e-6)) return 0;
+            const double e = r - (range[k] - latency);           /* residual */
+            const double g[3] = { d[0] / r, d[1] / r, d[2] / r }; /* d r / d x */
+            for (int a = 0; a < 3; ++a) { Jtr[a] += g[a] * e; for (int b = 0; b < 3; ++b) JtJ[a][b] += g[a] * g[b]; }
+        }
+        const double det = JtJ[0][0]*(JtJ[1][1]*JtJ[2][2] - JtJ[1][2]*JtJ[2][1]) - JtJ[0][1]*(JtJ[1][0]*JtJ[2][2] - JtJ[1][2]*JtJ[2][0])
+                         + JtJ[0][2]*(JtJ[1][0]*JtJ[2][1] - JtJ[1][1]*JtJ[2][0]);
+        if (!(fabs(det) > 1e-12)) return 0;
+        double step[3];
+        for (int c = 0; c < 3; ++c) {                             /* Cramer: column c replaced by Jtr */
+            double M[3][3];
+            for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) M[a][b] = (b == c) ? Jtr[a] : JtJ[a][b];
+            step[c] = (M[0][0]*(M[1][1]*M[2][2] - M[1][2]*M[2][1]) - M[0][1]*(M[1][0]*M[2][2] - M[1][2]*M[2][0])
+                     + M[0][2]*(M[1][0]*M[2][1] - M[1][1]*M[2][0])) / det;
+        }
+        double sn = 0.0;
+        for (int a = 0; a < 3; ++a) { x[a] -= step[a]; sn += step[a] * step[a]; }
+        if (!isfinite(x[0]) || !isfinite(x[1]) || !isfinite(x[2])) return 0;
+        if (sn < 1e-14) {                                         /* converged to 0.1 um */
+            for (int a = 0; a < 3; ++a) pos_io[a] = (float)x[a];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int calib_trilaterate_refine(const double* range, const float (*anchor)[3], int K, float pos_io[3], double* latency_io) {
+    if (!range || !anchor || !pos_io || !latency_io || K < 5) return 0;
+    float x[3] = { pos_io[0], pos_io[1], pos_io[2] };
+    double lat = 0.0;
+    for (int it = 0; it < 200; ++it) {
+        double s = 0.0;                                           /* latency = mean residual at this point */
+        for (int k = 0; k < K; ++k) {
+            const double dx = anchor[k][0] - x[0], dy = anchor[k][1] - x[1], dz = anchor[k][2] - x[2];
+            s += range[k] - sqrt(dx*dx + dy*dy + dz*dz);
+        }
+        const double nl = s / K;
+        float nx[3] = { x[0], x[1], x[2] };
+        if (!calib_locate_known_latency(range, anchor, K, nl, nx)) return 0;
+        const double mv = (nx[0]-x[0])*(nx[0]-x[0]) + (nx[1]-x[1])*(nx[1]-x[1]) + (nx[2]-x[2])*(nx[2]-x[2]);
+        memcpy(x, nx, sizeof x);
+        const double dl = nl - lat;
+        lat = nl;
+        if (it > 0 && mv < 1e-14 && dl * dl < 1e-14) {
+            memcpy(pos_io, x, sizeof x);
+            *latency_io = lat;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3]) {
+    if (!anchor || !x || K < 5) return -1.0;
+    double G[4][4] = {{0}};
+    for (int k = 0; k < K; ++k) {
+        const double d[3] = { anchor[k][0] - x[0], anchor[k][1] - x[1], anchor[k][2] - x[2] };
+        const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        if (!(r > 1e-6)) return -1.0;
+        const double row[4] = { -d[0] / r, -d[1] / r, -d[2] / r, 1.0 };
+        for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) G[a][b] += row[a] * row[b];
+    }
+    double e3[4] = { 0.0, 0.0, 0.0, 1.0 }, col[4];
+    if (!solve4(G, e3, col) || !(col[3] > 0.0)) return -1.0;    /* col = (J^T J)^-1 e3, so col[3] = [..]_33 */
+    return sqrt((double)K * col[3]);
+}
+
 static int dcmp(const void* a, const void* b) {
     double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y ? 1 : 0;
 }
@@ -332,6 +486,19 @@ static char* read_file(const char* path, long* len_out) {
     return buf;
 }
 
+/* The speaker record whose "index" is idx. Every writer below holds measurements indexed by SPEAKER
+ * (the loader files record k at L.speakers[index], in any array order), so writing measurement i into
+ * array element i put it on the wrong speaker in any file whose records are not in index order. The
+ * loader has already insisted on a unique numeric index for every record. */
+static cJSON* spk_by_index(cJSON* speakers, int idx) {
+    cJSON* sp;
+    cJSON_ArrayForEach(sp, speakers) {
+        cJSON* ix = cJSON_GetObjectItemCaseSensitive(sp, "index");
+        if (cJSON_IsNumber(ix) && ix->valuedouble == (double)idx) return sp;
+    }
+    return NULL;
+}
+
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
@@ -354,7 +521,8 @@ int calib_write_layout(const char* in_path, const char* out_path,
             FAIL("calib: refusing to write a non-finite/out-of-range trim (bad measurement?)");
 
     for (int i = 0; i < n; ++i) {
-        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON* sp = spk_by_index(speakers, i);
+        if (!sp) FAIL("calib: layout has no speaker record with that index");
         cJSON* g  = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
         cJSON* d  = cJSON_GetObjectItemCaseSensitive(sp, "delay_ms");
         if (g) cJSON_SetNumberValue(g, gain_db[i]);  else cJSON_AddNumberToObject(sp, "gain_db",  gain_db[i]);
@@ -450,7 +618,8 @@ int calib_write_eq(const char* in_path, const char* out_path, const float* taps,
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
 
     for (int i = 0; i < n; ++i) {
-        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON* sp = spk_by_index(speakers, i);
+        if (!sp) FAIL("calib: layout has no speaker record with that index");
         cJSON_DeleteItemFromObjectCaseSensitive(sp, "eq");     /* replace any prior correction */
         int m = lens[i]; if (m > max_taps) m = max_taps;
         if (m > 0) {
@@ -513,7 +682,8 @@ int calib_write_room_eq(const char* in_path, const char* out_path,
     }
 
     for (int i = 0; i < n; ++i) {
-        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON* sp = spk_by_index(speakers, i);
+        if (!sp) FAIL("calib: layout has no speaker record with that index");
         cJSON_DeleteItemFromObjectCaseSensitive(sp, "room_eq");   /* replace any prior */
         int m = counts[i]; if (m > max_sections) m = max_sections;
         if (m > 0) {
@@ -626,6 +796,13 @@ int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int n
 int calib_write_room_eq_grid(const char* in_path, const char* out_path, const float mic[3],
                              const MeasureEqSection* cuts, const int* counts, int n,
                              int max_sections, char* err, size_t errcap) {
+    return calib_write_room_eq_grid_n(in_path, out_path, 1, (const float (*)[3])mic, cuts, counts, n,
+                                      max_sections, err, errcap);
+}
+
+int calib_write_room_eq_grid_n(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
+                               const MeasureEqSection* cuts, const int* counts, int n,
+                               int max_sections, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
     cJSON* narr = NULL;             /* the rebuilt grid; owned here until attached to root */
@@ -643,15 +820,19 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
 
     /* same refusal as the trims writer: the schema clamps below are two-sided compares that PASS
      * NaN, so a NaN fit would serialize as JSON `null` and destroy the layout in place */
-    if (!isfinite(mic[0]) || !isfinite(mic[1]) || !isfinite(mic[2]))
-        FAIL("calib: refusing to write a non-finite mic position");
-    for (int s = 0; s < n; ++s) {
-        int m = counts[s] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[s];
-        if (m > max_sections) m = max_sections;
-        for (int t = 0; t < m; ++t) {
-            const MeasureEqSection* c = &cuts[(size_t)s * max_sections + t];
-            if (!isfinite(c->fc) || !isfinite(c->gain_db) || !isfinite(c->q))
-                FAIL("calib: refusing to write a non-finite room-EQ section (bad measurement?)");
+    if (nmic < 1 || !mics) FAIL("calib: no grid position to write");
+    for (int k = 0; k < nmic; ++k) {
+        const float* mic = mics[k];
+        if (!isfinite(mic[0]) || !isfinite(mic[1]) || !isfinite(mic[2]))
+            FAIL("calib: refusing to write a non-finite mic position");
+        for (int s = 0; s < n; ++s) {
+            int m = counts[(size_t)k * n + s] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[(size_t)k * n + s];
+            if (m > max_sections) m = max_sections;
+            for (int t = 0; t < m; ++t) {
+                const MeasureEqSection* c = &cuts[((size_t)k * n + s) * max_sections + t];
+                if (!isfinite(c->fc) || !isfinite(c->gain_db) || !isfinite(c->q))
+                    FAIL("calib: refusing to write a non-finite room-EQ section (bad measurement?)");
+            }
         }
     }
 
@@ -695,12 +876,14 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
         }
     }
 
-    /* replace the entry at (or append) this mic position */
-    {
+    /* replace the entry at (or append) each mic position, in order: the same result as one call per
+     * mic, but a grid that fills up part-way fails here, before anything is written */
+    for (int k = 0; k < nmic; ++k) {
+        const float* mic = mics[k];
         int slot = -1;
         for (int p = 0; p < npos; ++p) {
             float dx = gpos[p][0]-mic[0], dy = gpos[p][1]-mic[1], dz = gpos[p][2]-mic[2];
-            if (dx*dx + dy*dy + dz*dz < 0.05f * 0.05f) { slot = p; break; }
+            if (dx*dx + dy*dy + dz*dz < CALIB_RQ_GRID_REPLACE_M * CALIB_RQ_GRID_REPLACE_M) { slot = p; break; }
         }
         if (slot < 0) {
             if (npos >= (int)BWA_RQ_GRID_MAX) FAIL("calib: room_eq_grid is full (16 positions)");
@@ -708,9 +891,10 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
         }
         memcpy(gpos[slot], mic, sizeof(float) * 3);
         for (int s = 0; s < n; ++s) {
-            int m = counts[s] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[s];
+            const int ks = k * n + s;
+            int m = counts[ks] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[ks];
             if (m > max_sections) m = max_sections;
-            for (int t = 0; t < m; ++t) ALL(slot, s)[t] = cuts[(size_t)s * max_sections + t];
+            for (int t = 0; t < m; ++t) ALL(slot, s)[t] = cuts[(size_t)ks * max_sections + t];
             ACOUNT(slot, s) = m;
         }
     }
@@ -762,7 +946,8 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
                 }
                 cJSON_AddItemToArray(entries[p], secs);
             }
-            cJSON* sp = cJSON_GetArrayItem(speakers, s);     /* the schemes are mutually exclusive */
+            cJSON* sp = spk_by_index(speakers, s);           /* the schemes are mutually exclusive */
+            if (!sp) FAIL("calib: layout has no speaker record with that index");
             cJSON_DeleteItemFromObjectCaseSensitive(sp, "room_eq");
         }
         cJSON_DeleteItemFromObjectCaseSensitive(root, "room_eq_grid");
@@ -786,9 +971,11 @@ fail:
     #undef FAIL
 }
 
-int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap) {
+int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n,
+                          int* plan_recorded, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+    if (plan_recorded) *plan_recorded = 0;
 
     text = read_file(in_path, NULL);
     if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
@@ -805,8 +992,12 @@ int calib_write_positions(const char* in_path, const char* out_path, const float
             fabs(pos[i][0]) > 1000.f || fabs(pos[i][1]) > 1000.f || fabs(pos[i][2]) > 1000.f)
             FAIL("calib: refusing to write a non-finite/out-of-range position (degenerate solve?)");
 
+    int nplan = 0;
     for (int i = 0; i < n; ++i) {
-        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON* sp = spk_by_index(speakers, i);
+        if (!sp) FAIL("calib: layout has no speaker record with that index");
+        /* a measurement replaces `position`: the first survey keeps what it replaces as the plan */
+        if (layout_json_keep_plan(sp) == 1) ++nplan;
         double xyz[3] = { round(pos[i][0]*1000.0)/1000.0, round(pos[i][1]*1000.0)/1000.0, round(pos[i][2]*1000.0)/1000.0 };
         cJSON* p = cJSON_GetObjectItemCaseSensitive(sp, "position");
         if (cJSON_IsArray(p) && cJSON_GetArraySize(p) == 3) {
@@ -824,6 +1015,7 @@ int calib_write_positions(const char* in_path, const char* out_path, const float
     FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    if (plan_recorded) *plan_recorded = nplan;
     ok = 1;
 fail:
     free(outtext); cJSON_Delete(root); free(text);
@@ -915,14 +1107,18 @@ int calib_aim_row(const Layout* L, int s, CalibAimRow* out) {
     if (!out) return 0;
     memset(out, 0, sizeof *out);
     if (!L || s < 0 || (uint32_t)s >= L->count) return 0;
-    const Speaker* sp = &L->speakers[s];
-    memcpy(out->pos, sp->pos, sizeof out->pos);
+    /* the sheet is what the installer mounts the box TO, so it reads the PLAN when the file carries
+     * one: after a survey, `position`/`aim` are what was measured, and a sheet built from them would
+     * tell you to aim the box where it already points */
+    const float* ppos = layout_plan_pos(L, (uint32_t)s);
+    const float* paim = layout_plan_aim(L, (uint32_t)s);
+    memcpy(out->pos, ppos, sizeof out->pos);
     memcpy(out->target, L->ref, sizeof out->target);
-    const double dx = L->ref[0]-sp->pos[0], dy = L->ref[1]-sp->pos[1], dz = L->ref[2]-sp->pos[2];
+    const double dx = L->ref[0]-ppos[0], dy = L->ref[1]-ppos[1], dz = L->ref[2]-ppos[2];
     out->dist_m = (float)sqrt(dx*dx + dy*dy + dz*dz);
-    unit_dir(sp->pos, L->ref, out->aim);                  /* the loader's own default-aim rule */
+    unit_dir(ppos, L->ref, out->aim);                     /* the loader's own default-aim rule */
     calib_aim_angles(out->aim, &out->bearing_deg, &out->down_tilt_deg);
-    memcpy(out->layout_aim, sp->aim, sizeof out->layout_aim);
+    memcpy(out->layout_aim, paim, sizeof out->layout_aim);
     calib_aim_angles(out->layout_aim, &out->layout_bearing_deg, &out->layout_down_tilt_deg);
     out->off_deg = aim_angle_deg(out->layout_aim, out->aim);
     if (L->dir.nband) {
@@ -947,7 +1143,12 @@ int calib_layout_declared(const char* path, int n, int* has_listening_point, uns
                 *has_listening_point = cJSON_GetObjectItemCaseSensitive(root, "listening_point_m") != NULL;
             if (aim_explicit)
                 for (int i = 0; i < n; ++i)
-                    aim_explicit[i] = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(spk, i), "aim") != NULL;
+                {
+                    /* with a plan, the aim the sheet reports is plan_aim, so "explicit" means that field */
+                    cJSON* rec = spk_by_index(spk, i);
+                    const int planned = cJSON_GetObjectItemCaseSensitive(rec, "plan_position") != NULL;
+                    aim_explicit[i] = cJSON_GetObjectItemCaseSensitive(rec, planned ? "plan_aim" : "aim") != NULL;
+                }
             ok = 1;
         }
         cJSON_Delete(root);

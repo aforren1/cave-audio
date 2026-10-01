@@ -226,6 +226,26 @@ void layout_default(Layout* out) {
     L->max_delay_samples = 0;
 }
 
+int layout_json_keep_plan(struct cJSON* sp) {
+    if (!cJSON_IsObject(sp)) return -1;
+    if (cJSON_GetObjectItemCaseSensitive(sp, "plan_position")) return 0;   /* recorded once, never again */
+    cJSON* p = cJSON_GetObjectItemCaseSensitive(sp, "position");
+    if (!cJSON_IsArray(p) || cJSON_GetArraySize(p) != 3) return -1;
+    cJSON* pp = cJSON_Duplicate(p, 1);
+    if (!pp) return -1;
+    cJSON_AddItemToObject(sp, "plan_position", pp);
+    /* the record's aim travels with it, so the plan stays whole even when only the position is
+     * overwritten now and the aim later; no aim = the default (toward the listening point), which is
+     * exactly what an absent plan_aim means */
+    cJSON_DeleteItemFromObjectCaseSensitive(sp, "plan_aim");   /* a stray one (the loader refuses it) */
+    cJSON* a = cJSON_GetObjectItemCaseSensitive(sp, "aim");
+    if (a) {
+        cJSON* pa = cJSON_Duplicate(a, 1);
+        if (pa) cJSON_AddItemToObject(sp, "plan_aim", pa);
+    }
+    return 1;
+}
+
 static char* read_file(const char* path, char* err, size_t errcap) {
     FILE* f = os_fopen(path, "rb");
     if (!f) { set_err(err, errcap, "layout: cannot open file"); return NULL; }
@@ -340,6 +360,42 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
             }
             float inv = 1.f / sqrtf(len2);
             spk->aim[0] = v[0] * inv; spk->aim[1] = v[1] * inv; spk->aim[2] = v[2] * inv;
+        }
+        /* optional plan (the tools' target; the engine never reads it): the same checks as position and
+         * aim, because a garbage plan sends an installer to the wrong place as surely as a garbage
+         * position. plan_aim without plan_position is refused: an absent plan_aim means "toward the
+         * listening point from plan_position", so on its own it has nothing to hang from. */
+        spk->has_plan = 0;
+        spk->plan_aim[0] = spk->plan_aim[1] = spk->plan_aim[2] = 0.f;
+        cJSON* ppj = cJSON_GetObjectItemCaseSensitive(sp, "plan_position");
+        cJSON* paj = cJSON_GetObjectItemCaseSensitive(sp, "plan_aim");
+        if (paj && !ppj) { set_err(err, errcap, "layout: plan_aim needs plan_position in the same speaker record"); goto done; }
+        if (ppj) {
+            float v[3] = { NAN, NAN, NAN };
+            if (cJSON_IsArray(ppj) && cJSON_GetArraySize(ppj) == 3)
+                for (int c = 0; c < 3; ++c) {
+                    cJSON* e = cJSON_GetArrayItem(ppj, c);
+                    if (cJSON_IsNumber(e)) v[c] = (float)e->valuedouble;
+                }
+            if (!bwa_finite3_bounded(v, 1000.f)) {   /* position's bound, not BWA_MAX_COORD's */
+                set_err(err, errcap, "layout: plan_position must be [x, y, z], finite, within +/-1000 m"); goto done;
+            }
+            memcpy(spk->plan_pos, v, sizeof v);
+            spk->has_plan = 1;
+        }
+        if (paj) {
+            float v[3] = { NAN, NAN, NAN };
+            if (cJSON_IsArray(paj) && cJSON_GetArraySize(paj) == 3)
+                for (int c = 0; c < 3; ++c) {
+                    cJSON* e = cJSON_GetArrayItem(paj, c);
+                    if (cJSON_IsNumber(e)) v[c] = (float)e->valuedouble;
+                }
+            float len2 = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+            if (!bwa_finite3_bounded(v, 1e6f) || !(len2 > 1e-12f)) {
+                set_err(err, errcap, "layout: plan_aim must be [x, y, z], finite and non-zero"); goto done;
+            }
+            float inv = 1.f / sqrtf(len2);
+            spk->plan_aim[0] = v[0] * inv; spk->plan_aim[1] = v[1] * inv; spk->plan_aim[2] = v[2] * inv;
         }
         cJSON* gj = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
         if (cJSON_IsNumber(gj)) {
@@ -499,6 +555,10 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     for (int i = 0; i < nspk; ++i) {
         float* a = out->speakers[i].aim;
         if (a[0] == 0.f && a[1] == 0.f && a[2] == 0.f) unit_dir(out->speakers[i].pos, out->ref, a);
+        /* ...and a plan with no plan_aim faces it from the plan position */
+        float* pa = out->speakers[i].plan_aim;
+        if (out->speakers[i].has_plan && pa[0] == 0.f && pa[1] == 0.f && pa[2] == 0.f)
+            unit_dir(out->speakers[i].plan_pos, out->ref, pa);
     }
     /* optional speaker directivity model (tools/directivity/clf_to_json.py writes it; layout.h). A
      * malformed block rejects the file: a table the runtime would index wrongly is worse than none. */

@@ -280,10 +280,10 @@ jobs:
         run: cmake --build build --config Debug --target bw_audio bwa_minimal
 
       - name: Test
-        # 68 registered, 65 run: -E drops the three GUI UI suites, which need a display and OpenGL.
+        # 81 registered, 77 run: -E drops the four GUI UI suites, which need a display and OpenGL.
         # No binding test here any more - the bindings have their own tree (build-bind) below, and
         # this one is the engine the SDK is cut from.
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view)$'
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view|calib_view_session)$'
 
       - name: Smoke (Debug)
         # the Debug dll ships too — prove it loads and runs a lifecycle

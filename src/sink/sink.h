@@ -131,6 +131,13 @@ typedef struct {
     uint64_t period_ns;        /* the block period that budget is measured against; 0 = none */
     uint32_t device_lost;      /* the device went away; the sink is host-pacing SILENCE       */
     bool     measured;         /* false = this backend cannot observe dropouts at all        */
+    /* ASIO only (0 = SINK_TS_ABSENT everywhere else): the base the driver's systemTime is on, as
+     * sink_tsbase.h classifies it from the stamps, and the floor of (QPC at callback entry -
+     * systemTime). Under SINK_TS_HOST the stamp IS the block's system_time_ns and the offset is the
+     * callback's dispatch delay; under any other base the stamp is unused and the offset is that
+     * base's distance from QPC (about 27 ms for timeGetTime on the development box). */
+    int32_t  stamp_base;       /* SINK_TS_*                                                  */
+    int64_t  stamp_offset_ns;  /* 0 until a stamp has been seen                              */
 } bwa_sink_health;
 
 /* Frames lost between the position a callback was PREDICTED to report and the one it actually did.

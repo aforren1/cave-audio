@@ -11,6 +11,7 @@
  * failure.
  */
 #include "sink/sink.h"
+#include "sink/sink_tsbase.h"   /* the ASIO sink's host-stamp rule, tested offline below */
 
 #include <stdio.h>
 #include <stdlib.h>       /* getenv: every device section's device string is overridable */
@@ -133,6 +134,105 @@ static int test_injected_drop(void) {
     }
     if (!h.measured) { fprintf(stderr, "FAIL: injected run reports unmeasured\n"); ok = 0; }
     bwa_sink_close(s);
+    return ok;
+}
+
+/* THE ASIO HOST STAMP, offline (sink_tsbase.h). The ASIO sink cannot run here without a driver, so
+ * this drives the exact function its callback calls, sink_ts_select, with synthetic streams: the
+ * buffer switch on QPC every block, the callback some dispatch delay after it, timeGetTime read beside
+ * the entry clock on a 1 ms tick 27.3 ms behind QPC (the development box's measured offset), and the
+ * driver's systemTime on whichever base the case says. The contract each case checks is
+ * bwa_get_clock's: the stamp is on QPC, never steps back, and moves by no more than the dispatch
+ * jitter when its source changes. */
+enum { STC_QPC = 0, STC_TGT = 1, STC_FAR = 2, STC_NONE = 3 };
+typedef struct {
+    const char* what;
+    uint32_t    block;          /* frames per block at 48 kHz                                  */
+    int64_t     lag_ns;         /* the callback's dispatch floor after the switch              */
+    int         base;           /* STC_*: what the driver's systemTime is on                   */
+    int         off_from, off_to; /* blocks [from, to) arrive without kSystemTimeValid        */
+    int         glitch_at;      /* this block's systemTime is off by glitch_ns; -1 = none      */
+    int64_t     glitch_ns;
+    int         want_base;      /* SINK_TS_* the classifier must name at the end               */
+    int         want_driver;    /* 1: on the switch, and every valid block past warm-up IS
+                                 *    systemTime. 2: on the switch, source not pinned (a glitch
+                                 *    moves the classification for a window). 0: every stamp
+                                 *    is the plain entry read                                  */
+} StampCase;
+
+static int stamp_case(const StampCase* k) {
+    const uint32_t SR = 48000;
+    const int      NB = 400;
+    const int64_t  BLK = (int64_t)k->block * 1000000000LL / SR;
+    const int64_t  OFF = 27300000, T0 = 40000000000000LL, JIT = 320000;
+    SinkTsSel sel;
+    sink_ts_sel_init(&sel, SR, k->block);
+    int ok = 1, backward = 0, wrong_src = 0, steps = 0, first_valid = -1;
+    int64_t max_step = 0, max_err = 0, prev = 0;
+    for (int b = 0; b < NB; ++b) {
+        const int64_t sw   = T0 + b * BLK;                                   /* the switch, on QPC  */
+        const int64_t host = sw + k->lag_ns + (int64_t)((b * 7919) % 320) * 1000;
+        const int64_t tgt  = ((host - OFF) / 1000000) * 1000000;            /* ms, read at entry   */
+        int64_t sys = k->base == STC_QPC ? sw
+                    : k->base == STC_TGT ? ((sw - OFF) / 1000000) * 1000000
+                    : sw - 1000000000;
+        if (b == k->glitch_at) sys += k->glitch_ns;
+        const bool valid = k->base != STC_NONE && !(b >= k->off_from && b < k->off_to);
+        if (valid && first_valid < 0) first_valid = b;
+        const int64_t st = (int64_t)sink_ts_select(&sel, (uint64_t)host, (uint64_t)tgt, valid, (uint64_t)sys);
+
+        if (b > 0) {
+            if (st <= prev) ++backward;
+            /* The interval may differ from a block by the jitter, never by a base's offset. The one
+             * exception is the block the offset first becomes KNOWN: before any systemTime the stamp
+             * is the plain entry read, late by the whole dispatch delay, and it moves onto the switch
+             * then. That step is the measured offset itself. */
+            const int64_t d = st - prev - BLK, ad = d < 0 ? -d : d;
+            const int64_t allow = (b == first_valid && b > 0) ? k->lag_ns + JIT : JIT;
+            if (ad > max_step) max_step = ad;
+            if (ad > allow) ++steps;
+        }
+        prev = st;
+        if (k->want_driver == 0 || first_valid < 0) {
+            if (st != host) ++wrong_src;                     /* nothing known: the plain entry read */
+            continue;
+        }
+        const int64_t e = st - sw, ae = e < 0 ? -e : e;      /* on QPC, at the switch */
+        if (ae > max_err) max_err = ae;
+        if (k->want_driver == 1 && valid && b != k->glitch_at && b >= first_valid + SINK_TS_MIN_BLOCKS && st != sys)
+            ++wrong_src;
+    }
+    const int64_t off = sink_ts_lag_ns(&sel.cls);
+    printf("stamp select: %-46s base %d (want %d), offset %7.3f ms, worst step %.3f ms, worst error %.3f ms\n",
+           k->what, sel.base, k->want_base, off == INT64_MAX ? 0.0 : (double)off * 1e-6,
+           (double)max_step * 1e-6, (double)max_err * 1e-6);
+    if (sel.base != k->want_base) { fprintf(stderr, "FAIL: stamp %s: base %d, want %d\n", k->what, sel.base, k->want_base); ok = 0; }
+    if (backward)  { fprintf(stderr, "FAIL: stamp %s: %d stamps at or before the previous one\n", k->what, backward); ok = 0; }
+    if (steps)     { fprintf(stderr, "FAIL: stamp %s: %d intervals off a block by more than allowed (worst %.3f ms)\n",
+                             k->what, steps, (double)max_step * 1e-6); ok = 0; }
+    if (wrong_src) { fprintf(stderr, "FAIL: stamp %s: %d blocks took the wrong source\n", k->what, wrong_src); ok = 0; }
+    if (max_err > JIT) { fprintf(stderr, "FAIL: stamp %s: %.3f ms off the switch, more than the jitter\n",
+                                 k->what, (double)max_err * 1e-6); ok = 0; }
+    return ok;
+}
+
+static int test_stamp_select(void) {
+    const StampCase cases[] = {
+        /* what                                           block lag      base      off        glitch           want_base        drv */
+        { "QPC driver",                                   256,  80000,   STC_QPC,  -1, -1,    -1, 0,           SINK_TS_HOST,    1 },
+        /* 3 ms of dispatch against a 0.67 ms block: the warm-up's entry stamps must already sit on the
+         * switch, or naming the base steps back by more than a block and the floor never lets go */
+        { "QPC driver, 32-frame blocks, 3 ms dispatch",   32,   3000000, STC_QPC,  -1, -1,    -1, 0,           SINK_TS_HOST,    1 },
+        { "timeGetTime driver, 27.3 ms off, 1 ms tick",   256,  80000,   STC_TGT,  -1, -1,    -1, 0,           SINK_TS_TGT,     0 },
+        { "QPC driver, valid flag off for 100 blocks",    256,  3000000, STC_QPC,  200, 300,  -1, 0,           SINK_TS_HOST,    1 },
+        { "QPC driver, valid flag off for the first 50",  256,  3000000, STC_QPC,  0, 50,     -1, 0,           SINK_TS_HOST,    1 },
+        { "QPC driver, one systemTime 50 ms stale",       256,  80000,   STC_QPC,  -1, -1,    250, -50000000,  SINK_TS_HOST,    1 },
+        { "QPC driver, one systemTime 50 ms ahead",       256,  80000,   STC_QPC,  -1, -1,    100, 50000000,   SINK_TS_HOST,    2 },
+        { "unknown base (1 s off QPC)",                   256,  80000,   STC_FAR,  -1, -1,    -1, 0,           SINK_TS_UNKNOWN, 0 },
+        { "no systemTime",                                256,  80000,   STC_NONE, -1, -1,    -1, 0,           SINK_TS_ABSENT,  0 },
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; ++i) ok &= stamp_case(&cases[i]);
     return ok;
 }
 
@@ -1378,6 +1478,7 @@ int main(void) {
     if (!test_gap_rule())      return 1;
     if (!test_injected_drop()) return 1;
     if (!test_manual_unmeasured()) return 1;
+    if (!test_stamp_select())  return 1;
 
     printf("audio sink OK: backend=%s blocks=%lu last_sample_pos=%llu last_ns=%llu\n",
            backend, blocks, (unsigned long long)p.last_sample_pos, (unsigned long long)p.last_ns);
