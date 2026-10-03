@@ -21,9 +21,17 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   speakers and has room to grow; any layout of 4 to `BWA_MAX_CHANNELS` (64) speakers works, and with no layout the
   engine runs the 26-speaker `BWA_DEFAULT_GRID`), recomputed per audio block from the tracked head
   position: DBAP for a moving listener (the default), SPCAP/VBAP for a fixed one,
-  an optional dual-band mode, per-source angular spread. SPCAP's lobe width defaults
-  to what the array's own speaker spacing implies. It is a live knob
-  (`bwa_set_spcap_focus`) you can dial by ear.
+  an optional dual-band mode. SPCAP's lobe width defaults to what the array's own speaker
+  spacing implies. It is a live knob (`bwa_set_spcap_focus`) you can dial by ear.
+- Source extent: an angular spread, or a metric size in meters that holds as the listener
+  walks (`bwa_source_set_size`). Optional velvet-noise decorrelation keeps wide sources from
+  collapsing to a phantom image (`bwa_set_decorrelation`). A hole-aware spread floor covers
+  directions the array has no speaker in (`bwa_set_hole_spread`), near-listener widening covers
+  fly-throughs (`bwa_set_near_spread`), and a multi-listener compromise serves up to
+  `BWA_EXTRA_LIS` extra occupants (`bwa_set_extra_listeners`).
+- CAP: matches the rendered interaural time difference to a real source for the head's
+  current orientation (`bwa_set_dual_band_cap`). It is the one place head orientation reaches
+  the speaker path.
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage. Its LF room correction and,
   opt-in, its whole time alignment can follow the tracked listener instead of one fixed
@@ -44,7 +52,11 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   near-field proximity, pitch; opt-in per source. The speed of sound itself is a
   live engine-wide parameter (underwater, slow motion).
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
-  files, AmbiX ambisonic beds decoded world-locked to the array. Two ownership tiers:
+  files, push sources that take your own PCM into the engine (`bwa_source_push`, a source
+  feed, never a render path), and AmbiX or FuMa ambisonic beds decoded world-locked to the
+  array: a matrix decode (AllRAD or EPAD) or a parametric renderer whose direct stream re-pans
+  listener-relative (`bwa_set_bed_renderer`), with an orientation to line a capture up with
+  the scene (`bwa_bed_set_orientation`). Two ownership tiers:
   explicit load/unload, and a refcounted by-path cache (`bwa_sound_acquire`,
   `bwa_sound_release`) keyed on path plus load flags, with an async twin for content
   that appears mid-session.
@@ -52,16 +64,28 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   disagree with, apply the lot in one call, and read back what a source is set to
   (`bwa_source_preset`, `bwa_source_apply`, `bwa_source_get_desc`). The engine-wide equivalent is
   `bwa_tuning_preset` / `bwa_apply_tuning`.
-- Voices: fixed pool with priority stealing, pause and click-free seek, a play region
+- Voices: fixed pool with priority stealing, pause (per voice, per group, global) and
+  click-free seek, engine-side timed fades (`bwa_source_fade_to`), mix groups for category
+  gain and ducking (`bwa_group_set_gain`), gapless chaining into queued sounds
+  (`bwa_source_queue`), click-free scene stops (`bwa_group_stop`, `bwa_stop_all`), a play region
   (`bwa_source_set_region`) that truncates a one-shot or loops a sub-range, loop-boundary
   events (`bwa_poll_looped`) beside completion events,
-  sample-accurate scheduled starts against a device-anchored DSP clock. The device's own
-  block stamps bridge that clock to wall time for AV sync, with the device-vs-host drift
-  fitted in ppm for shows long enough to care. `bwa_host_time_ns` reads that host clock
+  sample-accurate scheduled starts and stops against a device-anchored DSP clock
+  (`bwa_source_play_at`, `bwa_source_stop_at`). The device's own
+  block stamps bridge that clock to wall time for AV sync, with the drift between the device
+  and host clocks fitted in ppm for shows long enough to care. `bwa_host_time_ns` reads that host clock
   directly, with no engine, so a client measures the offset to its own clock to a bound it
   can see instead of estimating it.
 - Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
-  freshest head pose at block time.
+  freshest head pose at block time, with optional pose prediction to hide motion-to-ears
+  latency (`bwa_set_pose_prediction`).
+- Headphones: a direct binaural render (`BWA_PROFILE_BINAURAL`, no speaker-array simulation
+  in the direct path) and an array-audition monitor (`BWA_PROFILE_CAVE_SIM`, the speaker bus
+  through virtual speakers). Headphone correction EQ loads an AutoEq `ParametricEQ.txt` and
+  swaps in click-free (`bwa_load_headphone_eq`).
+- Offline: the manual sink drops the audio thread and lets you pump blocks yourself
+  (`bwa_render_block`), bit-identically on every platform. Use it to pre-render stimuli that
+  play through something else.
 - Diagnostics: per-channel test tone, direct output-channel routing of a real source
   (`bwa_source_set_channel`, the single-speaker reference condition), output-level and
   listener-pose readbacks,
@@ -96,8 +120,8 @@ bwa_stop(eng); bwa_destroy(eng);
   surveyed `cave_layout.json`. A named layout that fails to load fails `bwa_start` with
   `BWA_ERR_LAYOUT` (a wrong-channel-count session can't start silently); `NULL` opts into
   the default grid (`BWA_DEFAULT_GRID`, 26 speakers) deliberately.
-- **`bwa_start` never demands hardware**: with no usable ASIO device the engine
-  keeps rendering into a silent offline sink. `bwa_get_audio_backend` reports which
+- **`bwa_start` never demands hardware** under `BWA_SINK_AUTO`: with no usable device the
+  engine keeps rendering into a silent offline sink. `bwa_get_audio_backend` reports which
   backend you actually got (see [Errors](#errors-and-return-codes)).
 - **Completion is an event, and also a poll**: `bwa_poll_ended` drains the handles
   whose voices finished since you last asked. Prefer it. `bwa_source_is_playing` is
@@ -143,14 +167,94 @@ render):
 | profile                 | what renders |
 |-------------------------|--------------|
 | `BWA_PROFILE_CAVE`      | bus → ASIO → Dante (production). Listener **position** only - real speakers, real ears. |
-| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-channel output device (a WASAPI endpoint on Windows, or an ASIO driver). Point sources (and their ISM reflections) skip the speaker panner: with the SDK each point voice gets its **own true HRTF convolution**, without it each SH-encodes at its **true** listener-relative direction into a shared field. Beds pass SH→SH, pathing sums in directly; only the FDN/reflection-bed tails ride the bus as virtual speakers. None of the array's phantom-source spread, and none of the layout's per-speaker corrections: the align stage (trims, correction FIR, room EQ, tracked alignment, directivity comp) is skipped, since no physical speaker exists. Full **pose**. Render details: [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim). |
-| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-channel output device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included, heard from the live listener position through a simulated room: each speaker's distance gain, propagation delay and (with a `directivity` model) off-axis loss toward you. Full **pose** - head orientation turns the virtual array around you, and walking moves you through it. Details: [spatialization.md](./spatialization.md#the-array-sims-room). |
+| `BWA_PROFILE_BINAURAL`  | direct per-source HRTF render → any 2-channel device. Point sources skip the speaker panner. Full **pose**. |
+| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-channel device (array auditioning): each bus channel is a virtual speaker in a simulated room. Full **pose**. |
 | `BWA_PROFILE_CAVE_BOTH` | array to Dante + the `CAVE_SIM` monitor tap, concurrently. Two devices: `device` names the array, the monitor takes the platform default. |
+
+**`BWA_PROFILE_BINAURAL`** is the first-class headphone render. It opens any 2-channel output
+device (a WASAPI endpoint on Windows, or an ASIO driver). Point sources, and their ISM
+reflections, skip the speaker panner. With the SDK each point voice gets its **own true HRTF
+convolution**. Without it, each SH-encodes at its **true** listener-relative direction into a
+shared field. Beds pass SH→SH and pathing sums in directly; only the FDN and reflection-bed tails
+ride the bus as virtual speakers. So you get none of the array's phantom-source spread, and none
+of the layout's per-speaker corrections: the align stage (trims, correction FIR, room EQ, tracked
+alignment, directivity comp) is skipped, because no physical speaker exists. Render details:
+[spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim).
+
+**`BWA_PROFILE_CAVE_SIM`** places each bus channel as a virtual speaker at its surveyed room
+position, DBAP artifacts included. You hear it from the live listener position through a
+simulated room: each speaker's distance gain, propagation delay and (with a `directivity` model)
+off-axis loss toward you. Head orientation turns the virtual array around you, and walking moves
+you through it. Details: [spatialization.md](./spatialization.md#the-array-sims-room).
 
 Pick by question, not habit: *"what will the room do?"* is `CAVE_SIM`; it hears
 the **same mix** production plays, panner and all. *"Best possible headphone
 rendering of this scene"* (demos, remote listening, development without the
 array) is `BINAURAL`. See [architecture.md](./architecture.md).
+
+## Recommended settings per setup
+
+The defaults target the CAVE: **one tracked listener roaming the array.** Change the setup and
+the right settings change with it, mostly because a *sweet spot* either exists or it doesn't.
+These are starting points. A/B them by ear in the playground.
+
+Start from a tuning preset: `bwa_tuning_preset(BWA_SETUP_ROAMING, ...)` for a roamer,
+`BWA_SETUP_SEATED` for a fixed seat, then `bwa_apply_tuning`. The presets carry the panner,
+dual-band, CAP and every other live knob, with the evidence for each value, in
+[Situation tuning](#situation-tuning-bwa_tuning_preset-bwa_apply_tuning). This section adds what a
+preset cannot carry: the profile, tracking, calibration, and the bed decoder. The calibration
+commands are in [calibration.md](./calibration.md#calibrate-a-rig-in-bwa_calib_view).
+
+| | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
+|---|---|---|---|---|
+| profile | `BWA_PROFILE_CAVE` | `BWA_PROFILE_CAVE` | `BWA_PROFILE_CAVE` | `BWA_PROFILE_CAVE_SIM` (verify the array) or `BWA_PROFILE_BINAURAL` (best headphone render) |
+| tuning preset | `BWA_SETUP_ROAMING` | `BWA_SETUP_SEATED` | `BWA_SETUP_ROAMING` | either |
+| panner | DBAP (preset) | SPCAP (preset); A/B VBAP | DBAP (preset) | any (DBAP) |
+| tracking | `bwa_tracker_connect` | none: set the pose once at the seat | track the main occupant, plus `bwa_set_extra_listeners` for the rest | push the head pose, or track |
+| dual-band | off (preset) | on, with CAP (preset) | off (preset) | your call (A/B it) |
+| calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
+| bed decoder | AllRAD (default); A/B EPAD | AllRAD | AllRAD; A/B EPAD | either |
+
+**Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image follows you
+instead of degrading away from a center. Leave dual-band and VBAP off: both sharpen the image *at a
+sweet spot*, and there isn't one. Use the grid for room correction
+(`bwa_calibrate --room-eq-grid rows.txt`, one placement per row). The engine interpolates the LF
+cuts at your live position and glides the biquads. `bwa_set_pose_prediction` hides the panning
+lag; start it at your measured motion-to-ears latency, typically 0.02 to 0.04 s. Decorrelation is
+off in the preset because it measured worse at the sweet spot. For wide sources that comb-filter
+as you walk, A/B `bwa_set_decorrelation`. A static `room_eq` layout in a moving session **fails
+`bwa_start`** on purpose: one measurement point cannot correct a roam.
+
+**Fixed seat.** Now a sweet spot exists, so spend it. The seated preset picks SPCAP: smooth,
+all-speaker, and placement-correcting on an uneven array. VBAP gives the sharpest image if the
+array triangulates cleanly, and falls back to DBAP if not; A/B it with `bwa_set_panner`.
+Dual-band tightens bass localization. CAP holds the rendered interaural time difference as the
+seated listener turns their head, and reduces to the plain panner when the head faces the source.
+Calibrate with `--room-eq` **with the mic at the seat**. Don't track; set the listener pose once.
+Apply the tuning before `bwa_start`: `bwa_start` refuses a `room_eq` layout while the panner is
+still DBAP.
+
+**Audience.** Panning is exact for one head and wrong for everyone else, so this is a compromise by
+construction. Track the person who matters. Hand the *other* occupants' positions to
+**`bwa_set_extra_listeners`** (up to `BWA_EXTRA_LIS`, 3): every source's gains become the
+per-speaker energy mean of the per-listener solves, so each occupant gets an image biased toward
+their own seat instead of one exact image and N wrong ones. Otherwise play it safe rather than
+sharp: DBAP, dual-band off, and no room EQ beyond `--eq`. `--eq` flattens the *speakers*, not the
+room, so it helps every seat. Raise `bwa_source_set_spread` on ambience: wide sources survive
+off-center listening far better than points do.
+
+**Desk.** Neither headphone profile needs a layout, Dante, or hardware beyond headphones.
+`BWA_PROFILE_CAVE_SIM` renders the *same* speaker mix through virtual speakers, so what you hear is
+the array render. Use it to verify what the room will do. `BWA_PROFILE_BINAURAL` renders sources
+directly at their true directions: the better *listen*, the wrong *probe*. Don't use either to
+judge timbre for the room. Load your headphones' AutoEq correction with `bwa_load_headphone_eq`
+first, or you are judging the headphones.
+
+**Everywhere:** the output limiter is on at -1 dBFS. Leave it on; it is speaker protection, not
+mastering. Reflections are opt-in per source. Pick one reverb bed: Steam Audio's (needs the SDK,
+ray-traced from your geometry) *or* the phonon-free FDN (`bwa_fdn_config`, a designed decay:
+cheaper, works in no-SDK builds). Details in [spatialization.md](./spatialization.md) and
+[calibration.md](./calibration.md).
 
 ## The threading contract
 
@@ -221,8 +325,7 @@ For a mono voice a sample is a frame, and the name already carries a unit, so it
 case this rule is about.
 
 The one rule that constrains new calls: a **decibel** value must say `_db`. Linear is the unmarked
-default across the whole ABI, so a dB parameter that doesn't say so is invisible: `limiter_ceiling`
-changed from dB to linear in 0.4.0 and only its parameter name records it.
+default across the whole ABI, so a dB parameter that doesn't say so is invisible.
 
 Bindings inherit this and add one rule of their own: never borrow a host-engine name that carries
 a *different* unit. Godot's `AudioServer.get_output_latency()` is seconds and
@@ -598,17 +701,33 @@ uint32_t    bwa_get_version(void);            // the DLL's packed BWA_VERSION (m
 uint32_t    bwa_get_sample_rate(bwa_engine* e);  // resolved config, valid from create on -
 uint32_t    bwa_get_block_size (bwa_engine* e);  //   derive seconds from THESE, not from your desc
 bwa_sink_type bwa_get_sink_type(bwa_engine* e);  // the sink actually running (AUTO resolved at start)
+const char* bwa_get_audio_backend(bwa_engine* e); // the same, human-readable: "asio:Digiface Dante"
 ```
 
-`bwa_get_version` lets a client verify the DLL matches the header it compiled against (the desc
-structs grow via reserved fields, but enum values and struct layouts are only guaranteed within a
-major.minor). The resolved-config getters exist because every zero desc field means "default":
+`bwa_get_version` lets a client verify the DLL matches the header it compiled against: compare it
+with the header's `BWA_VERSION`, packed from `BWA_VERSION_MAJOR`, `BWA_VERSION_MINOR` and
+`BWA_VERSION_PATCH`. The desc structs grow via reserved fields, but enum values and struct layouts
+are only guaranteed within a major.minor. The resolved-config getters exist because every zero desc field means "default":
 `seconds = frames / bwa_get_sample_rate(e)` is always right, even when the desc said 0.
 `bwa_get_sink_type` is the machine-readable side of `bwa_get_audio_backend`: after a SUCCESSFUL
 `bwa_start`, `BWA_SINK_AUTO` has resolved to the concrete backend that opened. Before start, after
 stop, and after a start that FAILED it reports the configured policy instead, so a refused start
 still answers the backend you demanded. Gate on `bwa_start`'s result; this getter does not replace
 it.
+
+`bwa_get_audio_backend` is for logs and HUDs. After `bwa_start` it reads `"<backend>:<device>"`,
+with the device part in the OS's own UTF-8 name: `"asio:Digiface Dante"`,
+`"wasapi:Headphones (Realtek Audio)"`. Three strings have no device part: `"null"` (the silent
+offline sink), `"manual"`, and `"none"` (not started). The headphone profiles append the decode
+in use, because the HRTF decode falls back to the simple pan silently and a by-ear report needs to
+know which ran:
+
+- `BINAURAL`: `"(steam HRTF direct)"` or `"(simple-pan direct)"`.
+- `CAVE_SIM` and `CAVE_BOTH`: `"(steam HRTF sim)"` or `"(simple-pan sim)"`.
+
+`CAVE_BOTH` opens two devices and names both, array first:
+`"asio:Digiface Dante + wasapi:Headphones (Realtek Audio) (steam HRTF sim)"`. Never parse this
+string. Program logic uses `bwa_get_sink_type`.
 
 Every pointer argument across the API is **consumed before the call returns**: no call retains
 caller memory (`bwa_create` copies its path strings; descs, geometry, and position arrays are
@@ -623,12 +742,12 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; the headphone profiles             |
 | `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
 | `block_size`     | render quantum, frames; 0 = 256. Also the device *period hint* - a driver or an OS mixer may run its own size, and the sinks adapt, but the quantum handed to the DSP is exactly this regardless; `bwa_get_block_size` reads it back |
-| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)), `BWA_SINK_ASIO` or `BWA_SINK_WASAPI` (demand that backend: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink - CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread - pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
-| `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
+| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)). A named device backend is a demand, and an open failure fails `bwa_start` loudly: `BWA_SINK_ASIO` and `BWA_SINK_WASAPI` (Windows), `BWA_SINK_JACK` and `BWA_SINK_ALSA` (Linux), `BWA_SINK_AAUDIO` (Android, stereo only), `BWA_SINK_WORKLET` (browser, stereo only), `BWA_SINK_COREAUDIO` (macOS, not in this build yet). `BWA_SINK_NULL` forces the offline sink (CI, profiling, tracking-only). `BWA_SINK_MANUAL` creates no device and no thread: you pump blocks with `bwa_render_block` (deterministic, for golden tests) |
+| `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). Three backends read it differently: JACK takes a port regular expression, AAudio a decimal Android device id, and the worklet sink a decimal AudioContext handle (see [Sink policy](#sink-policy)). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
-| `sink_flags`     | backend options for the PRIMARY device (like `device`, they do not reach the `cave_both` monitor); 0 is the default, and every bit is opt-in. `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode (AAudio: the MMAP path), which takes the device from every other application on the machine, so a monitor that shares its endpoint with the game, the browser and the OS leaves it off. `BWA_SINK_FLAG_EXACT_RATE` fails the open when the device cannot run at `sample_rate`, instead of accepting the OS resampler. `BWA_SINK_FLAG_TIGHT_BUFFER` takes the smallest device buffer the backend can, trading dropout margin for latency. `BWA_SINK_FLAG_DEEP_BUFFER` is the opposite trade, and only the browser sink uses it. See [Latency classes](#latency-classes) |
+| `sink_flags`     | `BWA_SINK_FLAG_*` backend options for the PRIMARY device (they do not reach the `cave_both` monitor); 0 is the default, every bit opt-in. The flags and what each backend does: [Latency classes](#latency-classes) |
 | `reserved[3]`    | zero; room to grow without an ABI break                             |
 
 ## Errors and return codes
@@ -637,8 +756,8 @@ The API reports failure three ways, all read on the **control thread**:
 
 - **Pointer/handle returns.** `bwa_create` returns `NULL` on failure; `bwa_load_sound` /
   `bwa_source_create` return `0`.
-- **`bwa_result` returns.** `bwa_create`'s companions `bwa_start`/`bwa_stop` and
-  `bwa_tracker_connect` return `BWA_OK` (0) on success, a nonzero code otherwise: the
+- **`bwa_result` returns.** `bwa_start`, `bwa_stop`, `bwa_tracker_connect` and
+  `bwa_load_headphone_eq` return `BWA_OK` (0) on success, a nonzero code otherwise: the
   `bwa_result` enum in [`include/bw_audio.h`](../include/bw_audio.h), listed below.
 - **`bwa_last_error`.** A human-readable string for the most recent failure on that engine, or
   `NULL` if none. Lifetime: the engine clears it at **entry** to the lifecycle/load-class calls (create,
@@ -650,22 +769,27 @@ The API reports failure three ways, all read on the **control thread**:
 | code            | value | cause |
 |-----------------|-------|-------|
 | `BWA_OK`         | 0     | success |
-| `BWA_ERR_CONFIG` | 1     | invalid `bwa_desc` (bad profile, sample_rate, block_size) |
+| `BWA_ERR_CONFIG` | 1     | bad call arguments (a NULL engine or desc), a static-`room_eq` layout in a moving-listener session, or an unparseable headphone EQ file |
 | `BWA_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked enough output channels for the layout, or failed to start |
 | `BWA_ERR_LAYOUT` | 3     | `bwa_start`: an explicitly-passed `layout_path` failed to load at create (missing/unparseable/failed validation - see [`layout-schema.md`](./layout-schema.md)) |
 | `BWA_ERR_HRTF`   | 4     | reserved; not currently returned. HRTF (SOFA) load failures are non-fatal - the monitor degrades and the reason lands in `bwa_last_error` |
 | `BWA_ERR_STATE`  | 5     | reserved; not currently returned. Wrong-state calls report through `bwa_last_error` instead |
 | `BWA_ERR_INTERNAL` | 6   | reserved; not currently returned |
-| `BWA_ERR_TRACKER` | 7    | `bwa_tracker_connect` failed (socket open, name didn't resolve, room_eq layout) |
+| `BWA_ERR_TRACKER` | 7    | `bwa_tracker_connect` failed to open the NatNet session (socket open, a rigid-body name that did not resolve) |
 
 What actually comes back today:
 
-- `bwa_create` returns `NULL` (bad config / out of memory). No code.
+- `bwa_create` returns `NULL` for a NULL desc or an allocation failure. No code. It does not
+  validate the desc fields: zero `sample_rate` and `block_size` take their defaults, and nothing
+  else is checked.
 - `bwa_start` returns `BWA_OK`, `BWA_ERR_CONFIG` (NULL engine, or a `room_eq` layout in a
   moving-listener session), `BWA_ERR_LAYOUT` (below), or `BWA_ERR_DEVICE`. A redundant
   `bwa_start` is a no-op returning `BWA_OK`.
+- `bwa_stop` returns `BWA_OK`, or `BWA_ERR_CONFIG` for a NULL engine.
 - `bwa_tracker_connect` returns `BWA_OK`, `BWA_ERR_CONFIG` (NULL args / a static-`room_eq`
   layout), or `BWA_ERR_TRACKER`.
+- `bwa_load_headphone_eq` returns `BWA_OK`, or `BWA_ERR_CONFIG` (NULL engine, or a file that
+  fails to read or parse; the previous EQ stays).
 - A failed **explicit** `layout_path` leaves `bwa_create` usable (the engine sits on the default
   grid; the reason is in `bwa_last_error`, readable right after create) but **fails
   `bwa_start` with `BWA_ERR_LAYOUT`**: a session that named a layout never silently runs the
@@ -689,7 +813,7 @@ update is corrected one frame later.
 There are none. You configure everything through the API: the output device is
 `bwa_desc.sink`/`device`, Embree is `bwa_desc.embree`, pathing is `bwa_desc.enable_pathing`,
 reflection baking is `bwa_reflections_desc.bake`, and the OptiTrack connection is
-`bwa_tracker_connect` (all of these used to be `BWA_*` env vars). One door per knob.
+`bwa_tracker_connect`. One door per knob.
 
 ### Ray-tracing acceleration (`bwa_desc.embree`)
 
@@ -712,35 +836,37 @@ to come, are in [backends.md](./backends.md).
 `BWA_SINK_AUTO` (the default) picks per platform, and on Windows also by channel count, because
 there the two output paths want different hardware:
 
-| request                        | Windows order          | Linux order        |
-|--------------------------------|------------------------|--------------------|
-| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null | JACK, ALSA, null |
-| more than 2 channels (the array) | ASIO, null           | JACK, ALSA, null   |
+| request                        | Windows order          | Linux order        | Android order | browser order |
+|--------------------------------|------------------------|--------------------|---------------|---------------|
+| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null | JACK, ALSA, null | AAudio, null | worklet, null |
+| more than 2 channels (the array) | ASIO, null           | JACK, ALSA, null   | null          | null          |
 
 The width does not split the Linux order, because nothing on Linux carries the "this transport is
 the array's" decision that ASIO carries on Windows: the same backend serves two channels and
 twenty-six. JACK goes first because it is the Linux production path, and `jack_client_open` carries
 `JackNoStartServer`, so a box with neither a JACK server nor PipeWire falls through to ALSA in
-about 4 ms instead of spawning a `jackd`.
+about 4 ms instead of spawning a `jackd`. Android and the browser carry no array transport, so a
+request wider than two channels goes straight to the offline sink there. macOS runs the null sink
+until the CoreAudio backend lands.
 
-A headphone profile therefore opens the **Windows default output**, which is the device the
-headphones are on. That is the one behavior change from earlier versions: the old order picked
-the first registered ASIO driver, which on a rig machine could be the Digiface, and played the
-monitor into Dante channels 1 and 2. The array never chooses WASAPI, because the array's
-transport is a settled decision ([architecture.md](./architecture.md)).
+A headphone profile on Windows therefore opens the **Windows default output**, which is the device
+the headphones are on, and never lands on the first registered ASIO driver (on a rig machine, the
+Digiface). The array never chooses WASAPI, because the array's transport is a settled decision
+([architecture.md](./architecture.md)).
 
 `cave_both` resolves on its own from that: the array takes ASIO and the monitor takes WASAPI, so
-the profile finally opens both devices at once. The ASIO SDK holds one driver per process, which
-is why it could not before. The monitor asks for `BWA_SINK_AUTO` with no device name, because
+the profile opens both devices at once. The ASIO SDK allows one driver per process, so the monitor
+cannot be a second ASIO device. The monitor asks for `BWA_SINK_AUTO` with no device name, because
 `device` belongs to the array: a name that matches no WASAPI endpoint is skipped by the rule
 above, and the monitor would fall to silence. `bwa_get_audio_backend` names both devices under
 this profile, array first.
 
 Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_JACK`,
-`BWA_SINK_ALSA` and `BWA_SINK_AAUDIO` fail `bwa_start` loudly when the device does not open,
-instead of falling back to silence. A backend this build does not carry (`BWA_SINK_COREAUDIO`
-anywhere, the Linux pair off Linux, the Windows pair off Windows, `BWA_SINK_AAUDIO` off Android)
-fails with a message that says so.
+`BWA_SINK_ALSA`, `BWA_SINK_AAUDIO` and `BWA_SINK_WORKLET` fail `bwa_start` loudly when the device
+does not open, instead of falling back to silence. A backend this build does not carry
+(`BWA_SINK_COREAUDIO` anywhere, the Linux pair off Linux, the Windows pair off Windows,
+`BWA_SINK_AAUDIO` off Android, `BWA_SINK_WORKLET` outside an Emscripten build with the worklet
+sink) fails with a message that says so.
 
 `BWA_SINK_AAUDIO` is stereo only. Android carries no array transport, so a request wider than two
 channels fails the open with a message naming the width, and AUTO on Android sends one straight to
@@ -753,6 +879,13 @@ ports rather than devices: there it is a `jack_get_ports` regular expression, su
 `system:playback_` or `RAVENNA:playback_`, and NULL connects to the physical playback ports in
 order. The connections are a starting point. The patchbay can rewire them live, and the sink never
 reasserts them.
+
+`BWA_SINK_WORKLET` is the browser's Wasm Audio Worklet, and it is stereo only for the same reason
+as AAudio. Its `bwa_desc.device` is a decimal AudioContext **handle**, not a name, because Web Audio
+enumerates no output devices. Pass the handle of a context your page created, so the page keeps
+the right to resume it; NULL makes the sink create its own. A suspended context is not a failure:
+the engine keeps rendering silence and reports `device_lost` until the page resumes it. The web
+binding and its two topologies are in [web.md](./web.md).
 
 `bwa_desc.device` names the device for whichever backend opens it. It matches **exactly** against
 the friendly name, then exactly against the stable id: no substring matching, because two
@@ -1016,24 +1149,12 @@ immediately and the worker's result is discarded when it arrives.
 
 #### Testing the held window
 
-A test that means to cover the held window has a problem: a small asset usually decodes before the
-first render, so the play binds at once, the held path never runs, and the test passes anyway.
+A finished decode is adopted **only** at a pump point (`bwa_sound_acquire`, `bwa_sound_is_ready`,
+`bwa_sound_find`, `bwa_sound_release`, `bwa_commit`), and `bwa_source_play` is not one. So a play
+issued straight after `bwa_sound_acquire_async`, with nothing pumping in between, is always held;
+`bwa_sound_get_channels` reads 0 while it is, and does not pump.
 
-Ordering solves it, without any test hook. A finished decode is adopted **only** at a pump point:
-`bwa_sound_acquire`, `bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, and `bwa_commit`.
-`bwa_source_play` is not one. So a play issued straight after `bwa_sound_acquire_async`, with
-nothing pumping in between, is guaranteed to be held. Check it with `bwa_sound_get_channels`, which
-reads 0 while the slot is still reserved and does not pump.
-
-Slipping a readiness check in before the play is what breaks this, and it breaks it silently: the
-decode gets adopted and the case turns into an ordinary bind while every assertion still passes.
-`test/assets_test.c` does it in the guaranteed order and says so.
-
-Cancelling an in-flight load cannot be pinned down this way, because `bwa_sound_release` pumps on
-entry. Both outcomes are safe, so that test covers the behavior without being able to claim which
-branch ran.
-
-The ownership handoff, for the record: the loader thread allocates the PCM and owns it until it
+**Ownership.** The loader thread allocates the PCM and owns it until it
 publishes the result. From the moment the control thread picks that result up, the control thread
 owns the buffer, hands it to the sound table, and frees it later through the retire-ack. The audio
 thread reaches it only through the ordinary play command, which is the same release the
@@ -1128,34 +1249,45 @@ uint32_t bwa_get_output_latency_frames(bwa_engine* e);                 // device
 bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted device-vs-host drift (ppm + its sigma)
 ```
 
-**Syncing with graphics.** Two cases. Events on the **audio timeline** (a cue in a track you
-scheduled) never need wall time: keep the `start_sample` you passed to `play_at` and fire the
-visual when `bwa_get_dsp_time_frames` crosses `start + cue` (or poll `bwa_source_get_playhead_frames`).
-Events that originate on the **graphics side** need the wall→dsp mapping, and that is
-`bwa_get_clock`: the (output sample position, host time) pair the audio stack stamps inside each
-block callback (ASIO's `ASIOGetSamplePosition` pair; the platform's monotonic clock on the null
-sink).
-Because the pair is captured *in* the callback, the mapping
-`dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9` carries none of the
-block-plus-scheduling jitter that pairing `bwa_get_dsp_time_frames` with your own clock read does.
-`host_time_ns` sits on a backend-defined epoch, and `bwa_host_time_ns` reads that same clock
-directly with no engine handle, so you measure the offset to your own clock rather than estimate
-it: `a = my_clock(); h = bwa_host_time_ns(); b = my_clock();` gives `offset = h - (a+b)/2` with the
-error bounded by `(b-a)/2`. See "Land a sound on a visual event" for the whole recipe, the
-per-platform clock table, and the decaying-max estimator that remains the fallback (it is what the
-Unity binding's `Engine.DspTimeFramesAt`/`RealtimeAt` use). It returns **false with the outputs untouched** until a host-stamped block has
-rendered, that is, before `bwa_start`.
-On ASIO the host time is on QPC whatever clock the driver's `systemTime` uses: the sink takes the
-driver's stamp only when the stamps show it is on QPC, and reads QPC at callback entry otherwise
-([backends.md: ASIO's systemTime](./backends.md#3-timestamp)).
-The **manual** sink is the deliberate exception: it stamps a *nominal* time derived from the
-sample position (`sample / rate`), so a fixed call sequence renders bit-identically; treat that
-pair as a sample-accurate fiction, exact for arithmetic and meaningless as wall time. Its first
-block carries nominal time 0 (read as "unstamped"), so the manual clock goes valid on block 2.
-Finally, the dsp clock stamps when a block is *rendered*, not heard:
-`bwa_get_output_latency_frames` is the device's render→DAC delay in frames (`ASIOGetLatencies`;
-the Digiface includes its Dante buffering), so sound scheduled for dsp time T reaches the room at
-`T + latency`; subtract your measured display delay and one constant aligns the whole AV chain.
+**Syncing with graphics.** There are two cases.
+
+- **Events on the audio timeline** (a cue in a track you scheduled) never need wall time. Keep the
+  `start_sample` you passed to `play_at`, and fire the visual when `bwa_get_dsp_time_frames`
+  crosses `start + cue`. Or poll `bwa_source_get_playhead_frames`.
+- **Events on the graphics side** need the wall→dsp mapping. That is `bwa_get_clock`: the (output
+  sample position, host time) pair the audio stack stamps inside each block callback. On ASIO it
+  is the `ASIOGetSamplePosition` pair; on the null sink it is the platform's monotonic clock.
+
+The graphics-side recipe:
+
+1. **Map with the pair.** `dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9`. The pair is
+   captured *in* the callback, so this carries none of the block-plus-scheduling jitter you get
+   from pairing `bwa_get_dsp_time_frames` with your own clock read.
+2. **Measure the epoch offset.** `host_time_ns` sits on a backend-defined epoch.
+   `bwa_host_time_ns` reads that same clock with no engine handle, so you measure the offset to
+   your own clock instead of estimating it: `a = my_clock(); h = bwa_host_time_ns(); b = my_clock();`
+   gives `offset = h - (a+b)/2`, with the error bounded by `(b-a)/2`.
+3. **Subtract the output latency.** The dsp clock stamps when a block is *rendered*, not heard.
+   `bwa_get_output_latency_frames` is the device's render→DAC delay in frames
+   (`ASIOGetLatencies`; the Digiface includes its Dante buffering), so sound scheduled for dsp
+   time T reaches the room at `T + latency`. Subtract that and your measured display delay, and one
+   constant aligns the whole AV chain.
+
+"Land a sound on a visual event" has the whole recipe, the per-platform clock table, and the
+decaying-max estimator that remains the fallback (the Unity binding's
+`Engine.DspTimeFramesAt`/`RealtimeAt` use it).
+
+Clock details:
+
+- `bwa_get_clock` returns **false with the outputs untouched** until a host-stamped block has
+  rendered, that is, before `bwa_start`.
+- On ASIO the host time is on QPC whatever clock the driver's `systemTime` uses. The sink takes
+  the driver's stamp only when the stamps show it is on QPC, and reads QPC at callback entry
+  otherwise ([backends.md: ASIO's systemTime](./backends.md#3-timestamp)).
+- The **manual** sink is the deliberate exception. It stamps a *nominal* time derived from the
+  sample position (`sample / rate`), so a fixed call sequence renders bit-identically. Treat that
+  pair as a sample-accurate fiction: exact for arithmetic, meaningless as wall time. Its first
+  block carries nominal time 0 (read as "unstamped"), so the manual clock goes valid on block 2.
 
 **Long shows drift.** The pair is exact at the instant it was stamped, but the device crystal and
 the host clock are different oscillators: 10 ppm is 36 ms an hour, a spec-worst ±50 ppm part
@@ -1363,7 +1495,8 @@ Three rules cover the model:
   next pushed sample. It slips, it never drops. Stay a frame's worth ahead; `bwa_source_push`
   returns the count accepted (pace with `bwa_source_push_space`).
 - **Push from the one control thread**: the ring is SPSC. The engine writes non-finite samples as 0
-  (nothing hands NaN to the audio thread).
+  and clamps samples beyond ±32 (+30 dBFS), so nothing hands NaN or an overflowing value to the
+  audio thread. File loads sanitize the same way.
 - **Ending is one-way.** `bwa_source_push_end` marks end-of-data: the voice ends once the ring
   drains, and further pushes are refused. A push source is not restartable: create a new one.
   `bwa_source_stop` / `bwa_source_fade_out` end it the same way (the unconsumed remainder is
@@ -1384,7 +1517,8 @@ void bwa_set_paused(bwa_engine* e, bool paused);         // pause EVERYTHING (ra
 ```
 
 `bwa_set_master_gain` is the volume knob / scene fade: it scales everything mixed (voices, beds,
-the reverb/pathing taps) **before** the per-speaker align stage (so trims and the raw channel-test
+the reverb/pathing taps, and under `BWA_PROFILE_BINAURAL` the direct-binaural field, which never
+touches the speaker bus) **before** the per-speaker align stage (so trims and the raw channel-test
 signal stay calibrated) and before the limiter (which still guards the sum). Ramped per block;
 dragging a slider never zippers. `bwa_set_paused` is app-focus /
 menu pause: every voice gates out with the per-voice pause machinery (memory, streamed, and bed
@@ -1483,9 +1617,9 @@ exactly the walking-listener case, at a slightly wider main lobe. The weights ar
 diffuse-energy-normalized per content order, so A and B stay level-fair. It reaches every consumer
 of the engine's own decode: bed matrix rendering (the sampling fallback / AllRAD / EPAD) and the FDN reverb's
 line render. It doesn't reach the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) or
-phonon's own decodes (reflection bed, pathing, the HRTF monitor). **ON by default** since the offline
-bed sweep, which had the taper winning every axis under both decoders and both observer models. The
-rig trial confirms rather than gates; if it disagrees, revert the default.
+phonon's own decodes (reflection bed, pathing, the HRTF monitor). **ON by default**: in the offline
+bed sweep the taper won every axis under both decoders and both observer models. The rig trial
+has not run yet.
 
 `bwa_set_max_re_split` is the **band-split** refinement (the literature-standard Gerzon
 basic-LF/max-rE-HF decode): with it on, the taper acts only **above a ~700 Hz crossover**; below,
@@ -1553,7 +1687,7 @@ disconnect to fall back to the committed/pushed pose. It is lifecycle-class (ope
 block briefly), not a per-frame call. Zero fields take the defaults shown.
 
 The engine resolves a rigid-body **name** to its streaming ID at connect through the model
-definitions (a `NAT_REQUEST_MODELDEF` exchange); this needs `server` and NatNet ≥ 4. A name that doesn't
+definitions (a `NAT_REQUEST_MODELDEF` exchange); this needs `server` and NatNet 3.0 or later. A name that doesn't
 resolve fails the connect with `BWA_ERR_TRACKER` and the reason in `bwa_last_error`. A failed
 connect leaves the engine running on the committed/default listener: nothing tears down.
 The tracker's lifetime is independent of `bwa_start`/`bwa_stop` (it survives a device restart);
@@ -1607,12 +1741,12 @@ the engine extrapolates the tracked **position** `lead_s` seconds along a veloci
 own frame timestamps (smoothed over ~100 ms so Motive's frame-to-frame jitter doesn't shake the
 image, speed-capped, and reset across drop-outs so a stale velocity never extrapolates). On
 NatNet 4.1–4.5 those timestamps come off the wire: the **server's camera clock** (mid-exposure when
-the command channel is available, the frame's software timestamp when the version is env-forced
-over pure multicast), so bursty packet delivery doesn't shake the estimate and a camera-rate
+the command channel is available, the frame's software timestamp when `version_major`/`version_minor`
+force the version over pure multicast), so bursty packet delivery doesn't shake the estimate and a camera-rate
 change in Motive doesn't mis-scale it. Older streams (and streams **newer** than the parser's
 certified suffix layout) fall back to stamping at packet arrival, so prediction keeps working
-either way. (If a future Motive outruns the parser, the unicast-only `Bitstream` command can pin
-the server to a known syntax; see `src/tracking/natnet.c`.)
+either way. If a future Motive outruns the parser, pin the server to a known syntax with NatNet's
+unicast-only `Bitstream` command.
 Set `lead_s` to your measured motion-to-ears latency (in seconds); too much lead **overshoots on
 direction changes**, so start at the measured value, not above it (clamped at 0.2 s). The engine does
 not predict orientation (it only feeds the headphone decodes). Internal tracking only (needs a
@@ -1621,7 +1755,8 @@ connected tracker).
 ### Extra listeners (multi-occupant compromise)
 
 ```c
-void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count);  // up to 3; 0 clears
+#define BWA_EXTRA_LIS 3
+void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count);  // up to BWA_EXTRA_LIS; 0 clears
 ```
 
 A CAVE usually holds more than one person; single-listener panning is exact for the tracked head
@@ -1716,31 +1851,29 @@ Geometry rules:
   `_set_ground`; a later room call resets every face.
 - **One scene, two consumers.** The same per-triangle materials feed both occlusion (per-band
   transmission) and the reflection bed (absorption/scattering): one shared `IPLScene`.
-- **The box and your own mesh are alternatives, not layers.** `bwa_scene_set_box` *is* a
-  `bwa_scene_set_mesh_mat` call, so it replaces the static mesh exactly like one. Calling
-  `_set_box` and then `_set_mesh_mat` (the natural order, room first and then the pillar
-  standing in it) drops the walls, and drops them **half-way**: the image-source shoebox is
-  separate state and survives, so early reflections keep bouncing off a room that occlusion
-  and the reflection bed can no longer see. To have both, call `_set_box` first (nothing else
-  captures the ISM room) and then **one** `_set_mesh_mat` carrying the box's 12 inward-facing
-  triangles alongside your own geometry.
+- **`bwa_scene_set_box` replaces the static mesh.** It *is* a `bwa_scene_set_mesh_mat` call plus
+  the ISM capture. Calling `_set_box` and then `_set_mesh_mat` (room first, then the pillar
+  standing in it) drops the walls **half-way**: the image-source shoebox is separate state and
+  survives, so early reflections keep bouncing off a room that occlusion and the reflection bed
+  can no longer see. To have both, use `bwa_scene_set_ism_room` and `bwa_box_mesh`; see
+  [Composing a scene](#composing-a-scene-out-of-the-box-and-your-own-geometry).
 - **Static versus dynamic.** `bwa_scene_set_mesh_mat`/`_set_box` set the STATIC world: committed once,
   BVH built once. For things that MOVE, `bwa_scene_add_dynamic_mesh` registers a rigid **instance**
   (its own sub-scene) that you reposition with `bwa_scene_set_dynamic_transform` (room-space position
   + orientation quaternion), a cheap top-level BVH refit, not a geometry rebuild, so it's the
   per-frame path. Geometry is in the mover's LOCAL space; one material token covers all its triangles;
   the movable table holds 32 instances. `add` returns a handle (or `-1`: no SDK / bad geometry / full).
-- **Runtime-safe.** Both the static swap and dynamic-mesh moves are safe to call at any time:
-  `iplSceneCommit` runs under an **exclusive** scene lock and every ray trace holds it
-  **shared**, so a commit can never race a trace (phonon documents exactly this constraint).
-  Staged geometry is **flushed synchronously** when the reflection bed or pathing is created, so
+- **Runtime-safe.** Both the static swap and dynamic-mesh moves are safe to call at any time; a
+  scene commit never races a ray trace. Staged geometry is **flushed synchronously** when the reflection bed or pathing is created, so
   `bwa_scene_set_box` followed immediately by `bwa_start` bakes the room you just set. Caveat:
   **baked** reflections/pathing don't track a runtime change (the bake froze the geometry; see
   [materials.md](./materials.md)); real-time reflections and occlusion do. Replacing the whole
   static mesh at runtime rebuilds the entire BVH; prefer dynamic meshes for movers.
 - **No SDK, no-op.** Everything here is a documented no-op without the `BWA_HAVE_STEAMAUDIO`
-  build, except token minting (plain table state) and `bwa_scene_set_box`, which ALWAYS captures
-  the shoebox for the image-source early reflections. `bwa_scene_add_dynamic_mesh` returns `-1`
+  build, except token minting (plain table state), the pure `bwa_box_mesh`, and the image-source
+  room calls: `bwa_scene_set_box` and `bwa_scene_set_ground` ALWAYS capture the room for the
+  early reflections, and `bwa_scene_set_ism_room` and `bwa_scene_set_pressure_release` touch
+  nothing else. `bwa_scene_add_dynamic_mesh` returns `-1`
   without the backend.
 - **The room calls are live-safe.** `bwa_scene_set_box` / `_set_ground` / `_set_pressure_release`
   publish the ISM room to the audio thread through a seqlock, and each opted-in source re-solves
@@ -1753,8 +1886,8 @@ Geometry rules:
 
 `bwa_scene_set_box` does two jobs: it captures the shoebox for the image-source early reflections
 (which works with or without the Steam Audio build) and it sets the ray-traced static mesh to that
-box. That is what you want when the box **is** the scene, and it replaces the static mesh, so the box
-and your own occluders used to be alternatives rather than layers.
+box. That is what you want when the box **is** the scene. It replaces the static mesh, so on its
+own it cannot layer the box under your occluders.
 
 Use the two calls it is made of when you have both:
 
@@ -1783,7 +1916,8 @@ void  bwa_source_set_occlusion (bwa_engine* e, bwa_source s, bool on);
 float bwa_source_get_occlusion (bwa_engine* e, bwa_source s);   // 1 = clear .. 0 = blocked (HUD)
 void  bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw);
 void  bwa_source_set_directivity(bwa_engine* e, bwa_source s, float weight, float power); // 0=omni/.5=card/1=fig8
-void  bwa_source_set_directivity_preset(bwa_engine* e, bwa_source s, bwa_directivity pattern);
+typedef enum { BWA_DIR_OMNI = 0, BWA_DIR_CARDIOID = 1, BWA_DIR_FIGURE8 = 2 } bwa_directivity;
+void  bwa_source_set_directivity_preset(bwa_engine* e, bwa_source s, bwa_directivity pattern); // OMNI disables it
 float bwa_source_get_directivity(bwa_engine* e, bwa_source s);   // 1 = on-axis/omni .. 0 = null (HUD)
 ```
 
@@ -1908,9 +2042,11 @@ equal values behave exactly as the isotropic spread, and a later `bwa_source_set
 isotropic (last call wins). The ring modes squash their virtual-source cap per axis (a 1×0 extent
 renders as a horizontal *arc* of panner solves), the lobe stretches its angular falloff on the
 extent ellipse. Width/height are **room-referenced** (anchored to the room's up axis), so straight
-overhead the split is inherently ill-defined; BS.2127's polar extent shares that singularity, and
-anisotropic sources give up the transported ring frame's pole-crossing continuity for exactly that
-reason. Rides everything spread rides: the size/near floors (they floor *both* axes, the larger
+overhead the split is inherently ill-defined; BS.2127's polar extent shares that singularity. So
+an anisotropic source's width and height axes can flip as a moving source passes near straight
+overhead. Isotropic spread avoids that flip by carrying a
+[transported frame](./glossary.md#transported-frame). Rides everything
+spread rides: the size/near floors (they floor *both* axes, the larger
 axis drives decorrelation), constant power, per-frame-safe.
 
 Prefer **`bwa_source_set_size`** when the content has a physical size: it floors the spread at the
@@ -1992,7 +2128,7 @@ bool       bwa_source_apply(bwa_engine* e, bwa_source s, const bwa_source_desc* 
 bool       bwa_source_get_desc(bwa_engine* e, bwa_source s, bwa_source_desc* out);    // what it is set to
 ```
 
-There are 24 `bwa_source_set_*` calls and configuring one source fully takes eighteen of them. This is
+Configuring one source fully takes most of the `bwa_source_set_*` calls. This is
 [Situation tuning](#situation-tuning-bwa_tuning_preset-bwa_apply_tuning) applied to a source instead
 of the engine: `bwa_source_kind` names what the source **is**, `bwa_source_preset` fills a complete
 configuration for it, and `bwa_source_apply` pushes the lot.
@@ -2005,12 +2141,11 @@ bwa_source generator = bwa_source_create_desc(e, &d);
 ```
 
 Fill-then-apply rather than one `apply_preset(e, s, PROP)`, for the same four reasons the engine
-tuning gives. You can **print** what a source is set to, which nothing could do before: only
-occlusion and directivity had getters, and those report the sim's live value, not your setting.
-Preset, override a field, apply, composes where apply-then-re-override is order dependent. The
-preset is pure, so a tool can show the table off-hardware. And two sources diff field by field,
-which is how you find the one that sounds wrong. It also gives a source a **reset**, which the API
-had no way to express: fill a preset, apply, done.
+tuning gives. You can **print** what a source is set to: the only per-source getters are
+occlusion and directivity, and those report the sim's live value, not your setting. Preset,
+override a field, apply, composes where apply-then-re-override is order dependent. The preset is
+pure, so a tool can show the table off-hardware. And two sources diff field by field, which is how
+you find the one that sounds wrong. It also gives a source a **reset**: fill a preset, apply, done.
 
 **What is in, and what is out.** The struct carries **configuration**: the settings that describe
 the source and stay put. Three things are deliberately absent. **Position and orientation** are
@@ -2219,8 +2354,7 @@ The fields answer two different questions with two different fixes:
   Fix downstream: a cheaper scene, fewer voices, and watch `peak_load`; it is the worst single block's
   render time as a fraction of the period, so 1.0 means a block exactly consumed its budget and
   anything near it is living dangerously. It covers the **last 4 to 5 seconds** of stream time, not
-  the whole run, so a slow first block or one old stall stops showing once it is 5 s old. Up to
-  0.16.0 it was a since-start maximum; the field and the struct layout did not change. On the web
+  the whole run, so a slow first block or one old stall stops showing once it is 5 s old. On the web
   AudioWorklet sink the clock under it is `Date.now`, whole milliseconds, so read it in ms there
   rather than as a percentage of a 2.7 ms period.
 - **`stream_starves`** is neither. The device kept its deadline and a *streamed voice* had nothing to
@@ -2335,7 +2469,8 @@ The focus default is **derived from your array**, not a constant: the geometry-d
 [spatialization.md](./spatialization.md) (the 26-speaker cube grid lands near 12.7).
 `bwa_spcap_focus_default` computes the same number for an arbitrary set of speaker positions
 (3 floats each, the `bwa_panner_gains_batch` convention) without an engine, so a tool can show
-what a layout implies before you override it. `bwa_panner_gains_batch` takes the same two knobs
+what a layout implies before you override it. It allocates scratch, so keep it off the audio
+thread, and it returns 0 on bad arguments or a failed allocation. `bwa_panner_gains_batch` takes the same two knobs
 with the same sentinel, so you can score a layout at the tuning you will ship ("Offline panner
 and bed evaluation" below).
 
@@ -2349,8 +2484,9 @@ and reports the comb depth each setting costs, against one speaker driven alone 
 
 `bwa_set_dual_band` (off by default, live-toggleable) **wraps** the selected panner. It splits
 each source at ~700 Hz, then pans the low band with **amplitude** (pressure / velocity-vector)
-normalization and the high band with the panner's usual **power** (energy-vector) normalization:
-SPAT's "VBP Dual-Band". You get sharper low-frequency localization for a near-centered listener.
+normalization and the high band with the panner's usual **power** (energy-vector) normalization
+(see [Dual-band panning](./glossary.md#dual-band-panning) and [rV](./glossary.md#rv) in the
+glossary). You get sharper low-frequency localization for a near-centered listener.
 The panning *direction* is unchanged; only the low band's level/coherence differs. It is
 sweet-spot dependent like VBAP, so for a roaming listener it's a by-ear / measurement call.
 
@@ -2427,16 +2563,16 @@ surveyed file. See the README's `bwa_playground` section for the lookup order.
 A layout can declare its listening point with `listening_point_m`; without it the engine listens
 from the array centroid (see [layout-schema.md](./layout-schema.md)).
 
-`BWA_DEFAULT_GRID` (26) is the default grid's count, not the capacity. The two numbers were the
-same before the capacity rose to 64, so do not use one where you mean the other.
+`BWA_DEFAULT_GRID` (26) is the default grid's count, not the capacity. Do not use one where you
+mean the other.
 
 Size meter/speaker arrays from this getter. Use `BWA_MAX_CHANNELS` only for a static buffer that
 must fit any layout.
 
-The old sharp edge here is now fenced: a **failed** explicit layout load still leaves the engine
-on the default grid (reason in `bwa_last_error`, readable after `bwa_create`), but
-`bwa_start` refuses it with `BWA_ERR_LAYOUT`, so a 24-speaker deployment can no longer silently
-render the default grid's 26 channels. Only `layout_path = NULL` runs the default grid.
+A **failed** explicit layout load leaves the engine on the default grid (reason in
+`bwa_last_error`, readable after `bwa_create`), and `bwa_start` refuses it with
+`BWA_ERR_LAYOUT`, so a 24-speaker deployment cannot silently render the default grid's 26
+channels. Only `layout_path = NULL` runs the default grid.
 
 ### Offline panner and bed evaluation
 
@@ -2451,8 +2587,10 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
 
 Both take no engine handle. They run the engine's own solves over a **candidate** layout you pass
 in, so a layout tool scores what will ship instead of a re-implementation. Both are pure and
-reentrant: the per-listener cache is per-call stack state, so any thread can call them, including
-while an engine renders.
+reentrant: the per-listener cache is per-call state with no globals, so any thread can call them,
+including while an engine renders. Both **allocate** one scratch layout per call and free it
+before returning, so never call them from an audio callback. Each returns 0 on a NULL argument,
+a zero count, more than `BWA_MAX_CHANNELS` speakers, or a failed allocation.
 
 `bwa_panner_gains_batch` writes `out[i*n + s]`, `nsrc*n` floats, and returns `nsrc`. It uses the
 default DBAP and distance tuning, and shares the SPCAP/VBAP per-listener cache across the batch,
@@ -2473,7 +2611,7 @@ quadrature for the sphere, which is what ambisonic content wants from an array a
 point-source panners cannot see.
 
 `bwa_layout_tool` drives both: the Score board, the rE coverage overlay, the badness map, and the
-optimizer cost all go through them. See [`layout-schema.md`](./layout-schema.md).
+optimizer cost all go through them. See [`layout-authoring.md`](./layout-authoring.md#scoring-and-the-observer-model).
 
 ## Tracked room EQ (control thread; live)
 
@@ -2576,7 +2714,7 @@ density, and an out-of-range panner or spread mode), and a readback whose job is
 must not itself report an unsanitized value. This is not per-knob getters, which the live A/B surface
 still deliberately lacks; it is one struct the ABI already owns.
 
-Fourteen rendering knobs is a lot to get right. `bwa_setup` names how the **listener** uses the
+That many rendering knobs is a lot to get right. `bwa_setup` names how the **listener** uses the
 install, `bwa_tuning_preset` fills a complete tuning for it, and `bwa_apply_tuning` pushes the lot.
 
 Fill-then-apply rather than one `apply_preset(e, SEATED)`, deliberately. You can print what the preset
@@ -2589,8 +2727,8 @@ field, which is the natural rig-day question.
 listener uses it. Seated-CAVE, roaming-CAVE and seated-binaural are all real. Create-time config is
 not part of a preset: `bwa_desc.bed_decoder` already defaults correctly, and the profile is yours.
 
-**This struct's zero is NOT its default.** A zero-filled `bwa_tuning` would force max-rE off, which
-stopped being the engine default. `struct_size` exists to make that fail loudly: `bwa_apply_tuning`
+**This struct's zero is NOT its default.** A zero-filled `bwa_tuning` would force max-rE off, and
+the engine default is on. `struct_size` exists to make that fail loudly: `bwa_apply_tuning`
 refuses a struct whose size is wrong, which is what a zero-init mistake looks like. Always start from
 `bwa_tuning_preset`.
 
@@ -2618,8 +2756,7 @@ at the engine default rather than a guess.
 | `align_*` guards | 0 | 0 | 0 means the built-in guards |
 
 Seated and roaming differ in exactly **three** fields today. That is not an oversight, it is what the
-evidence supports. The gap should widen after the rig day, and `smoke` asserts the count so a fourth
-opinion cannot arrive unannounced.
+evidence supports. The gap should widen after the rig day.
 
 ## Output protection limiter (control thread; ON by default)
 
@@ -2741,8 +2878,8 @@ A **phonon-free** late-reverb alternative that takes the reverb tap *instead of*
 mono aux send, so `bwa_source_set_reverb` and the per-source send levels apply unchanged, and
 `bwa_set_reverb_gain` sets its return level live.
 
-Inside: a 16-line **feedback delay network** (Householder feedback; lossless prototype, the decay
-filters are the only loss), each line assigned a direction on the sphere and rendered as a plane
+Inside: a 16-line **[feedback delay network](./glossary.md#fdn)** whose feedback matrix loses no
+energy on its own, so the decay filters set the whole decay. Each line is assigned a direction on the sphere and rendered as a plane
 wave through the layout's SH→speaker bed decode. `rt60_low_s`/`rt60_high_s`/`xover_hz` set a
 two-band decay (defaults 1.2 s low / 0.7 s high at 2 kHz). `decay_dir` + `decay_factor` make the
 decay **anisotropic**: the field dies faster (factor < 1) or slower toward that direction, the
@@ -2758,8 +2895,8 @@ air. `<= 0` keeps a parameter's current value; pre-start it just updates the sta
 scene can call it unconditionally. Structure (enable, anisotropy) stays load-time; the wet level is
 `bwa_set_reverb_gain`, as always.
 
-Deterministic CPU (no rays, no IRs, infinite tail), works in no-SDK builds: the reverb path no
-longer requires the Steam Audio SDK.
+Deterministic CPU (no rays, no IRs, infinite tail), and it works in no-SDK builds, so reverb does
+not require the Steam Audio SDK.
 
 ### Image-source early reflections (no SDK needed)
 

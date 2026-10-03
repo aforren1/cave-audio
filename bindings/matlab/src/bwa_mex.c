@@ -22,7 +22,7 @@
  *
  *   - `set_output_capture` is present but REFUSES, with the reason. Its callback runs on the AUDIO
  *     thread, and an interpreter must never run there - CLAUDE.md invariant 1, and
- *     docs/backends.md's own rule for this binding. The offline path is the manual sink plus
+ *     docs/backend-development.md's own rule for this binding. The offline path is the manual sink plus
  *     `render_block`, which hands back the same post-limiter samples on the caller's own thread.
  *   - Out-parameters become extra outputs: [dsp, host] = bwa_mex('get_clock', h), and a bool plus
  *     out-struct call returns [] on false and a struct on true. A char* out-buffer (device name or
@@ -1290,7 +1290,7 @@ CMD(set_output_capture)
         "on the AUDIO thread, where an interpreter must never run: entering the interpreter there "
         "allocates, takes locks and runs arbitrary code inside the device callback, which is the "
         "engine's first invariant. Use the manual sink and bwa_mex('render_block', h) instead - it "
-        "hands back the same post-limiter samples on your own thread. See docs/backends.md.");
+        "hands back the same post-limiter samples on your own thread. See docs/backend-development.md.");
 }
 
 CMD(render_block)

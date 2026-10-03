@@ -53,8 +53,7 @@ bus, after `align.c`'s per-speaker trim and delay. What comes back out is what t
 That matters because the shipping render is much more than a panner solve: dual-band and CAP
 renormalize the low band, the spread modes and decorrelation reshape the gain vector, the
 hole-aware floor widens, tracked alignment re-references the delays. A harness that multiplied a
-stimulus by panner gains could sweep every one of those flags and measure nothing. That is exactly
-what it used to do.
+stimulus by panner gains could sweep every one of those flags and measure nothing.
 
 The harness forces three things for measurement. They are not part of what it measures:
 
@@ -73,8 +72,8 @@ cell ran before it, and a cold engine renders the same cell as a warm one.
 
 **The physical reference arm does not go through the engine.** Driving one speaker alone involves
 no panner and no knob. It is the floor everything else is quoted against, so it must not acquire
-dependencies on engine runtime state. It still builds its feed the direct way
-(`valid_reference_feeds`). It is still **captured** like every other cell: only the feed builder
+dependencies on engine runtime state. It builds its feed the direct way
+(`valid_reference_feeds`), and it is **captured** like every other cell: only the feed builder
 differs. The ABI has a live counterpart, `bwa_source_set_channel`, and it is for listening rather
 than for measuring: see "The physical reference arm" below for why the two stay separate.
 
@@ -273,7 +272,7 @@ that subtraction as a matched-cell contrast, per speaker, in the physical-versus
 
 An absolute comb depth says as little on its own as an absolute angular miss, and for the same reason.
 
-### Limits
+### What comb depth cannot see
 
 - Ripple **slower** than the analysis band is indistinguishable from a spectral tilt, and the detrend
   removes it. Copies within about 1 ms of each other put their first notch above the band and read as
@@ -293,7 +292,7 @@ An absolute comb depth says as little on its own as an absolute angular miss, an
 
 Measured in the `zylia` test on a synthetic delay-and-add: one coherent copy reads 1.6 dB, the
 analysis floor. Adding weaker copies takes it to 4.6, 5.6, 8.6, 10.3 dB. One capsule carrying a
-different comb pulls the answer 0.4 dB off and drops quality from 1.00 to 0.58; masking it recovers the
+different comb pulls the answer 0.4 dB off and drops quality from 1.00 to 0.62; masking it recovers the
 clean answer exactly.
 
 ## Sweeping the render knobs
@@ -411,16 +410,17 @@ test asserts reachability for this whole group and nothing about direction. Whic
 intensity vector moves under a spread mode is a property of the array, and an assertion on it would
 bake today's answer into a regression test.
 
-**Decorrelation looks good in one cell and does not survive the sweep.** A single condition at
-source width 0.5 on the built-in grid has it improving both numbers (miss 11.9° to 9.5°, comb
-9.93 to 6.50 dB), which reads like a candidate for defaulting ON. Sweep it properly
-(`--simulate --spread 0.5 --decorrelation both`) and that disappears: at the sweet spot it is
-worse on both axes for all three panners (SPCAP worst, miss 1.0° to 3.0° and comb 5.48 to
-7.53 dB), and off-center it is mixed. Nothing here supports a default change. Two lessons.
-First, a single cell is not evidence (the entire reason this tool sweeps directions and
-placements). Second, the sweep bounds the knob's cost while it stays blind to the benefit, which is
-stopping a wide source collapsing or comb-filtering **as the listener moves through a room**. Every
-cell here is a static anechoic point. Leave it off by default and settle it by ear.
+**Decorrelation looks good in one cell and does not survive the sweep.**
+
+- In the single cell above (source width 0.5, built-in grid) it improves both numbers: miss 11.9°
+  to 9.5°, comb 9.93 to 6.50 dB.
+- The full sweep (`--simulate --spread 0.5 --decorrelation both`) reverses that. At the sweet spot
+  it is worse on both axes for all three panners (SPCAP worst: miss 1.0° to 3.0°, comb 5.48 to
+  7.53 dB). Off-center it is mixed.
+- A single cell is not evidence. That is why this tool sweeps directions and placements.
+- The sweep bounds the knob's cost but cannot see its benefit: keeping a wide source from
+  collapsing or combing **as the listener moves**. Every cell here is a static anechoic point.
+- Nothing here supports a default change. Leave it off and settle it by ear.
 
 **The hole-aware spread floor needs a barrel and a decisive floor.** On a barrel of 8 perimeter
 positions at 3 heights with the listener at 1.4 m, a source at the listener's nadir, VBAP:
@@ -465,42 +465,7 @@ bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 bwa_validate --simulate --tracked-align both --dual-band both --cap both
 ```
 
-| flag | meaning |
-| --- | --- |
-| `--simulate` | propagate the engine's feeds analytically instead of capturing them; no device needed |
-| `--layout <path>` | `cave_layout.json` (default: the built-in grid) |
-| `--driver <name>` | ASIO driver (default: first with enough channels) |
-| `--mic-in <n>` | first Zylia input channel |
-| `--position x,y,z` | one placement; repeatable, replaces the defaults |
-| `--positions <file>` | placements from a file, `x y z [label]` per line, `#` comments |
-| `--azimuths <n>` | azimuths per elevation row (default 12) |
-| `--radius <m>` | source distance from the sweet spot (default 1.4) |
-| `--focus <v[,v,…]>` | SPCAP lobe sharpness; a list sweeps it in one session. See above |
-| `--density <v>` | SPCAP placement-correction exponent, one value for the run |
-| `--dual-band off\|on\|both` | swept axis, see "Sweeping the render knobs" |
-| `--cap off\|on\|both` | swept axis; a cap condition turns dual-band on with it |
-| `--hole-spread <v[,v,…]>` | swept axis; 0 is off |
-| `--tracked-align off\|on\|both` | swept axis |
-| `--spread-mode lobe\|mdap\|spectral\|all` | swept axis |
-| `--decorrelation off\|on\|both` | swept axis |
-| `--near-spread <v[,v,…]>` | swept axis, meters; 0 is off |
-| `--spread <0..1>` | the source's own width; set it before sweeping the three knobs that act on width |
-| `--factorial` | measure the cross product of the axes instead of one knob at a time |
-| `--out <file.csv>` | every cell, one row each |
-| `--no-prompt` | don't wait for ENTER between placements (untracked, unattended runs; a tracked run waits for its gate instead) |
-| `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs a body-frame `--survey` |
-| `--survey <file>` | capsule survey. With `--track`: a body-frame survey the tracker rotates per placement. Without: a room-axes survey taken at the current mounting; a body-frame one is refused |
-| `--mount-offset x,y,z` or `ring` | the body origin to the array center, body axes, meters; only beside a body-frame survey that carries no offset. See below |
-| `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it, and the turn limit is the same budget at `--radius` (0.41° at the defaults) |
-| `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
-| `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
-| `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
-| `--track-sim` | with `--simulate`: a scripted stand instead of Motive. See below |
-| `--track-sim-bump <n>` | knock the scripted stand 15 mm after the nth capture |
-| `--track-sim-twist <n>` | turn the scripted stand 2° about the array center after the nth capture; no center moves |
-| `--no-reference` | skip the physical reference arm (each speaker driven alone and captured) and its matched phantoms; saves one capture per speaker, plus one per speaker per condition per solve mode, at every placement |
-| `--tone <hz>` | measure with a sustained tone instead of broadband; see below |
-| `--inject-fault <ch>` | self-check, see below |
+Every flag is in [Flags](#flags) at the end of this doc.
 
 The built-in placements are a plausible walking envelope, not your room. Pass your own with
 `--position` or `--positions` and give them labels. The labels come back in the report and the CSV,
@@ -579,8 +544,8 @@ tolerance does not bound a measurement error. You could gate on stillness alone,
 The default is 20 mm, twice the trims' 10 mm. The trims need 10 mm because a centimeter is 29 µs of
 arrival error. Validation reads directions from wherever the center turns out to be, so hitting the
 plan closer than 2 cm buys nothing: 2 cm of the 0.7 m envelope step is 3%. The bump limit is half the
-tolerance, 10 mm. At the 1.4 m source radius that is 0.4° of direction, a fifth of the estimator's
-2° anechoic floor. A placement with a full knob sweep can take an hour, and a tighter limit would stop
+tolerance, 10 mm. At the 1.4 m source radius that is 0.4° of direction, a fifth of the 2° floor
+the published chamber measurement reports (see "The physical reference arm"). A placement with a full knob sweep can take an hour, and a tighter limit would stop
 it for creep no result can resolve.
 
 On the rig a key takes the current reading anyway, with a warning. With no live pose it skips that
@@ -644,26 +609,28 @@ into directions), so `--mount-offset` matters only for a survey that has no offs
   from 8.4 cm off each plan over 2 s, settles 5.4 mm off it, yawed 30° and 1.5° off level, and the
   simulated captures come from its TRUE center, which it computes with its own quaternion code. With
   no `--survey` the built-in capsule table stands in as the body frame. The run exits 5 unless the
-  placement hook fired for every placement. That check exists because the hook was once passed into
-  the session loop and never called. `--track` stayed inert while it announced the tracker was
-  measuring. Asserting on the *result* would not have caught it: in simulate the field is
-  synthesized from the same capsule table the estimator reads, so a wrong table cancels out and looks
-  healthy. `--track-sim-bump <n>` knocks the stand 15 mm after the nth capture. `--track-sim-twist <n>`
+  placement hook fired for every placement. An assertion on the *result* cannot replace that check:
+  in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong
+  table cancels out and looks healthy. `--track-sim-bump <n>` knocks the stand 15 mm after the nth capture. `--track-sim-twist <n>`
   turns it 2° about the array center after the nth capture, which moves no center. Its orientation
   also wobbles by 0.03°, so a check that demanded a perfectly still pose would fail on it.
 
-The ctests: `validate_track` checks that the hook fires. `validate_track_settle` checks that the gate
-waits and that every CSV cell carries the measured center, which sits within 1 mm of the scripted
-stand's truth and 5 mm off the plan. It runs at a 40 mm tolerance, so a center computed a few
-centimeters wrong fails the truth check instead of timing out at the gate. `validate_track_bump`
-knocks the stand during the second placement: exit 4, that placement dropped, the first one's cells
-kept. It knocks it a second time inside the physical reference arm, which must be caught on the
-reference capture it lands on. `validate_track_twist` twists the stand during the second placement:
-exit 4 on a turn of about 2° with the center within 1 mm of the take, that placement dropped, the first
-one's cells kept and turn-checked on every capture. `validate_ref_capture` pins that the reference arm is captured at
-all: the counted captures per placement, an injected capsule fault reaching the reference cells
-(an offline reference would be bit-identical with and without it), and the exclusion holding them
-under 1°.
+The ctests:
+
+- `validate_track` checks that the hook fires.
+- `validate_track_settle` checks that the gate waits and that every CSV cell carries the measured
+  center, which sits within 1 mm of the scripted stand's truth and 5 mm off the plan. It runs at a
+  40 mm tolerance, so a center computed a few centimeters wrong fails the truth check instead of
+  timing out at the gate.
+- `validate_track_bump` knocks the stand during the second placement: exit 4, that placement
+  dropped, the first one's cells kept. It knocks it a second time inside the physical reference
+  arm, which must be caught on the reference capture it lands on.
+- `validate_track_twist` twists the stand during the second placement: exit 4 on a turn of about
+  2° with the center within 1 mm of the take, that placement dropped, the first one's cells kept
+  and turn-checked on every capture.
+- `validate_ref_capture` pins that the reference arm is captured at all: the counted captures per
+  placement, an injected capsule fault reaching the reference cells (an offline reference would be
+  bit-identical with and without it), and the exclusion holding them under 1°.
 
 Unverified against live Motive: the socket, the pose timing, the gate against real jitter, and the
 model definition the ring reads.
@@ -733,9 +700,7 @@ Two things to know before reading that table:
   information; the center row is a null control.
 - **Never pool it across placements.** The distribution is bimodal (≈0 centered, degrees off-center),
   so a pooled median lands in the empty middle and reads as "no effect", the exact opposite of the
-  truth. The tool reports per placement for this reason. This is not hypothetical: pooling one
-  centered placement with one off-center one during development produced 0.13°, against 1.8° for the
-  off-center placement alone.
+  truth. The tool reports per placement for this reason.
 
 Expect a triangle panner (VBAP) to show ~0 here even off-center, because it collapses onto the
 coincident speaker, while a distance-blurred panner (DBAP) spreads and pays a real penalty. That
@@ -818,6 +783,7 @@ not simply flagging everything.
 
 ```
 for each microphone placement (you move the ZM-1, the tool waits):
+    capture once with every feed silent                  the background
     for each speaker:                                    drive it alone → capture → score
     check the capsules once (on the first capture), report anything faulty, exclude it
     for each condition × {tracked, fixed} × speaker:     render at it → capture → score
@@ -825,7 +791,7 @@ for each microphone placement (you move the ZM-1, the tool waits):
 ```
 
 A **condition** is a panner plus one setting of every render knob. With no sweep flags there is one
-per panner, which is the old shape. Each swept axis adds one condition per non-baseline value, per
+per panner. Each swept axis adds one condition per non-baseline value, per
 panner, and focus adds them only under SPCAP, so a sweep costs only what it measures.
 
 The arithmetic for a realistic session: three panners, one baseline each is 3 conditions. Add
@@ -901,9 +867,13 @@ before you move the mic again. Then the claim worth making:
 
 ```
 matched-cell contrast (fixed - tracked), median of paired differences
-  SPCAP  (+0.70,+1.50,+0.00)  +10.2  CI [+6.4, +11.2]  *
+  SPCAP f 12.70 -                  right +0.7        +10.1  CI [+5.8, +11.5]  *
   (* = interval excludes zero)
 ```
+
+That row is from `bwa_validate --simulate` on the built-in grid: the panner, its condition (SPCAP
+at focus 12.70, no other knob), the placement label, the median paired difference in degrees, and
+its bootstrap interval.
 
 **Matched-cell** means the same direction and the same listening position under both conditions, so
 the difference is paired. That matters more than it sounds: a median of differences and a difference
@@ -922,17 +892,20 @@ knob column, because it ran no panner and no knob.
 
 ## What it has found so far
 
-On the **default grid**, in simulate, so this is the rendering term with no room. Treat it as a
-worked example, not as a result about your installation.
+The numbers in this section are from the `valid` ctest (`test/valid_test.c`), which pins this
+sweep: the **default grid**, in simulate, so the rendering term with no room. `bwa_validate
+--simulate` reports contrasts within a few tenths of a degree of these, and absolute misses up to
+about a degree apart. Treat them as a worked example, not as a result about your installation.
 
 **Tracking fixes horizontal displacement. It does not fix height.**
 
 | displacement | contrast (fixed − tracked) |
 | --- | --- |
-| horizontal, 0.7 m | DBAP +2.7°, VBAP +4.6°, SPCAP +10.2°, all intervals exclude zero |
+| horizontal, 0.7 m | DBAP +2.7°, VBAP +4.6°, SPCAP +9.9°, all intervals exclude zero |
 | height, 0.4 m | all three intervals include zero |
 
-Height still hurts in absolute terms (SPCAP 1.9° → 7.9°). The panner solve re-aims correctly for your
+Height still hurts in absolute terms (SPCAP, tracked: 2.0° at the sweet spot, 7.7° seated and 7.8°
+tall). The panner solve re-aims correctly for your
 new height. What it cannot undo is that the array's vertical resolving power from there is worse, and
 that the alignment delays were computed for one reference height. **Horizontal displacement is a
 tracking problem. Height is a placement and calibration problem.** Different failure, different
@@ -945,7 +918,7 @@ the harness measures acoustically. Spearman ρ against the measurement:
 | panner | rE direction (within position) | Frank spread |
 | --- | --- | --- |
 | DBAP | **0.82** | 0.45 |
-| SPCAP | 0.44 | 0.23 |
+| SPCAP | 0.40 | 0.22 |
 | VBAP | 0.19 | **0.77** |
 
 So the axis worth optimizing is not the same for every panner. VBAP puts all energy on two or three
@@ -996,19 +969,21 @@ still do not.
   cell here is a static point. You can measure a walking envelope one placement at a time and read
   the spread across placements, which is worth doing, but it is not the same as measuring what
   motion does.
-- **Beds at all.** The harness renders a point source; the bed path, its decoder choice, and the
-  max-rE taper never enter. A deliberate omission, for three reasons: the bed is rendered with a
-  **static** decode precisely because diffuse energy is not sweet-spot sensitive, so this tool's
-  solve-versus-microphone seam does not apply to it; the decoder and taper already have an
-  offline metric that orders them decisively (`--score <layout> [epad] maxre`, with `dsp_test`
-  pinning EPAD's energy flatness); and what remains is a by-ear question
-  [hardware-validation.md](./hardware-validation.md) already schedules with a stated prior and a
-  binomial test. The exception, if you ever want one, is `bwa_set_bed_renderer`: alone among the
-  bed knobs its claim is **position dependent**, it has no offline metric, and no trial is
-  scheduled for it. The build would be narrow (encode a plane wave per target direction, render
-  through the bed path, score with the DOA machinery and the existing placements), and the taper
-  would come along in the same mode for free. That gives the pending `bwa_set_max_re` default flip
-  its rig confirmation.
+- **Beds at all.** The harness renders a point source. The bed path, its decoder choice and the
+  max-rE taper never enter. That is deliberate:
+  - The bed uses a **static** decode because diffuse energy is not sweet-spot sensitive, so the
+    solve-versus-microphone seam does not apply to it.
+  - The decoder and taper already have an offline metric that orders them decisively
+    (`--score <layout> [epad] maxre`, with `dsp_test` pinning EPAD's energy flatness).
+  - What remains is a by-ear question, and
+    [hardware-validation.md](./hardware-validation.md) schedules it with a stated prior and a
+    binomial test.
+
+  The one exception worth building is `bwa_set_bed_renderer`. Alone among the bed knobs its claim
+  is **position dependent**, it has no offline metric, and no trial is scheduled for it. The build
+  is narrow: encode a plane wave per target direction, render through the bed path, and score with
+  the DOA machinery at the existing placements. The taper comes along in the same mode, which
+  would give the max-rE default (on) a rig confirmation.
 
 ## Not built yet: the rotating two-mic ITD rig
 
@@ -1045,6 +1020,48 @@ through different capsules, which separates capsule error from field structure f
 `zylia_check_capsules` can from one orientation. Second, a direct bias check on
 `zylia_intensity_doa`/`zylia_srp_doa`, whose estimates should rotate exactly with the array.
 
+## Flags
+
+`bwa_validate --help` prints all but `--inject-fault`, `--track-sim-bump` and `--track-sim-twist`.
+
+| flag | meaning |
+| --- | --- |
+| `--simulate` | propagate the engine's feeds analytically instead of capturing them; no device needed |
+| `--layout <path>` | `cave_layout.json` (default: the built-in grid) |
+| `--driver <name>` | ASIO driver (default: first with enough channels) |
+| `--mic-in <n>` | first Zylia input channel |
+| `--position x,y,z` | one placement; repeatable, replaces the defaults |
+| `--positions <file>` | placements from a file, `x y z [label]` per line, `#` comments |
+| `--azimuths <n>` | azimuths per elevation row (default 12) |
+| `--radius <m>` | source distance from the sweet spot (default 1.4) |
+| `--focus <v[,v,…]>` | SPCAP lobe sharpness; a list sweeps it in one session. See "Focus, and where the sweep has power" |
+| `--density <v>` | SPCAP placement-correction exponent, one value for the run |
+| `--dual-band off\|on\|both` | swept axis, see "Sweeping the render knobs" |
+| `--cap off\|on\|both` | swept axis; a cap condition turns dual-band on with it |
+| `--hole-spread <v[,v,…]>` | swept axis; 0 is off |
+| `--tracked-align off\|on\|both` | swept axis |
+| `--spread-mode lobe\|mdap\|spectral\|all` | swept axis |
+| `--decorrelation off\|on\|both` | swept axis |
+| `--near-spread <v[,v,…]>` | swept axis, meters; 0 is off |
+| `--spread <0..1>` | the source's own width; set it before sweeping the three knobs that act on width |
+| `--factorial` | measure the cross product of the axes instead of one knob at a time |
+| `--out <file.csv>` | every cell, one row each |
+| `--no-prompt` | don't wait for ENTER between placements (untracked, unattended runs; a tracked run waits for its gate instead) |
+| `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs a body-frame `--survey` |
+| `--survey <file>` | capsule survey. With `--track`: a body-frame survey the tracker rotates per placement. Without: a room-axes survey taken at the current mounting; a body-frame one is refused |
+| `--mount-offset x,y,z` or `ring` | the body origin to the array center, body axes, meters; only beside a body-frame survey that carries no offset. See "The mount offset" |
+| `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it, and the turn limit is the same budget at `--radius` (0.41° at the defaults) |
+| `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
+| `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
+| `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
+| `--track-sim` | with `--simulate`: a scripted stand instead of Motive. See "Two safety behaviors" |
+| `--track-sim-bump <n>` | knock the scripted stand 15 mm after the nth capture |
+| `--track-sim-twist <n>` | turn the scripted stand 2° about the array center after the nth capture; no center moves |
+| `--no-reference` | skip the physical reference arm (each speaker driven alone and captured) and its matched phantoms; saves one capture per speaker, plus one per speaker per condition per solve mode, at every placement |
+| `--tone <hz>` | measure with a sustained tone instead of broadband. See "Stimulus, and where content dependence actually comes from" |
+| `--inject-fault <ch>` | self-check. See "Proving the integrity layer on your own data" |
+| `--sim-background <dBFS>` | with `--simulate`: a steady noise floor on every simulated capsule; see "The background check" |
+
 ## Where the code lives
 
 | file | what |
@@ -1056,7 +1073,7 @@ through different capsules, which separates capsule error from field structure f
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the engine-versus-direct regression, determinism, the per-knob effects, the sweep |
 | - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep; `validate_track`: the placement hook fires |
 | `examples/mic_track.cpp` | the tracked ZM-1: NatNet, the mount offset, the capsule re-aim, the gate's console loop and the bump check, shared with `bwa_calibrate` |
-| `test/validate_cli_test.cmake` | the `validate_track_settle`, `validate_track_bump` and `validate_ref_capture` ctests: the measured center against the scripted stand's truth and the CSV, the bump (in the reference arm too), and the reference arm going through the capture path |
+| `test/validate_cli_test.cmake` | the `validate_track_settle`, `validate_track_bump`, `validate_track_twist`, `validate_ref_capture` and `validate_background` ctests: the measured center against the scripted stand's truth and the CSV, the bump (in the reference arm too), the turn, the reference arm going through the capture path, and the background flag |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

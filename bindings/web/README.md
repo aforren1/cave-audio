@@ -181,8 +181,8 @@ The ACTIVE count is `engine.info.channelCount`: the layout's speaker count, anyw
 | `push(Float32Array)` | promise | push sources. Mono frames. Resolves to the count accepted |
 | `space()`, `pushEnd()` | promise | push sources |
 
-`invoke` is the reason this list is short. Every one of the 167 calls in `include/bw_audio.h` is
-reachable by its C name minus the prefix: `engine.invoke("source_set_reverb_send", src.handle, 0.3)`
+`invoke` is the reason this list is short. Every call in `include/bw_audio.h` except
+`bwa_set_output_capture` is reachable by its C name minus the prefix: `engine.invoke("source_set_reverb_send", src.handle, 0.3)`
 is `bwa_source_set_reverb_send(e, src, 0.3f)`. Units are the C units. Frame-valued calls keep saying
 frames, because Web Audio speaks seconds everywhere and mixing the two is how the Godot binding
 shipped a bug.
@@ -284,8 +284,8 @@ await src.play(snd, true);                                 // looped by the audi
 
 The browser's own decoder gets you there from any format it serves: `decodeAudioData`, fold the
 channels down to the mono a point source takes, re-wrap as a wav. `playground/wav.js` does the
-wrapping, in one function; the engine reads wav, flac and mp3 through dr_wav and resamples at
-load.
+wrapping, in one function; the engine reads wav, flac and mp3 (dr_wav, dr_flac, dr_mp3) and
+resamples at load.
 
 **A push source**, for audio the page makes or receives as it goes: a synthesizer, a microphone, a
 network stream. The engine's one inbound exception, and a source feed rather than a render path.
@@ -295,8 +295,8 @@ Prefer the first for anything you have in full before it starts, and that is not
 preference. A push feed keeps the page in the audio path forever, and a page stalls: a garbage
 collection, a window drag, a heavy frame on a weak GPU, a tab losing focus. Any stall longer than
 what you queued ahead is a hole in the sound, and the engine counts it as a stream starve
-(`bwa_health.streamStarves`). The playground fed its stimuli that way and the holes were audible
-(2026-09-22); it loads them now, and the same 400 ms stall makes no sound at all.
+(`bwa_health.streamStarves`). The playground loads its stimuli for that reason: a 400 ms
+main-thread stall makes no sound at all.
 
 If you do push, pace the feed on the ring's own space (`src.space()`), not on the animation frame:
 a background tab gets fewer frames and the audio thread does not slow down with it. And pace it
@@ -343,10 +343,9 @@ goes quiet. A fresh context is a fresh worklet scope. The wasm module is reused 
 Two, because the two profiles put the audio in different places.
 
 The speaker cones and the bus strip are `bwa_get_bus_levels`, sampled on a 4 ms interval rather
-than on the animation frame. That readback is the LAST BLOCK's peak, a block is 5.3 ms, and the
-page used to read it every 120 ms: it saw one block in 22 and the default stimulus is a click train
-whose burst is 2 ms in every 250 ms, so the meter read "silent" and the cones stayed dark while the
-click was plainly audible. The tick holds the peak and the frame loop consumes it. The strip then
+than on the animation frame. That readback is the LAST BLOCK's peak and a block is 5.3 ms, while
+the default click train has a 2 ms burst in every 250 ms, so a slow poll misses the click and the
+meter reads "silent" while the click is plainly audible. The tick holds the peak and the frame loop consumes it. The strip then
 falls at the rate the cones and the output strips fall at, because a click's peak lands in about
 one animation frame in fifteen and an instantaneous strip reads silent between them.
 
@@ -364,17 +363,9 @@ source plays it with `loop = true`. A stimulus change is one `bwa_source_play`, 
 ramps click free over its first block. Your own clip goes the same way: the picker under the
 stimulus menu decodes it with the browser, folds it to mono and loads it.
 
-It used to feed a push source from a 20 ms timer on the main thread with 100 ms queued ahead of
-the audio clock, and that was wrong in both directions. A stall longer than the queue was a hole
-in the sound, which is what "the click train becomes inaudible for short periods" was (reported
-2026-09-22; headless Chrome on a fast desktop collected 31 to 37 stream starves in one ordinary
-check run before anyone stalled anything on purpose). And the queue was also the switch latency: a
-menu change waited for the old signal to drain.
-
-Both numbers moved. A stimulus switch is heard after 6 to 16 ms, where the feed took 97 to 170. A
-deliberate 400 ms main-thread stall now produces zero starves, where the feed produced 45 to 59. The health table keeps
-one row for it, `stream starves`, and it stays at zero because nothing on the page feeds the
-engine any more. If you hear a dropout now, it is the audio thread, and the `late blocks` row is
+A stimulus switch is heard after 6 to 16 ms, and a deliberate 400 ms main-thread stall produces
+zero stream starves. The health table keeps one row for it, `stream starves`, and it stays at zero
+because nothing on the page feeds the engine. If you hear a dropout, it is the audio thread, and the `late blocks` row is
 where it shows. `run-playground.mjs` asserts both halves: the switch bound, and the stall making
 no starve while the audio thread renders straight through it.
 
@@ -539,9 +530,8 @@ is not. The page prints the table beside the view.
 
 **A phone viewer has no controller.** A Cardboard-style runtime reports one input whose
 `targetRayMode` is `gaze`, with the ray starting at the eyes, and a tap on the screen as a
-one-frame `screen` input. Both press. Neither is a hand, and the first build drew the gaze as
-one, which put the grip sphere on the user's face. Now a gaze draws nothing but a 1.2 cm dot at
-the end of its ray, and only while that ray is on the menu; a screen tap draws nothing.
+one-frame `screen` input. Both press. Neither is a hand, so neither draws a grip sphere. A gaze
+draws nothing but a 1.2 cm dot at the end of its ray, and only while that ray is on the menu; a screen tap draws nothing.
 
 The menu changes its follow policy for a gaze as well. The controller policy parks the panel
 0.34 m to the left of the gaze line and moves it with every head turn, which a hand can reach
@@ -671,22 +661,28 @@ node bindings/web/tests/run-playground.mjs         # or directly
 `web_browser` proves the sink. This proves the demo on top of it. The runner's server appends one
 script tag to the playground's HTML for a request carrying `?__drive=1`, so the page a visitor loads
 carries no test code and the check still drives the real page through `window.__bwaPlayground`, the
-hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with the dome's 24 bus
-channels, every speaker read back from `bwa_get_speakers` 2 m from the center and none below the
-floor, and the Start panel is gone with a status line in
-its place; a source at room `+x` draws on the left of the screen AND is louder in the left ear,
-measured by rendering the page's own click through a second engine on the manual sink
-(`playground/probe.js`); the speaker cones and both meter strips MOVE while the default click train
-plays; a stimulus change reaches the output inside 60 ms; the channel walk lights the channel it
-drove and nothing else within 20 dB; a wall across the line of sight drops the occlusion factor and
-moving it away restores it; a figure-of-eight source nulls at 90 degrees; a 400 ms main-thread
-stall makes no stream starve and the output still carries the stimulus afterwards; the profile
-rebuild lands
-back on the worklet sink, keeps `device_lost` at 0 and still puts a `+x` source in the left ear of
-the LIVE output, in both directions; and an uploaded layout rebuilds the array, reads back through
-`bwa_get_speakers` with the position it was given, while a layout the engine refuses is reported and
-falls back to the dome, and a reset returns to the dome. It skips when it finds no browser, no `dist/` or no vendored
-three.js.
+hook `playground/main.js` documents. What it asserts:
+
+- The page starts on the worklet sink with the dome's 24 bus channels. Every speaker read back
+  from `bwa_get_speakers` is 2 m from the center and none is below the floor. The Start panel is
+  gone, with a status line in its place.
+- A source at room `+x` draws on the left of the screen AND is louder in the left ear, measured by
+  rendering the page's own click through a second engine on the manual sink
+  (`playground/probe.js`).
+- The speaker cones and both meter strips MOVE while the default click train plays.
+- A stimulus change reaches the output inside 60 ms.
+- The channel walk lights the channel it drove and nothing else within 20 dB.
+- A wall across the line of sight drops the occlusion factor, and moving it away restores it.
+- A figure-of-eight source nulls at 90 degrees.
+- A 400 ms main-thread stall makes no stream starve, and the output still carries the stimulus
+  afterwards.
+- The profile rebuild lands back on the worklet sink, keeps `device_lost` at 0 and still puts a
+  `+x` source in the left ear of the LIVE output, in both directions.
+- An uploaded layout rebuilds the array and reads back through `bwa_get_speakers` with the
+  position it was given. A layout the engine refuses is reported and falls back to the dome, and a
+  reset returns to the dome.
+
+It skips when it finds no browser, no `dist/` or no vendored three.js.
 
 The live-output assertions read an AnalyserNode pair on `engine.outputNode()`, and they are there
 because a health block cannot tell silence from sound: a sink whose worklet never came up

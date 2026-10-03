@@ -3452,7 +3452,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     /* decorrelation: convolve the decor bus through each channel's sparse velvet filter into the main
      * bus. Runs while anything wrote this block, plus one filter-length of flush so the tail rings
      * out; on going idle the history is wiped, so a later re-engage can never replay stale samples. */
-    if (dc_live)    if (dc_live)    if (c->dc_wrote) c->dc_tail = c->dc_histlen;
+    if (dc_live && c->dc_wrote) c->dc_tail = c->dc_histlen;
     if (dc_live && c->dc_tail > 0) {
         BWA_ZONE_BEGIN(zdc, "decorrelate");
         const uint32_t hm = c->dc_hmask, hl = c->dc_histlen, w = c->dc_w, nt = c->dc_ntaps;

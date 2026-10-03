@@ -226,7 +226,7 @@ uint64_t os_monotonic_ns(void) {
 #if defined(__APPLE__)
     /* mach_absolute_time counts in a unit the timebase names; on Apple silicon that is 125/3 ns
      * per tick, so the conversion is not optional. Split the scale (ticks * numer can overflow on
-     * a long uptime) the same way the QPC path does. UNTESTED on a Mac; see docs/backends.md. */
+     * a long uptime) the same way the QPC path does. UNTESTED on a Mac; see docs/backend-development.md. */
     static mach_timebase_info_data_t tb;
     if (tb.denom == 0) mach_timebase_info(&tb);
     const uint64_t t = mach_absolute_time();
@@ -257,7 +257,7 @@ void os_sleep_until_ns(uint64_t deadline_ns) {
 #if defined(__APPLE__)
     /* mach_wait_until takes mach ticks, so the deadline converts back through the same timebase
      * os_monotonic_ns used. A signal can cut the wait short, so re-arm on what is left.
-     * UNTESTED on a Mac; see docs/backends.md. */
+     * UNTESTED on a Mac; see docs/backend-development.md. */
     static mach_timebase_info_data_t tb;
     if (tb.denom == 0) mach_timebase_info(&tb);
     for (int tries = 0; tries < 64; ++tries) {

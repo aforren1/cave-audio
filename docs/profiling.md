@@ -18,11 +18,17 @@ costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON
 ## What's instrumented
 
 - **A Tracy "frame" = one audio block.** That's the budget unit. At 256 samples / 48 kHz the block
-  period is **5.33 ms**. The whole `asio block` (or `null block`) zone must stay well under it, with
-  headroom for jitter. The audio thread shows up as `bw-audio (ASIO)` (the driver's `bufferSwitch`
-  thread) or `bw-audio (null)` (the no-hardware render thread; same `render()`, so you can profile
-  without a device).
-- **Zones**: `asio block` / `null block` (whole callback) → `rt_render` → `mix voices`, `reflect tap`,
+  period is **5.33 ms**. The block zone must stay well under it, with headroom for jitter.
+- **The block zone depends on the sink.** `asio block`, `null block`, `alsa block` and
+  `manual block` time one block directly. WASAPI, JACK, AAudio and the worklet go through the
+  fixed-quantum adapter, so each rendered block is a `quant block` zone inside the device callback
+  (`wasapi block`, `jack cycle`, `aaudio callback`, `worklet quantum`).
+- **Threads.** The audio thread shows up as `bw-audio (ASIO)` (the driver's `bufferSwitch`
+  thread), `bw-audio (WASAPI)`, `bw-audio (ALSA)`, or `bw-audio (null)` (the no-hardware render
+  thread; same `render()`, so you can profile without a device). JACK, AAudio and the worklet
+  render on a thread the server, the OS or the browser owns; their named threads
+  (`bw-audio (JACK lost)` and so on) are the host-paced fallbacks after a device is lost.
+- **Zones** under the block: `rt_render` → `mix voices`, `decorrelate`, `reflect tap`,
   `path tap`, `align`; plus `binaural decode` and `convert_out`. The sim threads show
   `occlusion ray-trace` / `reflection ray-trace` on `bw-sim (occlusion)` / `bw-sim (reflections)`;
   the pathing sim thread appears as `bw-sim (pathing)`.
@@ -92,7 +98,8 @@ tracy-csvexport bench.tracy            # 3) per-zone CSV to stdout
 ```
 
 `tracy-csvexport` emits one row per zone with **count, total, mean, median, min, max, std (ns)**. The
-budget check is the `asio block` / `null block` (and `rt_render`) rows: `mean` and especially `max`
+budget check is the block-zone row for your sink (`asio block`, `null block`, `quant block` and so
+on) and the `rt_render` row: `mean` and especially `max`
 must sit comfortably below the block period (**5.33 ms = 5,333,333 ns** at 256/48 kHz). For reference,
 a 16-voice load with all propagation effects + the reflection bed measures ~458 us mean / ~1550 us max
 (≈9% / 29% of budget). The GUI's Statistics window has the same numbers and an Export-to-CSV button.
@@ -122,17 +129,20 @@ this build read the per-zone *proportions*, not the absolute block total.
 - **The hard-RT audio thread is the ASIO driver's `bufferSwitch` thread; the host doesn't create it.** A real
   ASIO driver (including RME Digiface Dante) already schedules its callback time-critical / via
   MMCSS "Pro Audio". The host shouldn't (and can't cleanly) re-register it. Nothing to do here.
-- **The engine's own threads are soft/background**: the `null_sink` render loop (no-hardware fallback),
-  the three Steam Audio **sim threads** (`bw-sim (occlusion)`, `bw-sim (reflections)`,
-  `bw-sim (pathing)`), and the NatNet receiver. The one real risk is the sim threads: they ray-trace at ~30 / 12 / 10 Hz
+- **The engine's own render threads ask for real-time.** Every render thread the engine owns (the null
+  sink, the WASAPI and ALSA sinks, and the host-paced fallbacks) calls `os_thread_set_realtime` at
+  its top: MMCSS "Pro Audio" on Windows, `SCHED_FIFO` on Linux (which can be refused; the ALSA
+  sink reports that through `bwa_last_error`), a time-constraint policy on macOS. See
+  [backends.md: Thread](./backends.md#7-thread).
+- **The background threads**: the three Steam Audio **sim threads** (`bw-sim (occlusion)`,
+  `bw-sim (reflections)`, `bw-sim (pathing)`), and the NatNet receiver. The one real risk is the sim threads: they ray-trace at ~30 / 12 / 10 Hz
   respectively and are CPU-heavy, so at normal priority they could preempt the audio callback and
   glitch it. The engine therefore drops all three below normal priority through
   `os_thread_lower_priority` (`steam_scene.c`, `steam_reflect.c`, `steam_path.c`). Tracy makes the
   interaction visible: the sim zones should yield, never overlap an overrunning audio block.
-- **The null sink no longer raises the machine's timer resolution.** It used to bracket its render
-  loop with `timeBeginPeriod(1)`, which is system-wide in effect, so any tool that happened to open
-  the offline sink held the whole machine at a 1 ms timer tick for as long as it ran. The self-paced
-  loops now wait on an absolute deadline through `os_sleep_until_ns`, which uses a
+- **No sink raises the machine's timer resolution.** `timeBeginPeriod(1)` is system-wide in
+  effect, so a sink that called it would hold the whole machine at a 1 ms timer tick. The
+  self-paced loops wait on an absolute deadline through `os_sleep_until_ns`, which uses a
   high-resolution waitable timer on Windows 10 1803 and later and needs no global change to hit a
   sub-millisecond wake. Measured on a desk machine over 200 wakes 2 ms apart: median lateness
   0.43 ms, p99 0.74 ms, against 5.6 ms and 13.0 ms on the pre-1803 fallback path. Only that

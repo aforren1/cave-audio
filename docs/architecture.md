@@ -6,27 +6,31 @@ spatial-audio term it uses, see [glossary.md](./glossary.md).
 ## Goal
 
 Render spatialized audio for a CAVE. A tracked observer moves within a ~3×3 m area
-inside a **24-speaker array** (with room to grow). A game engine (Unity and/or Unreal) drives it.
+inside a **24-speaker array** (with room to grow). A game engine or an experiment
+framework drives it.
 Output goes to an **RME Digiface Dante** over **ASIO**. Latency and timing
 precision are first-class requirements.
 
 ## Top-level decision: self-hosted core, engines as control clients
 
 The spatializer, mixer, device output, and tracking ingest all live in one native
-process behind a single audio callback. Unity/Unreal call a C ABI to trigger sounds
-and push positions. **No rendered audio crosses the boundary**: the mix never
+process behind a single audio callback. The clients (Unity, Godot, Python, MATLAB and
+Octave, the browser) call a C ABI to trigger sounds and push positions. **No rendered audio crosses the boundary**: the mix never
 routes through the game engine, only control. (The opt-in push-source API feeds
 caller-generated PCM *into* the engine over the same control thread; that is a
 source feed, not a render path.)
 
 Why:
 
-- **Timing.** Direct ASIO gives you the hardware-anchored clock the design needs:
-  `bufferSwitchTimeInfo` delivers an `ASIOTime` with sample position and a
-  nanosecond `systemTime`, plus `ASIOGetSamplePosition` on demand. Middleware hides
-  these.
-- **Engine-agnostic.** One core, two thin clients. The only per-engine code reads
-  transforms and tracking.
+- **Timing.** Direct ASIO gives you the device clock the design needs:
+  `bufferSwitchTimeInfo` delivers an `ASIOTime` with the sample position and a host
+  stamp (`systemTime`), plus `ASIOGetSamplePosition` on demand. Middleware hides
+  these. The stamp is in nanoseconds, but the SDK derives it from `timeGetTime`
+  (1 ms resolution, a different base from the engine's host clock), so the sink
+  uses it only when the stamps prove it is on that clock
+  ([`src/sink/sink_tsbase.h`](../src/sink/sink_tsbase.h)).
+- **Engine-agnostic.** One core, several thin clients. The only per-client code
+  reads transforms and tracking.
 - **One system to run and author.** The experiment deploys as a single process on
   the machine that runs the endpoint. The alternative is an external renderer (Spat,
   SSR, Max) driven over OSC. That means a second implementation in a second system:
@@ -70,9 +74,9 @@ stereo sink.
 The **direct binaural render** (`BWA_PROFILE_BINAURAL`) is the one deliberate
 extension of that picture: point voices bypass the speaker panner and SH-encode at
 their true listener-relative directions into a 16-channel **direct field** beside
-the bus (with the SDK, each point voice's dry additionally rides its own
-`IPLBinauralEffect`). Beds pass SH→SH into the same field, and the pathing
-accumulator sums in raw. The bus keeps the synthesized-diffuse taps (the FDN tail,
+the bus. With the SDK, each point voice's dry signal power-splits instead: the point
+share rides its own `IPLBinauralEffect`, and only the spread share enters the field.
+Beds pass SH→SH into the same field, and the pathing accumulator sums in raw. The bus keeps the synthesized-diffuse taps (the FDN tail,
 the reflection bed), and one HRTF decode consumes both. It is still "render
 targets + consumers": the direct field and the point taps are profile-gated render
 targets, not a parallel engine. Anything synthesized-diffuse belongs on the bus.
@@ -170,7 +174,7 @@ that implement and configure it. This ASCII version is canonical for structure.)
 
  output stage - everything that reaches a device passes through, in this order
  ─────────────────────────────────────────────────────────────────────────────
- × master gain (ramped)
+ × master gain (ramped; BINAURAL profile: DIRECT and the point taps too)
  align: per-speaker correction FIR · room-EQ biquads (re-aimed at the tracked pose) ·
         directivity comp (gain + HF shelf per speaker, the vendor's balloon re-aimed at the
         tracked pose: bwa_set_tracked_directivity) ·
@@ -238,8 +242,8 @@ identical across all four:
 
 | profile     | what renders                                              | tracking needed | Dante HW |
 |-------------|-----------------------------------------------------------|-----------------|----------|
-| `cave`      | bus → ASIO/Digiface                                       | position only   | yes      |
-| `binaural`  | direct field + diffuse bus → one HRTF decode → stereo     | full head pose  | no       |
+| `cave`      | bus → ASIO/Digiface                                       | position (pose under CAP) | yes |
+| `binaural`  | direct field + diffuse bus → one HRTF decode (+ per-voice HRTF taps with the SDK) → stereo | full head pose | no |
 | `cave_sim`  | bus → array-sim room → virtual-speaker monitor → stereo   | full head pose  | no       |
 | `cave_both` | bus → ASIO/Digiface + the `cave_sim` monitor → stereo     | full head pose  | yes      |
 
@@ -260,12 +264,14 @@ The renders need different tracking, and the API reflects this:
 
 - **Array render** needs listener **position only**. Head orientation is irrelevant:
   this is real sound from real speakers, and the listener's actual ears localize it.
+  The one exception is opt-in: CAP (`bwa_set_dual_band_cap`) reads the head's
+  orientation to hold the rendered interaural time difference as the head turns.
 - **The headphone renders** need full head **pose** (position + orientation): the
   sim monitor rotates the virtual speakers with the head, and the direct render
   applies orientation at the HRTF decode.
 
 So the tracking layer always provides full pose. The array renderer ignores the
-orientation component.
+orientation component unless CAP is on.
 
 ## Locked decisions
 
@@ -288,7 +294,8 @@ orientation component.
   carries the whole acoustics stack: the binaural HRTF decode (`src/binaural/steam_decode.c`),
   occlusion + per-band transmission EQ + directivity (`src/acoustics/steam_scene.c`), the
   reflection bed with an optional baked mode (`src/acoustics/steam_reflect.c`), and sound
-  pathing (`src/acoustics/steam_path.c`), all wired up in `src/engine.c` at `bwa_start`.
+  pathing (`src/acoustics/steam_path.c`), all wired up in `src/engine.c`: the scene at
+  `bwa_create`, the HRTF monitor, reflection bed and pathing at `bwa_start`.
 - **Spatialization: listener-relative DBAP**, recomputed per frame from tracked
   position. Pure ambisonics' single sweet spot does not survive a 3×3 m roam. SPCAP
   and VBAP are selectable for fixed-listener installs. The full argument and the
@@ -302,10 +309,12 @@ orientation component.
 
 The engine core links four external pieces:
 
-- **ASIO SDK** (GPLv3 option, vendored): the device backend.
+- **ASIO SDK** (GPLv3 option): the Windows array backend. You fetch it into
+  `third_party/asiosdk`; it is not committed. Without it, the array profiles fall back
+  to the offline sink.
 - **Steam Audio (phonon)**: HRTF decode, occlusion, reflections, pathing. Optional:
-  auto-detected at `third_party/steam-audio-artifacts/` (`BWA_HAVE_STEAMAUDIO`).
-  Without it, the simple-pan monitor is the fallback.
+  auto-detected at `third_party/steam-audio-artifacts/` (`BWA_HAVE_STEAMAUDIO`) and
+  linked statically. Without it, the simple-pan monitor is the fallback.
 - **dr_libs** (dr_wav/dr_flac/dr_mp3): WAV/FLAC/MP3 decode in `src/core/sound.c`.
 - **cJSON**: `cave_layout.json` parsing in `src/core/layout.c`.
 
@@ -314,9 +323,11 @@ CMake fetches and pins dr_libs and cJSON. Neither is vendored. The NatNet
 proprietary SDK is a wire-format reference only, never linked.
 
 The opt-in tools carry their own stack, and the engine links none of it:
-**imgui / implot / implot3d / imgui_test_engine** plus **raylib / rlImGui** for
-`bwa_playground`, `bwa_layout_tool`, and `bwa_calib_view`. **Intel Embree** is an
-optional acceleration for the ray-traced sims (`bwa_desc.embree`, with a
-graceful fallback to the default tracer).
+**imgui / imgui_test_engine** for all three GUI tools, **raylib / rlImGui** for
+`bwa_playground` and `bwa_layout_tool`, and **implot / implot3d** for `bwa_calib_view`.
+
+**Intel Embree** is an optional acceleration for the ray-traced sims
+(`bwa_desc.embree`). It needs an Embree-enabled phonon build and falls back to the
+default tracer otherwise.
 
 Everything else is first-party. See `docs/build.md`.

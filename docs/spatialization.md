@@ -28,7 +28,7 @@ level, and exterior injectivity.
 
 The sweet-spot claim is measured, not just argued. The layout tool's bed metric
 (`bwa_bed_gains_batch`, the engine's real AllRAD/EPAD builds; see
-[layout-schema.md](./layout-schema.md)) scores one co-optimized 26-speaker layout
+[layout-authoring.md](./layout-authoring.md#beds-in-the-cost)) scores one co-optimized 26-speaker layout
 at 2.4°/8.1° mean/worst [rE error](./glossary.md#re-error) for a sweet-spot listener and 14.4°/52.5° over
 the 3×3 m roam, against 5.0°/25.5° for tracked DBAP on the same speakers. The
 static decode is the best render on the array at the center, and it loses 3× to the
@@ -37,68 +37,78 @@ reconstructs the field only within roughly N·c/(2πf) of the center, about 16 c
 at 1 kHz for 3rd order. No order the CAVE's 24 speakers can drive reaches a 3 m working
 volume.
 
-> **Fixed-observer installs are a supported mode.** The case above is the *moving*,
-> tracked listener. A seated install needs no extra machinery. Leave tracking off and
-> set the listener once to the sweet spot. You can also leave the pose unset: the
-> default is the array centroid, the nominal listening point. DBAP is position-based, so it
-> pans correctly for that fixed point, unlike an origin-only ambisonic decode. The
-> layout tool's `V` key scores either observer model
-> ([layout-schema.md](./layout-schema.md)).
->
-> For best-in-class fixed-observer quality, **SPCAP** (speaker-placement correction
-> amplitude panning) is a selectable panner: `bwa_set_panner(e, BWA_PAN_SPCAP)`
-> (`spcap.c`, next to `dbap.c` behind the bus seam). It weights every speaker by a
-> smooth lobe `((1+cos)/2)^focus` toward the source's bearing from the listener.
-> Then it scales by a per-speaker **placement correction** `1/local-density`, so a
-> *cluster* of speakers doesn't pull the image toward it. Finally it normalizes for
-> constant power, with the same distance attenuation as DBAP. The engine caches the
-> correction and rebuilds it only when the listener or layout changes, so the
-> per-voice solve stays alloc/lock-free.
->
-> **The lobe width follows the array.** `focus` used to be a compile-time 12: right
-> for this 26-speaker grid, arbitrary anywhere else. The default now comes from the
-> geometry. Measure the mean angle from each speaker to its nearest neighbor. Then
-> pick the exponent that puts the lobe 6 dB down in energy at that angle,
-> `n = ln(0.25) / ln((1+cos delta)/2)`. A sparse array gets a broad lobe, a dense one
-> a tight lobe. The cube grid sits at 37.5 degrees of mean spacing and lands on 12.7,
-> close to the constant it replaced. `bwa_spcap_focus_default` computes the same
-> number for any speaker set, so a tool can show what an in-progress array implies.
->
-> **Both exponents are live knobs**, not file settings:
-> `bwa_set_spcap_focus(e, focus, density)` retunes the render on the next block. Pass
-> 0 or less on either argument to revert that one to its default. Like the rest of the live
-> A/B group they persist nowhere on disk. Focus rewrites the gain vector of every
-> source, so the engine re-solves even sources that never move (rt.c bumps a panner
-> generation the mixer compares against, rather than writing voice state from the
-> control thread). The same knobs reach the offline scoring path
-> (`bwa_panner_gains_batch`, same "0 or less means this array's default" sentinel).
-> They are inert under DBAP and VBAP, which have no lobe.
->
-> **VBAP** (`BWA_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 speakers of the
-> hull triangle containing the source carry it. Sharpest of the three, also
-> fixed-observer. It needs a clean triangulation (it falls back to DBAP for a
-> non-triangulable array) and has VBAP's direction-dependent source-width artifact,
-> so SPCAP stays the recommended fixed-observer default on an irregular survey. Pick
-> VBAP when pinpoint sweet-spot localization is the priority. It shares the
-> convex-hull + VBAP solve (`hull.c`) with AllRAD's decode. It is also the optimal
-> *sparse* panner: with non-negative gains, the l1-optimal speaker-gain solution is
-> exactly VBAP over a Delaunay triangulation (Franck, Wang and Fazi 2017, IEEE TASLP).
->
-> The hull is incremental (`hull.c`). It starts from a tetrahedron, adds speakers in
-> index order, and replaces the faces each new speaker can see with a cone to their
-> rim. That is O(n^2) at worst, under 30 microseconds at 64 speakers, with no allocation, so the
-> panner rebuilds it on the audio thread whenever the tracked listener moves. A hull on
-> n speakers has at most 2n-4 triangles (48 at 26, 124 at 64). A coplanar ring, such as
-> a barrel's top cap, gets one triangulation of its polygon, not every triple of its
-> points. Which triangulation depends on speaker order, and every one covers the cap
-> exactly once. A speaker within 1e-5 of the hull surface, about half a degree from a
-> neighbor, counts as on it and merges into that neighbor. Faces the listener sees from
-> the front only exist when it stands outside the array. The hull drops them, because
-> the far faces already cover those bearings.
->
-> **Pick DBAP for a moving observer, SPCAP for a fixed one.** The layout tool's
-> preview `B` key A/Bs the panners live, with the focus and density sliders beside
-> it.
+### Fixed-observer installs
+
+Fixed-observer installs are a supported mode. The case above is the *moving*,
+tracked listener. A seated install needs no extra machinery. Leave tracking off and
+set the listener once to the sweet spot. You can also leave the pose unset: the
+default is the layout's nominal listening point (`listening_point_m`, else the array
+centroid). DBAP is position-based, so it pans correctly for that fixed point, unlike an
+origin-only ambisonic decode. The layout tool's `V` key scores either observer model
+([layout-authoring.md](./layout-authoring.md#scoring-and-the-observer-model)).
+
+### SPCAP: the fixed-observer panner
+
+For best-in-class fixed-observer quality, **SPCAP** (speaker-placement correction
+amplitude panning) is a selectable panner: `bwa_set_panner(e, BWA_PAN_SPCAP)`
+(`spcap.c`, next to `dbap.c` behind the bus seam). It weights every speaker by a
+smooth lobe `((1+cos)/2)^focus` toward the source's bearing from the listener.
+Then it scales by a per-speaker **placement correction** `1/local-density`, so a
+*cluster* of speakers doesn't pull the image toward it. Finally it normalizes for
+constant power, with the same distance attenuation as DBAP. The engine caches the
+correction and rebuilds it only when the listener or layout changes, so the
+per-voice solve stays alloc/lock-free.
+
+**The lobe width follows the array.** The default `focus` comes from the geometry.
+Measure the mean angle from each speaker to its nearest neighbor, seen from the
+listening point. Then pick the exponent that puts the lobe 6 dB down in energy at
+that angle, `n = ln(0.25) / ln((1+cos delta)/2)`. A sparse array gets a broad lobe, a
+dense one a tight lobe. The cube grid sits at 37.5 degrees of mean spacing and lands
+on 12.7. `bwa_spcap_focus_default` computes the number for any speaker set, so a tool
+can show what an in-progress array implies. It measures from the array centroid, so
+on a layout that declares `listening_point_m` it can differ from the engine's value.
+
+**Both exponents are live knobs**, not file settings:
+`bwa_set_spcap_focus(e, focus, density)` retunes the render on the next block. Pass
+0 or less on either argument to revert that one to its default. Like the rest of the live
+A/B group they persist nowhere on disk. Focus rewrites the gain vector of every
+source, so the engine re-solves even sources that never move (rt.c bumps a panner
+generation the mixer compares against, rather than writing voice state from the
+control thread). The same knobs reach the offline scoring path
+(`bwa_panner_gains_batch`, same "0 or less means this array's default" sentinel).
+They are inert under DBAP and VBAP, which have no lobe.
+
+### VBAP and the convex hull
+
+**VBAP** (`BWA_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 speakers of the
+hull triangle containing the source carry it. Sharpest of the three, also
+fixed-observer. It needs a clean triangulation (it falls back to DBAP for a
+non-triangulable array) and has VBAP's direction-dependent source-width artifact,
+so SPCAP stays the recommended fixed-observer default on an irregular survey. Pick
+VBAP when pinpoint sweet-spot localization is the priority. It shares the
+convex-hull + VBAP solve (`hull.c`) with AllRAD's decode. It is also the optimal
+*sparse* panner: with non-negative gains, the solution that minimizes the sum of the
+speaker gains (the l1 norm) is exactly VBAP over a Delaunay triangulation (Franck, Wang
+and Fazi 2017, IEEE TASLP).
+
+The hull is incremental (`hull.c`). It starts from a tetrahedron, adds speakers in
+index order, and replaces the faces each new speaker can see with a cone to their
+rim. That is O(n^2) at worst, under 30 microseconds at 64 speakers, with no allocation,
+so the panner rebuilds it on the audio thread whenever the tracked listener moves. A hull on
+n speakers has at most 2n-4 triangles (48 at 26, 124 at 64).
+
+A coplanar ring, such as a barrel's top cap, gets one triangulation of its polygon,
+not every triple of its points. Which triangulation depends on speaker order, and every
+one covers the cap exactly once. A speaker within 1e-5 of the hull surface, about half a degree from a
+neighbor, counts as on it and merges into that neighbor. Faces the listener sees from
+the front only exist when it stands outside the array. The hull drops them, because
+the far faces already cover those bearings.
+
+### Which panner to pick
+
+**Pick DBAP for a moving observer, SPCAP for a fixed one.** The layout tool's
+preview `B` key A/Bs the panners live, with the focus and density sliders beside
+it.
 
 ### Array holes, and why the panner has no imaginary speakers
 
@@ -159,7 +169,7 @@ to any layout instead of hard-coding an angle. Both ends of the ramp carry meani
   direction is ever a full speaker spacing away from a speaker **as seen from the
   reference**, so the floor is 0 there. Watch the frame mismatch though. The knee is an
   array property measured from `Layout.ref`, while the gap follows the live listener.
-  Angular gaps stretch as you leave the middle. On the default grid the worst gap is 27.5
+  Angular gaps stretch as you leave the middle. On the default grid the worst gap is 27.3
   degrees at center, 39.7 at 0.7 m out and 61 at a corner, against a 37.5 degree knee. A
   hole-free array can therefore still derive a floor off-center. That is the feature
   working rather than misfiring: from a corner those bearings really do have no speaker
@@ -212,9 +222,10 @@ hard-coded count.
 
 `r` (blur) and the distance-attenuation curve are the two tuning knobs. The layout
 file exposes them, so you can dial them against the real array. If the layout omits
-`rolloff_r`, the loader derives it from the geometry: `0.25 ×` the mean
-centroid→speaker distance (Sundstrom 2021's recommended 0.2–0.5 band), a defensible
-starting point, not a substitute for dialing it by ear.
+`rolloff_r`, the loader derives it from the geometry: `0.25 ×` the mean distance from the
+listening point (`listening_point_m`, else the centroid) to the speakers (Sundstrom 2021
+recommends 0.2 to 0.5 of it). That is a defensible starting point, not a substitute for
+dialing it by ear.
 
 ### Implemented formulation (`dbap.c`)
 
@@ -229,7 +240,10 @@ For each speaker `k` (positions in room space):
    the listener, the bearing is undefined and `dir_k = 1` for all: omnidirectional.
 3. **Constant power**: normalize `g_k ← g_k / ‖g‖₂` so `Σ g_k² = 1`.
 4. **Level**: scale all gains by `user_gain · atten(|src − lis|)`, where the inverse
-   distance-attenuation is `atten = clamp((ref/max(d,ref))^rolloff, min, 1)`.
+   distance-attenuation is `atten = clamp((ref/max(d,ref))^rolloff, min, 1)`. The
+   layout's `dbap.distance_attenuation` sets the default curve. A per-source
+   attenuation (see [api.md](./api.md)) replaces it for that source, applied as a ratio
+   on top of the solve, so it works the same under every panner.
 
 The result: a source *at* a speaker localizes to that speaker (smallest `d_k`,
 `dir_k ≈ 1`), two speakers split a source between them, the total power is
@@ -423,8 +437,10 @@ over the array is zero. That does three things. It makes the correction purely r
 since a delay common to every speaker is just latency. It keeps every target non-negative,
 so the aligner only ever reads further back in its ring. It also makes a listener standing
 exactly at `ref` bit-exact identity rather than approximately so. The cost of that choice
-is added latency: at 1 m off-center the whole array runs about 280 frames (5.8 ms) later
-than it does at the reference.
+is added latency. At 1 m off-center the speaker you walked toward is delayed about 280 frames
+(5.8 ms at 48 kHz) and the speakers you walked away from not at all. Every speaker waits for
+the farthest one, so the aligned wavefront reaches you about 140 frames (2.9 ms) later than it
+does at the reference.
 
 Both corrections ride on top of the layout's own trims and are slewed, never stepped.
 Nothing here touches the gain solve, so it composes with every panner and re-solves
@@ -474,7 +490,8 @@ rig says the level half hurts, splitting it off is a small change.
 
 **The added latency is not reported anywhere.** `bwa_get_output_latency_frames` does not
 include the tracked-align shift, so a client doing audio-video sync against the DSP clock
-will drift by up to those ~280 frames as the listener walks. The drift reverses as they
+will drift as the listener walks: about 140 frames of aligned-arrival delay 1 m out, with
+single speakers shifted by up to about 280. The drift reverses as they
 return. Nothing else in the engine has position-dependent latency. Worth knowing before
 you use this in a session that also cares about AV sync.
 
@@ -531,8 +548,8 @@ from the tracked position? Yes, within four limits that decide how far to push i
   The model describes the direct sound. The reverberant field is set by the speaker's
   total radiated power, which the boost raises uniformly, so past the -6 dB angle you buy a
   little direct level and a lot of reverberant treble, and the direct-to-reverberant ratio
-  that localization rides on gets worse. That is why the comp clamps at +6 dB broadband and
-  +10 dB on the shelf instead of chasing the curve.
+  that localization rides on gets worse. That is why the comp clamps the broadband gain at ±6 dB
+  and the high band's total (broadband plus shelf) at ±10 dB instead of chasing the curve.
 - **It compensates the level, not the beam.** Off-axis, a two-way speaker also has a
   crossover lobe and, with a waveguide, a different horizontal and vertical width. The
   model is the power mean over rotation about the axis, because the mounting roll is not in
@@ -688,7 +705,7 @@ headphone tap.
 their ISM reflection images) bypass the speaker panner. The mixer SH-encodes each
 at its **true** listener-relative direction into a 16-channel direct field
 (`rt.c`, the same `gcur→gtarget` ramp machinery; the coefficients ramp, so motion
-never zippers). It applies the same user gain and layout distance curve the panner
+never zippers). It applies the same user gain and distance curve the panner
 would. None of the array's phantom-source spread reaches the ears. Ambisonic
 **beds pass SH→SH** into the same field: one diagonal per channel
 (`ambi_canon_to_phonon`: the `(-1)^|m|` axis flip times the orthonormal rescale)
@@ -797,13 +814,12 @@ so they cannot drift apart):
   `ambisonics.c`).
 - **m<0 sign: no fix-up.** phonon's real-SH m<0 convention **matches** the
   engine's encode on every channel (the xval golden pins `ambi_encode_sn3d`
-  against phonon's own SH table, sin harmonics included). A negation of ACN
-  1, 4, 5, 9, 10, 11 lived in `steam_decode.c` briefly, added to satisfy a
-  DC-driven laterality test. The default HRTF's per-ear DC gains are laterally
-  opposite its audible ILD, so the DC assertion passed exactly when the field was
-  mirrored. If you touch any convention, run the `steam_decode` laterality test
-  (a 660 Hz **tone**, never DC; right source → right ear, 180° flips);
-  `test_ambi` only checks m≥0 and will not catch a mirror.
+  against phonon's own SH table, sin harmonics included). Do not add a sign
+  flip. Never check laterality with DC: the default HRTF's per-ear DC gains are
+  laterally opposite its audible ILD, so a DC test passes exactly when the field
+  is mirrored. If you touch any convention, run the `steam_decode` laterality test
+  (a 660 Hz **tone**; right source → right ear, 180° flips). `test_ambi` only
+  checks m≥0 and will not catch a mirror.
 
 **Ambisonic order:** default to **3rd order (16 channels, 3D)** for the
 encode/decode. This is the right balance for the CAVE's 24-speaker array: order `N` uses
@@ -822,8 +838,10 @@ the diffuse-ish content, where it doesn't hurt.
 
 ## Diffuse-bed decode (AllRAD versus EPAD)
 
-A fixed SH→speaker **decode matrix** renders the diffuse layer (ambisonic beds, the
-reflection bed) per block (`build_bed_decode` / `mix_bed` in `rt.c`). The engine
+A fixed SH→speaker **decode matrix** renders the diffuse layer (ambisonic beds and the
+FDN reverb) per block (`build_bed_decode` / `mix_bed` in `rt.c`). The Steam reflection bed
+is the exception: it decodes through phonon's own decode effect
+([materials.md](./materials.md)). The engine
 builds that matrix from the speaker geometry at load time. Two decoders are selectable
 with **`bwa_desc.bed_decoder`** (create-time). The plain **sampling (projection) decode**
 `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`ambi_sad_decode`) is **not** one of
@@ -846,9 +864,9 @@ non-triangulable fallback.
   AllRADecoder practice): it closes the triangulation at the hole and its decode
   share is *discarded*. Without it, a floor-less array's hull spans the nadir
   with triangles of bottom-ring speakers, and downward diffuse energy smears onto
-  them. With it, energy aimed where no speaker exists is dropped. The cube grid's
-  ~55° nadir gap stays under the threshold, so genuinely-covered poles are
-  untouched.
+  them. With it, energy aimed where no speaker exists is dropped. A covered pole is
+  untouched: the cube grid has a speaker straight above and straight below the
+  listening point, so it gets no imaginary speaker.
 
 - **EPAD (`BWA_DECODE_EPAD`, `epad.c`)**: Energy-Preserving Ambisonic Decoding
   (Zotter, Pomberger and Noisternig 2012). The decode is the **polar factor** of the
@@ -925,13 +943,16 @@ fewer than 4 channels stay on the matrix.
 ## Early reflections: image sources, panned like point sources (`ism.c`)
 
 The FDN below renders the late tail. `ism.c` renders the **first-order specular
-reflections**: the six wall bounces that carry room size and source distance.
+reflections**: the six wall bounces that carry room size and source distance (one ground
+bounce in the outdoor case).
 Together they are the classic early+late hybrid, and neither needs phonon. The
 engine has a complete acoustics path with no SDK at all.
 
-The geometry is trivial for a shoebox (the room `bwa_scene_set_box` already
-describes): mirroring the source across a face flips the one coordinate normal to
-it. The engine then renders each of the six images as **a point source at its mirrored
+The geometry is trivial for a shoebox: mirroring the source across a face flips the
+one coordinate normal to it. `bwa_scene_set_box` or `bwa_scene_set_ism_room` sets the
+shoebox. `bwa_scene_set_ground` replaces it with a single horizontal mirror plane, and
+`bwa_scene_set_pressure_release` inverts the polarity of chosen faces (the underside of a
+water surface). Contracts: [api.md](./api.md) → "Materials and scene geometry". The engine then renders each of the six images as **a point source at its mirrored
 position, through the engine's own listener-relative panner**. A reflection therefore
 has the right *direction*, the panner's own distance attenuation over its longer path,
 and, crucially, **parallax**. Walk toward the wall and its reflection changes
@@ -948,7 +969,7 @@ FDN renders for free. A source outside the room renders dry.
 
 ## Directional FDN reverb (`bwa_fdn_config`)
 
-The reflection bed no longer *requires* phonon: a 16-line **feedback delay
+The reverb bed does not need phonon: a 16-line **feedback delay
 network** (`fdn.c`, Householder feedback, two-band decay filters per line) can
 take the reverb bus tap instead. The engine assigns each line a Fibonacci-sphere
 direction and renders it as a plane wave through the same SH→speaker bed decode. The

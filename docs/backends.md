@@ -1,198 +1,32 @@
 # Device backends
 
-Status: **phases 0, 1, 2, 3 and 5 are implemented**; phase 4 is still specification. The engine
-has seven sinks today: ASIO (`src/sink/asio_sink.cpp`), WASAPI (`src/sink/wasapi_sink.cpp`), JACK
-(`src/sink/jack_sink.c`), ALSA (`src/sink/alsa_sink.c`), AAudio (`src/sink/aaudio_sink.c`), null
-(`src/sink/null_sink.c`), and manual (`src/sink/manual_sink.c`), over the two shared pieces
-(`src/sink/sink_convert.h`, `src/sink/sink_quant.c`) that phase 0 built.
-The ABI those needed is in place: the appended `bwa_sink_type` values,
-`bwa_desc.device` and `sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`,
-all in the 0.14 minor bump. Phase 2 put the OS shim in (`src/os/os.h`, `src/os/os_win.c`,
-`src/os/os_posix.c`), so the library, the tests and the console examples build and pass with gcc and
-clang on Linux, macOS and Android. What remains is the CoreAudio backend.
+This is the reference for the device sinks: the contract every backend meets, the shared pieces,
+the ABI, the AUTO order, what each backend does, and how they build and test. Why the backends
+exist, the design decisions behind them, the phase plan, the next-backend checklist and the open
+verify list are in [backend-development.md](./backend-development.md).
+
+Status: **phases 0 to 3, 5 and 6 are implemented**; phase 4 (CoreAudio) is still specification.
+The engine has eight sinks: ASIO (`src/sink/asio_sink.cpp`), WASAPI (`src/sink/wasapi_sink.cpp`),
+JACK (`src/sink/jack_sink.c`), ALSA (`src/sink/alsa_sink.c`), AAudio (`src/sink/aaudio_sink.c`),
+Wasm Audio Worklet (`src/sink/worklet_sink.c`), null (`src/sink/null_sink.c`), and manual
+(`src/sink/manual_sink.c`), over the two shared pieces (`src/sink/sink_convert.h`,
+`src/sink/sink_quant.c`).
+The ABI those need is in place: the appended `bwa_sink_type` values, `bwa_desc.device` and
+`sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`. The OS shim
+(`src/os/os.h`, `src/os/os_win.c`, `src/os/os_posix.c`) lets the library, the tests and the
+console examples build and pass with gcc and clang on Linux, macOS and Android. What remains is
+the CoreAudio backend.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
 [concurrency.md](./concurrency.md) for the audio-thread rules every backend inherits.
 
-## Why
-
-The goals, per platform, as stated for this spec:
-
-| platform | goal                                                                                          | backend                            |
-|----------|-----------------------------------------------------------------------------------------------|------------------------------------|
-| Windows  | ease of development at the desk, and reach for head-mounted VR games: a PC headset's audio is a WASAPI endpoint, not an ASIO driver | WASAPI, beside ASIO for the array |
-| Android  | the same reach on standalone headsets (Meta Quest, Pico), which run Android                   | AAudio                             |
-| macOS    | ease of development at the desk                                                               | CoreAudio                          |
-| Linux    | a Windows alternative for the rig in future, and seated or VR headphone experiments now, driven from Psychtoolbox or PsychoPy | JACK, ALSA            |
-
-Nothing in the backend layer is VR-specific. A headset's pose reaches the engine through the
-existing listener API (`bwa_set_listener_pose` each frame, with the prediction lead for
-motion-to-sound latency); the OptiTrack path stays CAVE-only. What the goals change is the
-order in [Phases](#phases) and one default: shared-mode device access everywhere, because a
-VR runtime and an experiment framework both keep their own audio open beside the engine.
-
-Three concrete problems the backends fix, in order of pain:
-
-- **Headphones on Windows need an ASIO driver.** The `binaural` and `cave_sim` profiles open a
-  2-channel ASIO device, so a desk machine without a pro interface runs ASIO4ALL or FlexASIO.
-  Both are wrappers over the OS audio stack. A native WASAPI sink removes that dependency and
-  opens the device the user's headphones are actually on.
-- **`cave_both` cannot open its second device.** The ASIO SDK holds one current driver per
-  process, and the sink refuses a second open (`asio_sink.cpp`, the `g_sink` check at the top of
-  `bwa_asio_sink_open`). `bwa_start` opens the monitor through the same path with the same driver
-  name (`engine.c`, the `cave_both` branch of `bwa_start`), so under `BWA_SINK_AUTO` the monitor
-  falls to the silent null sink, and under `BWA_SINK_ASIO` the start fails. The profile has never
-  had a live monitor on hardware. The fix is a second backend for the second device: ASIO for the
-  array, WASAPI for the headphones.
-- **Unity and Godot projects run on macOS, Linux, and Android.** The engine is Windows-only, so a
-  collaborator on a Mac cannot run the headphone profiles at all, and a standalone headset
-  cannot run the engine. CoreAudio, JACK, ALSA, and AAudio cover those hosts. Two of them can
-  also drive the array, a bonus rather than the goal: CoreAudio, because the RME Digiface
-  Dante has a macOS driver; Linux, because a JACK or ALSA client can drive a multichannel card
-  directly, or reach the existing Dante network as an AES67 sender. See
-  [Linux and the array](#linux-and-the-array). Both are unverified; see the checklist at the
-  end.
-
-What does not change: ASIO stays the Windows array transport (a locked decision in
-architecture.md), the bus seam stays, and the render contract in `src/sink/sink.h` stays. A backend is
-one more consumer of the bus. It must not touch the core.
-
-## Scope
-
-| backend   | platform             | API                                   | serves                                                     | phase |
-|-----------|----------------------|---------------------------------------|------------------------------------------------------------|-------|
-| WASAPI    | Windows 10 and later | MMDevice + `IAudioClient3` (COM)      | headphone profiles, the `cave_both` monitor, any 2-ch use. Multichannel through exclusive mode is possible but not the production path | 1 |
-| CoreAudio | macOS 11 and later   | the HAL (`AudioDevice*`, not AUHAL)   | headphones at the desk; the array too if the Digiface's macOS driver exposes 26 outputs | 4 |
-| JACK      | Linux: a JACK server, or PipeWire through pipewire-jack | libjack, loaded at run time (`jack_client_open`, the process callback) | the Linux production path: headphones on a PipeWire desktop, the array through a multichannel card or the AES67 virtual card, per-speaker port routing in the host's patchbay | 5 |
-| ALSA      | Linux                | alsa-lib, loaded at run time (`snd_pcm_*`) | the no-server path: headphones on a bare box (an experiment wanting the raw device clock), or the array on a `hw:` card (MADI, ADAT, or the AES67 daemon's card) opened directly | 5 |
-| AAudio    | Android 8.0 (API 26) and later | `AAudio*`                   | headphones on standalone VR headsets                       | 3 |
-
-Phase 2, between WASAPI and the rest, is the OS shim that lets the engine build off Windows at
-all. It is done, and so is phase 5: see [Phases](#phases).
-
-### Linux and the array
-
-Audinate ships no Dante host driver for Linux. Dante Virtual Soundcard and the Dante PCIe cards
-are Windows and macOS only, so the Digiface plays no part in a Linux rig. Two routes reach 26
-speakers anyway:
-
-- **A multichannel card wired to the amps.** A MADI or ADAT card with an in-kernel ALSA driver
-  (RME's HDSPe family, `snd-hdspm`), or a class-compliant USB interface. The Dante network is
-  not involved. This is different hardware from the CAVE's, so it is a second install, not a
-  drop-in for the rig.
-- **AES67 into the existing Dante network.** Dante devices with AES67 mode enabled receive
-  AES67 multicast flows from any sender. On Linux the sender is `aes67-linux-daemon` on the
-  RAVENNA ALSA kernel module (both GPL), which presents a virtual ALSA card; the engine opens
-  it through the JACK or ALSA sink like any other card. The config changes are on the Dante
-  side, in Dante Controller: AES67 mode per receiving device, multicast flows of at most 8
-  channels each (26 channels is 4 flows), 48 kHz only, and PTPv2 clocking with the Dante
-  leader as grandmaster. The PTP part is a gain, not a cost: it puts the audio clock on the
-  network clock that api.md's clock-model section wants the display machines on too.
-
-Either way the sink sees an ordinary ALSA card or a set of JACK ports. Nothing in a backend
-knows about AES67. The verify list at the end carries the hardware questions.
-
-### Experiments from Psychtoolbox or PsychoPy
-
-Two integration shapes, and the second needs no Linux backend at all:
-
-- **Live.** The engine owns the device; the experiment drives sources through a binding and
-  schedules onsets with `bwa_source_play_at` against `bwa_get_clock` and
-  `bwa_get_output_latency_frames` (api.md, "Land a sound on a visual event"). When onset
-  precision is the measurement, open the card directly through ALSA: `hw:`, the raw device
-  clock, the engine as the card's only client. When the framework keeps its own audio open
-  beside the engine, JACK on PipeWire shares the card.
-- **Offline.** The manual sink renders stimuli deterministically (`bwa_render_block`,
-  bit-identical run to run) to files, and PsychPortAudio plays them with its own
-  sample-accurate scheduler. This works on Windows today and on Linux after phase 2. It is the
-  shape to start with for any experiment that can pre-render.
-
-**The Python binding exists** ([`bindings/python/`](../bindings/python/), and
-[integration.md](./integration.md) puts it beside Unity and Godot). It is the nanobind extension
-this section used to describe as future work: wheels for Python 3.10 and later on all three
-desktops, with the engine library inside each one, and with `bwa_render_block`'s engine-owned
-block exposed as a read-only numpy view so the offline shape costs no copy. PsychoPy is Python, so
-it uses that package directly. `bindings/python/examples/offline_render.py` and `live_onset.py` are
-the two shapes above, runnable.
-
-**The MATLAB and Octave binding exists too** ([`bindings/matlab/`](../bindings/matlab/)). It is the
-MEX this section used to describe as future work: one gateway dispatching on a subcommand string,
-the shape PsychPortAudio uses, written against the classic C MEX API, which Octave implements, and
-not the MATLAB-only C++ Data API. One source builds a binary for each interpreter. Psychtoolbox is
-MATLAB or Octave, so it uses that package, and
-`bindings/matlab/examples/offline_render.m` and `live_onset.m` are the two shapes above, runnable.
-`AudioTunnel3DDemo_bwa.m` is a third: Psychtoolbox's own `AudioTunnel3DDemo2` idea, re-done against
-this engine.
-
-One rule the MEX carries that the Python binding does not have to: PsychPortAudio and the engine
-must not open the same device exclusively. Either the engine owns the device, or PsychPortAudio
-does and the engine pre-renders through the manual sink, or both run shared and give up the lowest
-latency.
-
-One rule holds for both bindings, and both enforce it by refusing to expose the call: never install
-the audio-thread capture tap (`bwa_set_output_capture`) from an interpreter, even through a wrapper
-that takes the GIL. The manual sink is the offline path. The MEX keeps the subcommand and raises
-with the reason, so a reader finds the explanation where they looked for the call.
-
-Out of scope, on purpose:
-
-- **Capture.** The calibration and validation tools run their own full-duplex ASIO host
-  (`examples/asio_session.cpp`). This spec covers output sinks only. Capture on other platforms
-  is a later spec.
-- **A native PipeWire client (`pw_stream`).** pipewire-jack runs the JACK backend unchanged,
-  with the same fixed quantum and planar float ports. Write a `pw_stream` backend only if
-  pipewire-jack's quantum handling proves inadequate on the rig. PulseAudio natively: a
-  desktop-only path, reachable through its ALSA plugin, and PipeWire has replaced it.
-- **PortAudio, miniaudio, RtAudio, Oboe.** A third-party abstraction would replace the seam this
-  repo already owns and hide the timing hooks that justify self-hosting. Oboe wraps AAudio for
-  the same callback the engine already handles.
-- **Automatic device recovery.** A lost device is reported, not reopened. The ASIO reset request
-  has the same gap today (`asio_sink.cpp`, `kAsioResetRequest`). One later design covers both.
-- **Resampling inside the engine.** The array never resamples. A headphone stream may let the
-  OS resample, with a warning. See [Sample rate](#6-sample-rate).
-
-## What stays fixed
-
-`src/sink/sink.h` is the contract. A backend is one file that fills the vtable:
-
-```c
-typedef struct {
-    bwa_sink_type type;                                              /* which backend this is */
-    int          (*start)(bwa_sink*);
-    void         (*stop)(bwa_sink*);
-    void         (*close)(bwa_sink*);
-    const char*  (*backend)(bwa_sink*);
-    uint32_t     (*block_size)(bwa_sink*);
-    uint32_t     (*output_latency)(bwa_sink*);
-    const float* (*render_block)(bwa_sink*, uint32_t*, uint32_t*);   /* manual only */
-    void         (*health)(bwa_sink*, bwa_sink_health*);
-} bwa_sink_vtbl;
-```
-
-The engine hands every sink one `bwa_render_fn` and a planar float bus. The sink calls it once
-per block, on the audio thread, with a `bwa_timestamp`. Three rules from the existing sinks
-carry over unchanged:
-
-1. One backend, one file, one `BWA_HAVE_*` define, one CMake block. No backend type leaves
-   its file. The CLAUDE.md trap "do not bake ASIO assumptions outside `asio_sink.cpp`" becomes
-   "outside the `*_sink` files".
-2. Adding a backend does not change `rt.c`, `engine.c`'s render callbacks, or the profiles. The
-   only engine change is the selection logic in `sink.c` and the ABI surface below.
-3. The audio-thread invariants apply to the backend's own code, not only to the render it
-   calls. The convert and interleave loop, the timestamp read, and the health update all run
-   on the audio thread. Preallocate at open. No locks, no syscalls that can block, no logging.
-
-Two things the vtable gains, both internal:
-
-- `bwa_sink_type type` on the vtable, so `bwa_get_sink_type` stops sniffing the backend string
-  (`engine.c`, `bwa_get_sink_type` matches `"asio"` by prefix today).
-- `bwa_sink_open` takes `(sink_type, device, flags, exact_rate)` instead of `(sink_type,
-  asio_driver)`. `exact_rate` is set by the engine for the array sink and clear for a
-  headphone sink. See rule 6.
-
 ## The contract a backend must meet
 
-Numbered so a code review can cite them.
+A backend is one file that fills the `bwa_sink_vtbl` in `src/sink/sink.h`, and the engine hands
+it one `bwa_render_fn` and a planar float bus.
+[backend-development.md: What stays fixed](./backend-development.md#what-stays-fixed) shows the
+vtable and the rules that keep the core untouched. The rules below are numbered so a code review
+can cite them.
 
 ### 1. Fixed quantum
 
@@ -224,9 +58,8 @@ whose quantum wanders pays one FIFO.
 ### 2. Format
 
 The bus is planar float, channel-major (`sink.h`). The backend converts to the device's format
-and layout. The ASIO sink's `convert_out` and `to_i32` move to a shared header
-(`sink_convert.h`) and gain interleaved variants, because every non-ASIO API wants interleaved
-frames. NaN converts to 0, never to an out-of-range integer, for the reason noted in
+and layout. The conversions live in a shared header (`sink_convert.h`), in planar and
+interleaved variants, because most non-ASIO APIs want interleaved frames. NaN converts to 0, never to an out-of-range integer, for the reason noted in
 `asio_sink.cpp`: the limiter is optional, and float-to-int out of range is undefined.
 
 Preference order when the device offers a choice: float32, int32, int24, int16. Reject
@@ -273,7 +106,7 @@ Where each backend gets the pair:
 | JACK      | `jack_get_cycle_times` at the top of the process callback: `current_frames` and `current_usecs`, the server's DLL-filtered pair in microseconds on `CLOCK_MONOTONIC`. Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
 | AAudio    | `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. Fails until the stream has run a little; keep the previous pair and set `measured` only after the first success |
-| Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat, and it is invisible: `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. Until 2026-09-23 `os_monotonic_ns` ignored that and returned uninitialized stack there (measured: one constant, so render times read 0 and the first one read a whole second). It now falls back to `emscripten_get_now`, which is `Date.now` in that scope: same epoch as the control thread's, a thousand times coarser, and not monotonic. That makes both of the adapter's backward-step rules load-bearing rather than defensive: a stamp never steps back, and a render time that would go negative books 0 |
+| Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat: `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. `os_monotonic_ns` checks that and falls back to `emscripten_get_now`, which is `Date.now` in that scope: same epoch as the control thread's, a thousand times coarser, and not monotonic. That makes both of the adapter's backward-step rules load-bearing rather than defensive: a stamp never steps back, and a render time that would go negative books 0 |
 
 **ASIO's `systemTime`.** The ASIO SDK says `systemTime` is derived from `timeGetTime` on Windows
 (`asio.h`, `AsioTimeInfo`), and the SDK's sample driver does exactly that. `timeGetTime` ticks at
@@ -432,8 +265,8 @@ relies on this to free the `cave_both` handoff buffers safely.
 
 `backend()` returns `"<backend>:<device name>"`, ASCII backend, UTF-8 device name from the OS
 (WASAPI's wide strings and CoreAudio's `CFString` convert at the seam, as the ASIO sink already
-converts from the ANSI codepage). The engine's `backend_buf` grows to hold a long WASAPI
-endpoint name plus the decode suffix. Fixed strings stay ASCII per the repo rule.
+converts from the ANSI codepage). The engine's `backend_buf` holds a long WASAPI endpoint name
+plus the decode suffix. Fixed strings stay ASCII per the repo rule.
 
 ### 10. Selection semantics
 
@@ -450,15 +283,14 @@ rewire them live, and the sink never reasserts them.
 
 ## Shared pieces
 
-Build these before the first backend. They are pure, so they get the hardware-free tests the
-backends cannot.
+Every backend builds on these. They are pure, so they get the hardware-free tests the backends
+cannot.
 
 ### `src/sink/sink_convert.h`
 
-Planar float in, one of {float32, int32, int24 packed, int16} out, planar or interleaved.
-Moved out of `asio_sink.cpp` with its NaN and clamp rules intact; the ASIO sink keeps calling
-the planar variants. Around 120 lines. Test: every format times both layouts, the clamps, NaN
-to 0, and a 26-channel interleave round trip.
+Planar float in, one of {float32, int32, int24 packed, int16} out, planar or interleaved, with
+one set of NaN and clamp rules. The ASIO sink calls the planar variants. Test: every format times
+both layouts, the clamps, NaN to 0, and a 26-channel interleave round trip.
 
 ### `src/sink/sink_quant.h`, `src/sink/sink_quant.c`
 
@@ -507,9 +339,9 @@ confirm the test goes red before trusting it, per the CLAUDE.md trap.
 
 ### `src/os/os.h`, `src/os/os_win.c`, `src/os/os_posix.c`
 
-**Implemented (phase 2).** The portability shim. Not needed for WASAPI. Required before CoreAudio,
-ALSA, or AAudio, because those backends imply building the whole library off Windows, and the
-library calls Win32 outside the sinks. The inventory, from a grep of `src/`:
+**Implemented (phase 2).** The portability shim. Every backend off Windows needs it, because it
+is what lets the whole library build there. This is the Win32 surface it replaces, and where each
+call lived:
 
 | Win32 use                                                   | files                                                              | shim                                  |
 |-------------------------------------------------------------|--------------------------------------------------------------------|---------------------------------------|
@@ -526,8 +358,8 @@ library calls Win32 outside the sinks. The inventory, from a grep of `src/`:
 | `_strdup`, `_stricmp`                                       | engine.c, assets.c, stream.c, sound.c                              | `os_strdup`, `os_strcasecmp`          |
 | `__declspec(dllexport)` on internal test hooks              | sink.h, profile_self.h                                             | one `BWA_EXPORT` macro: `__attribute__((visibility("default")))` off Windows, with `-fvisibility=hidden` on the library |
 
-Two more went in afterwards, neither of them a portability move. They are in the shim because the
-shim is where a platform difference belongs:
+Three more are not portability moves. They are in the shim because the shim is where a platform
+difference belongs:
 
 | need                                                        | files                                                              | shim                                  |
 |-------------------------------------------------------------|--------------------------------------------------------------------|---------------------------------------|
@@ -536,8 +368,8 @@ shim is where a platform difference belongs:
 | a device library loaded at run time                         | jack_sink.c, alsa_sink.c                                           | `os_dl_open`, `os_dl_sym`, `os_dl_close` |
 
 **`os_fopen`** is the whole UTF-8 path story. The ABI speaks UTF-8, but the Windows C runtime reads
-a narrow path in the process ANSI codepage, so a path with an accent or a CJK character simply
-failed to open. `os_fopen` converts to UTF-16 and calls `_wfopen`; off Windows it is `fopen`, since
+a narrow path in the process ANSI codepage, so a path with an accent or a CJK character fails to
+open through plain `fopen`. `os_fopen` converts to UTF-16 and calls `_wfopen`; off Windows it is `fopen`, since
 the bytes there already mean what they say. Every `fopen` in `src/` goes through it, and the three
 dr_libs decoders take their `_w` openers on Windows through `os_utf8_to_wide`, which converts into
 a caller buffer so no path conversion allocates. One path does not go through it: `bwa_desc.hrtf_path`
@@ -576,61 +408,42 @@ Two threads use it, and they use it differently:
   on close, which signals. The control thread signals on open, start, close and stop.
 
 `test_idle` pins both: with nothing loading and nothing streaming, each thread's loop-iteration
-count must stay under 5 across 500 ms. Putting the sleeps back measured 35 and 35 on a Windows desk
-box, and more on a machine whose timer resolution something else has raised.
+count must stay under 5 across 500 ms.
 
-`test/` and `examples/` carry their own `Sleep`, `GetTickCount64`, and `<windows.h>` (13 test
-files, 14 examples). They move onto the shim in the same phase. Around 300 lines of shim plus a
-mechanical pass over about 40 files. Tests may include `src/os/os.h`, because they compile the core
-in; examples are client code of the public ABI, so they get their own two-function
-`examples/portable.h` instead of reaching into `src/`.
+Tests may include `src/os/os.h`, because they compile the core in. Examples are client code of the
+public ABI, so they use their own two-function `examples/portable.h` instead of reaching into
+`src/`.
 
-Six things the inventory above did not predict. Four were found while implementing phase 2, and
-two more came out of the macOS CI runner after it:
+Rules the shim carries that the inventory does not show:
 
-- **`SRWLOCK` is not `CRITICAL_SECTION`.** `steam_scene.c` guards the committed `IPLScene` with a
+- **`os_rwlock` is not `os_mutex`.** `steam_scene.c` guards the committed `IPLScene` with a
   reader/writer lock: several sim threads borrow the scene for concurrent ray traces while the
-  owner takes it exclusively around `iplSceneCommit`. Collapsing that to a plain mutex would
-  serialize traces that have no reason to wait on each other, so the shim gains `os_rwlock`
-  (SRWLOCK on Windows, `pthread_rwlock_t` elsewhere) beside `os_mutex`.
-- **`pose.h` cannot be a C++-visible header any more.** Its payload fields are `_Atomic` now (see
-  below), and `_Atomic` is not C++. `examples/validate.cpp` reached the seqlock through
-  `natnet.h`, so `natnet.h` gained `natnet_read_pose` and the tool calls that; `pose.h` gives C++
-  the type as opaque. `rt.h` and `natnet.h` forward-declare `PoseSlot` rather than including
-  `pose.h`, which keeps `<stdatomic.h>` (and MSVC's `/experimental:c11atomics`) off the twenty-odd
+  owner takes it exclusively around `iplSceneCommit`. A plain mutex would serialize traces that
+  have no reason to wait on each other. `os_rwlock` is SRWLOCK on Windows and `pthread_rwlock_t`
+  elsewhere.
+- **`pose.h` is not C++-visible.** Its payload fields are `_Atomic`, and `_Atomic` is not C++.
+  `pose.h` gives C++ the type as opaque, and C++ code (`examples/validate.cpp`) reads the pose
+  through `natnet_read_pose`. `rt.h` and `natnet.h` forward-declare `PoseSlot` rather than
+  including `pose.h`, which keeps `<stdatomic.h>` (and MSVC's `/experimental:c11atomics`) off the
   translation units that only pass the slot around by pointer.
-- **`bwa_null_sink_skip_blocks` stays a plain `volatile int`.** It is declared in `sink.h`, which
-  the two C++ sinks include, so it cannot be an `_Atomic`. One test-thread writer and one
-  sink-thread read-and-clear on an aligned `int`: the ordering nobody depends on is the only thing
-  the change gives up.
-- **Path normalization was a Windows fact.** `assets.c` folded case and backslashes into the cache
-  key. On a POSIX filesystem `A.wav` and `a.wav` are different files and a backslash is an ordinary
-  character in a name, so folding either there would hand one cache entry to two files. Both folds
-  are now `_WIN32`-only, and the test section that pins them skips off Windows.
-- **Priority is not one call with three spellings.** `os_thread_set_realtime(period_ns)` is what
-  every SELF-PACED render thread now calls at its top, and the three platforms mean three different
-  things by it. Windows joins the "Pro Audio" MMCSS task, which the WASAPI sink used to ask for
-  inline. Linux asks for `SCHED_FIFO`, the one that can be REFUSED, which is why
-  `os_thread_realtime_available()` exists beside it: the ALSA sink has to report that degradation
-  through the open's `err` channel, and by the time its render thread exists that channel is gone.
-  Apple sets `THREAD_TIME_CONSTRAINT_POLICY`, and there it is not about priority at all: Darwin
-  COALESCES timers for threads without one, so a correct `mach_wait_until` lands milliseconds late
-  on an ordinary thread. The macOS CI runner measured p50 2.749 ms and p99 9.759 ms against a 2 ms
-  deadline, and `os_sleep_ms(50)` taking 100.7 ms, with the timebase conversions verified correct
-  in both directions. `period_ns` exists on the call for that platform alone.
-
-  The Windows effect is larger than it sounds, and it was measured rather than assumed: on a desk
-  machine pinned at 100 percent CPU by unrelated work, the same 200-wake measurement gave p50
-  12 to 18 ms on an ordinary thread and p50 0.407 ms with p99 0.811 ms on the MMCSS thread.
-- **The null sink stamped its own epoch, and a zero stamp reads as no stamp.** It used
-  `os_monotonic_ns() - base`, with `base` captured a few instructions earlier on the same thread.
-  Every other backend stamps the platform clock (`sink_quant_now_ns`, or QPC in the ASIO sink), so
-  this was the one backend with a private epoch. Worse, on a clock whose tick is coarse enough
-  (Apple Silicon's `mach_absolute_time` is 41.67 ns) the FIRST block's stamp came out exactly 0,
-  which `rt.c`'s publish gate reads as "no stamp": `bwa_get_clock` then had nothing until block 1,
-  and a late wake pushed that past the 30 ms window `test_smoke` allows. Windows and Linux avoided
-  it by clock resolution, not by design. The sink stamps the absolute monotonic clock now, and
-  `base` survives for the deadline arithmetic only.
+- **`bwa_null_sink_skip_blocks` is a plain `volatile int`.** It is declared in `sink.h`, which the
+  two C++ sinks include, so it cannot be an `_Atomic`. It has one test-thread writer and one
+  sink-thread read-and-clear on an aligned `int`, and nothing depends on its ordering.
+- **Path normalization is Windows-only.** `assets.c` folds case and backslashes into the cache key
+  on `_WIN32` only. On a POSIX filesystem `A.wav` and `a.wav` are different files and a backslash
+  is an ordinary character, so folding there would hand one cache entry to two files. The test
+  section that pins the folds skips off Windows.
+- **`os_thread_set_realtime(period_ns)` means three things.** Every self-paced render thread calls
+  it at its top. Windows joins the "Pro Audio" MMCSS task. Linux asks for `SCHED_FIFO`, which can
+  be REFUSED, so `os_thread_realtime_available()` exists beside it: the ALSA sink has to report
+  that degradation through the open's `err` channel, which is gone by the time its render thread
+  exists. Apple sets `THREAD_TIME_CONSTRAINT_POLICY`, and there it is about timers, not priority:
+  Darwin coalesces timers for threads without one, so a correct `mach_wait_until` lands
+  milliseconds late on an ordinary thread. `period_ns` exists for Apple alone.
+- **Every sink stamps the absolute platform clock, never a private epoch.** `rt.c`'s publish gate
+  reads a zero stamp as "no stamp", and a stamp relative to a start time captured a moment earlier
+  can come out exactly 0 on a coarse clock (Apple Silicon's `mach_absolute_time` ticks at
+  41.67 ns). The null sink keeps its start time for the deadline arithmetic only.
 
 #### The absolute-deadline sleep
 
@@ -647,12 +460,14 @@ kernel sees it, so the error accumulates block after block.
 | macOS | `mach_wait_until` on the deadline converted back to mach ticks through `mach_timebase_info` |
 
 The point of the high-resolution timer is not only precision. `timeBeginPeriod` is system-wide in
-effect, so the old null-sink loop held the whole machine at a 1 ms timer tick for as long as a
-visual-only tool had the offline sink open. The sink no longer raises it at all.
+effect, so a loop that raised it would hold the whole machine at a 1 ms timer tick for as long as
+any tool had the offline sink open. No sink raises it.
 
-Only SELF-PACED paths use this: the null sink's block loop and the WASAPI sink's `host_paced_block`
-(what runs after the device is lost). Device-paced paths keep their own wait, because the device is
-the clock there: the WASAPI event wait and the ASIO callback are untouched.
+Only SELF-PACED paths use this: the null sink's block loop, and the host-paced loops that take
+over after a device is lost (WASAPI's `host_paced_block`, ALSA's `alsa_host_paced_block`, and the
+JACK, AAudio and worklet host-paced threads). Device-paced paths keep their own wait, because the
+device is the clock there: the WASAPI event wait, the ASIO callback, ALSA's blocking write, the
+JACK process callback, the AAudio data callback and the worklet's `process()`.
 
 `test_os` measures it: 200 wakes 2 ms apart, reporting median and p99 lateness. A desk Windows
 machine gave 0.43 ms and 0.74 ms; WSL2 gave 0.13 ms and 0.33 ms. Forcing the pre-1803 fallback with
@@ -664,13 +479,12 @@ and on Darwin measuring anywhere else measures timer coalescing instead of the s
 bound is deliberately gross, p50 under 20 ms and p99 under 50 ms: the tight bound exists to catch
 Windows losing its high-resolution timer path, Darwin has no counterpart to lose, and the only
 Apple data point anyone has is a virtualized CI runner. Tightening it wants a physical Mac, which
-is on the verify list.
+is on the [verify list](./backend-development.md#verify-before-relying-on-it).
 
 ## ABI changes
 
-All in one minor bump, `BWA_VERSION_MINOR` 13 to 14. Enum values are appended, the desc keeps
-its layout, and both bindings mirror the changes (`bindings/unity/Runtime/Bwa.cs`,
-`bindings/godot/src/bwa_engine_node.h`).
+Enum values are appended, the desc keeps its layout, and the bindings mirror the changes (for
+example `bindings/unity/Runtime/Bwa.cs` and `bindings/godot/src/bwa_engine_node.h`).
 
 ### `bwa_sink_type`
 
@@ -696,22 +510,22 @@ uint32_t reserved[3];
 ```
 
 `device` names the device for whichever backend opens, a friendly name or a stable id. NULL is
-the backend's default device (ASIO: the first driver with enough outputs, as today). The
-anonymous union keeps `asio_driver` compiling and keeps the C# and GDExtension field offsets.
+the backend's default device (ASIO: the first driver with enough outputs). The anonymous union
+keeps `asio_driver` compiling and keeps the C# and GDExtension field offsets.
 
-`sink_flags` carries three bits, all opt-in and all describing the PRIMARY device only:
+`sink_flags` carries four bits, all opt-in and all describing the PRIMARY device only:
 
 | bit | value | effect |
 |-----|-------|--------|
 | `BWA_SINK_FLAG_EXCLUSIVE` | 0x1 | WASAPI opens in exclusive mode, AAudio requests exclusive sharing. Off by default, because exclusive mode takes the device from every other application on a desk machine, and shared mode with an `IAudioClient3` period is low-latency enough for a monitor |
 | `BWA_SINK_FLAG_EXACT_RATE` | 0x2 | rule 6's array strictness on a headphone sink: the open fails naming both rates rather than accepting the OS resampler. Folded into `bwa_sink_open`'s `exact_rate` argument, so no backend reads the bit |
 | `BWA_SINK_FLAG_TIGHT_BUFFER` | 0x4 | rule 5's smallest device buffer: ALSA 2 periods instead of 3, AAudio 1 burst instead of 2. A no-op on WASAPI, ASIO and JACK |
+| `BWA_SINK_FLAG_DEEP_BUFFER` | 0x8 | a deeper output buffer: more latency, more slack for a render that overruns its callback. Only the worklet sink reads it (latencyHint `"playback"` on a context the sink creates); a no-op everywhere else |
 
-`docs/api.md` maps PsychPortAudio's latency classes 0 to 4 onto these three bits and a block
-size.
+`docs/api.md` maps PsychPortAudio's latency classes 0 to 4 onto these flags and a block size.
 
-`bwa_sink_health` (internal, `src/sink/sink.h`) gains `device_lost` in the same change, because the
-flag has to reach `engine.c` from the sink somehow. It is not ABI.
+`bwa_sink_health` (internal, `src/sink/sink.h`) carries `device_lost` too, because the flag has to
+reach `engine.c` from the sink. It is not ABI.
 
 ### AUTO order
 
@@ -719,24 +533,26 @@ Per platform, and on Windows per requested channel count:
 
 | platform | 2 channels                     | more than 2 channels        |
 |----------|--------------------------------|-----------------------------|
-| Windows  | WASAPI, ASIO, null             | ASIO, null (unchanged)      |
+| Windows  | WASAPI, ASIO, null             | ASIO, null                  |
 | macOS    | CoreAudio, null                | CoreAudio, null             |
 | Linux    | JACK, ALSA, null               | JACK, ALSA, null            |
 | Android  | AAudio, null                   | null                        |
 | Browser  | Wasm Audio Worklet, null       | null                        |
 
-This is the one behavior change: a headphone profile on Windows under AUTO opens the
-Windows default output instead of the first registered ASIO driver. That is the device the
-headphones are on, which the ASIO auto-pick could not know (it may have picked the Digiface and
-played the monitor into Dante channels 1 and 2). `sink = BWA_SINK_ASIO` or a `device` naming an
-ASIO driver keeps the old path, by rule 10. Multichannel WASAPI is never chosen by AUTO: an
-unintended exclusive grab of a 26-channel WDM device would surprise, and the locked decision
-says the array goes over ASIO.
+The macOS entry is in `sink.c` already, but no CoreAudio sink is compiled until phase 4, so a Mac
+opens the null sink today. Each backend is in the order only when the build carries it.
+
+A headphone profile on Windows under AUTO opens the Windows default output, not the first
+registered ASIO driver. That is the device the headphones are on, which an ASIO pick cannot know
+(it could land on the Digiface and play the monitor into Dante channels 1 and 2).
+`sink = BWA_SINK_ASIO` or a `device` naming an ASIO driver takes ASIO, by rule 10. AUTO never
+chooses multichannel WASAPI: that would be an exclusive grab of a WDM device, and the locked
+decision says the array goes over ASIO.
 
 On Linux, `jack_client_open` gets `JackNoStartServer`, so a box with neither a JACK server nor
 PipeWire falls through to ALSA at once instead of spawning a `jackd`.
 
-`cave_both` on Windows then resolves on its own: the array request takes ASIO, the monitor
+`cave_both` on Windows resolves on its own: the array request takes ASIO, the monitor
 request takes WASAPI, and the adapter makes the monitor's block size equal the array's, so the
 "same buffer size" check in `bwa_start` passes. `bwa_start` opens the monitor for the **array's
 resolved block**, not `cfg.block_size`, which is the part that makes that true when the ASIO
@@ -761,7 +577,7 @@ configuration where hearing the sim is how you find out the array never opened.
 human-readable only. Program logic reads `bwa_get_sink_type`, which reports the array.
 
 To pin the monitor's endpoint you need a `monitor_device` field, which does not exist yet. See
-[Deferred follow-ups](#deferred-follow-ups).
+[backend-development.md: Deferred follow-ups](./backend-development.md#deferred-follow-ups).
 
 ### Device query
 
@@ -783,7 +599,7 @@ lists `kAudioHardwarePropertyDevices` filtered to devices with output streams, w
 `kAudioObjectPropertyName` and `kAudioDevicePropertyDeviceUID`. ALSA walks
 `snd_device_name_hint(-1, "pcm", ...)` for output hints, name and description. JACK lists the
 client prefixes of the physical playback ports (`system`, `RAVENNA`), one device each, so a
-picker offers the card rather than 26 ports. AAudio has no
+picker offers the card rather than one entry per port. AAudio has no
 C enumeration: it reports one device, "default"; `device` also accepts a decimal Android
 device id obtained from Java's `AudioManager`, passed to `AAudioStreamBuilder_setDeviceId`.
 
@@ -809,7 +625,7 @@ Open sequence, shared mode (the default):
 2. Format: `WAVEFORMATEXTENSIBLE`, float32, the engine rate, the requested channel count.
    `IsFormatSupported(SHARED)` with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` in the flags lets a
    mismatched engine rate through with a warning (rule 6). Shared mode is stereo or the
-   endpoint's own channel layout only; a 26-channel request in shared mode fails at open with
+   endpoint's own channel layout only; an array-width request in shared mode fails at open with
    a message pointing at exclusive mode.
 3. Period: `GetSharedModeEnginePeriod` gives default, fundamental, min, max. Choose the engine
    block size when it is in range and a multiple of the fundamental, else the minimum. A
@@ -846,7 +662,7 @@ the release-interval check of rule 4.
 
 `GetCurrentPadding() == 0` at a wake is **not** the shared-mode underrun test, though it reads like
 the obvious one. This client refills the buffer to full on every event, and a starve leaves the
-stream event already signalled, so the catch-up wake returns at once and reports the frames just
+stream event already signaled, so the catch-up wake returns at once and reports the frames just
 written rather than an empty buffer. Measured on a live endpoint: a render stalled past two full
 buffers produced zero such wakes, and the release-interval rule caught it on the first cycle.
 
@@ -860,35 +676,8 @@ CI: GitHub's Windows runners have no audio endpoint, so `GetDefaultAudioEndpoint
 
 ### CoreAudio
 
-Files: `src/sink/coreaudio_sink.c`. The HAL is a C API; no Objective-C. Link the `CoreAudio` and
-`CoreFoundation` frameworks. Define `BWA_HAVE_COREAUDIO`.
-
-The HAL, not AUHAL, because the array needs the device's raw channel count and no converter
-in the path. Open sequence:
-
-1. Resolve the device: `kAudioHardwarePropertyDefaultOutputDevice`, or match the UID or name.
-2. Read `kAudioDevicePropertyStreamConfiguration` for the output scope: an `AudioBufferList`
-   with one buffer per **stream**, each with its own channel count. A device can present 26
-   outputs as one 26-channel stream or as several streams; the sink maps bus channels across
-   streams in order. Read each stream's `kAudioStreamPropertyVirtualFormat`; it is float32,
-   interleaved within the stream, on every device the HAL virtualizes. Reject anything else.
-3. Set `kAudioDevicePropertyNominalSampleRate` to the engine rate. The property set is
-   asynchronous: listen for the change or poll with a bounded wait, then read it back. A
-   device that stays at another rate fails the open (rule 6, and the headphone case does not
-   relax this one: the HAL has no per-client resampler without AUHAL).
-4. Set `kAudioDevicePropertyBufferFrameSize` to the block size, clamped to
-   `kAudioDevicePropertyBufferFrameSizeRange`. Read it back; the adapter handles a mismatch.
-5. `AudioDeviceCreateIOProcID`, then `AudioDeviceStart` on `start()`.
-6. Add property listeners for `kAudioDeviceProcessorOverload` (a `driver_resyncs` tick) and
-   `kAudioDevicePropertyDeviceIsAlive` (`device_lost`).
-
-The IOProc gets `inOutputTime` with `mSampleTime` and `mHostTime`. Both feed rule 3; the
-host time converts through `mach_timebase_info`. The IOProc's `outOutputData` is the ABL
-from step 2, already sized; the sink writes every buffer or the HAL plays stale data.
-
-The goal on a Mac is the desk, and the HAL design permits the array as a bonus. If that is
-ever wanted, verify first that the RME macOS driver presents the Digiface Dante's outputs as
-one device, and that the count at 48 kHz is 26 or more.
+Not implemented yet (phase 4). The planned design is in
+[backend-development.md: CoreAudio](./backend-development.md#coreaudio).
 
 ### JACK
 
@@ -944,28 +733,18 @@ server went away) sets `device_lost` and starts the host-paced thread, per rule 
 
 The PipeWire graph rate and quantum are pinned in [build.md](./build.md), under "Linux notes".
 Note also that PipeWire links ports across devices with its own resampling, which would let
-`cave_both` be one 28-port client on Linux later; the two-sink design stands for now.
+`cave_both` be one client (the array's ports plus two) on Linux later; the two-sink design stands for now.
 
-Four things the implementation settled that the sequence above left open:
+Behavior worth knowing. The reasons are in
+[backend-development.md](./backend-development.md#jack-what-the-implementation-settled).
 
-- **Step 4 runs at `open()`, not at `start()`.** "The server offers 2 playback ports and this sink
-  has 26" is exactly the message a caller has to see, and `bwa_start` prints one fixed string for a
-  sink's `start()` failure while it surfaces an open failure verbatim. So the client activates and
-  connects during the open, and `start()` only lifts a gate that the process callback reads. Before
-  the gate opens, the callback writes silence into the ports, which is also what a patchbay wants to
-  see while the engine finishes starting.
-- **The xrun callback runs on a notification thread, not on the process thread.** It may not touch
-  the adapter's plain counters, so it parks the event and the frame estimate in two atomics and the
-  next process callback folds them in through `sink_quant_note_dropout`. Every count stays in one
-  place, and the whole thing stays race-free under ThreadSanitizer.
-- **The adapter never sees a device position.** JACK hands out exactly `nframes` every cycle, so
-  `written` telescopes to follow the server's frame counter and the queued-depth rule can never
-  fire. On a real xrun the server's counter jumps and that rule would report the same fault the
-  xrun callback already reported, so `quant_pull` is called with `device_pos_valid` clear and
-  `measured` is set from the xrun route instead.
-- **The buffer-size callback resizes nothing.** The adapter takes the count per pull, and its FIFO
-  is allocated for 8192 frames at open, so the callback only records the new size. A cycle larger
-  than that ceiling is silenced past it and booked as a dropout.
+- The client activates and connects at `open()`, so a port-count error reaches the caller
+  verbatim. `start()` only lifts a gate; until then the process callback writes silence.
+- The xrun callback runs on a notification thread. It parks the event and the frame estimate in
+  two atomics, and the next process callback folds them in through `sink_quant_note_dropout`.
+- `quant_pull` is called with `device_pos_valid` clear, and `measured` comes from the xrun route.
+- The adapter's FIFO is allocated for 8192 frames at open. The buffer-size callback only records
+  the new size; a cycle larger than the ceiling is silenced past it and booked as a dropout.
 
 ### ALSA
 
@@ -1012,35 +791,20 @@ theirs and are reported as they come. That is enough for a desk monitor, and on 
 AUTO has already tried JACK first. A rig on Linux uses a `hw:` device: a MADI or ADAT card, or
 the AES67 daemon's RAVENNA card, which is an ordinary ALSA PCM to the sink.
 
-Five things the implementation settled that the sequence above left open:
+Behavior worth knowing. The reasons are in
+[backend-development.md](./backend-development.md#alsa-what-the-implementation-settled).
 
-- **Rule 3's pair is built from the PREVIOUS block's status.** `snd_pcm_status` can only be read
-  after a write, so the correspondence it gives, "the frame at `written - delay` was playing at
-  `htstamp`", stamps the NEXT block: that block starts `delay` frames later on the same stream, so
-  its host time is `htstamp + delay / rate`. The offset between a `sample_pos` and its host time is
-  then constant, which is all the drift fit needs. Before the first status, and after a restart, the
-  host clock stands in, and every stamp is floored at the previous one plus a nominal block so none
-  can step backward.
-- **`S24_LE` needs a conversion `sink_convert.h` does not carry.** The shared header's `int24` is
-  three packed bytes, which is `S24_3LE`. `S24_LE` is 24 valid bits inside a 32-bit container, so
-  the sink writes that container itself, from `sink_to_i32(v) >> 8`. The clamp and NaN rules stay in
-  the shared header, where the float becomes an integer; only the container is ALSA's business.
-- **The `SCHED_FIFO` question is asked at open, and answered on the thread.** The degradation has to
-  reach the caller through the open's `err` channel, and by the time the render thread exists that
-  channel is gone. So the open asks `os_thread_realtime_available()`, which reads `RLIMIT_RTPRIO`,
-  the same limit the kernel checks, and the render thread makes the actual
-  `os_thread_set_realtime()` attempt.
-- **`output_latency()` reports the buffer size until the first block.** The header promises a
-  constant, and `snd_pcm_delay` can only be read after a write, so the open's buffer-size figure
-  stands until the first successful write latches the measured delay in its place.
-- **`stop()` joins before it touches the PCM.** An `snd_pcm_t` is not thread-safe, so calling
-  `snd_pcm_drop` to cut short an in-flight `snd_pcm_writei` from the control thread is a race. The
-  wait costs one blocking write, which is one period.
-- **The device query SYNTHESIZES `default` when the hints do not carry it.**
-  `snd_device_name_hint` lists only PCMs that declare a hint block, and a `pcm.!default` in an
-  asoundrc declares none: that is exactly the PulseAudio and PipeWire plugin route, and every
-  user-defined default. So the one name `snd_pcm_open` always understands was missing from the
-  list. Index 0 is `default` whether or not a hint mentioned it.
+- Each block's rule 3 pair comes from the PREVIOUS block's status: host time
+  `htstamp + delay / rate`. The host clock stands in before the first status and after a
+  restart, and no stamp steps backward.
+- `S24_LE` (24 bits in a 32-bit container) is written by the sink itself, from
+  `sink_to_i32(v) >> 8`. The clamp and NaN rules stay in `sink_convert.h`.
+- The open asks `os_thread_realtime_available()` (it reads `RLIMIT_RTPRIO`); the render thread
+  makes the `os_thread_set_realtime()` attempt.
+- `output_latency()` reports the buffer size until the first successful write latches the
+  measured delay.
+- `stop()` joins the render thread before it touches the PCM.
+- The device query lists `default` at index 0 whether or not a hint names it.
 
 ### AAudio
 
@@ -1064,60 +828,38 @@ read once per callback and tolerated when it fails early. Dropouts are the OS's 
 the sink only sets `device_lost` and the callback thread ends. The sink then starts a host-paced
 thread (the null-sink loop) so the engine keeps running, per rule 4.
 
-Four decisions the specification left open, and what each one settled on:
+Behavior worth knowing. The reasons are in
+[backend-development.md](./backend-development.md#aaudio-what-the-implementation-settled).
 
-- **Stereo only, said at the open.** Android AUTO already sends a wider request straight to the
-  offline sink, so the only caller that can reach a multichannel AAudio open is an explicit
-  `BWA_SINK_AAUDIO` with an array layout. That gets a message naming the width rather than a
-  device error, because Android carries no array transport at all.
-- **`setUsage` is never called.** `AAudioStreamBuilder_setUsage` is `__INTRODUCED_IN(28)` and the
-  library targets API 26, so an unguarded call is a weak symbol that crashes on an API 26 device.
-  The default usage is `AAUDIO_USAGE_MEDIA`, which is right for a game. A headset build that wants
-  `AAUDIO_USAGE_GAME` can raise `ANDROID_PLATFORM` and add the call behind a runtime check.
-- **`device_pos_valid` is false at every pull.** AAudio reports the fault directly through
-  `getXRunCount`, and the adapter's queued-depth rule would count the same starve a second time:
-  the callback keeps asking for a burst whether or not the render was late, so `written` lags the
-  presented position by exactly the silence the service already counted. Same reasoning as JACK's.
-- **The device's own rate is probed before the real open.** A shared-mode stream opened AT the
-  engine rate reports the engine rate whether or not the service is resampling underneath, so
-  without a probe the sink could not tell a native 48 kHz device from a converted 44.1 kHz one and
-  rule 6's degradation channel would have nothing to say. The probe is one stream opened with
-  everything unspecified and closed again, on the control thread, which is the only way to ask
-  AAudio this from C. It also lets a failed open name both rates.
+- Stereo only: an explicit multichannel `BWA_SINK_AAUDIO` open fails with a message naming the
+  width.
+- `setUsage` is never called, so the usage stays `AAUDIO_USAGE_MEDIA`.
+- `quant_pull` is called with `device_pos_valid` clear; dropouts are `getXRunCount` deltas.
+- The device's own rate is probed with a throwaway stream before the real open, so a resampled
+  shared-mode stream is reported and a failed open names both rates.
 
 `output_latency()` is latched once, not recomputed: `getFramesWritten` minus the presented
 position from the first successful timestamp, extrapolated to now at the nominal rate, plus what
 the adapter holds. `sink.h` promises the value stays constant for the life of the sink, so the
 buffer-size estimate from the open stands until that first timestamp replaces it.
 
-Verified on an Android 34 `google_apis` x86_64 emulator: a 960-frame burst, a 1920-frame buffer,
-1400 to 2050 frames of reported latency depending on the run, since it is latched off whichever
-callback first gets a timestamp, a constant 256-frame render quantum through the adapter, a
-monotonic timestamp pair, `measured` true, and an injected 120 ms stall that
-`AAudioStream_getXRunCount` did report as one xrun. Breaking the xrun fold on purpose turned that
-last assertion red, per the CLAUDE.md trap, before it was trusted green. `bwa_minimal` under AUTO
-opened `aaudio:default` and its clock model measured 48000.00 Hz over a 6 second run, +0.1 ppm,
-which is the timestamp pair checked through the whole engine rather than at the sink. The
-emulator's audio HAL is virtual, so its block counts wander (54 to 96 across identical runs) and
-say nothing; what it exercises is the code path.
+What the emulator verified is in
+[backend-development.md](./backend-development.md#aaudio-on-the-emulator).
 
 Consumers: standalone VR headsets (Meta Quest, Pico) through a Godot Android export
 (GDExtension, arm64-v8a) or a Unity Android build. The headset supplies the pose through the
-game engine; nothing tracks over the network. Two things ride along with the sink and are
-bigger than it.
+game engine; nothing tracks over the network.
 
-The NDK cross-build of the whole library, and the packaging on top of it: phase 2's shim covers
-the code, the toolchain wiring landed with this phase, and the packaging landed with the
-follow-up. CI cross-builds both ABIs in its own `android` job, and both bindings carry the
-`arm64-v8a` library: the Unity package at `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, the
-Godot addon at `addons/bw_audio/bin/` beside its own `arm64` extension. See build.md, "Android".
+CI cross-builds both ABIs in its own `android` job, and both bindings carry the `arm64-v8a`
+library: the Unity package at `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, the Godot addon
+at `addons/bw_audio/bin/` beside its own `arm64` extension. See build.md, "Android".
 
-And phonon for Android, which landed after it. CI builds the Steam Audio core statically for both
-ABIs and links it in, so a headset gets the real HRTF decode, automatic occlusion, pathing and the
-reflection bed rather than the fallback pan. The DSP is scalar C with no SSE intrinsics (a grep of
-`src/` finds none), so ARM needed no porting beyond the shim. The packaging needed no change at
-all: phonon links statically, so it lands inside `libbw_audio.so` and neither package gains a file.
-It costs size. The stripped arm64 library goes from 0.4 MB to 7.0 MB.
+Phonon is in the Android build too. CI builds the Steam Audio core statically for both ABIs and
+links it in, so a headset gets the real HRTF decode, automatic occlusion, pathing and the
+reflection bed rather than the fallback pan. The DSP is scalar C with no SSE intrinsics, so ARM
+needs no port beyond the shim. Phonon links statically, so it lands inside `libbw_audio.so` and
+neither package gains a file. It costs size: the stripped arm64 library is about 7 MB instead of
+0.4 MB.
 
 ### Wasm Audio Worklet
 
@@ -1160,38 +902,22 @@ writes one quantum of silence; the host thread skips one period. It is not a mut
 thread never blocks, which is what keeps invariant 1. It is contended only in the single quantum
 where a context resumes or suspends, so bailing is the right answer rather than a cost. The host
 thread decides the worklet is live from a heartbeat the `process()` callback bumps, and stands
-down after eight quiet block periods.
+down after a quiet window.
 
-**The host thread's quiet window is at least three browser callbacks.** A deep output buffer makes
-the browser render its quanta in bursts as long as that buffer (50 ms of quanta back to back, then
-nothing, under a 0.05 hint), and the old fixed window of eight blocks is only 43 ms at 256 frames.
-When the XR page moved to 0.05 the heartbeat went quiet inside every burst gap, the host thread took
-over, `device_lost` flapped, and the two pullers alternated on one adapter (`run-xr` caught it at
-block 128). The window is now `max(8 blocks, 3 x baseLatency)`, read at open; putting the fixed
-eight back turns that check red again.
+**The host thread's quiet window is `max(8 blocks, 3 x baseLatency)`, read at open.** A deep
+output buffer makes the browser render its quanta in bursts as long as that buffer (50 ms of quanta
+back to back, then nothing, under a 0.05 hint), and eight blocks is only 43 ms at 256 frames. A
+shorter window lets the heartbeat go quiet inside every burst gap: the host thread takes over,
+`device_lost` flaps, and the two pullers alternate on one adapter. The `run-xr` check catches it.
 
-**Render ahead was tried and rejected, and the reasons should stop anyone rebuilding it.** Rendering
-a 256-frame block inside a 128-frame `process()` puts 5.3 ms of work inside a 2.7 ms deadline, and a
-Galaxy XR headset chopped. On 2026-09-24 the obvious fix was built, tested and measured: a render
-thread (a pthread Worker) filling a ring of blocks while `process()` only copied, then a hybrid in
-which `process()` rendered a rescue block when the ring ran dry and the render thread was idle. It
-lost, for one reason: a Worker has NO priority, and the AudioWorklet thread is the one thread a page
-owns that the OS treats as audio. On a busy laptop (a 12-core hybrid i7-1360P running several
-CPU-bound jobs) the render thread was descheduled mid-render for 40 to 200 ms, and it held the
-non-reentrant render at exactly the moments a rescue would have helped (14 rescues against about
-380 starves over eight hybrid runs). Paired runs, builds alternated at one pinned load, 3 s each:
+**Render ahead was tried and rejected.** It renders in a Worker thread, and a Worker has no
+priority: the AudioWorklet thread is the one thread a page owns that the OS treats as audio, so
+render ahead lost to rendering in `process()` at every load measured. The slack a slow render
+needs comes from the BROWSER'S output buffer, which the priority thread already owns, and that is
+what `BWA_SINK_FLAG_DEEP_BUFFER` asks for. docs/web.md has the latencyHint measurement. Do not
+rebuild render ahead without new evidence; NOTES.md has the measurements.
 
-| sources (mean block) | render in `process()`: device underrun | render ahead alone: ring starve | hybrid (rescue): ring starve |
-|----------------------|----------------------------------------|---------------------------------|------------------------------|
-| 64 (2.2 to 3.7 ms)   | 0, 0, 0, 0 s                           | 0.13, 0.03, 0, 0.03 s           | 0.20, 0, 0, 0.11 s           |
-| 96 (3.1 to 5.3 ms)   | 0.18, 0.30 s                           | 0.31, 0.10 s                    | 0.11, 0.59 s                 |
-
-Render ahead never beat rendering in `process()` at any load. The slack an overrun needs has to
-come from the BROWSER'S output buffer, which the priority thread already owns, and that is what
-`BWA_SINK_FLAG_DEEP_BUFFER` asks for. docs/web.md has the latencyHint measurement.
-
-**Nothing on the audio path waits on the main thread**, audited 2026-09-24 after a headset froze
-with its window (cause still unknown). Every `emscripten_proxy_sync` in the sink is on the control
+**Nothing on the audio path waits on the main thread.** Every `emscripten_proxy_sync` in the sink is on the control
 thread (open, start, close, the `health()` playbackStats read, and a context-state read nobody
 calls), and in the one topology this sink opens in the control thread IS the main thread, so none
 of them proxies. `process()` and the host-paced thread call nothing proxied.
@@ -1207,7 +933,7 @@ all and would otherwise hang the close forever.
 | option               | default                         | effect                                                          |
 |----------------------|---------------------------------|-----------------------------------------------------------------|
 | `BWA_WITH_WASAPI`    | ON on `WIN32`                   | compiles `wasapi_sink.cpp`, links `ole32 avrt`, defines `BWA_HAVE_WASAPI` |
-| `BWA_WITH_COREAUDIO` | ON on `APPLE`                   | compiles `coreaudio_sink.c`, links the frameworks, defines `BWA_HAVE_COREAUDIO` |
+| `BWA_WITH_COREAUDIO` | planned (phase 4); the option does not exist yet | will compile `coreaudio_sink.c`, link the frameworks, and define `BWA_HAVE_COREAUDIO`, ON on `APPLE` |
 | `BWA_WITH_JACK`      | ON on Linux when `pkg-config jack` succeeds | compiles `jack_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libjack.so.0`), defines `BWA_HAVE_JACK` |
 | `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libasound.so.2`), defines `BWA_HAVE_ALSA` |
 | `BWA_WITH_AAUDIO`    | ON on `ANDROID`                 | compiles `aaudio_sink.c`, links `aaudio`, defines `BWA_HAVE_AAUDIO` |
@@ -1215,47 +941,41 @@ all and would otherwise hang the close forever.
 
 Every one of them is off on the other platforms and cannot be forced on.
 
-Phase 2 did the rest of that list. The `if(NOT WIN32) message(WARNING ...)` is gone, replaced by
-a status line naming the platform and what it can open. gcc and clang get `-Wall -Wextra` per
-target (not globally, so the fetched third-party sources keep their own levels) and the library
-gets `-fvisibility=hidden`. `libbw_audio.so` and `.dylib` fall out of CMake's defaults, and the
-bindings load `bw_audio` either way. `ws2_32` and `winmm` moved behind one `bwa_link_os` helper,
-which also supplies pthreads and `libm` off Windows; the dll needs its own call, because it takes
-bwa_core's OBJECTS and so does not inherit its link interface.
+Off Windows, configure prints a status line naming the platform and what it can open. gcc and
+clang get `-Wall -Wextra` per target (not globally, so the fetched third-party sources keep their
+own levels) and the library gets `-fvisibility=hidden`. `libbw_audio.so` and `.dylib` fall out of
+CMake's defaults, and the bindings load `bw_audio` either way. `ws2_32` and `winmm` sit behind one
+`bwa_link_os` helper, which also supplies pthreads and `libm` off Windows; the dll needs its own
+call, because it takes bwa_core's OBJECTS and so does not inherit its link interface.
 
-Two auto-detects gained a platform guard, both for the same reason: a dev checkout has the SDKs
+Two auto-detects carry a platform guard, both for the same reason: a dev checkout has the SDKs
 staged, so without the guard a Linux configure of that same tree "finds" a Windows artifact and
-fails at compile or link. `BWA_WITH_ASIO` now requires `WIN32` as well as the SDK, and Steam Audio
+fails at compile or link. `BWA_WITH_ASIO` requires `WIN32` as well as the SDK, and Steam Audio
 requires the archive set under the platform's own `lib/<platform>/` and not just `phonon.h`. The
 calibration viewer and the ASIO capture tools are WIN32-only targets, skipped with a status message
 elsewhere. The other two GUI tools are not: `bwa_layout_tool` and `bwa_playground` are raylib plus
-Dear ImGui, so `-DBWA_BUILD_PLAYGROUND=ON` builds them on Linux too. The `/experimental:c11atomics` per-file flags are still under `if(MSVC)`; the list grew
-with the files that became atomic (see build.md).
+Dear ImGui, so `-DBWA_BUILD_PLAYGROUND=ON` builds them on Linux too. The `/experimental:c11atomics`
+per-file flags are under `if(MSVC)` (see build.md).
 
-Steam Audio now builds in CI for **Windows**, **Linux** and **macOS** as well, each job staging its
-own `lib/<platform>/` under its own cache key (a cache is scoped to the repository, not to the
-runner OS, so one shared key would have served the wrong archives). The follow-up turned out to be
-as small as predicted, because phonon links statically and nothing downstream changes, but it cost
-three fixes worth naming:
+Steam Audio builds in CI for every platform, each job staging its own `lib/<platform>/` under its
+own cache key (a cache is scoped to the repository, not to the runner OS, so one shared key would
+serve the wrong archives). Three rules keep the static link correct off Windows:
 
-- **`-t` is a Windows-only argument** in both pinned build scripts, so the composite action's
-  `make` default was an argparse error rather than a no-op. It passes `-t` on the Windows branch
-  only now.
-- **`enable_language(CXX)`** had to move into the phonon block. `project()` declares `LANGUAGES C`,
-  and the other `enable_language(CXX)` calls all sit under Windows-only features, so a Linux
-  configure set `LINKER_LANGUAGE CXX` on a project that had no CXX link rule. CMake does not error
-  on that: it emits an EMPTY link rule, and the build reports "Linking CXX shared library
-  libbw_audio.so", exits 0, and writes no library. Every test still passed, because the tests link
-  `bwa_core`'s objects rather than the library.
+- **`-t` is a Windows-only argument** in both pinned phonon build scripts. The composite action
+  passes it on the Windows branch only.
+- **`enable_language(CXX)` sits in the phonon block.** `project()` declares `LANGUAGES C`, and a
+  static phonon makes the link C++. Without CXX enabled, CMake emits an EMPTY link rule rather than
+  an error: the build reports "Linking CXX shared library libbw_audio.so", exits 0, and writes no
+  library, and every test still passes because the tests link `bwa_core`'s objects.
 - **`-Wl,--exclude-libs,ALL`** on the library. phonon's `IPLAPI` expands to
-  `__attribute__((visibility("default")))` in its own objects, so a static link re-exported every
-  `ipl*` entry point out of `libbw_audio.so` in spite of `-fvisibility=hidden`. That is not
-  cosmetic: a host that also loads a real `libphonon.so` (a Unity project with Valve's own plugin,
-  say) would have two definitions to choose between.
+  `__attribute__((visibility("default")))` in its own objects, so without the flag a static link
+  re-exports every `ipl*` entry point in spite of `-fvisibility=hidden`. A host that also loads a
+  real `libphonon.so` (a Unity project with Valve's own plugin, say) would then have two
+  definitions to choose between.
 
-A no-SDK build stays fully viable (build.md, "Building without Steam Audio"), so nothing here is
-required. What it buys is the real HRTF decode, automatic occlusion, pathing and the reflection bed
-on the two platforms that had none.
+A no-SDK build stays fully viable (build.md, "Building without Steam Audio"), so none of this is
+required. What phonon buys is the real HRTF decode, automatic occlusion, pathing and the
+reflection bed.
 
 ## Tests
 
@@ -1263,16 +983,16 @@ The rule from CLAUDE.md applies with force here, because CI has no audio hardwar
 runner: a test that cannot fail is the default outcome. Split what can be tested purely from
 what needs a device, and make the device-dependent part **skip visibly** rather than pass.
 
-- **`test_sink_convert`** and **`test_sink_quant`**: pure, always run, described above. Both
-  shipped with phase 0. `test_sink_quant`'s design is the part worth copying: the render writes a
+- **`test_sink_convert`** and **`test_sink_quant`**: pure, always run, described above.
+  `test_sink_quant`'s design is the part worth copying: the render writes a
   value derived from its own TIMESTAMP and the device side checks each frame against the value its
   own stream index implies, so one comparison pins the ordered concatenation, the no-duplication
   rule, and the `sample_pos` rule at once, and a wrong stamp corrupts audio rather than merely
-  failing a stamp assertion. Per the CLAUDE.md trap the pop arithmetic was broken on purpose and
-  the test confirmed red before being trusted green.
-- **`test_os`** (phase 2, shipped): thread create and join, `os_sleep_ms` bounds, the monotonic
+  failing a stamp assertion. Per the CLAUDE.md trap, break the pop arithmetic on purpose and confirm
+  the test goes red before you trust it green.
+- **`test_os`**: thread create and join, `os_sleep_ms` bounds, the monotonic
   clock advancing at the right rate over 100 ms against the C clock, `os_sleep_until_ns` lateness
-  percentiles, mutex exclusion under two threads, and the rewritten pose seqlock under a writer
+  percentiles, mutex exclusion under two threads, and the pose seqlock under a writer
   thread and a reader thread with torn-read detection (the writer stamps one generation number
   into all seven payload fields, so a straddled read reads back a mix).
 
@@ -1289,8 +1009,7 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   ctest skip code and the target carries `SKIP_RETURN_CODE 77`, so the dashboard says
   "skipped" and not "passed". The null and manual sections keep running everywhere.
 
-  The WASAPI section shipped with phase 1, the JACK and ALSA sections with phase 5, and the AAudio
-  section with phase 3. Only the *specific* "there is no device" message skips ("no active render
+  Only the *specific* "there is no device" message skips ("no active render
   endpoint", "no jack server", "no PCM named", "no usable AAudio output device"); any other open
   failure is a failure, because a machine WITH audio that cannot open it is exactly what the
   section exists to catch. The JACK section additionally skips on two
@@ -1323,7 +1042,7 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 
   Each section takes its device string from the environment (`BWA_TEST_ALSA_DEVICE`,
   `BWA_TEST_AAUDIO_DEVICE`, `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so
-  one binary reaches a 26-port rig, a dummy server, a PulseAudio route, or a headset's Bluetooth
+  one binary reaches an array-width rig, a dummy server, a PulseAudio route, or a headset's Bluetooth
   output without editing code. Do not point the ALSA
   one at the hardware-free `null` PCM: it accepts writes as fast as they arrive and never paces, so
   the device cannot run dry and the underrun assertion fails by construction. It rendered 257,811
@@ -1346,20 +1065,18 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   The WASAPI EXCLUSIVE subsection opens the default endpoint at 256, 128 and 64 frames, skipping
   and printing any size the device refuses. It asserts lower latency than a shared open at the same
   block, `measured` true, and the injected stall producing exactly ONE dropout with a nonzero frame
-  count. That last one is the queued-depth rule, which nothing else in the suite had ever
-  exercised: every earlier live dropout came through the shared-mode release-interval rule or the
-  null sink. It also prints which format the walk chose and whether the alignment retry fired, so a
-  reader knows which device-dependent paths the run actually went down. The stall is sized at 150 ms
-  rather than at "two buffers plus slack" for a reason worth repeating: an exclusive buffer is one
-  device period, three milliseconds on an onboard codec, and `IAudioClock` advances by only about
-  half the wall time a starved stream spends starved, since it counts frames read FROM OUR BUFFER.
-  A 36 ms stall tripped the rule at one block size out of three.
+  count. That last one is the queued-depth rule, which no other test exercises. It also prints which format the walk chose and whether the alignment retry fired, so a
+  reader knows which device-dependent paths the run actually went down. The stall is 150 ms,
+  not "two buffers plus slack": an exclusive buffer is one device period, three milliseconds on an
+  onboard codec, and `IAudioClock` advances by only about half the wall time a starved stream
+  spends starved, since it counts frames read FROM OUR BUFFER. A shorter stall trips the rule at
+  some block sizes and not others.
 
   The WASAPI EXACT_RATE subsection has an ORDER that matters. It asks the DEFAULT open first and
   takes rule 6's degradation as ground truth about what the OS is resampling, then demands that the
-  same open with the flag fails naming both rates. The first draft did it the other way round, and
-  a build with the fold removed came out SKIP rather than red, because a strict open that succeeds
-  cannot distinguish "the endpoint takes both rates" from "the flag went nowhere".
+  same open with the flag fails naming both rates. The other order cannot fail: with the fold
+  removed it comes out SKIP rather than red, because a strict open that succeeds cannot
+  distinguish "the endpoint takes both rates" from "the flag went nowhere".
 
   ALSA checks TIGHT_BUFFER twice: reported on the section's own PCM, demanded on the hardware-free
   `null` PCM. The split exists because the ALSA PulseAudio plugin returns three periods whether or
@@ -1387,240 +1104,23 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   reads the test list out of the build directory's `CTestTestfile.cmake` (so it and ctest cannot
   disagree about what the suite is), pushes `libbw_audio.so` and the executables to
   `/data/local/tmp/bwa`, runs each under `adb` with `LD_LIBRARY_PATH` set, and maps the skip code 77
-  through. All 33 tests of a default no-SDK, no-tool build run there. Thirty-two pass every run;
-  `test_os` is flaky on an emulator, on its two tightest timing bounds alone. See the verify list.
-- **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2,
-  shipped). This is the port's regression gate: **38 tests**, none of which touch a device. The two
-  jobs sit in `ci.yml` beside the Windows one and they catch a Win32 call sneaking back in. Note
-  what the count means: off Windows `bwa_calib_view` and the ASIO capture tools are skipped
-  targets, so the viewer's suite and the four `validate_*` runs are absent, and the two raylib
-  tools are behind an option the jobs leave off, which together take the Windows 45 down to 33;
-  both jobs now build phonon, which adds the five SDK-gated tests back. Configure a Linux tree with
-  `-DBWA_BUILD_PLAYGROUND=ON` and the `playground` and `layout_tool` suites come back too, for 40
-  with phonon and 35 without. They need a display, so run ctest inside an X or Wayland session, or
-  under `xvfb-run`. Measured on Ubuntu 22.04, gcc 11.4, software GL. A cold run pays
-  for that phonon build, a warm one restores it from the cache. The macOS job is unverified
-  locally, both its shim paths and its phonon build.
+  through. The whole suite runs there. `test_os` is flaky on an emulator, on its two tightest
+  timing bounds alone. See the
+  [verify list](./backend-development.md#verify-before-relying-on-it).
+- **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`.** This is the
+  port's regression gate, and none of it touches a device. The two jobs sit in `ci.yml` beside the
+  Windows one and catch a Win32 call sneaking back in. Off Windows the suite is smaller:
+  `bwa_calib_view` and the ASIO capture tools are skipped targets, so the viewer's suite and the
+  `validate_*` and capture-tool calibrate runs are absent, and the two raylib tools sit behind an
+  option the jobs leave off. Both jobs build phonon, so the SDK-gated tests run. `ctest -N` in a
+  build tree gives the count for that configuration. Configure a Linux tree with
+  `-DBWA_BUILD_PLAYGROUND=ON` and the `playground` and `layout_tool` suites come back too. They need
+  a display, so run ctest inside an X or Wayland session, or under `xvfb-run` (software GL
+  passes). A cold run pays for the phonon build, a warm one restores it from the cache. The macOS
+  job is unverified locally, both its shim paths and its phonon build.
 - **On hardware**, a "desk day" section for hardware-validation.md, one pass per backend on a
   real machine: the laterality tone left and right (never DC, per the trap); a ten-minute soak
   with a busy scene at a 256 block and zero `xruns` with `measured` true; and the reported
   output latency against a loopback measurement, within one block. The `cave_both` monitor on
   a Windows machine with the Digiface is the one check that closes the defect in
-  [Why](#why).
-
-## Phases
-
-| phase | deliverable                                                            | needs                                   | hardware                    | size                         |
-|-------|------------------------------------------------------------------------|-----------------------------------------|-----------------------------|------------------------------|
-| 0 **(done)** | `sink_convert.h`, `sink_quant`, their tests; the ASIO sink onto `sink_convert` | nothing                        | none                        | ~400 lines                   |
-| 1 **(done)** | WASAPI sink; the ABI bump (enum, desc union and flags, device query, `device_lost`); `sink.c` AUTO order; both bindings mirror; docs | phase 0 | a Windows desk machine; the rig for the `cave_both` check | ~600 lines of sink, ~200 of ABI and bindings |
-| 2 **(done)** | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
-| 3 **(done, except phonon)** | AAudio sink; NDK toolchain wiring; `tools/android/run-tests.ps1`; the CI cross-build of both ABIs and both bindings' Android packaging. Phonon for Android is NOT done and is its own follow-up | phases 0 and 2 | a standalone headset (an emulator covered the code paths) | ~400 lines of sink and test, plus the toolchain and the packaging |
-| 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional 26-channel check | ~450 lines |
-| 5 **(done)** | JACK sink, then ALSA sink                                        | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
-| 6 **(done)** | Wasm Audio Worklet sink; the `BWA_SINK_WORKLET` enum value; `sink.c`'s browser AUTO entry; `bindings/web` and `tools/wasm/build-web.sh` | phase 2, and the wasm spike in [web.md](./web.md) | a browser, and a headless Chromium is enough: `ctest -R web_browser` drives the sink end to end and skips where there is none. Nobody has LISTENED to it yet | ~450 lines of sink, ~900 of binding |
-
-Phase 1 goes first because it fixes a live defect, removes a dependency for every desk user,
-and is the PC VR path. Phase 2 is independent of it and can run in parallel; it is mechanical
-and touches many files, so it wants its own review. Phases 3 to 5 depend only on phase 2 and
-not on each other, so their order was a scheduling choice. Phase 5 went first of the three,
-because a Linux box with both a JACK server and an ALSA card was the hardware at hand, and phase 3
-second, because an Android emulator is a download rather than hardware. CoreAudio is the one that
-remains and can slot in whenever a Mac is available.
-
-## What to update when implementing
-
-- `include/bw_audio.h`: the enum, the desc union and `sink_flags`, the device query, `bwa_health`,
-  the `BWA_VERSION_MINOR` bump, and the `bwa_desc.block_size` comment ("the ASIO buffer-size
-  hint" becomes "the device period hint; the render quantum is exact regardless").
-- `docs/api.md`: the desc table, the sink policy paragraph, "ASIO device query" becomes "Device
-  query", the profile table's "any 2-ch ASIO device" wording, the health section.
-- `docs/build.md`: the Platform section, the options table, libjack and alsa-lib in the
-  dependency table, the CI section, and a Linux notes section: `RLIMIT_RTPRIO` for ALSA, the
-  PipeWire rate and quantum config, the AES67 daemon and the Dante-side AES67 settings.
-- `docs/architecture.md`: the bus consumers list and the "Transport: ASIO" locked decision,
-  which becomes "ASIO for the array on Windows; any system backend for a stereo monitor".
-- `CLAUDE.md`: the repo layout entries, and the ASIO trap generalized to the `*_sink` files.
-- `docs/integration.md`: the bindings' enum values and the `device` property.
-- `docs/hardware-validation.md`: the desk-day section.
-- `bindings/unity/Runtime/Bwa.cs`, `Engine.cs`, `Editor/EngineEditor.cs` (the `"asio:"` prefix
-  check that decides the inspector's warning); `bindings/godot/src/bwa_engine_node.{h,cpp}`
-  (the `Sink` enum, `asio_driver` becomes `device` with the old setter kept, the no-ASIO
-  warning that assumes `cave` needs ASIO).
-- `third_party/README.md`: the sink selection paragraph.
-- `examples/` (deferred until the backends settle): `playground.cpp` decides "silent" by an
-  `asio` prefix check on the backend string, so a WASAPI open shows as NO SOUND; use
-  `bwa_get_sink_type`. Its picker and `--list-drivers` enumerate ASIO only; list both backends
-  through `bwa_get_device_count` and set `cfg.device`. Same prefix check in `layout_tool.cpp`;
-  stale `--driver` and ASIO4ALL wording in `minimal.c`. The capture tools stay ASIO-only.
-- `NOTES.md`: the `engine.c` comment that says "WASAPI is future" and its NOTES twin.
-
-## Deferred follow-ups
-
-Known, deliberately not done yet. Each names its trigger.
-
-- **A `monitor_device` field.** `bwa_desc.device` names the primary device, so the `cave_both`
-  monitor takes the platform default and cannot be pinned. That is right for the rig, where the
-  monitor is whatever headphones the operator has on. It is wrong for a machine with two
-  candidate endpoints and a preference. The fix is one more `bwa_desc` field out of the
-  reserved tail, with NULL keeping today's behavior. Do it when someone needs the monitor on a
-  named endpoint.
-- **Blocking waits for the three Steam sim threads.** The occlusion, pathing and reflection
-  sims run at a fixed rate (30 Hz and 10 Hz), so they are paced, not polling, and they cost
-  what their simulation costs. The asset loader and the stream thread were the polling pair and
-  they now block on `os_event`. Revisit the sim threads if a headset's battery says so.
-- **The examples' backend awareness**, listed under
-  [What to update when implementing](#what-to-update-when-implementing).
-
-## Verify before relying on it
-
-- [ ] `test_os` on a PHYSICAL Mac, so the Apple deadline bound can be tightened from the gross one
-      the coalescing evidence justifies. Everything Apple in the shim is CI-verified only: nobody
-      here has a Mac, and the `THREAD_TIME_CONSTRAINT_POLICY` call was written from the macOS CI
-      log plus the documentation.
-- [ ] The RME Digiface Dante's macOS driver: one CoreAudio device, 26 or more outputs at 48 kHz.
-- [ ] Whether the Digiface is USB Audio Class compliant, which decides if ALSA's `snd-usb-audio`
-      sees it at all. RME's product page is the source; do not assume. (Even then it is a
-      Dante *transmitter* only through RME's driver; on Linux the AES67 route below is the way
-      into the Dante network.)
-- [ ] The rig's Dante receivers, the amp-side endpoints, offer AES67 mode, and Dante Controller
-      can route four 8-channel AES67 flows onto their 26 channels at 48 kHz.
-- [ ] `aes67-linux-daemon` and the RAVENNA ALSA kernel module build against the rig box's
-      kernel, and their PTPv2 slave locks to the Dante leader in AES67 mode.
-- [ ] pipewire-jack on the box's PipeWire version honors a pinned quantum and reports port
-      latency; otherwise run JACK2's `jackd` on the card directly. Everything verified so far ran
-      against JACK2's own `jackd` under WSL; pipewire-jack has never answered this sink.
-- [ ] The JACK sink against a REAL driver rather than `jackd -d dummy`. The dummy driver paces from
-      a timer, so what it cannot exercise is the xrun path (it never called the client late), the
-      port latency of a real card, and the buffer-size callback.
-- [x] The JACK shutdown path, by killing the server under a running engine. Verified against a
-      dummy `jackd` under WSL: `device_lost` set, the dsp clock kept advancing at real time on the
-      host-paced thread (23,808 frames in 500 ms against a nominal 24,000), and `bwa_stop` and
-      `bwa_destroy` both returned. What is still open is the same check on ALSA, where losing the
-      device means a write returning something other than `-EPIPE` or `-ESTRPIPE`, which needs real
-      hardware to unplug.
-- [ ] The ALSA sink against a REAL card. It has run against a `null` PCM (the API flow only, since
-      that PCM does not pace) and against the alsa-plugins PulseAudio route into WSLg, which is what
-      timed the blocks and produced the underruns. A `hw:` card is untested, and with it the whole
-      format walk past float32: `S32_LE`, `S24_3LE`, the `S24_LE` container, and `S16_LE` have
-      never converted a sample on a device that asked for them.
-- [ ] The ALSA sink at 26 channels. Every run so far was stereo, because no wide card was at hand.
-- [ ] `SCHED_FIFO` actually granted. Under WSL the `RLIMIT_RTPRIO` probe answers no and the sink
-      reports the degradation, which is the path that got exercised; the granted path has not run.
-- [ ] `-ESTRPIPE` recovery. A suspend needs a real power event to produce, so the resume loop and
-      its `driver_resyncs` tick are written and compiled but unexercised.
-- [x] The minimum `IAudioClient3` shared period on the desk machine's driver. Onboard codecs
-      often offer nothing under 10 ms, and this one is exactly that: `test_audio_sink` reports a
-      480-frame period against a 1056-frame buffer on a Realtek endpoint at 48 kHz, so the
-      shared-mode underrun rule is armed there and the monitor's added latency is one engine block
-      plus 10 ms. A codec that answers a shorter period has not been seen yet.
-- [x] WASAPI EXCLUSIVE mode on a real endpoint, which until now was written and compiled and had
-      never opened. `test_audio_sink`'s exclusive subsection opens the default endpoint at 256,
-      128 and 64 frames and exercises the queued-depth dropout rule, which no other test reached:
-      an injected stall produces exactly one dropout with a nonzero frame count at every size.
-      Measured latency on a Realtek endpoint at 48 kHz: 736 frames shared, then 544, 416 and 352
-      frames exclusive at those three block sizes. Two things it did NOT reach, and both are still
-      open. The format walk stopped at the FIRST accepted entry, `int24`, so float32, int32 and
-      int16 have still never converted a sample in exclusive mode. And
-      `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` never fired: this driver takes its own 144-frame period
-      at any request, so the realign-and-retry path is still unexercised.
-- [ ] Standalone headsets: the AAudio native rate and burst size on the Quest and Pico
-      generations in play (48 kHz and a 256-frame burst are typical; the block size should be
-      a multiple of the burst), and that the Steam Audio Android build runs the mode-2
-      per-voice HRTF fleet within the headset's CPU budget. The emulator answered 48 kHz with a
-      960-frame burst, which is a virtual HAL's number and not a headset's.
-- [ ] The AAudio MMAP path. `BWA_SINK_FLAG_EXCLUSIVE` is written and compiled but the emulator
-      grants only the legacy shared path, so `AAUDIO_SHARING_MODE_EXCLUSIVE` and the lower burst
-      it brings have never run. `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` is likewise requested and
-      granted nominally on an image that has no low-latency path to give.
-- [ ] `AAUDIO_ERROR_DISCONNECTED` on a REAL route change: unplug a headset or take a Bluetooth
-      device mid-run. `device_lost` must set, the host-paced thread must keep the dsp clock
-      advancing, and `bwa_stop` then `bwa_destroy` must both return. The error callback and its
-      host-thread handshake are the JACK shutdown path's twin, which WAS verified by killing a
-      server; the AAudio half is written and compiled and has never fired.
-- [x] Static phonon for Linux. Built with the composite action's own steps under WSL (NixOS, gcc
-      14.3.0), staged at `lib/linux-x64/`, and the whole suite run against it: **38 of 38**, the
-      five SDK-gated tests included. `readelf -d libbw_audio.so` names no phonon, and
-      `bwa_get_audio_backend` reports the `steam HRTF` suffix. What a static phonon adds to the
-      link is `libstdc++.so.6`, which a no-SDK build does not carry.
-- [ ] Static phonon for macOS, which runs ONLY in CI. Nobody here has a Mac, so the job's
-      `stage-dir: osx-universal` was read off `core/CMakeLists.txt`, and that reading was WRONG:
-      its `set(CMAKE_OSX_ARCHITECTURES ...)` comes after `project()` and does nothing, so the first
-      CI run staged an arm64-only core archive and the universal engine link failed. The action
-      now passes the architectures itself and lipo-checks every archive. The Xcode generator's
-      tree layout is staged from by CI and nowhere else. The configure assertion
-      (`Steam Audio ENABLED`) is what keeps a wrong guess loud instead of silently no-SDK.
-- [x] Static phonon for Android, on the emulator. Both ABIs built on a Windows host with the
-      composite action's own steps and staged at `lib/android-arm64/` and `lib/android-x64/`, and
-      the whole suite run on an x86_64 emulator (API 34): **37 of 38 every run**, the five SDK-gated
-      tests included, with and without the emulator's audio device. The one red is `os`, and it is
-      the emulator rather than this work: what fails is `os_sleep_until_ns` median lateness, which
-      measures about 1.1 ms against a 1 ms bound on an image that refuses a real-time priority, and
-      a no-SDK library of the same commit fails it the same way on the same emulator. Under host
-      load `audio_sink` joins it on a block-rate floor. `bwa_minimal` on the device reports
-      `backend: aaudio:default (steam HRTF direct)`. `readelf -d` names no phonon and no
-      `libc++_shared.so`: the NDK's CMake toolchain links libc++ statically, and the C ABI means
-      nothing C++ crosses the library boundary. What it costs is size, 0.4 MB stripped to 7.0 MB
-      on arm64. Two android-only upstream patches are in `third_party/patches/`. Nothing in either
-      binding's packaging changes: a static phonon ships inside the engine library.
-- [ ] The CPU budget for that decode ON a headset. The emulator says it is correct, not that it
-      fits: a Quest core is far slower than a desktop one, and the per-voice HRTF convolutions are
-      the part that scales with the scene. Measure with the headless bench (docs/profiling.md)
-      before committing a game to it.
-- [x] The Android packaging for both bindings. The library cross-builds in CI for both ABIs, and
-      both packages now carry the `arm64-v8a` library with its import settings: the Unity package at
-      `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so` (a committed `PluginImporter` meta, Android
-      with CPU ARM64 and nothing else), the Godot addon at `addons/bw_audio/bin/` with the
-      `android.template_release.arm64` entries in its manifest. Both pack scripts refuse to pack
-      without them.
-- [ ] A MAC COLLABORATOR loading both packages for the first time: the Unity package imported into
-      a project on macOS (the Editor picks the `.dylib` up, `DllImport("bw_audio")` resolves, Play
-      runs the offline sink) and the Godot addon unzipped into a project (the editor loads
-      `macos.editor` and the extension finds `libbw_audio.dylib` through `@loader_path`). Both are
-      built and name-checked in CI and neither has ever been opened on a Mac. Expect Gatekeeper
-      first: the libraries are unsigned, so the quarantine flag on a downloaded archive has to be
-      cleared (`xattr -dr com.apple.quarantine <folder>`) before either editor will load them.
-- [ ] The same on LINUX: the Unity package in a Linux editor, and the Godot addon in a Linux
-      editor. The Linux extension is the one whose engine library sits in `bin/linux/` rather than
-      beside it, so what this check really exercises is the `$ORIGIN` run path - and an exported
-      Linux game exercises the other half of it, where the exporter flattens every dependency
-      beside the binary.
-- [ ] An exported build from either binding, ON a headset: a Godot Android export and a Unity
-      Android player. The packaging is verified only as far as the archives go (the files are in
-      them, at the paths the manifests name, with the import settings Unity needs). Nobody has yet
-      exported an APK, installed it, and heard the AAudio sink open under a game engine rather than
-      under `tools/android/run-tests.ps1`. That run is also what would catch a Godot exporter that
-      does not copy a listed Android dependency into the APK's `lib/` directory.
-- [ ] `test_os` on a physical Android device. It is FLAKY on an emulator and only on its two
-      tightest timing bounds: ten back-to-back runs on an idle image passed six times, with the
-      `os_sleep_until_ns` median lateness straddling its 1.00 ms bound at p50 0.89 to 1.11 ms
-      (p99 2.31 to 2.72 ms, max 2.43 to 3.11 ms), and one run also tripping "a past deadline
-      returns at once", which allows 1 ms between two clock reads around a call that does not wait.
-      Every other assertion passed every time. The `SCHED_FIFO` request is refused, as Android
-      refuses it for every app thread. The primitive is the right one
-      (`clock_nanosleep(TIMER_ABSTIME)`), so this reads as the virtual machine's scheduler rather
-      than the shim, but nothing has measured a real device. The bound was deliberately NOT widened
-      to fit one emulator - the same call the Apple row above makes, and for the same reason. A
-      headset that also flaps is the finding; a headset that sits well under is the reason to
-      leave it.
-- [ ] Which binding the experiments reach for first, now that both exist: the nanobind module for
-      PsychoPy, or the MEX for Psychtoolbox and Octave. Both are off-hardware verified only.
-- [ ] The ASIO reset-request plumbing, when it is written, uses the `device_lost` design above
-      rather than a second mechanism.
-- [ ] `cave_both` on the rig: ASIO for the array and WASAPI for the monitor, at once, with the
-      monitor's block matching the array's resolved one. Phase 1 makes it resolve; only the rig
-      can confirm it. This is the check that closes the defect in [Why](#why).
-- [ ] The reported WASAPI output latency against a loopback measurement. The sink reports
-      `GetStreamLatency` plus one period (shared) or the buffer (exclusive), plus the one block
-      the adapter can hold. On a desk machine that came to 736 frames at a 256 block; nothing has
-      measured whether it is right.
-- [ ] Exclusive mode on a real interface. The path is written and compiled but has only ever run
-      in shared mode, so `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` and the format walk past float32 are
-      both unexercised.
-- [ ] The `device_lost` degradation, by unplugging a USB endpoint mid-run: the flag must set, the
-      engine must keep advancing its clocks, and `bwa_stop` then `bwa_start` must recover.
-- [ ] The EXCLUSIVE-mode depth rule against a deliberately starved stream. Shared mode is settled
-      (the release-interval rule in rule 4, pinned by `test_audio_sink`: a render stalled past two
-      full buffers on a 1056-frame buffer with a 480-frame period counted exactly one dropout of
-      about 2860 frames, and a healthy run counted none). Exclusive mode keeps the depth rule and
-      has never been run at all, so it is unverified along with the rest of that path.
+  [Why](./backend-development.md#why).

@@ -20,7 +20,7 @@
  * and diffuse energy aimed into the hole smears onto them (a floor-less CAVE array over-energizes
  * its bottom ring). Adding an imaginary speaker at the pole closes the triangulation there, and its
  * decode row is DISCARDED — energy pointed where no speaker exists is dropped, not mis-panned. 60°
- * leaves genuinely-covered poles alone (the cube grid's nadir gap is ~55°: unchanged). */
+ * leaves genuinely-covered poles alone (the cube grid has a speaker at each pole: unchanged). */
 #define ALLRAD_IMAG_COS 0.5f   /* cos(60°) */
 
 /* fib_sphere_dir (virtual layer) + room_to_ambi (z,x,y) come from ambisonics.h — shared with fdn.c. */

@@ -243,11 +243,11 @@ The engine reports what it actually opened through `e.backend`, so check rather 
 ## Examples
 
 Each runs as a function, and each takes `--tests` for a self-check that forces an offline sink and
-exits nonzero on a failure. ctest runs all four under both interpreters.
+exits nonzero on a failure. ctest runs every one under both interpreters.
 
 - `examples/minimal.m` orbits a click around the listener's head for six seconds and quits. Start
   here: it is the smallest realistic client, and every other binding of this engine ships the same
-  demo with the same stimulus, so the four are comparable by ear. See `docs/integration.md`,
+  demo with the same stimulus, so you can compare them by ear. See `docs/integration.md`,
   "The minimal example".
 - `examples/offline_render.m` renders a moving source to a matrix and writes a wav, with no device.
   The manual sink is bit-identical run to run, which is what makes a pre-rendered stimulus set
@@ -290,13 +290,13 @@ that quietly changed a gain, a position or a channel order cannot pass.
 ## CI
 
 Both MEX files are built inside each desktop CI job, after that job's engine build, so each links
-that platform's engine with its own backends intact. The `windows` job then assembles all six into
+that platform's engine with its own backends intact. The `package` job then assembles all six into
 the one toolbox folder a release ships.
 
 Every desktop job installs Octave itself: `octave` and `octave-dev` from apt on Linux,
 `octave.portable` from Chocolatey on Windows, `octave` from Homebrew on macOS. Each configures with
 `BWA_BUILD_MATLAB=ON` before the engine build, so the Octave MEX is an ordinary `ALL` target and the
-four `octave_*` ctests run with the rest of the suite. MATLAB's half waits for the `matlab-actions`
+`octave_*` ctests (the suite plus one per example) run with the rest. MATLAB's half waits for the `matlab-actions`
 steps, because only MATLAB needs an action to install it and a licensed `run-command` step to drive
 it.
 

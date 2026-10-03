@@ -7,9 +7,9 @@
  *
  * The binding therefore COLLECTS. Every static piece registers itself in _enter_tree — which
  * Godot runs top-down, before any _ready — and BwaEngine merges the lot into ONE call before
- * bwa_start. The room box is applied first (it is the only way to capture the shoebox for
- * the image-source reflections, which works with or without the Steam Audio SDK) and then
- * contributes its own walls to that merged mesh.
+ * bwa_start. The room box captures the shoebox for the image-source reflections through
+ * scene_set_ism_room (with or without the Steam Audio SDK), which leaves the ray-traced mesh
+ * alone, and then contributes its own walls to that merged mesh.
  */
 #pragma once
 

@@ -52,7 +52,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Array-sim monitor](#array-sim-monitor), [Array-sim room](#array-sim-room),
 [Azimuth reference](#azimuth-reference)
 
-**B** [Badness map](#badness-map), [Baked reflections](#baked-reflections), [Bed](#bed),
+**B** [Background check](#background-check), [Badness map](#badness-map),
+[Baked reflections](#baked-reflections), [Bed](#bed),
 [Bed metric](#bed-metric), [Bending loss](#bending-loss), [Blur](#blur),
 [Bootstrap interval](#bootstrap-interval), [Bump check](#bump-check)
 
@@ -68,7 +69,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Distance attenuation](#distance-attenuation), [Doppler](#doppler), [Drift check](#drift-check),
 [Dual-band panning](#dual-band-panning)
 
-**E** [Early reflections](#early-reflections), [EPAD](#epad), [Exponential sweep](#exponential-sweep),
+**E** [Early reflections](#early-reflections), [EPAD](#epad),
+[Expected-arrival window](#expected-arrival-window), [Exponential sweep](#exponential-sweep),
 [Extent](#extent), [Extra listeners](#extra-listeners)
 
 **F** [FDN](#fdn), [First-order ceiling](#first-order-ceiling), [Focus](#focus),
@@ -115,7 +117,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [SN3D and N3D](#sn3d-and-n3d), [SOFA](#sofa), [Solve position](#solve-position),
 [SPCAP](#spcap), [Spectral widening](#spectral-widening), [Speed of sound](#speed-of-sound),
 [Spread](#spread), [SRP-PHAT](#srp-phat), [Stimulus](#stimulus), [Survey spread](#survey-spread),
-[Sweet spot](#sweet-spot)
+[Sweep quality](#sweep-quality), [Sweet spot](#sweet-spot)
 
 **T** [Tracked listener alignment](#tracked-listener-alignment),
 [Tracked directivity compensation](#tracked-directivity-compensation),
@@ -135,26 +137,22 @@ The three point-source panners and the knobs that shape them. Full treatment:
 ### Blur
 
 DBAP's `rolloff_r`, the `r` in the blurred source-to-speaker distance
-`d_k = sqrt(|src - spk_k|^2 + r^2)` (`src/spatial/dbap.c:21`, `src/spatial/dbap.c:34`). Larger `r` spreads a source
-over more speakers. It also removes the singularity when a source lands exactly on a speaker, so it
-is not optional. Omit `dbap.rolloff_r` from the layout file and the loader derives it as `0.25 x`
-the mean distance from the listening point (`Layout.ref`, the array centroid when the file declares
-no `listening_point_m`) to each speaker (`src/core/layout.c:593`), which is a starting point to dial
-against the real array, not a finished tuning. Schema:
+`d_k = sqrt(|src - spk_k|^2 + r^2)` (`src/spatial/dbap.c:21`, `src/spatial/dbap.c:34`). Larger `r`
+spreads a source over more speakers, and any `r > 0` removes the singularity at a speaker. Omit it
+and the loader derives `0.25 x` the mean listening-point-to-speaker distance
+(`src/core/layout.c:653`); treat that as a starting point to tune on the real array. Schema:
 [layout-schema.md](./layout-schema.md#fields).
 
 ### CAP (compensated amplitude panning)
 
-`bwa_set_dual_band_cap` (Menzies and Fazi), a projection on top of the selected panner that
-corrects the [dual-band](#dual-band-panning) low band's **interaural time difference** for the
-tracked head **orientation**. The constraint is one scalar, `rV . e == target` (`src/spatial/cap.c:75-76`),
-where the target blends the true source's `u_s . e` with the seed panner's own `rV . e` by the
-strength (`src/spatial/cap.c:57`). At strength 1 the ITD comes out exact and stays exact as the head
-turns, which plain dual-band does not do. A speaker the panner left silent stays silent. With the
-head facing the source, it reduces to the selected panner. The target is clamped to what the lit
-speakers can reach (`src/spatial/cap.c:67-73`), so it saturates at the most lateral speaker lit
-rather than going negative. See
-[spatialization.md](./spatialization.md).
+`bwa_set_dual_band_cap` (Menzies and Fazi): a projection on top of the selected panner that makes
+the [dual-band](#dual-band-panning) low band's **interaural time difference** match the true
+source's for the tracked head **orientation**, by solving `rV . e == target`, where the target
+blends the source's `u_s . e` with the seed panner's own `rV . e` by the strength
+(`src/spatial/cap.c:57`, `src/spatial/cap.c:75-76`). Turn it on when head orientation is tracked and
+ITD stability under head turns matters; facing the source it reduces to the selected panner. It
+cannot render an ITD more lateral than the most lateral speaker the panner lit
+(`src/spatial/cap.c:67-73`). See [spatialization.md](./spatialization.md).
 
 ### Constant power
 
@@ -176,14 +174,14 @@ See [spatialization.md](./spatialization.md#implemented-formulation-dbapc).
 
 SPCAP's placement-correction exponent. It sets how sharply `sum cos^density` over the front
 hemisphere counts a speaker's local neighbors (`src/spatial/spcap.c:34`). The default is a flat 2.0 with no
-geometry link at all (`src/core/layout.h:179`), unlike [focus](#focus). It is a live knob
+geometry link at all (`src/core/layout.h:207`), unlike [focus](#focus). It is a live knob
 (`bwa_set_spcap_focus`). It invalidates SPCAP's cached correction when it moves, so dragging it is
 more expensive than dragging focus. Inert under DBAP and VBAP.
 
 ### Distance attenuation
 
 The source-to-listener level curve, `clamp((ref/max(d,ref))^rolloff, min, 1)`
-(`src/core/layout.h:103-104`, `src/core/layout.h:185-191`). One implementation serves every panner, the per-source
+(`src/core/layout.h:112-116`, `src/core/layout.h:213-219`). One implementation serves every panner, the per-source
 override, and loudness compensation's tracker, so there is exactly one curve in the system. It is
 separate from [occlusion](#occlusion) and from the reflection sim's own distance handling, which
 stay off precisely so nothing counts distance twice.
@@ -213,9 +211,9 @@ from the listener (`src/spatial/spcap.c:60-65`). The default comes from the arra
 nearest-neighbor angle, clamped to 1..64 (`src/core/layout.c:187-197`). The 26-speaker cube grid lands
 on 12.7. It is the knob that trades image tightness against [comb depth](#comb-depth), and
 [validation.md](./validation.md#focus-and-where-the-sweep-has-power) puts numbers on the trade.
-Trap: the moment the default stopped being the integer 12, `powf` of a slightly negative lobe
-with a fractional exponent returned NaN and silenced whole gain vectors. The code clamps the lobe
-at 0 now (`src/spatial/spcap.c:64`). Any future non-integer exponent reopens that class of bug.
+Trap: `powf` of a slightly negative lobe with a fractional exponent is NaN, and one NaN silences
+the whole gain vector. The code clamps the lobe at 0 (`src/spatial/spcap.c:64`). Keep that clamp
+for any non-integer exponent.
 
 ### Listener-relative panning
 
@@ -237,9 +235,9 @@ is the point-source counterpart of what [AllRAD](#allrad) does for the diffuse l
 The listener position a panner computed its gains *for*, as distinct from where a listener actually
 stands. They coincide only for a tracked renderer. Keeping them separate is the whole reason
 `bwa_validate` can measure something a sweet-spot measurement cannot, and the reason the layout
-tool's scoring changed. See
+tool scores a moving observer by default. See
 [validation.md](./validation.md#the-seam-solve-position-versus-microphone-position) and
-[layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+[layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### SPCAP
 
@@ -283,7 +281,7 @@ The layout tool's `M` view: a grid of **listener** positions through the working
 over a spread of directions and drawn as semitransparent voxels. It answers "where can somebody
 stand", where the [coverage shell](#coverage-shell) answers "which directions work from here".
 Toggle the [observer model](#observer-model) while watching it and a fixed solve draws an island
-around the sweet spot. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+around the sweet spot. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Bed metric
 
@@ -291,12 +289,12 @@ The `AMBI (AllRAD)` row on the layout tool's scoreboard: plane waves at infinity
 engine's real bed decode build (`bwa_bed_gains_batch`), scored over the same shell as the panners.
 A bed wants a good **quadrature** of the sphere, which the point-source scores cannot see. Grade it
 with the decoder and the max-rE setting your install actually ships, or you are scoring a sibling of
-your render. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+your render. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Bootstrap interval
 
 A percentile bootstrap confidence interval on a **median**, fixed seed so a reported interval is
-reproducible (`src/calib/valid.h:345-347`). Medians rather than means throughout, because localization
+reproducible (`src/calib/valid.h:386-396`). Medians rather than means throughout, because localization
 error is heavy-tailed and a mean follows the few directions that fail badly. "The interval excludes
 zero" is the claim worth making. See [validation.md](./validation.md#reading-the-output).
 
@@ -307,7 +305,7 @@ Two different things wear this name, so check which doc you are in.
 - **Layout tool**: a named bundle of optimizer objective knobs (worst weight, focus weight,
   elevation weight), a scoring-shell elevation band, an azimuth wedge, and a
   [leash](#leash). Three ship: `3d`, `horizontal`, `visual`. Conditions chain as **stages**, each
-  seeding the next. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+  seeding the next. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 - **`bwa_validate`**: one panner at one SPCAP [focus](#focus). A `--focus` list gives SPCAP one
   condition per value and leaves DBAP and VBAP at one each, so a sweep costs only what it measures.
   See [validation.md](./validation.md#the-session-shape).
@@ -322,7 +320,7 @@ you where in the room to stand; that is the [badness map](#badness-map).
 ### Frank spread
 
 The modeled perceived source **width** in degrees, `186.4 * (1 - |rE|) + 10.7`
-(`examples/layout_tool.cpp:676`, `src/calib/valid.c:660`), a function of the energy vector's **length**
+(`examples/layout_tool.cpp:756`, `src/calib/valid.c:678`), a function of the energy vector's **length**
 alone. [rE error](#re-error) reads the same vector's *direction*, so raising SPCAP
 [focus](#focus) can improve spread and worsen direction at once. Against acoustic measurement,
 rE direction predicts DBAP cells and Frank spread predicts VBAP cells; the layout tool defaults
@@ -335,7 +333,7 @@ An optimizer constraint: while climbing the target panner, reject any move that 
 panner's cost slip more than `tol` (default 0.5, roughly degrees) above its stage-start value. You
 cannot climb two objectives at once, but you can climb one **inside the other's feasible set**. The
 guard baseline is wherever the stage starts, so guarding from an unoptimized layout protects almost
-nothing. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+nothing. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Leash
 
@@ -343,7 +341,7 @@ A cap on how far any speaker may drift from where the optimizer stage started. T
 do not make it redundant: the feasible shell between the CAVE screens and the room walls is thin
 radially but long tangentially. Without a leash, a speaker slides meters around the perimeter away
 from its rigged position for no score gain. Measured, a 0.75 m leash scored the same as a free
-run. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+run. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Observer model
 
@@ -351,13 +349,13 @@ Whether a layout is scored at the sweet spot alone (`fixed`) or averaged over a 
 across the working volume (`moving`, the default). The two do not transfer symmetrically: a
 sweet-spot-optimized layout scored under the roam came out **worse than the unoptimized dome**,
 while the reverse is benign. Optimize `fixed` only for a permanently seated install. See
-[layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+[layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Perceptual weighting
 
 The layout tool's rE error is **not** a plain great-circle angle by default: `loc_err_deg`
-(`examples/layout_tool.cpp:558`) scales the elevation component by `elev_wt` (default 0.3), with
-near-vertical targets falling back to the raw angle. `src/calib/valid.c:656` computes the plain `acos`
+(`examples/layout_tool.cpp:638-652`) scales the elevation component by `elev_wt` (default 0.3), with
+near-vertical targets falling back to the raw angle. `src/calib/valid.c:674` computes the plain `acos`
 instead, so a layout-tool degree and a `valid_re_proxy` degree are **not the same unit** unless
 you turn the weight off. Do not compare them casually.
 
@@ -367,13 +365,13 @@ Per-speaker authoring state confining a speaker to a slab about the ear plane (`
 default plus or minus 0.3 m). When an allocation is a *requirement*, pin it rather than weighting
 it: measured, unpinned staged runs erode the in-slab population by half or more. Pins ride the
 layout file; the engine ignores them. See
-[layout-schema.md](./layout-schema.md#authoring-with-bwa_layout_tool).
+[layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### rE
 
 The Gerzon **energy vector**: the gain-squared-weighted sum of unit speaker directions seen from the
-listener, `rE = sum_k g_k^2 * dir_k / sum_k g_k^2` (`examples/layout_tool.cpp:659-664`,
-`src/calib/valid.c:636-646`). Its direction models where a listener localizes the phantom above roughly
+listener, `rE = sum_k g_k^2 * dir_k / sum_k g_k^2` (`examples/layout_tool.cpp:739-746`,
+`src/calib/valid.c:654-665`). Its direction models where a listener localizes the phantom above roughly
 700 Hz and its length models how tight the image is.
 
 The limitation worth stating up front: `rE` is a **static statistic over a gain vector**. It knows
@@ -389,7 +387,7 @@ rE-error numbers, and read [Frank spread](#frank-spread) before trusting it on V
 
 ### rE magnitude
 
-`|rE|` in 0..1, computed as `rl / esum` and clamped (`examples/layout_tool.cpp:674-675`). 1 means a
+`|rE|` in 0..1, computed as `rl / esum` and clamped (`examples/layout_tool.cpp:754-755`). 1 means a
 single speaker carries the source; small values mean energy is smeared over many. It is the sole
 input to [Frank spread](#frank-spread).
 
@@ -480,8 +478,8 @@ An AllRAD device for holes in the array. If no real speaker lies within 60 degre
 (`src/spatial/allrad.c:24`), the decoder adds a fictitious speaker there to close the triangulation. It then
 **discards** that speaker's decode share (`src/spatial/allrad.c:77`). Without it, a floor-less array's hull
 spans the nadir with triangles of bottom-ring speakers, and downward diffuse energy smears onto
-them. The cube grid's
-roughly 55 degree nadir gap stays under the threshold, so genuinely covered poles are untouched.
+them. A pole with a real speaker within 60 degrees is untouched; the default cube grid has a speaker
+at each pole.
 
 ### max-rE
 
@@ -742,7 +740,7 @@ See [materials.md](./materials.md#reflections--reverb-a-diffuse-ambisonic-bed).
 ### RT60
 
 The time for a decaying field to drop 60 dB. `bwa_calibrate --room` measures it by Schroeder backward
-integration, reading T20 from the -5 dB to -25 dB span and tripling it (`src/calib/measure.c:211-224`).
+integration, reading T20 from the -5 dB to -25 dB span and tripling it (`src/calib/measure.c:270-283`).
 
 **Do not copy a measured RT60 into the engine's reverb settings.** The room's own decay is a
 **floor**: you cannot render a space deader than the room you are standing in, and setting the
@@ -790,13 +788,10 @@ source count does not change it.
 
 The physics the [array-sim monitor](#array-sim-monitor) puts back before its decode, per channel,
 on a copy of the bus (`src/binaural/arraysim.c`): the speaker's [directivity](#directivity) loss
-at its angle to the listener, as a graphic EQ with one section per model band (gains from a
-precomputed interaction matrix, Liski and Valimaki 2017); a distance gain `r0 / d` (absolute, `r0`
-the mean speaker distance from the listening point); and a propagation delay `(d - C) / c` (`C`
-the nearest speaker's distance from the listening point) on a fractional delay line that creeps at
-3 m/s. Without it the audition plays the layout's trims and the tracked compensations with none
-of the distance, arrival time or off-axis loss they exist to fight. Never under
-`BWA_PROFILE_BINAURAL`. See
+toward the listener as a per-band graphic EQ, an absolute distance gain `r0 / d`, and a
+propagation delay `(d - C) / c` on a fractional line. Without it the audition plays the trims and
+the tracked compensations with none of the distance, arrival time or off-axis loss they exist to
+fight. Never under `BWA_PROFILE_BINAURAL`. See
 [spatialization.md](./spatialization.md#the-array-sims-room).
 
 ### Direct binaural field
@@ -833,10 +828,9 @@ above roughly 1.5 kHz. Named here because of the trap in the next entry.
 ### Laterality check
 
 A test asserting that a right-hand source lands in the right ear. **Drive it with a tone, never DC.**
-A DC-driven `steam_decode` assertion had inverted polarity, because the default HRTF's per-ear DC
-gains oppose its audible [ILD](#ild), so the assertion passed exactly when the field was mirrored. It
-mis-diagnosed a correct encode and shipped a left/right mirror that only a by-ear report caught. The
-current test drives a 660 Hz tone. `test_ambi` only checks `m >= 0` and will not catch a mirror.
+The default HRTF's per-ear DC gains oppose its audible [ILD](#ild), so a DC-driven assertion passes
+exactly when the field is mirrored. The `steam_decode` test drives a 660 Hz tone. `test_ambi` only
+checks `m >= 0` and does not catch a mirror.
 
 ### SOFA
 
@@ -937,36 +931,24 @@ arrival do not change when the array rotates. See
 
 ### Bump check
 
-After every capture of a tracked run, the ZM-1's center is read again and compared with the center
-the run took. A move past half the [placement gate](#placement-gate)'s tolerance stops the run with
-exit 4 and writes nothing: a trim set measured from two points is wrong in a way no later pass can
-see. The direction modes (the `--zylia` position survey, `--capsule-survey`, the live-aim position
-readout, `bwa_validate`) also compare the orientation, because a stand turned about the array center moves no
-center and turns every direction they read. Their turn limit is the move limit's budget at the
-mode's range, atan(tolerance / 2 / range), floored at 0.3° for Motive's single-frame jitter
-(`place_bump_pose`, `placement.c`). The center-only modes do not check the turn. See
-[calibration.md](./calibration.md#the-bump-check).
+After every capture of a tracked run, the tool reads the ZM-1's center again and compares it with
+the center the run took. A move past half the [placement gate](#placement-gate)'s tolerance stops
+the run with exit 4 and writes nothing: a measurement from two points is wrong in a way no later
+pass can see. The direction modes (the `--zylia` position survey, `--capsule-survey`, the live-aim
+position readout, `bwa_validate`) also check the orientation, because a stand turned about the
+array center moves no center but turns every direction they read. Their turn limit is
+`atan(tolerance / 2 / range)`, floored at 0.3° and capped at 5° (`place_turn_limit_deg`,
+`placement.h`). See [calibration.md](./calibration.md#the-bump-check).
 
 ### Capsule survey
 
-`zylia_survey`: recover the ZM-1's capsule positions **in room axes, indexed by the ASIO channel
-that fed them**, from claps at known positions, or from the speakers' sweeps
-(`bwa_calibrate --capsule-survey`, see
-[calibration.md](./calibration.md#the-speaker-sweep-capsule-survey---capsule-survey)). The result therefore *is* the
-[channel order](#channel-order) and *is* the mounted orientation, so you have nothing left to pin.
-Read
-[survey spread](#survey-spread) and [residual](#residual) before believing a result. Clap positions are
-typed, or measured by a tracked clicker whose tip must hold still before each clap, against the tracked
-stand's center when there is one (see
-[calibration.md](./calibration.md#clap-positions-from-a-tracked-clicker)). Taken with
-the ZM-1 on a tracked stand, it can be saved in the stand's BODY frame, and the tools then re-aim
-it from every pose (see [mount offset](#mount-offset)). See
+`zylia_survey`: the ZM-1's capsule positions recovered **in room axes, indexed by the ASIO channel
+that fed them**, from claps at known positions or from the speakers' sweeps
+(`bwa_calibrate --capsule-survey`). The result *is* the [channel order](#channel-order) and the
+mounted orientation, so run one instead of pinning either by hand; on a tracked stand, save it in
+the body frame (see [mount offset](#mount-offset)). Check [survey spread](#survey-spread),
+[residual](#residual) and the leave-one-out flags (`zylia_survey_loo`) before you believe it. See
 [calibration.md](./calibration.md#the-capsule-self-survey-zylia_survey).
-
-A clap banks only inside an **armed window**, and only the first transient in it. From the sixth
-clap on, its direction must also agree with a provisional survey. After Solve, **leave-one-out**
-(`zylia_survey_loo`) scores each clap against the geometry the others solve to and flags one that
-does not fit. See [calibration.md](./calibration.md#which-transient-is-the-clap).
 
 ### Capsule cross-correlation
 
@@ -1061,15 +1043,12 @@ positions out and make them non-coplanar. The same failure in the capsule survey
 
 ### Live aiming
 
-`bwa_calibrate --live N --zylia`, and `bwa_calib_view`'s Aim tab: sweep ONE speaker over and over,
-about one reading a second, while an installer turns the box. Each reading gives a peak-hold
-**tilt meter** (direct-sound 10 kHz up against 3 to 10 kHz: treble falls off axis, so the tilt
-peaks when the box points at the ZM-1) and the box's position against its
-[plan position](#plan-position), with the [move in room words](#move-in-room-words). It also
-estimates the off-axis ANGLE by inverting the directivity model's tilt curve, from a stored
-reference speaker or the file's `on_axis_db`. One mic position gives a magnitude, never a
-direction: the tool cannot say "turn left". Near the axis the curve is flat, so a reading under
-about 7 degrees prints "on axis". See [calibration.md](./calibration.md#live-aiming---live-n---zylia-the-aim-tab).
+`bwa_calibrate --live N --zylia`, and `bwa_calib_view`'s Aim tab: one speaker swept about once a
+second while an installer turns the box, read as a peak-hold treble **tilt meter**, an off-axis
+angle, and the box's position against its [plan position](#plan-position). Use it to point a box
+at the listening point: turn until the tilt peaks. It gives a magnitude, never a direction (it
+cannot say "turn left"), and near the axis it reads only "on axis". See
+[calibration.md](./calibration.md#live-aiming---live-n---zylia-the-aim-tab).
 
 ### Mount offset
 
@@ -1077,10 +1056,9 @@ The vector from the ZM-1 stand's rigid-body pivot to the array's acoustic center
 axes. The tracked tools compute `center = p + R(q) . offset` from every pose (`place_center`). It
 comes from a body-frame [capsule survey](#capsule-survey), from `--mount-offset x,y,z`, or from
 `--mount-offset ring`, which fits a circle through a ring of markers around the housing's equator.
-Motive's default pivot is the marker CENTROID, which sits off the ring's axis whenever the markers
-are unevenly spaced (11.5 mm for 0, 90, 180 and 225 degrees on a 60 mm ring), and uneven spacing
-is what gives the body a stable yaw. The ring fit assumes the ring sits at the array center's
-height. With a zero offset the center does not depend on the body's orientation at all. See
+Use the ring fit rather than Motive's default pivot: the pivot is the marker centroid, which sits
+off the ring's axis whenever the markers are unevenly spaced, and uneven spacing is what gives the
+body a stable yaw. The ring fit assumes the ring sits at the array center's height. See
 [calibration.md](./calibration.md#placing-the-zm-1-with-the-tracker---track).
 
 ### Move in room words
@@ -1095,28 +1073,23 @@ the move is the opposite, read on the room frame (room-right is -x, up is +y, th
 ### Optical speaker check
 
 `bwa_speaker_survey`: the speakers the cameras can see, each a rigid body named `spk<N>` with its
-markers flat on the baffle, measured against the layout. Aim is the normal of the best-fit plane
-through the markers, taken toward the listening point, so Motive's orientation of the body does
-not matter. One rigid fit over all matched speakers then says whether Motive's frame IS the room
-frame: rotation under 0.5 degrees and translation under 10 mm read as agreement, and handedness is
-`OK`, `MIRRORED`, or `UNDETERMINED` when the speakers lie on one plane and their aims cannot decide.
-On a layout whose positions `--localize` measured, it also reads the **baffle depth**, the distance
-from the baffle back to the acoustic center, by refitting the frame with that depth as a fourth
-unknown (`survey_fit_depth`), and prints the `--baffle-offset-m` to pass.
-See [calibration.md](./calibration.md#optical-speaker-check-bwa_speaker_survey).
+markers flat on the baffle, measured against the layout for aim, position, and whether Motive's
+frame is the room frame (`OK`, `MIRRORED` or `UNDETERMINED` handedness). Run it first on rig day
+(the Session's `frame` step): every tracked position assumes the two frames agree. On a layout whose
+positions `--localize` measured, it also reports the **baffle depth** to pass as
+`--baffle-offset-m` (`survey_fit_depth`, `src/tracking/survey.c`). See
+[calibration.md](./calibration.md#optical-speaker-check-bwa_speaker_survey).
 
 ### Placement gate
 
-What a tracked run waits for before it measures (`placement.h`): the ZM-1's center **still**
-(every center of the last 0.5 s within a quarter of the tolerance of their mean, clamped to 0.5 to
-2 mm), **within tolerance** (the window's mean within `--place-tol-mm` of the target, default 10 mm:
-1 cm is up to 29 µs of arrival error), and **held** both for 1 s, because a stand reads still the
-moment a hand pauses. Then the window's mean IS the mic position. For `--localize` and the
-`--room-eq-grid` rows the tolerance is a loose 100 mm: trilateration and the grid key need each
-position known, not hit, but a gate on stillness alone would open at the previous row. In a direction mode (see [bump check](#bump-check)) still also means
-the orientation: every pose of the window within 0.3° of their mean, and the window's mean orientation
-is what the run takes. A pose counts only while
-NatNet reports the body live. See [calibration.md](./calibration.md#the-readout-and-the-gate).
+What a tracked run waits for before it measures (`placement.h`). The ZM-1's center must be
+**still** (every center of the last 0.5 s within a quarter of the tolerance of their mean, clamped
+to 0.5 to 2 mm) and **within tolerance** of the target (`--place-tol-mm`), and **hold** both for
+1 s. The window's mean is then the mic position. The tolerance defaults to 10 mm in
+`bwa_calibrate` and 20 mm in `bwa_validate`. In a direction mode (see [bump check](#bump-check)),
+still also covers the orientation: every pose of the window within `max(0.3°, turn limit / 2)` of
+their mean. A pose counts only while NatNet reports the body live. Per-mode tolerances and the
+reasons: [calibration.md](./calibration.md#the-readout-and-the-gate).
 
 ### Plan position
 
@@ -1214,18 +1187,12 @@ Unrelated to source [spread](#spread), which is a width. See
 
 ### Tracked directivity compensation
 
-`bwa_set_tracked_directivity`, on by default: each speaker's off-axis loss, from the layout's
-`directivity` model (the vendor's CLF balloon, converted by `tools/directivity/clf_to_json.py`)
-and its `aim`, re-referenced from the listening point onto the **tracked** listener as a slewed
-broadband gain plus a high shelf per channel (`src/core/rt.c`, `directivity_track`;
-`src/spatial/align.c`, `align_dir_targets`). Pure gain, so unlike
-[tracked listener alignment](#tracked-listener-alignment) it resamples nothing and can default on.
-Clamped at +6 dB and +10 dB, because a boost past a speaker's beam raises the room, not the
-listener. The gain + shelf DSP is `src/spatial/dirstage.c`. `BWA_PROFILE_BINAURAL` has no
-physical speakers and skips the whole align stage, this included. The
-[array-sim room](#array-sim-room) applies the same model at full resolution as each virtual
-speaker's ABSOLUTE loss toward the listener, so the audition hears the comp's two-band residual
-against the loss it corrects. See
+`bwa_set_tracked_directivity`, on by default: each speaker's off-axis loss (the layout's
+`directivity` model and `aim`) re-referenced from the listening point onto the **tracked**
+listener, as a slewed broadband gain plus a high shelf per channel (`directivity_track` in
+`src/core/rt.c`, `align_dir_targets` in `src/spatial/align.c`, `src/spatial/dirstage.c`). It is pure gain, so unlike
+[tracked listener alignment](#tracked-listener-alignment) it resamples nothing; leave it on.
+`BWA_PROFILE_BINAURAL` skips it with the rest of the align stage. See
 [spatialization.md](./spatialization.md#compensating-speaker-directivity-for-the-tracked-listener-bwa_set_tracked_directivity-on-by-default).
 
 ### Tracked listener alignment
@@ -1305,26 +1272,25 @@ direction from 17 capsules you believed came from 19 is not. See
 ### Cell
 
 One measured or simulated data point: a panner, a solve mode, a listening position, a target
-direction, and what came back (`ValidCell`, `src/calib/valid.h:123-144`). A cell carries **both** an
+direction, and what came back (`ValidCell`, `src/calib/valid.h:123-147`). A cell carries **both** an
 [angular miss](#angular-miss) and a [comb depth](#comb-depth), and the two estimators refuse
 independently, so `ok` and `comb_ok` are separate flags.
 
 ### Comb depth
 
 The spectral ripple a phantom's coherent copies impose, in dB: the **interdecile range** of the
-detrended sub-band spectrum (`src/calib/zylia.c:828`), averaged over the included capsules. 0 dB is a
-flat response, what a single coherent arrival gives. Three traps: the axis is **frequency, not
-the capsules** (all 19 capsules see nearly the same comb; they average its noise down, they do
-not sample it independently); it **cannot come from [rE](#re)**, which knows nothing about
-arrival times or frequency; and **two equal copies null completely**, so tightening SPCAP
-[focus](#focus) does *not* monotonically reduce it on a general direction. See
+detrended sub-band spectrum, averaged over the included capsules (`src/calib/zylia.c:843`). 0 dB is
+a flat response. It is the timbral cost of a render, which no [rE](#re) score can give you; read it
+as an excess over the [physical floor](#physical-floor), and do not expect tighter SPCAP
+[focus](#focus) to lower it on a general direction. See
 [validation.md](./validation.md#comb-depth-zylia_comb_depth).
 
 ### Comb quality
 
 The believability number beside a [comb depth](#comb-depth): the **standard error** of the capsule
 mean, not the raw spread, because the spread is what the averaging already handled
-(`src/calib/zylia.c:856`, with 1.0 dB of standard error taking it to 0). It reads the opposite way to
+(`src/calib/zylia.c:869-873`; 1.0 dB of standard error, `ZY_COMB_QSPREAD` at
+`src/calib/zylia.c:729`, takes it to 0). It reads the opposite way to
 [diffuseness](#diffuseness): **1 is good**. Below about 0.5 the capsules are not seeing one comb, so
 suspect a capsule fault or a capture that drifted.
 
@@ -1332,8 +1298,8 @@ suspect a capsule fault or a capture that drifted.
 
 `bwa_source_set_channel`: send one source's content to exactly ONE output channel, with every
 spatial and propagation stage bypassed (`src/core/rt.c`, `direct_channel_gains`). It is the live,
-in-engine form of the [physical reference arm](#physical-reference-arm) that `bwa_validate` builds
-offline, so the A/B a listener hears matches the one the measurement scores. It is installed as a
+in-engine form of the [physical reference arm](#physical-reference-arm), whose feed `bwa_validate`
+builds outside the engine, so the A/B a listener hears matches the one the measurement scores. It is installed as a
 one-hot gain vector at the panner's output, NOT as a post-align injection like
 `bwa_set_test_signal`, which is what keeps the reference on the same output stage, the same gain
 ramps and the same level scale as the phantom it is compared against. See
@@ -1358,11 +1324,11 @@ on the raw signals. See
 ### Matched-cell contrast
 
 A median of **paired** differences over the same cells measured two ways, with a
-[bootstrap interval](#bootstrap-interval) (`valid_contrast`, `src/calib/valid.h:349-355`). A median of
+[bootstrap interval](#bootstrap-interval) (`valid_contrast`, `src/calib/valid.h:398-404`). A median of
 differences and a difference of medians are not the same number; only the first is a statement
 about the same cells. Two traps: drop cells where either side failed first, and **never pool the
 physical-versus-phantom contrast across placements** (its distribution is bimodal, so a pooled
-median lands in the empty middle and reads as "no effect"; it happened during development). See
+median lands in the empty middle and reads as "no effect"). See
 [validation.md](./validation.md#reading-the-output).
 
 ### Mode strength
@@ -1394,17 +1360,15 @@ afterwards is interpretable. There is a comb-depth floor too. See
 
 **The array's own speakers are physical sources at known positions**, so driving speaker `i`
 alone gives a real-source measurement through the same chain in the same room, with nothing moved
-(`src/calib/valid.h:272-299`). It buys a [physical floor](#physical-floor), a
+(`src/calib/valid.h:305-337`). It is captured like every phantom cell; only its feed is built
+outside the engine. Keep it on: it gives the [physical floor](#physical-floor), the
 [matched-cell contrast](#matched-cell-contrast), and the negative control for content dependence.
-It is about 0 at the array center by symmetry (the center row is a null control), and VBAP shows
-about 0 even off-center because it collapses onto the coincident speaker: a genuine
-characterization, not an artifact. See
-[validation.md](./validation.md#the-physical-reference-arm).
+See [validation.md](./validation.md#the-physical-reference-arm).
 
 ### Precisely wrong
 
 The property of a tone measurement: **sub-degree repeatable and tens of degrees biased**
-(`src/calib/valid.h:171-172`). Repeats will agree beautifully with each other and with nothing else. Never
+(`src/calib/valid.h:191-192`). Repeats will agree beautifully with each other and with nothing else. Never
 read repeatability as accuracy. It is the single most quotable reason to state the
 [stimulus](#stimulus) beside any number.
 
@@ -1436,7 +1400,7 @@ returning a confidently over-fitted answer. Use it to check a number, not to be 
 ### Stimulus
 
 What the harness plays. Broadband (a 24-tone sum across 420-1150 Hz) is the default and the
-**optimistic** end of the range; `--tone <hz>` is the pathological end (`src/calib/valid.h:181-184`).
+**optimistic** end of the range; `--tone <hz>` is the pathological end (`src/calib/valid.h:202-203`).
 The analysis band follows the stimulus, and a tone whose band lies entirely above the
 [first-order ceiling](#first-order-ceiling) is refused with its frequency named. Content
 dependence has **two** mechanisms (the room's standing waves, and the phantom's own free-field

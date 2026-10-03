@@ -1234,7 +1234,7 @@ jobs:
               gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
             done
 
-  # ---- portability gate, and two more shipping jobs (docs/backends.md phases 2 and 5) ----------
+  # ---- portability gate, and two more shipping jobs (docs/backend-development.md phases 2 and 5) ----------
   # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
   # runner has an audio device, so both build the library, the console examples and the whole test
   # suite and run them on the null and manual sinks.
@@ -1249,7 +1249,7 @@ jobs:
   # runner: no JACK server is running and there is no sound card.
   #
   # Both jobs now BUILD PHONON, each into its own lib/<platform> and under its own cache key, so
-  # both run the with-SDK suite (38 tests) rather than the no-SDK one (33) and both assert
+  # both run the with-SDK suite rather than the no-SDK one and both assert
   # "Steam Audio ENABLED". A cold run pays for the phonon build the way the windows job does; a
   # warm one restores the archives and costs a few minutes. No ASIO: it is Windows-only by
   # definition, and nothing here fetches it.
@@ -1266,7 +1266,7 @@ jobs:
   # 3 verified the AAudio sink on a local emulator, and the numbers that matter (burst size, the MMAP
   # path, a real route-change disconnect, the CPU budget) need a headset, which no runner has. The
   # cross-BUILD is the part worth gating, and it is the cheap part.
-  # ---- Android cross-build (docs/backends.md phase 3 + the bindings' Android packaging) ---------
+  # ---- Android cross-build (docs/backend-development.md phase 3 + the bindings' Android packaging) ---------
   # Builds the library for both ABIs, proves the AAudio backend is in it, and produces the two things
   # no other job can: the arm64-v8a engine library that both bindings package, and the Godot
   # GDExtension for arm64-v8a (template_release, the flavour an exported game loads).
@@ -1800,9 +1800,9 @@ jobs:
                    submodule and linked INSIDE libbw_audio.so, so the binaural path is the real
                    HRTF decode and automatic occlusion, pathing and the reflection bed are all
                    present. There is no second file to ship or to keep beside it.
-          no ASIO  ASIO is a Windows driver model. Linux reaches the 26-channel array through
+          no ASIO  ASIO is a Windows driver model. Linux reaches the speaker array through
                    JACK (a PipeWire desktop answers the same ABI) or a raw ALSA card; AES67 into
-                   the Dante network is the transport. See docs/backends.md.
+                   the Dante network is the transport. See docs/backend-development.md.
           contents lib/libbw_audio.so (stripped) + lib/libbw_audio.so.debug (its DWARF, linked
                    by gnu_debuglink: keep the two together to debug, ship only the .so) +
                    include/bw_audio.h. A Unity or Godot consumer wants the package or the addon
@@ -2210,7 +2210,7 @@ jobs:
           commit   ${{ github.sha }} (${{ github.ref_name }})
           built    $(date -u +%Y-%m-%dT%H:%M:%S)Z  (GitHub Actions run ${{ github.run_id }})
           arches   one UNIVERSAL library, x86_64 + arm64 ($(lipo -info dist-macos/lib/libbw_audio.dylib))
-          backends none. macOS has no device backend yet (CoreAudio is docs/backends.md phase 4),
+          backends none. macOS has no device backend yet (CoreAudio is docs/backend-development.md phase 4),
                    so this runs the null and manual sinks: offline rendering and the test suite.
                    SteamAudio=yes (STATIC), so the binaural path is the real HRTF decode.
           unsigned NOT code-signed and NOT notarized. Gatekeeper blocks a downloaded unsigned

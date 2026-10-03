@@ -1,4 +1,4 @@
-# bw_audio — self-hosted spatial audio engine for a 26-speaker CAVE array.
+# bw_audio — self-hosted spatial audio engine for a CAVE speaker array (24 speakers to start, up to 64).
 # See docs/ for the design; CLAUDE.md for invariants.
 #
 # What this builds:
@@ -1286,7 +1286,7 @@ option(BWA_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches i
 # Only ONE of the three GUI tools is Windows-bound, and the reason is per tool:
 #   bwa_calib_view       IS. It is on the win32 + d3d11 imgui backend and it links the ASIO capture
 #                        shells (zylia_capture / calib_capture / asio_session). Porting it is not
-#                        part of the OS shim (docs/backends.md, phase 2) - the LIBRARY is what has
+#                        part of the OS shim (docs/backend-development.md, phase 2) - the LIBRARY is what has
 #                        to build elsewhere.
 #   bwa_playground       are NOT. Each links bw_audio + raylib + rlImGui + imgui and nothing else;
 #   bwa_layout_tool      no capture shell, no ASIO, no win32 API. Their only Windows pieces are

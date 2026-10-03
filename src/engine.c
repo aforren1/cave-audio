@@ -604,7 +604,7 @@ bwa_result bwa_start(bwa_engine* e) {
                  * silence everywhere, on the one configuration where hearing the sim is how you find
                  * out the array never opened. An explicit null or manual still resolves to itself, so
                  * offline stays offline either way.
-                 * Pinning the monitor's endpoint wants a `monitor_device` field; see backends.md. */
+                 * Pinning the monitor's endpoint wants a `monitor_device` field; see docs/backend-development.md. */
                 const bool mon_devfree = (e->cfg.sink == BWA_SINK_NULL || e->cfg.sink == BWA_SINK_MANUAL);
                 const bwa_sink_type mon_type = e->cfg.sink;
                 e->sink_mon = bwa_sink_open(sr, e->cap, 2,

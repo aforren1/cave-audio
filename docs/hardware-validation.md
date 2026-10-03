@@ -25,10 +25,6 @@ What only the rig can prove:
 - the Session tab, which has run only in simulate;
 - the by-ear checks: HRTF quality, the A/B/X knob bake-off, room EQ on the array.
 
-Live Motive (Stage 3) and the by-ear HRTF check (Stage 5) are the last two open engine
-milestones. The Unreal binding is the one unbuilt piece, and it is a control client
-([integration.md](./integration.md)).
-
 **Every threshold in Stage 2 is provisional.** They were set in simulation, which has no noise
 floor and no Motive jitter. Read [Record these numbers](#record-these-numbers) before you start,
 and fill it in as you go.
@@ -47,8 +43,10 @@ and fill it in as you go.
       Set **simulated truth** to a copy of the plan with a few speakers moved several centimeters.
       Run every step. Pass: `as_built.json` lands on the truth, not on the plan.
 - [ ] **Rehearse the tracker**: in any `bwa_calibrate` command below, replace the device and
-      tracker flags with `--simulate --track-sim`. Add `--track-sim-bump N` or
-      `--track-sim-twist N` to see a bump or a turn stop the run with exit 4. `bwa_speaker_survey <plan> --simulate` rehearses the frame check.
+      tracker flags with `--simulate --track-sim`. Add `--track-sim-bump N` to see a bump stop
+      any tracked run with exit 4. Add `--track-sim-twist N` to see a turn stop the capsule survey
+      and live aiming with exit 4; the center-only steps (localize, trims, verify, grid) run to
+      the end. `bwa_speaker_survey <plan> --simulate` rehearses the frame check.
       [calibration.md: Rehearse without Motive](./calibration.md#rehearse-without-motive---track-sim).
 
 ### Make the plan
@@ -66,11 +64,11 @@ point where the box's acoustic center will be, not on its front baffle or its mo
 
 - [ ] **Place the speakers** in `bwa_layout_tool plan.json`, with a `constraints.json` beside it
       for the room's bounds, keep-out boxes and obstacles
-      ([layout-schema.md: Constraints](./layout-schema.md#constraints-constraintsjson)).
+      ([layout-schema.md: Constraints](./layout-authoring.md#constraints-constraintsjson)).
 - [ ] **Optimize** if you want to: `bwa_layout_tool --optimize plan.json dbap` (or `spcap`,
       `vbap`). It hill-climbs inside the constraints and saves in place. Keep the default
       `moving` observer: one array serves every use, so do not optimize it for one seat
-      ([layout-schema.md: The optimizer](./layout-schema.md#the-optimizer)).
+      ([layout-schema.md: The optimizer](./layout-authoring.md#the-optimizer)).
 - [ ] **Declare the listening point**: `bwa_layout_tool --export plan.json ears=1.448 listen`.
 - [ ] **Add the speaker model**: `uv run tools/directivity/clf_to_json.py Genelec_Oy-4410A.CF2
       --into plan.json`. Live aiming, the aiming sheet and the trims read it.
@@ -246,10 +244,10 @@ with the reason, or `OK`.
   rows, which record the measured position; 20 mm for `bwa_validate`.
 - **The bump check** runs after every capture. A move past half the tolerance (5 mm; 10 mm for
   `bwa_validate`) stops the run with exit 4 and writes nothing.
-- **The turn.** The direction modes (the capsule survey, the live-aim position readout, the
-  `--zylia` position survey, `bwa_validate`) also hold the gate while the stand turns
-  (`HOLD turning`, every pose of the window within 0.3 degrees of their mean) and stop with exit 4
-  on a turn past their limit: 0.3 degrees, the floor, for the `bwa_calibrate` modes, and 0.41
+- **The turn.** The direction modes are the capsule survey, the live-aim position readout, the
+  `--zylia` position survey and `bwa_validate`. They also hold the gate while the stand turns
+  (`HOLD turning`: every pose of the window within 0.3 degrees of their mean). They stop with
+  exit 4 on a turn past their limit: 0.3 degrees (the floor) for the `bwa_calibrate` modes, 0.41
   degrees for `bwa_validate`. The center-only modes (localize, trims, verify, grid, the tilt meter)
   do not stop on a turn.
 - **The turn readout.** Each placement prints `mount yaw` and `tilt`; the Placement panel shows
@@ -321,7 +319,9 @@ On failure:
 - `off the room frame`: set the ground plane again in Motive. On pass 1, a translation alone,
   with the visible speakers all on one side, can be the guessed depth: do pass 2 and come back.
 - `UNDETERMINED` or no fit: add a visible speaker off the others' plane.
-- Exit 2: no frames from Motive; check streaming, the IP, the multicast group, the firewall.
+- Exit 2: no frames or no model definitions from Motive; check streaming, the IP, the multicast
+  group, the firewall. Exit 2 also means no rigid body maps to a speaker: name the bodies
+  `spk<N>`, or pass `--map name=index`.
 - One speaker far off in "after the fit" while the rest agree: that box is off its plan, not the
   frame.
 - Pass 2 says `not measured`: it names the reason. Fewer than 3 measured speakers with an aim,
@@ -387,10 +387,10 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
       its plan or you know why, and a sane latency residual (below).
 - [ ] **Latency residual**: the `-> residual <ms>` at the end of the `solved system latency`
       line must be positive. Negative is a wrong device or a sample-rate mismatch. With the ZM-1
-      on Dante Via, tens of ms is a correct run: the driver does not report the Via leg (about
+      on Dante Via, tens of ms is a correct run. The driver does not report the Via leg (about
       60 ms for the whole chain on the rig), and the next line says so. A WARNING fires only past
-      150 ms, the most the arrival window allows past the driver's loop: check the Via latency
-      setting and any extra buffer. Record the value.
+      150 ms, the most the arrival window allows past the driver's loop. On a WARNING, check the
+      Via latency setting and any extra buffer. Record the value.
 - [ ] Optional, by hand: add `--check-aim` to fit each box's acoustic axis from these captures.
       A box more than 15 degrees off its aim is flagged
       ([calibration.md: Modes](./calibration.md#modes)).
@@ -494,8 +494,8 @@ bwa_calibrate --layout as_built.json --live <spk> --zylia --survey capsules.json
       it read `STALE` until you run them again.
 - [ ] Record the reading rate: a CLI run ends with `live: N reading(s) in X s, Y per second`.
 
-On failure: `position: n/a (no body-frame survey)` means the run has no capsule survey; the tilt
-meter still works. No `--latency`, `--ref` or `--ref-speakers`: direction only, no distance.
+On failure: `position: n/a (no body-frame survey)` means the tracked run has no body-frame
+capsule survey. The tilt meter still works. No `--latency`, `--ref` or `--ref-speakers`: direction only, no distance.
 [calibration.md: Live aiming](./calibration.md#live-aiming---live-n---zylia-the-aim-tab).
 
 ### Step 5: trims and the room report
@@ -740,36 +740,8 @@ The checks with no assertion. Bring ears you trust.
 - [ ] **Tracked room EQ** (`bwa_set_tracked_room_eq`, needs the Stage 2 grid): walk the room and
       A/B. Low-frequency evenness improves from position to position with it on.
 
-### Driving these trials from a Unity scene
-
-Build the scene to mirror the list above: one row per trial, a blind A/B, a recorded verdict.
-Every knob is on the Unity binding; two cost a scene restart.
-
-| Trial | Unity control | Cost |
-| --- | --- | --- |
-| Phantom against a real speaker | `Emitter.Channel` (`Bwa.CHANNEL_AUTO` to go back) | live |
-| Preset baseline | `Engine.situation` + `ApplySituation()` | live |
-| SPCAP focus | `spcapFocus` / `spcapDensity` | live |
-| Hole-aware floor | `holeSpread`, 0 against 1 | live |
-| CAP | `dualBandCap` (needs `dualBand`) | live |
-| Tracked alignment | `trackedAlign` + dead zone / slew | live |
-| Tracked room EQ | `trackedRoomEq` | live |
-| Panner | `panner` | live |
-| max-rE and its band split | `maxRe`, `maxReSplit` | live |
-| Air absorption | `Emitter.airAbsorption` | live |
-| Spread mode, decorrelation | `spreadMode`, `decorrelation` | live |
-| Bed decoder, AllRAD vs EPAD | `bedDecoder` | restart |
-| HRTF monitor quality | profile `Binaural` | restart |
-
-- **Load twice, not four times**: `bedDecoder` is the only load-time half of the decoder and taper
-  pair. Load AllRAD, then EPAD, and toggle `maxRe` inside each.
-- **Build the reference row first**, then the three trials no instrument settles: SPCAP focus, the
-  hole-aware floor, and CAP.
-- **Encode the ordering rules**: refuse the tracked alignment trial before Stage 2 is accepted, and
-  show its listening-point row as a null check.
-- **Record the configuration beside every verdict** with `Engine.TryGetEngineTuning`, which reads
-  what the engine has rather than what the inspector claims.
-- Put spread mode and decorrelation last: Stage 4b already settled them.
+To run these trials from a Unity scene, see
+[integration.md: Driving rig-day trials from a Unity scene](./integration.md#driving-rig-day-trials-from-a-unity-scene).
 
 ## Record these numbers
 
@@ -790,7 +762,7 @@ the day.
 | Range residuals | the capsule survey's per-speaker `from the median` (mm) | flag 10 mm | `CSURVEY_RANGE_FLAG_MM`, `examples/calibrate.cpp` |
 | Rigid-sphere effect | the capsule survey's `residual` and `radius`, against a clap survey of the same mounting | WARNING over 5 µs, radius outside 40 to 60 mm | `CSURVEY_RESID_WARN_US`, `examples/calibrate.cpp`; [calibration.md: The speaker-sweep capsule survey](./calibration.md#the-speaker-sweep-capsule-survey---capsule-survey) |
 | Live-aiming reading rate | `live: N reading(s) in X s, Y per second` | 1 to 1.2 per second, untimed | [calibration.md: Update rate](./calibration.md#update-rate) |
-| Latency residual with the ZM-1 | localize's `-> residual` | WARNING over 20 ms | [calibration.md: Modes](./calibration.md#modes) (`--localize`) |
+| Latency residual with the ZM-1 | localize's `-> residual` | WARNING over 150 ms | `CALIB_WIN_LAT_DRIVER_S`, `src/calib/calib.h`; [calibration.md: Modes](./calibration.md#modes) (`--localize`) |
 | Physical floor | `bwa_validate`'s `physical floor` | 1 to 3 deg expected, stop above 5 | [validation.md: The physical reference arm](./validation.md#the-physical-reference-arm) |
 
 ## Known limits

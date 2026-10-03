@@ -1,8 +1,8 @@
 # Materials and reflections
 
 How surface **materials** shape simulated **occlusion**, **reflections/reverb**, and **sound
-pathing**, and how that audio reaches the speaker array (26 in the CAVE) and the binaural monitor.
-Two implementations now exist behind these features: Steam Audio's ray tracer
+pathing**, and how that audio reaches the speaker array (24 in the CAVE) and the binaural monitor.
+Two implementations sit behind these features: Steam Audio's ray tracer
 (`src/acoustics/steam_scene.c`, `src/acoustics/steam_reflect.c`, `src/acoustics/steam_path.c`, gated on the SDK build) and a
 phonon-free geometric path (`src/acoustics/ism.c` early reflections + `src/acoustics/fdn.c` late reverb + manual
 occlusion). **Read "Choosing an acoustics path" first.** They are complementary, not rivals, and
@@ -12,20 +12,20 @@ any term below.
 
 ## Choosing an acoustics path
 
-The array render no longer needs Steam Audio at all. What the SDK still buys is *automatic*
+The array render does not need Steam Audio. What the SDK buys is *automatic*
 occlusion, pathing, and a real HRTF monitor. Feature by feature:
 
 | | Steam Audio | Homegrown | Take |
 |---|---|---|---|
 | **Occlusion / transmission** | ray-traced against any mesh, automatic | `bwa_source_set_occlusion_manual` - the game supplies the answer | **Steam**, clearly |
 | **Sound pathing** (around occluders) | yes (probe-baked visibility) | none | **Steam** |
-| **Early reflections** | ray-traced, any geometry, but a **listener-centric bed** (one field around one point, 30 Hz) | image-source, shoebox only, **panned as point sources** (direction + parallax, per block) | **Homegrown** - see below |
+| **Early reflections** | ray-traced, any geometry, but a **listener-centric bed** (one field around one point, 12 Hz) | image-source, shoebox only, **panned as point sources** (direction + parallax, per block) | **Homegrown** - see below |
 | **Late reverb** | convolved IR (finite length) | FDN: infinite tail, designable, anisotropic decay | **Homegrown** |
 | **Binaural HRTF monitor** | real HRTF (SOFA) | lateral pan, no HRTF | **Steam** |
 | **Arbitrary scene geometry** | any mesh | shoebox only (ISM) | **Steam** |
 | **Cost in sources** | O(1) - one shared bed, N sends | ISM is **O(N)** - six solves + six taps per wet voice | **Steam** at scale |
-| **Determinism** | ray count drives CPU; sim lags at 30 Hz | fixed cost, updates every block (~5 ms) | **Homegrown** |
-| **Dependency** | submodule + built artifacts + an alignment patch + a shipped DLL | ~200 lines each, no deps | **Homegrown** |
+| **Determinism** | ray count drives CPU; sims update at 10 to 30 Hz | fixed cost, updates every block (~5 ms) | **Homegrown** |
+| **Dependency** | submodule + built static archives + an alignment patch | ~200 lines each, no deps | **Homegrown** |
 
 **Reflections are where the homegrown path wins the argument that matters here.** Steam's reflection
 bed is listener-*centric*: one ambisonic field decoded around one point. Structurally, it cannot
@@ -46,7 +46,7 @@ That configuration never calls `steam_reflect` at all. **Do not run the Steam re
 ISM at the same time.** Steam's bed already contains early reflections, so you would hear them twice.
 `bwa_source_set_early_reflections` warns once via `bwa_last_error` if the bed owns the tap.
 
-**No-SDK builds are now fully viable** for the array: ISM + FDN + manual occlusion. What you lose is
+**No-SDK builds are fully viable** for the array: ISM + FDN + manual occlusion. What you lose is
 automatic occlusion, pathing, and the real HRTF monitor. The monitor is the practical loss for a
 developer working off-site. The fallback is a lateral pan: fine for routing checks, useless for
 timbre or front/back.
@@ -61,7 +61,7 @@ double-counts. Same trap as matching the measured RT60 ([calibration.md](./calib
 > everything else, so the ASIO array and the binaural monitor both get reflections for free.
 > Protect that property; see [architecture.md](./architecture.md) "the bus seam."
 
-The bus is as wide as the loaded layout has speakers (4..64; 26 in the CAVE; see
+The bus is as wide as the loaded layout has speakers (4..64; 24 in the CAVE; see
 [layout-schema.md](./layout-schema.md)). Everything below decodes to that count, not to a
 hard-wired one.
 
@@ -80,7 +80,9 @@ sweet-spot-sensitive, so a fixed decode is robust across the moving observer
 ```
 
 Two paths, one bus. Materials feed both. (Sound pathing, the indirect route around occluders,
-is a third feed onto the same bus; see "Pathing" below.) The engine decodes the reflection ambisonic field
+is a third feed onto the same bus; see "Sound pathing" below. The exception is
+`BWA_PROFILE_BINAURAL`: there the pathing accumulator sums straight into the headphone SH field and
+skips the bus. See [spatialization.md](./spatialization.md).) The engine decodes the reflection ambisonic field
 to the **same bus channels**. The binaural monitor then re-encodes those bus channels back to
 ambisonics for its stereo decode, like any other bus content; see "The monitor and reflections."
 
@@ -111,15 +113,17 @@ movers) live in [api.md](./api.md) → "Materials and scene geometry".
 
 **Scene lifecycle.** The geometry setters are safe to call at runtime, reflection bed or not. The
 occlusion sim owns the `IPLScene` and is the sole thread that commits it. The borrowing reflection
-and pathing sims take that scene's lock **shared** around their ray traces (`steam_scene_ray_lock`,
-an `SRWLOCK`), so an `iplSceneCommit` can no longer race a `RunReflections`/`RunPathing`. What moves
-each frame is a **dynamic mesh** (`bwa_scene_add_dynamic_mesh` → an `IPLInstancedMesh` you reposition
+and pathing sims take that scene's reader-writer lock **shared** around their ray traces
+(`steam_scene_ray_lock`, an `os_rwlock`), so an `iplSceneCommit` cannot race a
+`RunReflections`/`RunPathing`.
+
+What moves each frame is a **dynamic mesh** (`bwa_scene_add_dynamic_mesh` → an `IPLInstancedMesh` you reposition
 with `bwa_scene_set_dynamic_transform`), a cheap top-level BVH refit (not a geometry rebuild). It is
 the acoustic analogue of a physics collider with a transform. Replacing the whole *static* mesh at runtime
 also works but rebuilds the entire BVH, so it's for occasional swaps, not per-frame motion. The one
 thing runtime geometry does **not** move is a **baked** reverb/pathing result: the bake froze the
 geometry at `bwa_start`, so a mover changes nothing there. Use real-time reflections (the default) if
-the scene animates. `scene_locked` in `src/engine.c` now only means "no scene" (no SDK / failed
+the scene animates. `scene_locked` in `src/engine.c` means only "no scene" (no SDK, or a failed
 create).
 
 ### Reflection bed: hybrid reverb (directional early reflections + parametric tail)
@@ -173,12 +177,26 @@ Two authoring modes, and they are **alternatives, not layers**:
 2. **Arbitrary mesh**: vertices/triangles/material-tokens from the content scene, via
    `bwa_scene_set_mesh_mat`.
 
-Mode 1 is implemented *as* mode 2, so it replaces the static mesh the same way. Doing both (a
-shoebox and then a pillar inside it) loses the walls, and loses them half-way. The image-source
-room is separate state and survives, so early reflections keep working off a room the ray tracer
-no longer has. Want both? Call `bwa_scene_set_box` first, because nothing else captures the ISM
-room. Then call `bwa_scene_set_mesh_mat` once, with the box walls plus your geometry. (The Godot
-binding does exactly this; see `bindings/godot/src/bwa_geometry.h`.)
+Mode 1 is implemented *as* mode 2, so it replaces the static mesh the same way. Call
+`bwa_scene_set_box` and then `bwa_scene_set_mesh_mat` for a pillar, and the ray tracer loses the
+walls. The image-source room is separate state and survives, so early reflections keep working off
+a room the ray tracer no longer has.
+
+Want a box plus your own geometry? Use the two calls `bwa_scene_set_box` is made of:
+
+1. `bwa_scene_set_ism_room(w, h, d, faces)` captures the shoebox for the image-source reflections
+   only. It does not touch the ray-traced mesh, and it works without the SDK.
+2. `bwa_box_mesh(w, h, d, faces, ...)` returns the same box's 8 vertices, 12 inward-facing
+   triangles and per-triangle materials. It is pure: no engine, no allocation.
+
+Concatenate the box triangles with yours and pass them to ONE `bwa_scene_set_mesh_mat`. Neither
+step depends on call order. The Godot binding does this (`BwaEngine::scene_set_ism_room` in
+`bindings/godot/src/bwa_engine_node.cpp`).
+
+`bwa_scene_set_ground(y, mat, pressure_release)` is the outdoor case: one horizontal mirror plane
+instead of a box. It replaces any prior room. `bwa_scene_set_pressure_release` flips the
+image-source polarity of chosen box faces. Contracts: [api.md](./api.md) → "Materials and scene
+geometry".
 
 Set geometry before `bwa_start` if you use the reflection bed. The runtime-swap rule is under
 "Scene lifecycle" above.
@@ -187,8 +205,8 @@ Set geometry before `bwa_start` if you use the reflection bed. The runtime-swap 
 
 ### Direct sound (per source): occlusion, not distance
 
-Spatialization stays **DBAP**, and **DBAP keeps owning distance attenuation and air
-absorption** (spatialization.md step 4 scales gains by `user_gain · atten(|src − lis|)`).
+The panner keeps owning **distance attenuation** (spatialization.md step 4 scales gains by
+`user_gain · atten(|src − lis|)`), and per-voice DSP keeps owning **air absorption**.
 Materials add only a per-source occlusion stage. The occlusion sim ray-traces with phonon's direct
 simulation configured for **occlusion + transmission only**. The `distanceAttenuation` and
 `airAbsorption` flags stay **off**, so distance is not counted twice and the level is identical
@@ -238,11 +256,12 @@ A dedicated sim thread (12 Hz) runs Steam Audio's **`IPLSimulator`** reflections
 image sources). The audio thread runs the **`IPLReflectionEffect`** convolution against that IR,
 which yields an ambisonic reflection signal. It then **decodes that signal to the bus channels with
 an `IPLAmbisonicsDecodeEffect` in panning mode** (`binaural = false`), and sums it onto the bus.
-That decode's `speakerLayout` is the **same `IPL_SPEAKERLAYOUTTYPE_CUSTOM` layout** the binaural
-monitor builds from the surveyed geometry (one direction per layout speaker).
+That decode's `speakerLayout` is an **`IPL_SPEAKERLAYOUTTYPE_CUSTOM` layout** that
+`steam_reflect.c` builds from the surveyed geometry: one direction per layout speaker, seen from
+the layout's listening point. This bed does not use the engine's own AllRAD/EPAD bed decode.
 
-Decoding an ambisonic field onto an **irregular** speaker grid (the CAVE's 3×3×3 boundary minus
-center, *not* a uniform sphere) is the hard, non-unique direction. A naïve sampling/transpose or raw
+Decoding an ambisonic field onto an **irregular** speaker array (a real CAVE survey, *not* a
+uniform sphere) is the hard, non-unique direction. A naïve sampling/transpose or raw
 pseudo-inverse gives uneven loudness and direction errors. Steam Audio's decoder handles the custom
 layout with a sane decode law and the right SH channel-order/normalization convention. A literal
 precomputed matrix is only an *optimization* of the same effect (skipping per-block effect

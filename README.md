@@ -2,7 +2,7 @@
 
 Self-hosted spatial audio engine for a CAVE installation. It drives a speaker array (up
 to 64 channels; the CAVE starts with 24, with room to grow) over ASIO into an RME Digiface Dante. A second path
-does **binaural HRTF headphone rendering**: a first-class direct render, plus an array-audition monitor
+does **binaural headphone rendering** through an HRTF (head-related transfer function): a first-class direct render, plus an array-audition monitor
 for desk-side debugging. Game engines and experiment frameworks connect as thin
 control clients over a C ABI. No rendered audio crosses that boundary, only control.
 
@@ -25,8 +25,8 @@ speaker array. These parts need the hardware:
 - the multichannel ASIO path into the Digiface, and the full-duplex capture that both
   measurement tools use,
 - live Motive tracking. The NatNet parser and its lifecycle are tested off-wire only. That
-  covers the head tracker, the optical speaker check and the tracked ZM-1 stand, including
-  the assumption that Motive sends marker offsets in the body's own frame.
+  covers the head tracker, the optical speaker check and the tracked stand for the
+  ZM-1 (the Zylia 19-capsule measurement microphone), including the assumption that Motive sends marker offsets in the body's own frame.
 - the Zylia channel order and azimuth reference. Both survive every off-hardware check,
   and both report a confident wrong direction if they are wrong. So does the ZM-1's rigid
   sphere, which bends the arrival differences away from the free-field model the
@@ -53,80 +53,38 @@ that day. The Unreal binding is planned and not written.
 
 ## Engine features
 
-- **Spatialization**: per-voice listener-relative DBAP (SPCAP/VBAP selectable, a
-  dual-band option), recomputed per block from the tracked head position; source
-  extent as an angular spread (lobe or MDAP virtual-source ring) or a **metric
-  size in meters** that holds constant as the listener walks, with optional
-  velvet-noise **decorrelation** so wide sources don't collapse to phantom images;
-  a hole-aware spread floor for directions the array has no speaker in;
-  near-listener widening for fly-throughs; a **multi-listener compromise** mode
-  (energy-mean over up to 4 occupants); per-speaker gain/delay/correction-EQ
-  output stage, master gain, and a linked protection limiter as the final stage.
-  Three modifiers follow the head rather than the layout: **CAP** matches the rendered
-  interaural time difference to a real source for the head's current orientation
-  (`bwa_set_dual_band_cap`), **tracked alignment** re-aims the per-speaker trims
-  and delays onto the live head (`bwa_set_tracked_align`), and **tracked directivity**
-  puts each speaker's off-axis loss back as the head crosses its beam, from the
-  vendor's measured balloon (`bwa_set_tracked_directivity`).
-- **Acoustics**: ray-traced occlusion with per-band transmission EQ, source
-  directivity, a directional reflection bed (real-time, or baked over a probe
-  grid), and sound pathing with bending-loss EQ via Steam Audio, **plus a
-  complete SDK-free path**: geometric **image-source early reflections** (each
-  wall bounce panned as a point source, so it has parallax as you walk) into a
-  **directional FDN reverb** (anisotropic decay, live decay retune), with **manual
-  occlusion** driven from game logic.
+The catalog, with the calls behind each item, is
+[docs/api.md, "Feature overview"](./docs/api.md#feature-overview). In short:
+
+- **Spatialization**: listener-relative DBAP (distance-based amplitude panning) re-solved
+  every block from the tracked head. SPCAP (speaker-placement correction amplitude
+  panning) and VBAP (vector base amplitude panning) are there for a fixed listener.
+- **Source extent**: angular spread (a lobe, or an MDAP (multiple-direction amplitude
+  panning) ring) or a metric size, with velvet-noise decorrelation, a hole-aware floor and
+  a multi-listener compromise for up to 4 occupants.
+- **Head-following modifiers**: CAP (compensated amplitude panning) holds the interaural
+  time difference as the head turns. Tracked alignment and tracked directivity re-aim the
+  per-speaker trims and the speakers' off-axis loss onto the live head.
+- **Acoustics**: with Steam Audio, ray-traced occlusion, a reflection bed and sound
+  pathing. In any build, image-source early reflections, a directional FDN (feedback delay
+  network) reverb and manual occlusion.
 - **Propagation**: distance attenuation, Doppler, air absorption, equal-loudness
-  compensation, playback **pitch**; opt-in per source, ramped/glided.
-- **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
-  files; **push sources** that take caller-generated PCM into the engine
-  (`bwa_source_push`, a source feed on the control thread, never a render path);
-  an optional **shared-ownership cache** (`bwa_sound_acquire` / `bwa_sound_release`)
-  that dedupes by path plus load flags and refcounts, with **async loading**
-  (`bwa_sound_acquire_async`) for content that arrives mid-session; AmbiX
-  ambisonic beds: matrix decode (AllRAD or EPAD) or a
-  **parametric DirAC-style renderer** whose direct stream re-pans listener-relative
-  (a walkable soundfield), with yaw rotation to line a capture up with the scene.
-- **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
-  global) and click-free seek; engine-side timed fades; **mix groups** for
-  category gain/ducking; sample-accurate start and scheduled click-free stop
-  against a device-anchored DSP clock (`bwa_source_play_at` / `bwa_source_stop_at`);
-  **intro to loop** and **play regions** that loop a sub-range or cut a one-shot
-  short; **gapless chaining** into queued sounds (`bwa_source_queue`); **end and
-  loop-wrap events** (`bwa_poll_ended`, `bwa_poll_looped`) you drain after each
-  commit, because a clip shorter than your frame can start and finish unseen and a
-  looping voice never ends at all. Starts and stops are click-free, including the
-  scene-transition sweeps (`bwa_group_stop`, `bwa_stop_all`). A source's whole
-  configuration is one printable, diffable struct (`bwa_source_desc`) you fill from
-  a preset and apply in one call, instead of a setter per knob.
-- **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
-  freshest head pose at block time, with optional **pose prediction** to hide
-  motion-to-ears latency; **tracked room EQ** interpolates measured LF room
-  correction at the live listener position.
-- **Headphones**: a first-class **direct binaural render** (`binaural` profile:
-  point sources SH-encode at their true listener-relative directions into one Steam
-  Audio HRTF decode, no speaker-array simulation in the direct path) and an
-  **array-audition monitor** (`cave_sim`: the same speaker bus through virtual
-  speakers, DBAP artifacts included). Both open a normal 2-channel output device:
-  WASAPI on Windows, JACK or ALSA on Linux, AAudio on Android. `cave_both` runs the
-  array over ASIO and the monitor over WASAPI at the same time. **Headphone
-  correction EQ** loads an AutoEq `ParametricEQ.txt` and swaps in click-free
-  (`bwa_load_headphone_eq`).
-- **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
-  lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
-  every parameter change ramps; nothing steps. Zone profiling is built in behind
-  `-DBWA_TRACY=ON` (Tracy) or `-DBWA_PROFILE_SELF=ON` (headless, no server tooling).
-- **Offline and diagnostics**: the manual sink drops its thread and lets you pump
-  blocks yourself (`bwa_render_block`), bit-identically on every platform. That is the
-  pre-render path for an experiment that plays its stimuli through something else, and
-  it is what the test suite drives. Plus a per-channel test signal, output meters, a
-  voice gauge, and a **direct single-speaker route** (`bwa_source_set_channel`) that
-  plays a real source out of one speaker with no spatial processing, the ground-truth
-  condition to A/B a phantom against.
-- **Validation**: the core math (SH encode, VBAP, AllRAD, EPAD, biquads, EQ rendering)
-  is cross-checked against independent implementations (scipy/qhull/linear-
-  programming goldens) in CI, alongside the DSP/concurrency test suite and UI-driven
-  tests for all three tools. `bwa_validate` grades the array itself: render a phantom,
-  measure where it landed, report the angular miss and the comb depth.
+  compensation and pitch, opt-in per source.
+- **Assets**: WAV/FLAC/MP3 resampled at load, disk streaming, push sources fed from your
+  PCM, a refcounted shared cache with async loading, and AmbiX/FuMa ambisonic beds.
+- **Voices**: priority stealing, pause, click-free seek and stop, fades, mix groups,
+  sample-accurate scheduling, play regions, gapless queues, and end and loop-wrap events.
+- **Tracking**: OptiTrack NatNet parsed in-process, pose prediction, and low-frequency
+  (LF) room EQ interpolated at the live listener position.
+- **Headphones**: a direct binaural render through an HRTF, an array-audition monitor
+  (`cave_sim`), and AutoEq headphone correction.
+- **Real-time discipline**: no allocation, locks or I/O on the audio thread, lock-free
+  rings, frame-coherent commits, ramps on every change. Profiling via Tracy or a built-in
+  headless profiler.
+- **Offline and diagnostics**: the manual sink lets you pump blocks yourself
+  (`bwa_render_block`), plus a test signal, meters and a direct single-speaker route.
+- **Validation**: the core math is cross-checked against independent implementations in
+  CI, and `bwa_validate` measures where the array actually puts a phantom.
 
 ## Control clients
 
@@ -144,63 +102,10 @@ and tracking at the boundary. See [`docs/integration.md`](./docs/integration.md)
 
 ## Recommended settings per setup
 
-The defaults target the CAVE: **one tracked listener roaming the array.** Change the
-setup and the right settings change with it, mostly because a *sweet spot* either
-exists or it doesn't. These are starting points. A/B them by ear in the playground.
-The calibration commands behind the last row are under
-[One array, several audiences](#calibrate-bwa_calib_view).
-
-| | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
-|---|---|---|---|---|
-| profile | `cave` | `cave` | `cave` | `cave_sim` (verify the array) / `binaural` (best headphone render) |
-| panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP** | any (DBAP) |
-| tracking | `bwa_tracker_connect` | none - listener sits at the seat | track the main occupant + `bwa_set_extra_listeners` for the rest | push head pose, or track |
-| dual-band | off | **on** | off | your call (A/B it) |
-| calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
-| bed decoder | AllRAD (default); A/B EPAD | AllRAD | AllRAD; A/B EPAD | either |
-
-**Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
-follows you instead of degrading away from a center. Leave dual-band and VBAP off:
-both sharpen the image *at a sweet spot*, and there isn't one. Use the grid for room
-correction (`bwa_calibrate --room-eq-grid rows.txt`, one placement per row). The engine
-interpolates the LF cuts at your live position and glides the biquads.
-`bwa_set_pose_prediction` (start at 20 to 40 ms, your measured motion-to-ears latency) hides
-the panning lag. `bwa_set_decorrelation` keeps wide sources from comb-filtering as you
-move. Loading a static `room_eq` layout into a moving session **fails `bwa_start`** on
-purpose: one measurement point cannot correct a roam.
-
-**Fixed seat.** Now a sweet spot exists, so spend it. Use VBAP for the sharpest image. It
-needs a cleanly triangulable array, and it falls back to DBAP if not. Use SPCAP if the
-array is uneven, or if you want a smoother, all-speaker image. Turn **dual-band on** for
-tighter bass localization, and calibrate with `--room-eq` **with the mic at the seat**.
-Don't track; set the listener pose once. If the seated listener turns their head, add
-CAP on top of dual-band: it holds the rendered interaural time difference against that
-rotation, and it reduces to the plain panner when the head faces the source.
-
-**Audience.** Panning is exact for one head and wrong for everyone else, so this is a
-compromise by construction. Track the person who matters. Hand the *other* occupants'
-positions to **`bwa_set_extra_listeners`** (up to 3): every source's gains become the
-per-speaker energy mean of the per-listener solves, so each occupant gets an image
-biased toward their own seat instead of one exact image and N wrong ones. Otherwise play
-it safe rather than sharp: DBAP, dual-band off, and no room EQ beyond `--eq` (which
-flattens the *speakers*, not the room, so it helps every seat). Raise
-`bwa_source_set_spread` on ambience: wide sources survive off-center listening far
-better than points do.
-
-**Desk.** Neither headphone profile needs a layout, Dante, or hardware beyond
-headphones. `cave_sim` renders the *same* speaker mix through virtual speakers, so
-what you hear is the array render. Use it to verify what the room will do.
-`binaural` renders sources directly at their true directions: the better *listen*,
-the wrong *probe*. Don't use either to judge timbre for the room. Load your
-headphones' AutoEq correction with `bwa_load_headphone_eq` first, or you are judging
-the headphones.
-
-**Everywhere:** the output limiter is on at -1 dBFS. Leave it on; it is speaker
-protection, not mastering. Reflections are opt-in per source. Pick one reverb bed: Steam
-Audio's (needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN
-(`bwa_fdn_config`, a designed decay: cheaper, works in no-SDK builds). Details in
-[`docs/spatialization.md`](./docs/spatialization.md) and
-[`docs/calibration.md`](./docs/calibration.md).
+The defaults target the CAVE: one tracked listener roaming the array. A fixed seat, an
+audience or a desk with headphones each want different settings, mostly because a sweet spot
+either exists or it doesn't. The per-setup table and the reasons are in
+[docs/api.md, "Recommended settings per setup"](./docs/api.md#recommended-settings-per-setup).
 
 ## Non-goals and current limitations
 
@@ -247,8 +152,9 @@ Current gaps (may change):
 ## Getting started
 
 A default build vendors nothing by hand: dr_wav, dr_flac, dr_mp3, and cJSON are fetched
-by CMake. Without the ASIO SDK you get the offline sink on Windows, and the library still
-builds and links.
+by CMake. Without the ASIO SDK the library still builds and links on Windows: the
+headphone profiles open a WASAPI device, and the array profiles fall back to the offline
+sink.
 
 ```
 cmake -S . -B build -A x64
@@ -302,8 +208,10 @@ bwa_commit(e);
 | [`docs/spatialization.md`](./docs/spatialization.md) | DBAP/SPCAP/VBAP, dual-band, binaural decode, alignment |
 | [`docs/materials.md`](./docs/materials.md) | occlusion, reflections, sound pathing |
 | [`docs/backends.md`](./docs/backends.md) | the sink contract and every device backend |
+| [`docs/backend-development.md`](./docs/backend-development.md) | backend design rationale, phases, adding and verifying a backend |
 | [`docs/integration.md`](./docs/integration.md) | the five bindings, coordinate seam |
 | [`docs/layout-schema.md`](./docs/layout-schema.md) | `cave_layout.json` format |
+| [`docs/layout-authoring.md`](./docs/layout-authoring.md) | authoring a layout with `bwa_layout_tool`, scoring and the optimizer |
 | [`docs/calibration.md`](./docs/calibration.md) | trims, EQ, acoustic and optical survey, aiming, placing the mic, room report |
 | [`docs/validation.md`](./docs/validation.md) | `bwa_validate`: grading the array's phantom images |
 | [`docs/hardware-validation.md`](./docs/hardware-validation.md) | the rig-day runbook and its pass criteria |
@@ -317,168 +225,67 @@ user documentation).
 
 ## Tools
 
-Opt-in, in workflow order (design, calibrate, audition). `bwa_layout_tool` and
-`bwa_playground` build on Windows and Linux: they are raylib plus Dear ImGui and nothing
-else. `bwa_calib_view` is a Windows-only target, because it is on the win32 and d3d11
-ImGui backend and it links the full-duplex ASIO capture. So are the capture tools
-(`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`), for the ASIO half alone.
-`bwa_speaker_survey` builds everywhere: it needs only the NatNet stream. The
-browser playground under [`bindings/web/playground/`](./bindings/web/playground/) is a port
-of `bwa_playground`'s scenes on three.js, minus the reverb bed; it is the one you can open
-without building anything.
+The tools are opt-in. Listed in workflow order: design, calibrate, grade, audition.
 
 ```
 cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON -DBWA_BUILD_CALIBRATE=ON
 cmake --build build --config RelWithDebInfo
 ```
 
+`bwa_layout_tool` and `bwa_playground` are raylib plus Dear ImGui and build on Windows and
+Linux. `bwa_calib_view` and the capture tools (`bwa_calibrate`, `bwa_validate`,
+`bwa_zylia_probe`) are Windows-only, because they run a full-duplex ASIO host.
+`bwa_speaker_survey` builds everywhere: it needs only the NatNet stream. All three GUI tools
+run their UI test suites under ctest (`--tests`), and the screenshots below come from those
+runs. Off Windows the raylib suites need a display: an X or Wayland session, or `xvfb-run`.
+
 ### Design: `bwa_layout_tool`
 
 ![bwa_layout_tool](docs/img/layout_tool.png)
 
-Authors `cave_layout.json`:
-
-- Place the speakers (4 to 64; the count control sets the array size, and the file's
-  count *is* the engine's channel count). A speaker's index is its output channel,
-  so the built-in test tone tells you which physical speaker is which.
-- Load placement constraints from `constraints.json`.
-- Shade a coverage shell by nearest-speaker gap, or by the selected panner's
-  rE-localization error. The tool computes that error with the engine's own gain solve.
-- Optionally hill-climb the positions against that error.
-- Preview a moving pink-noise source through the edited layout.
-
-Headless: `--export`, `--score`, `--optimize`.
+Authors `cave_layout.json`: place the speakers (4 to 64), identify each one by ear, shade
+coverage by the selected panner's predicted localization error, and optionally optimize
+the positions. Launch it from the build directory as `bwa_layout_tool [layout.json]`. Headless:
+`--export`, `--score`, `--optimize`. See
+[docs/layout-authoring.md](./docs/layout-authoring.md#authoring-with-bwa_layout_tool).
 
 ### Calibrate: `bwa_calib_view`
 
 ![bwa_calib_view: layout diff](docs/img/calib_view_diff.png)
 
-The Session tab walks a rig day in order: the Motive frame check, speaker positions, the
-capsule survey, live aiming, trims, verify, the room-EQ grid and validation. Each step runs the
-tested tool, writes a new file in one session folder and hands it to the next, so the plan is
-never written. It keeps one log, reopens where you left off, and marks every later step stale
-when you run an earlier one again. **simulate** rehearses the whole day with no hardware. It has
-not met the rig yet.
-
-The Capture tab runs sweep, measure, solve, and writeback (simulated, or full-duplex
-ASIO), then loads the result into a layout diff: A the
-input, B what was written. You catch a swapped channel or a bad mic placement
-before you trust the file. The mic is an omni or the ZM-1, and the tab runs the
-verify pass too, through the same measurement code as `bwa_calibrate`.
-
-Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IRs.
-The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere: a
-seconds-fast check of capsule mapping and geometry, and the capsule survey.
-The Aim tab is live aiming for the speakers you cannot see (below).
-
-![bwa_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
-
-`bwa_calibrate` is the whole pipeline headless, and `--simulate` runs every mode with
-no hardware. On the rig the ZM-1 is the only mic, and `--zylia` says so. The trims and
-verify rows also run in the Capture tab, with its ZM-1 mic:
-
-| Step | Command | What it does |
-| --- | --- | --- |
-| Aiming sheet | `--aim-sheet aim.csv` | the bearing and down-tilt each mount needs, before the boxes go up |
-| Positions | `--localize rows.txt --zylia` | every speaker, trilaterated from the ZM-1 at several placements; the first survey keeps the plan |
-| Capsule table | `--capsule-survey s.json --zylia` | the ZM-1's channel order and orientation, swept from the speakers |
-| Trims | `--zylia --trims` | delay and gain per speaker, the 19 capsules pooled into one omni-like reading |
-| Verify | `--zylia --verify` | play the trims back through the engine's output stage and flag what is off |
-| Live aiming | `--live N --zylia` | sweep one speaker over and over while someone turns and moves it to its plan |
-| Aim check | `--localize f --check-aim` | fit each box's real axis from several mic placements |
-
-`bwa_zylia_probe` is a console level meter. See
-[`docs/calibration.md`](./docs/calibration.md).
-
-**Place the mic with the tracker.** With the ZM-1 on a stand that Motive tracks, add
-`--track <body>` to any of the sweeping modes. The tool shows where the array's center is
-against the target in mm, waits until it is there and still, measures from where it
-actually is, and stops the run if the stand is bumped. `bwa_calib_view` has the same
-readout as a Placement panel on its Capture and Aim tabs. A ring of markers around the
-ZM-1's equator works: `--mount-offset ring` finds the array center from them.
-
-**Aim the boxes you cannot see.** Most of the array hangs behind the screens or
-overhead. Live aiming turns the ZM-1 into an aiming instrument: the treble tilt peaks
-when a box points at the mic, so an installer turns the box until the meter reads 0 dB
-below its peak. It measures each box against its plan, which the first survey keeps in the
-layout (`plan_position`, `plan_aim`), and says how to move it in room words: "move 12 mm
-toward room-left, 30 mm toward the front wall". For the few speakers the cameras can see, `bwa_speaker_survey` measures
-the aim and position optically from rigid bodies named `spk<N>`, and checks that
-Motive's frame is the room frame. One of those makes a good reference for aiming the
-rest.
-
-**One array, several audiences.** You survey the speaker positions once. The trims and
-EQ are relative to a reference point, so one installation can keep several calibrated
-variants of the same geometry and pick one per session
-(`bwa_desc.layout_path` + the panner):
-
-```
-bwa_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
-bwa_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
-bwa_calibrate --layout cave_layout.roaming.json --room-eq-grid grid_rows.txt    # one placement per row
-```
-
-- **Seated** (SPCAP/VBAP, fixed listener pose): trims and room correction both at the
-  seat. `--room-eq` is only valid for a listener who stays at the measurement point.
-- **Roaming** (DBAP + tracking): trims aligned at the working-volume center at
-  standing ear height, speaker-only EQ; one point can't room-correct a roam.
-- **Roaming + tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic
-  placement at a time, every row of a positions file in one run (with `--track`, each
-  row's measured position is its grid key; `--mic` still works for one placement). The
-  engine interpolates them at the live tracked position, so the correction survives a walk.
-
-Diff the variants in calib_view: identical positions, only trim and EQ differences.
-Unknown JSON fields survive recalibration, so a variant can carry its own annotation.
-Loading the seated file into a moving-listener session fails `bwa_start`. It does not
-quietly mis-correct the array.
+The calibration station for a rig day. Its Session tab runs every step in order (frame check,
+positions, capsule survey, live aiming, trims, verify, room-EQ grid, validation), each through
+the tested command-line tool, and **simulate** rehearses the whole day with no hardware.
+`bwa_calibrate` is the same pipeline headless, and `bwa_zylia_probe` is a console level meter.
+Neither has met the rig yet. See
+[docs/calibration.md, "Calibrate a rig in `bwa_calib_view`"](./docs/calibration.md#calibrate-a-rig-in-bwa_calib_view).
 
 ### Grade: `bwa_validate`
 
-Calibration fixes the array. This grades it. `bwa_validate` renders a phantom through
-the real engine core, measures where a Zylia ZM-1 says it landed, and reports the
-angular miss per direction, per panner, per listening position. Driving one speaker
-alone gives a physical source through the same chain, so the miss reads against a floor
-instead of in a vacuum, and every cell carries a comb depth beside its angle. Each live
-A/B knob is a swept axis: dual-band, CAP, the spread modes, decorrelation, the
-hole-aware floor, tracked alignment, and the SPCAP focus. `--simulate` runs the whole
-flow with no hardware. With the ZM-1 on a tracked stand, `--track` measures each listening position rather
-than trusting a typed one. Same `-DBWA_BUILD_CALIBRATE=ON` switch. See
-[`docs/validation.md`](./docs/validation.md).
+Calibration fixes the array. This grades it: it renders a phantom through the real engine
+core, measures where a Zylia ZM-1 says it landed, and reports the angular miss and the comb
+depth against a single-speaker floor. `--simulate` runs it with no hardware. Same
+`-DBWA_BUILD_CALIBRATE=ON` switch. See [docs/validation.md](./docs/validation.md).
 
 ### Audition: `bwa_playground`
 
 ![bwa_playground](docs/img/playground.png)
 
-The array sim (`cave_sim`) on headphones by default, out of the system default output
-(WASAPI on Windows). The panel's device combo lists every backend's devices, so you can
-pick an ASIO driver instead, and `--device <name or id>` does the same from the command
-line (`--list-devices` prints them). With no device at all the engine falls back to the
-null sink and keeps rendering, visual-only, live, just silent. The render picker switches
-to `binaural` (the direct per-source render, for by-ear A/Bs against the sim) or `cave`
-(the array itself over ASIO, the same harness pointed at real speakers on the rig
-machine). A headphone-EQ field loads an AutoEq correction for your headphones.
+The array sim (`cave_sim`) on headphones by default. The render picker switches to
+`binaural` or to `cave` (the real array over ASIO). Pick a device in the panel, or pass
+`--device <name or id>` (`--list-devices` prints them). With no device the engine keeps
+rendering silently, so the 3D view still shows the panner driving the speakers.
 
-The array is a generated 24-speaker dome by default: `examples/dome_24.json`, 2 m around a
-listening point 1.5 m above the floor, spread evenly over the part of the sphere above the
-floor (`tools/layout/gen_dome.py` writes it, and CMake copies it next to the exe). To audition a
-surveyed array instead, pass its file (`bwa_playground my_layout.json`) or put a
-`cave_layout.json` in the working directory. The order is: the argument, `./cave_layout.json`,
-the dome, then the engine's built-in 26-speaker grid. The startup line says which one loaded.
-The web and Godot playgrounds default to the same dome.
+The layout comes from, in order: the argument (`bwa_playground my_layout.json`),
+`./cave_layout.json`, the generated 24-speaker dome (`examples/dome_24.json`, copied next to
+the exe), then the built-in 26-speaker grid. The startup line says which one loaded. The web
+and Godot playgrounds default to the same dome.
 
-Scenes: localization, occlusion + materials, directivity, channel walk,
-reverb bed, an underwater medium boundary (live FDN retune, speed of sound,
-the Lloyd's-mirror surface bounce), and a blind A/B/X comparison over single
-engine knobs (dual-band, panner choice, spread, air absorption) scored with a
-binomial p-value. The 3D speakers shade by their live output level (mirrored as a
-meter strip in the panel), so you can watch the panner drive the array even with no
-audio device. The playground draws a `constraints.json` next to the exe for
-orientation: the same room boxes the layout tool edits against. The Godot addon ships
-a port of it, so the demo installs with the binding.
-
-All three GUI tools run their UI test suites under ctest (`--tests`). The screenshots
-above come from those runs. Off Windows the two raylib suites need a display: an X or
-Wayland session, or run ctest under `xvfb-run`.
+Scenes: localization, occlusion and materials, directivity, channel walk, reverb bed, an
+underwater medium boundary, and a blind A/B/X knob comparison scored with a binomial
+p-value. The Godot addon ships a port. The browser playground under
+[`bindings/web/playground/`](./bindings/web/playground/) ports the scenes to three.js, minus
+the reverb bed, and needs no build.
 
 ## Platforms and licensing
 

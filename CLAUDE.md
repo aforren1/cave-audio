@@ -207,7 +207,7 @@ src/
                          render in process(), both lost to rendering in process() because a Worker has
                          no priority (descheduled mid-render for 40 to 200 ms on a busy laptop, and
                          holding the non-reentrant render when a rescue was needed). The slack for a
-                         slow render is the BROWSER's output buffer; docs/backends.md has the table.
+                         slow render is the BROWSER's output buffer; NOTES.md has the table.
                          VERIFIED in headless Chrome (bindings/web/tests/run-browser.mjs, the
                          `web_browser` ctest): worklet:1 renders at the audio clock and the
                          suspend/resume handoff flips device_lost both ways. Nobody has LISTENED
@@ -525,7 +525,7 @@ bindings/
                        bw_audio is a thin Pythonic layer over it (Engine context manager, Sound /
                        Source / PushSource / Bed / Listener, exceptions from bwa_result). The one
                        EXCLUSION is bwa_set_output_capture — its callback runs on the audio thread
-                       and an interpreter must never run there (invariant 1, and docs/backends.md
+                       and an interpreter must never run there (invariant 1, and docs/backend-development.md
                        says so for this binding by name); the manual sink + render_block is the
                        offline path, handing back a READ-ONLY numpy view of the engine's own planar
                        buffer with no copy. The GIL is released around the blocking/IO calls and
@@ -628,7 +628,7 @@ third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-aud
 ## Build
 
 Target: **Windows** is production (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
-Linux is a second host: JACK and ALSA are device backends there (docs/backends.md phase 5).
+Linux is a second host: JACK and ALSA are device backends there (docs/backend-development.md phase 5).
 **Android** is a third: AAudio is a device backend there (phase 3), stereo only, cross-built with
 the NDK against API 26 or later - `tools/android/run-tests.ps1` runs the suite on a device or
 emulator, and docs/build.md's "Android" section has the toolchain. CI cross-builds both ABIs in its
@@ -1220,7 +1220,7 @@ comparison + rationale is `docs/materials.md` → "Choosing an acoustics path"):
 - **Steam scene** (`steam_scene.c`) for occlusion + directivity + pathing — ray tracing
   earns its keep; the manual path needs the game to already know the answer.
 - **ISM** (`ism.c`) for early reflections — the Steam bed is listener-CENTRIC (one field
-  around one point, 30 Hz) so its reflections have no parallax; the ISM pans each bounce
+  around one point, 12 Hz) so its reflections have no parallax; the ISM pans each bounce
   as a point source through the listener-relative panner, per block. That is the engine's
   own thesis applied to reflections. Cost: O(N) in sources vs the bed's O(1) — opt in on
   the few that matter.
@@ -1266,16 +1266,20 @@ freely. It still follows the US English rule above.
   binding as built, the "main" topology deviation and its ways out, phonon under wasm and its
   exception-model residue, GitHub Pages hosting through the service worker, the playground and XR
   pages, and the list of what a browser has never run. Live at aforren1.github.io/cave-audio.
-- `docs/backends.md` — the sink contract + the backends beside ASIO. WASAPI (Windows), JACK + ALSA
-  (Linux) are IMPLEMENTED; CoreAudio and AAudio are still spec.
-  The 10-rule sink contract (fixed quantum, timestamp pair, health, exact-rate policy), the fixed-quantum
-  adapter, the OS shim inventory, the ABI bump (enum, `bwa_desc.device`, device query), AUTO order, phases.
-  Linux reaches the array via AES67 into the Dante net (or a multichannel card); JACK is the Linux production
-  backend (runs on PipeWire via pipewire-jack), ALSA the no-server path. Goals per platform up top: Windows +
-  Android = dev ease + reach for head-mounted VR games; Mac = dev ease; Linux = future rig alternative + seated
-  headphone experiments (Psychtoolbox/PsychoPy, live or offline via the manual sink).
+- `docs/backends.md` — the backend REFERENCE: the 10-rule sink contract (fixed quantum, timestamp pair,
+  health, exact-rate policy), the shared pieces (sink_convert, the fixed-quantum adapter, the OS shim
+  inventory), the ABI (enum, `bwa_desc.device`, device query, AUTO order), per-backend notes, CMake, tests.
+  ASIO, WASAPI, JACK, ALSA, AAudio and the Worklet sink are IMPLEMENTED; CoreAudio (phase 4) is still spec.
+- `docs/backend-development.md` — the backend EXPLANATION + contributor how-to: why (goals per platform:
+  Windows + Android = dev ease + reach for head-mounted VR games; Mac = dev ease; Linux = future rig
+  alternative + seated headphone experiments from Psychtoolbox/PsychoPy), scope (Linux reaches the array
+  via AES67 into the Dante net, JACK the production Linux backend, ALSA the no-server path), what stays
+  fixed, design decisions per backend, the planned CoreAudio sink, phases, the next-backend checklist,
+  deferred follow-ups, and the verify-on-hardware list.
 - `docs/profiling.md` — Tracy instrumentation (`BWA_TRACY`), the headless benches (`profile_bench`/`bench_situations`), real-time scheduling + memory notes.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
+- `docs/layout-authoring.md` — authoring a layout with `bwa_layout_tool` (how-to first), then how the
+  scoring, observer model, conditions, guard and optimizer work. layout-schema.md is the pure file reference.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
 - `docs/validation.md` — `bwa_validate`: render a phantom, measure where it landed. The Zylia
   intensity/integrity/SRP/comb-depth estimators, the solve-position-versus-mic-position seam, the

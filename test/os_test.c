@@ -1,7 +1,7 @@
 /*
  * os_test.c — the OS portability shim (src/os/os.h) and the seqlock built on top of it (src/tracking/pose.h).
  *
- * Why this exists: phase 2 of docs/backends.md moved every Win32 call the engine made outside the
+ * Why this exists: phase 2 of docs/backend-development.md moved every Win32 call the engine made outside the
  * sinks behind one seam, and rewrote pose.h's seqlock from Interlocked intrinsics onto C11 atomics.
  * The rest of the suite exercises the shim only INCIDENTALLY (every threaded test sleeps), so a
  * broken sleep or a torn pose would show up as a confusing failure somewhere else. Here it shows up
@@ -165,7 +165,7 @@ static void deadline_section(void) {
      * to lose. The only Apple measurement anyone here has is a virtualized CI runner, so a tight
      * number would be tuned to one sample of one machine. What this catches is a hang, or the
      * 100 ms-class coalescing the time-constraint policy is there to prevent. Run test_os on a
-     * physical Mac and tighten it (docs/backends.md, the verify list). */
+     * physical Mac and tighten it (docs/backend-development.md, the verify list). */
     CHECK(p50 < 20.0, "os_sleep_until_ns median lateness under 20 ms (Apple: coalescing bound)");
     CHECK(p99 < 50.0, "os_sleep_until_ns p99 lateness under 50 ms (Apple: coalescing bound)");
 #else

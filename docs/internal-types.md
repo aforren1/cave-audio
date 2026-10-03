@@ -30,8 +30,8 @@ concurrency.md).
 
 ## DSP state (audio thread owns)
 
-`Voice` (rt.c) is ~50 fields. The protocol core, the fields the concurrency
-doc's snapshot logic manipulates:
+`Voice` (rt.c) is large: well over 100 fields once every feature's state is counted.
+The protocol core, the fields the concurrency doc's snapshot logic manipulates:
 
 ```c
 typedef struct {
@@ -53,7 +53,7 @@ typedef struct {
     float    gtarget[BWA_CHANNELS]; /* panner solve output (per-speaker target gains) */
     float    gcur[BWA_CHANNELS];    /* ramp state; mix_voice interpolates gcur -> gtarget */
 
-    /* ... ~35 more fields; groups below ... */
+    /* ... the per-feature groups below ... */
 } Voice;
 ```
 
@@ -74,16 +74,17 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 - **scheduling / streaming**: `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
   `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`),
-  `loop_beg`/`loop_end` (the play region: `bwa_source_play_loop` sets it at play time and
-  `bwa_source_set_region` sets it later, and both resolve against the asset the same way, at
-  `CMD_PLAY` and `CMD_SET_REGION`; 0/0 = whole clip. At `loop_end` the mix seam hands `cursor` to
-  `loop_wrap` on a looping voice, which folds the overshoot by modulo and posts `EVT_VOICE_LOOPED`
-  per wrap, and ends a non-looping one. `mix_voice` and both `mix_bed` renderers share that helper,
-  so the two mixers answer one `bwa_source_set_region` the same way), `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
+  `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
   `rt_render` fires the one-block fade once the block reaches `stop_at`),
   `queue`/`queue_loop`/`queue_head`/`queue_len` (the gapless chain FIFO, depth `BWA_QUEUE`;
   entries are resolved `SoundData*` like `sound`, so `CMD_SOUND_RETIRE` NULL-tombstones any
   it frees; `mix_voice` pops the next valid entry at a non-looping end instead of stopping).
+- **play region**: `loop_beg`/`loop_end`, 0/0 = whole clip. `bwa_source_play_loop` sets
+  it at play time and `bwa_source_set_region` sets it later. Both resolve against the asset
+  the same way, at `CMD_PLAY` and `CMD_SET_REGION`. At `loop_end` a looping voice hands
+  `cursor` to `loop_wrap`, which folds the overshoot by modulo and posts `EVT_VOICE_LOOPED`
+  per wrap. A non-looping voice ends there. `mix_voice` and both `mix_bed` renderers share
+  that helper, so both mixers answer one `bwa_source_set_region` the same way.
 - **direct output-channel route**: `out_ch_on` / `out_ch` (`bwa_source_set_channel`). The enable
   is a separate byte so the voice-create memset leaves routing off, which a signed index whose zero
   meant "channel 0" would not. `compute_gains` installs a one-hot vector instead of the panner's
@@ -92,13 +93,13 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
 - **occlusion / directivity**: `occ_cur`, `dir_cur` ramp state plus the
-  3-band transmission-EQ biquad state (`eqg_cur`, `eq_co`, DF-I histories,
-  `eq_engaged`). The published *targets* live in `RtCore`'s atomic arrays, not
-  here (see below).
+  3-band transmission-EQ biquad state `eq`, a `VoiceEq` (`g_cur`, `co`, DF-I
+  histories, `engaged`). The published *targets* live in `RtCore`'s atomic arrays,
+  not here (see below).
 - **reflection send**: `refl_send`, `refl_dist`, `refl_gain`, `refl_g_cur`
   (ramped effective send gain).
 - **pathing**: `path_on`, `path_sh_cur` (ramped SH coefficients), and a
-  second, structurally identical bending-loss EQ state (`path_eq*`).
+  second `VoiceEq` for the bending-loss tilt (`path_eq`).
 - **propagation**: `air_on` / `air_a_cur` / `air_y1` (air-absorption
   low-pass), `dop_on` / `dop_init` / `dop_delay` / `dop_dtgt` / `dop_w`
   (Doppler fractional-delay line), `spread` (source angular width).
@@ -111,11 +112,14 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 typedef struct {
     float p_pending[3], q_pending[4];   /* written by CMD_SET_LISTENER */
     float p_active[3],  q_active[4];    /* promoted on CMD_COMMIT */
+    float   ex_pending[BWA_EXTRA_LIS][3], ex_active[BWA_EXTRA_LIS][3];   /* extra listeners */
+    uint8_t nex_pending, nex_active;    /* how many extra listeners are set */
 } Listener;
 ```
 
-The position drives the panners. The quaternion drives the binaural monitor, and
-the reflection/pathing taps receive it too. With a tracker connected,
+The position drives the panners. The extra listeners feed the compromise solve
+(`bwa_set_extra_listeners`). The quaternion drives the binaural monitor and CAP,
+and the reflection/pathing taps receive it too. With a tracker connected,
 `rt_render` overwrites the active fields from the tracker's seqlock each block.
 
 ## Sound (control thread owns; audio thread only reads via const*)
@@ -140,6 +144,7 @@ typedef struct {
     uint16_t  gen;           /* generation for the sound handle */
     uint8_t   inuse;
     uint8_t   retiring;      /* unload requested; awaiting EVT_SOUND_RETIRED before free */
+    uint8_t   pending;       /* reserved for an async load: live handle, empty data, no bind may use it */
 } SoundSlot;
 ```
 
@@ -159,7 +164,9 @@ See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
 while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
 channel count. The loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
 complete `0..count-1` permutation. A layout with fewer than `BWA_CHANNELS` speakers
-leaves the tail `speakers[]` entries unused (harmless: `count` gates every consumer). From [`src/core/layout.h`](../src/core/layout.h):
+leaves the tail `speakers[]` entries unused (harmless: `count` gates every consumer).
+Abridged from [`src/core/layout.h`](../src/core/layout.h) (the SPCAP defaults, the tracked
+room-EQ grid and the directivity model are left out):
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */
@@ -180,7 +187,7 @@ typedef struct {
 typedef struct {
     Speaker  speakers[BWA_CHANNELS];   /* capacity; only `count` are real */
     uint32_t count;                /* 4..BWA_CHANNELS - and it IS the engine's channel count */
-    float    ref[3];               /* nominal listening point = the array centroid */
+    float    ref[3];               /* nominal listening point: `listening_point_m`, else the array centroid */
     float    rolloff_r;            /* DBAP spatial blur (meters) */
     /* distance attenuation: atten = clamp((ref/max(d,ref))^rolloff, min_lin, 1) */
     float    atten_ref_m, atten_rolloff, atten_min_lin;
@@ -211,7 +218,7 @@ struct bwa_engine {                /* abridged; see engine.c */
     Layout      layout;          /* effective geometry; layout.count IS the channel count */
     bwa_sink*     sink;            /* primary device (cave: layout.count ch / binaural: 2 ch) */
     bwa_sink*     sink_mon;        /* both: the monitor (2-ch) device */
-    float*      scratch26;       /* binaural: array render before the monitor decode */
+    float*      scratch26;       /* binaural/cave_sim: array render before the monitor decode */
     float*      mon_buf[2];      /* both: stereo double-buffer, array -> monitor thread */
     NatNet*     tracker;         /* internal tracking (bwa_tracker_connect); NULL otherwise */
     SteamMonitor* steam;         /* production HRTF decode; NULL = simple-pan fallback */
@@ -222,7 +229,8 @@ struct bwa_engine {                /* abridged; see engine.c */
 
 There is no bus field in either struct. The bus is a `float* bus` **argument**
 to `rt_render`. Whichever sink render callback is running supplies it per block:
-the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
+the device's own buffer for `cave` and `cave_both`, `scratch26` for `binaural` and
+`cave_sim`. (`scratch26` is
 allocated at the `BWA_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
 
 ### Also lives in RtCore
@@ -255,8 +263,8 @@ reference):
 
 ## Helper signatures (implemented in `src/`)
 
-Everything marked *(audio)* MUST obey invariant 1 (no alloc/lock/syscall/I/O);
-see [`CLAUDE.md`](../CLAUDE.md).
+Everything marked *(audio)* runs on the audio thread and must not allocate, lock,
+make a syscall, or do I/O; see [`concurrency.md`](./concurrency.md).
 
 ```c
 /* rings (rt.c; static) */
@@ -286,10 +294,11 @@ reflection aux-send buffer. `align_process` takes the `Aligner`, not the engine.
 Two things that are *not* helpers here:
 
 - **The headphone decode** is a sink render callback in engine.c
-  (`render_binaural` → `monitor_process` / `steam_monitor_process`, with the
-  `binaural` profile's direct SH field read via `rt_direct_ambi` on the same
-  thread), not a bus tap. The engine creates Steam Audio's phonon objects at
-  `bwa_start`, and the decode runs inside the sink render callback.
+  (`render_binaural` → `arraysim_apply` in `cave_sim` → `monitor_process` /
+  `steam_monitor_process`, with the `binaural` profile's direct SH field and point
+  taps read via `rt_direct_ambi` / `rt_direct_voices` on the same thread), not a bus
+  tap. The engine creates the Steam scene at `bwa_create` and the HRTF monitor at
+  `bwa_start`; the decode runs inside the sink render callback.
 - **Device output** goes through the `bwa_sink` abstraction
   ([`src/sink/sink.h`](../src/sink/sink.h)), whose render callback fills the device's
   planar buffers directly.

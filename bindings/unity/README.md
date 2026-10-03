@@ -4,8 +4,9 @@ Unity **control client** for the bw_audio spatial-audio engine. Unity is a *thin
 control (source positions, triggers, listener pose) over the engine's C ABI. **No audio crosses the
 boundary.** The engine renders the CAVE's speaker array (24 to start) over ASIO/Dante and a binaural monitor.
 
-This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours - a scene manager
-(`Engine`) and a positional emitter (`Emitter`) - and the coordinate seam (`Room`).
+This is a UPM package: a verified P/Invoke layer (`Bwa`), the coordinate seam (`Room`), and
+MonoBehaviours built around two of them - a scene manager (`Engine`) and a positional emitter
+(`Emitter`).
 
 ## Replacing Unity audio (mental model)
 
@@ -87,8 +88,8 @@ built, root-level copy of the package to it. Against a working tree, use a local
 
 The package has a headless PlayMode suite in `test~/`, wired into ctest as `unity_playmode`. It runs
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
-it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is skipped, because Unity is
-not a build dependency. See
+it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
+Unity is not a build dependency. See
 [docs/integration.md → Tests](../../docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
 ignores any folder whose name ends in `~`.
@@ -97,58 +98,6 @@ ignores any folder whose name ends in `~`.
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
 > [`docs/build.md`](../../docs/build.md) for the proprietary-ASIO alternative.
-
-## Releasing (maintainers)
-
-The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](../../docs/build.md#releasing). This is the Unity-package view of it.
-
-**The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
-
-To cut a release, fill in the CHANGELOG's `[Unreleased]` section, then run the helper. The helper
-rolls that heading to the version, commits, and creates the matching annotated tag:
-
-```
-powershell -File tools/release.ps1 0.3.0            # roll CHANGELOG, commit, tag v0.3.0 (no push)
-powershell -File tools/release.ps1 0.3.0 -DryRun    # preview the roll; change nothing
-powershell -File tools/release.ps1 0.3.0 -Push      # ...and push, which triggers the CI release
-```
-
-**The tag is the version.** CI stamps it into the packaged `package.json`, so there's no manifest
-field to bump and nothing to keep in sync. The committed `version` stays `0.0.0-dev`, the honest value
-for an unreleased checkout. Prefer `git tag v0.3.0` by hand? That works too; the helper just also does
-the CHANGELOG roll. CI packs on *every* run, so a broken package fails the build rather than the
-release. On a tag it also creates the Release with the stamped version.
-
-A release carries four assets. **Two matter here**: this package
-(`com.brainworks.bw_audio-<ver>.tgz`) and the engine on its own (`bw_audio-win64-<tag>.zip` -
-dll/lib/header/tools, for C/C++ consumers and the CAVE machine). The other two are the Godot addon
-and the ASIO SDK corresponding source. See
-[docs/build.md](../../docs/build.md#continuous-integration) for the full breakdown.
-
-Locally:
-
-```
-cmake --build build --config RelWithDebInfo         # produces the DLLs
-powershell -File tools/upm/pack.ps1                 # -> dist/com.brainworks.bw_audio-<version>.tgz
-```
-
-Without a `-Version`, the local pack derives its version from `git describe`, for example
-`0.2.0-dev.32.gcf83c8e` (32 commits past `v0.2.0`). A dev tarball is therefore traceable to a commit
-instead of a flat placeholder. Pass `-Version` (or let CI pass the tag) for a release build.
-
-Two things that will bite if forgotten:
-
-- **New file in the package? Run `tools/upm/gen-meta.ps1`.** Every asset must ship a committed `.meta`,
-  or its GUID is regenerated per-project and scenes lose their script references. `pack.ps1` refuses to
-  build a tarball with one missing.
-- **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.** Every UPM registry
-  that could ever serve this speaks the npm protocol, and keys on a single publishable tarball. One
-  `.tgz` per release keeps that door open at zero cost.
-
-Not on a registry, and deliberately so: this drives one specific CAVE, so the audience is
-people who already have the repo. A tarball costs them one click. The tarball *is* the artifact a
-registry would serve, so listing it later is a config change, not a rebuild.
 
 ## Assets under StreamingAssets
 
@@ -280,7 +229,7 @@ not scene configuration, so it is not serialized.
 
 When the audio isn't a file but something you **generate** - a software synth, an engine model, a
 network voice stream - add a **`PushEmitter`** instead of an `Emitter` and feed it mono float PCM at
-`Engine.SampleRate`. It's a full positional source: position, gain, spread, occlusion, reflections,
+`Engine.sampleRate`. It's a full positional source: position, gain, spread, occlusion, reflections,
 Doppler, groups and fades all work, and ride the same centralized push. The only difference from
 `Emitter` is *where the samples come from*. There's no clip, and the engine **refuses**
 play / seek / pitch / queue on a push voice, so those members simply aren't here. Godot splits
@@ -319,7 +268,7 @@ public sealed class SineFeeder : MonoBehaviour
 Feed from Unity's **main thread**, like every other `bw_audio` call. Generate on a worker thread if
 you must, but hand the finished buffers to `Push` from `Update`/`LateUpdate`.
 
-## Acoustic geometry & materials (authoring)
+## Acoustic geometry and materials (authoring)
 
 Occlusion and reflections need the room's geometry. Two ways to author it, both **load-time**:
 
@@ -345,7 +294,7 @@ single X mirror (`Room` does it in one place - Unity identity rotation maps to r
 Set `Room.UnityToRoom` once from your CAVE registration (the rigid transform mapping Unity world →
 the physical room origin/axes). **Getting this wrong silently swaps front/back or left/right.**
 
-## Threading & lifecycle notes
+## Threading and lifecycle notes
 
 - All calls come from Unity's **main thread**; per-frame calls are non-blocking (they enqueue onto an
   SPSC ring). `bwa_create`/`bwa_start`/`bwa_load_*` allocate/do I/O - they run once at startup.
@@ -382,3 +331,56 @@ peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one 
 checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
 for the rest.
+
+## Maintainers
+
+### Releasing (maintainers)
+
+The canonical whole-repo release process (version model, steps, dev versions) lives in
+[docs/build.md → Releasing](../../docs/build.md#releasing). This is the Unity-package view of it.
+
+**The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
+
+To cut a release, fill in the CHANGELOG's `[Unreleased]` section, then run the helper. The helper
+rolls that heading to the version, commits, and creates the matching annotated tag:
+
+```
+powershell -File tools/release.ps1 0.3.0            # roll CHANGELOG, commit, tag v0.3.0 (no push)
+powershell -File tools/release.ps1 0.3.0 -DryRun    # preview the roll; change nothing
+powershell -File tools/release.ps1 0.3.0 -Push      # ...and push, which triggers the CI release
+```
+
+**The tag is the version.** CI stamps it into the packaged `package.json`, so there's no manifest
+field to bump and nothing to keep in sync. The committed `version` stays `0.0.0-dev`, the honest value
+for an unreleased checkout. Prefer `git tag v0.3.0` by hand? That works too; the helper just also does
+the CHANGELOG roll. CI packs on *every* run, so a broken package fails the build rather than the
+release. On a tag it also creates the Release with the stamped version.
+
+**Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
+Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
+and the CAVE machine). See [docs/build.md](../../docs/build.md#continuous-integration) for the
+rest.
+
+Locally:
+
+```
+cmake --build build --config RelWithDebInfo         # produces the DLLs
+powershell -File tools/upm/pack.ps1                 # -> dist/com.brainworks.bw_audio-<version>.tgz
+```
+
+Without a `-Version`, the local pack derives its version from `git describe`, for example
+`0.2.0-dev.32.gcf83c8e` (32 commits past `v0.2.0`). A dev tarball is therefore traceable to a commit
+instead of a flat placeholder. Pass `-Version` (or let CI pass the tag) for a release build.
+
+Two things that will bite if forgotten:
+
+- **New file in the package? Run `tools/upm/gen-meta.ps1`.** Every asset must ship a committed `.meta`,
+  or its GUID is regenerated per-project and scenes lose their script references. `pack.ps1` refuses to
+  build a tarball with one missing.
+- **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.** Every UPM registry
+  that could ever serve this speaks the npm protocol, and keys on a single publishable tarball. One
+  `.tgz` per release keeps that door open at zero cost.
+
+Not on a registry, and deliberately so: this drives one specific CAVE, so the audience is
+people who already have the repo. A tarball costs them one click. The tarball *is* the artifact a
+registry would serve, so listing it later is a config change, not a rebuild.

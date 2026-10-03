@@ -3,7 +3,7 @@
 How the speaker array (24 in the CAVE) is surveyed, trimmed, and characterized at install time, and
 how those numbers reach the engine. The tool is `bwa_calibrate` (`examples/calibrate.cpp`, opt-in
 `-DBWA_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
-`calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`). The ASIO
+`calib.c`. All of it is unit-tested off-hardware (the `measure` and `calib` ctests). The ASIO
 full-duplex capture is the only part that needs the rig. Terms used here without definition are in
 [glossary.md](./glossary.md).
 
@@ -21,12 +21,20 @@ layouts with different speaker counts rather than mis-compare them.
 - **`bwa_calibrate`**, *survey + tuning*: measures positions acoustically, and the per-speaker
   delay/gain trims, into the same `cave_layout.json`.
 
-Bring-up order: `calibrate --aim-sheet` (before the boxes go up) → `layout_tool` (channel map) →
-`bwa_speaker_survey --require-frame` (Motive's frame) → `calibrate --localize --zylia` (positions) →
-`calibrate --capsule-survey` (the ZM-1's capsule table) → `calibrate --live N --zylia` (aim the hidden
-boxes) → `calibrate --zylia --trims --room` (trims and the room report) → `calibrate --verify` from
-the same placement → `calibrate --room-eq-grid rows.txt`. Then the engine loads the layout. The
-rig-day procedure, with pass criteria: [hardware-validation.md](./hardware-validation.md).
+Bring-up order:
+
+1. `calibrate --aim-sheet`, before the boxes go up.
+2. `layout_tool`: the channel map.
+3. `bwa_speaker_survey --require-frame`: Motive's frame.
+4. `calibrate --localize --zylia`: the positions.
+5. `calibrate --capsule-survey`: the ZM-1's capsule table.
+6. `calibrate --live N --zylia`: aim the hidden boxes.
+7. `calibrate --zylia --trims --room`: the trims and the room report.
+8. `calibrate --verify`, from the same placement.
+9. `calibrate --room-eq-grid rows.txt`.
+
+Then the engine loads the layout. The rig-day procedure, with pass criteria:
+[hardware-validation.md](./hardware-validation.md).
 
 **Keep one file.** What the layout tool saves is the plan. The first survey that writes
 positions copies the plan into each speaker's `plan_position` and `plan_aim` before it overwrites
@@ -35,6 +43,100 @@ plan and the as-built from then on, the engine renders the as-built, and live ai
 plan. The rule: [layout-schema.md](./layout-schema.md#plan-versus-as-built). The Session tab is
 the one exception: it never writes the plan file, and each step writes a new file in the session
 folder instead (see "The rig-day session" below). Its `as_built.json` carries the plan the same way.
+
+## Calibrate a rig in `bwa_calib_view`
+
+![bwa_calib_view: layout diff](./img/calib_view_diff.png)
+
+`bwa_calib_view` (opt-in `-DBWA_BUILD_CALIBVIEW=ON`) is the calibration station: one window for
+the rig day. This is the short path. Each step links to the section that explains it.
+
+1. **Open the Session tab.** Type a folder for the day and press **New**. Fill in the inputs: the
+   plan layout, the localize rows, the grid rows, the ASIO driver, the first ZM-1 input, the
+   temperature, the stand's rigid body and Motive's IP. Tick **simulate** to rehearse the whole
+   day with no hardware. The tab has not met the rig yet.
+2. **Press Run on each step, in order**: the Motive frame check, speaker positions, the capsule
+   survey, live aiming, trims, verify, the room-EQ grid and validation. Each step runs the tested
+   tool, writes a new file in the session folder and hands it to the next. The plan is never
+   written. The tab keeps one log, reopens where you left off, and marks every later step stale
+   when you run an earlier one again. See
+   [The rig-day session](#the-rig-day-session-bwa_calib_view-session-tab).
+3. **Place the ZM-1 with the tracker.** With the ZM-1 on a stand that Motive tracks, every
+   sweeping step shows where the array's center is against the target in mm, waits until it is
+   there and still, measures from where it actually is, and stops the run if the stand is bumped.
+   The Capture and Aim tabs show the same readout as a Placement panel. A ring of markers around
+   the ZM-1's equator works: `--mount-offset ring` finds the array center from them. See
+   [Placing the ZM-1 with the tracker](#placing-the-zm-1-with-the-tracker---track).
+4. **Aim the boxes you cannot see** in the Aim tab. Most of the array hangs behind the screens or
+   overhead. The treble tilt peaks when a box points at the mic, so the installer turns the box
+   until the meter reads 0 dB below its peak. The tab measures each box against its plan
+   (`plan_position`, `plan_aim`) and says how to move it in room words: "move 12 mm toward
+   room-left, 30 mm toward the front wall". For the few speakers the cameras can see,
+   `bwa_speaker_survey` measures the aim and position from rigid bodies named `spk<N>` and checks
+   that Motive's frame is the room frame. One of those makes a good aiming reference. See
+   [Live aiming](#live-aiming---live-n---zylia-the-aim-tab) and
+   [Optical speaker check](#optical-speaker-check-bwa_speaker_survey).
+5. **Review before you trust the file.** Load the plan and the result as A and B in the Diff tab
+   (or `bwa_calib_view plan.json grid.json`). A swapped channel or a bad mic placement shows at a
+   glance. See [Reviewing the results](#reviewing-the-results-bwa_calib_view).
+
+The other tabs:
+
+- **Capture** runs sweep, measure, solve and writeback (simulated, or full-duplex ASIO) outside a
+  session, then loads the result into the Diff tab: A the input, B what was written. The mic is an
+  omni or the ZM-1. It runs the verify pass too, through the same measurement code as
+  `bwa_calibrate`.
+- **Array**, **Trims**, **EQ** and **IRs** show the array in 3D, the gain and delay trims, the
+  correction-EQ curves and the retained IRs.
+- **Zylia** shows clap direction of arrival on the ZM-1's capsule sphere: a seconds-fast check of
+  the capsule mapping and geometry. It also runs the clap capsule survey.
+- **Aim** is live aiming (step 4).
+
+![bwa_calib_view: Zylia tab](./img/calib_view_zylia.png)
+
+### The same steps, headless
+
+`bwa_calibrate` is the whole pipeline headless, and `--simulate` runs every mode with no hardware.
+On the rig the ZM-1 is the only mic, and `--zylia` says so. The trims and verify rows also run in
+the Capture tab, with its ZM-1 mic. `bwa_zylia_probe` is a console level meter.
+
+| Step | Command | What it does |
+| --- | --- | --- |
+| Aiming sheet | `--aim-sheet aim.csv` | the bearing and down-tilt each mount needs, before the boxes go up |
+| Positions | `--localize rows.txt --zylia` | every speaker, trilaterated from the ZM-1 at several placements; the first survey keeps the plan |
+| Capsule table | `--capsule-survey s.json --zylia` | the ZM-1's channel order and orientation, swept from the speakers |
+| Trims | `--zylia --trims` | delay and gain per speaker, the 19 capsules pooled into one omni-like reading |
+| Verify | `--zylia --verify` | play the trims back through the engine's output stage and flag what is off |
+| Live aiming | `--live N --zylia` | sweep one speaker over and over while someone turns and moves it to its plan |
+| Aim check | `--localize f --check-aim` | fit each box's real axis from several mic placements |
+
+Add `--track <body>` to any sweeping mode to place the mic with the tracker (step 3).
+
+### One array, several audiences
+
+You survey the speaker positions once. The trims and EQ are relative to a reference point, so one
+installation can keep several calibrated variants of the same geometry and pick one per session
+(`bwa_desc.layout_path` plus the panner). `--eq` and `--room-eq` need an omni mic: the ZM-1
+refuses them.
+
+```
+bwa_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
+bwa_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
+bwa_calibrate --layout cave_layout.roaming.json --room-eq-grid grid_rows.txt    # one placement per row
+```
+
+- **Seated** (SPCAP or VBAP, fixed listener pose): trims and room correction both at the seat.
+  `--room-eq` is valid only for a listener who stays at the measurement point.
+- **Roaming** (DBAP plus tracking): trims aligned at the working-volume center at standing ear
+  height, speaker-only EQ. One point cannot room-correct a roam.
+- **Roaming plus tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic placement at
+  a time, every row of a positions file in one run. With `--track`, each row's measured position
+  is its grid key; `--mic` still works for one placement. The engine interpolates the cuts at the
+  live tracked position, so the correction survives a walk.
+
+Diff the variants in `bwa_calib_view`: identical positions, only trim and EQ differences. Unknown
+JSON fields survive recalibration, so a variant can carry its own annotation. Loading the seated
+file into a moving-listener session fails `bwa_start`. It does not quietly mis-correct the array.
 
 ## How it measures (exponential sweep + deconvolution)
 
@@ -78,18 +180,14 @@ phantom error term rather than a physical-source one, which is exactly what make
 
 **Speakers that fire over the screen top are a different population.** In a CAVE the ceiling band
 clears the screen edge while every wall speaker fires through fabric. If the over-screen speakers run
-even 1 to 2 dB hot in band, phantom images pull upward. The collaborators' 24-speaker array has that
-split and measured that signature, a median +12° of upward elevation displacement, which the paper
-attributes to speaker density. Both mechanisms push the same way, so their data cannot separate them.
-Calibrating through the screens is what keeps the two populations comparable. Check it directly:
+even 1 to 2 dB hot in band, phantom images pull upward. A 24-speaker array with that split has
+shown that signature (a median +12° of upward elevation displacement). Calibrating through the screens is what keeps the two populations comparable. Check it directly:
 split the per-speaker levels by whether the path crosses a screen, and compare.
 
 ## Sweep quality: the window, the SNR floor, the re-sweep
 
 A sweep cannot tell its own sound from a cough, a door, a projector fan spinning up, or a person
-talking. Each speaker used to be swept once, and the arrival was the strongest tap anywhere in the
-IR. One loud event during a sweep could move a level, an EQ band, or, rarely, the arrival, and
-nothing said so.
+talking. One loud event during a sweep can move a level, an EQ band, or, rarely, the arrival.
 
 But every sweep is the tool's own. It knows when the sweep plays, and roughly when each speaker's
 sound must arrive: the system latency plus the distance over c. Every mode that sweeps uses that.
@@ -280,7 +378,7 @@ it. Do not expect it to be audible.
 
   The solved latency gets a free sanity check: at open, the capture shell logs the driver's own
   `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; the Digiface reports its Dante
-  buffering there). After the solve the CLI prints solved-vs-driver with the residual. The
+  buffering there). After the solve the CLI prints the solved latency against the driver's, with the residual. The
   residual is what the driver *can't* see, so it is positive. **Negative is physically impossible**
   (wrong device, sample-rate mismatch), with either mic. How large is fine depends on the mic:
   - An omni: the residual is DAC/ADC conversion and analog, a few ms. Over 20 ms the run warns:
@@ -320,47 +418,49 @@ it. Do not expect it to be audible.
   surfaces that throw early reflections smear localization. If the room is too live, **treat it
   physically**: you cannot DSP reverb away for a moving listener (it is non-invertible and
   position-dependent). The binaural monitor (headphones, room-free) is the clean reference.
-  Comparing array-vs-monitor measures how much the room is adding.
+  Compare the array with the monitor to measure how much the room adds.
 - **`--check-aim`** (with `--localize`, and a layout carrying a `directivity` model): fit each
-  speaker's acoustic axis from the captures `--localize` already took. Each mic position sees
-  each speaker at a known bearing, and the deconvolved response's high-to-mid band tilt changes
-  with that bearing the way the model says, while the speaker's own response cancels out as a
-  per-speaker constant. The tilt is the DIRECT sound's: `measure_response` gates the impulse
-  response from 1 ms before its peak to just before the first reflection (the `--eq` gate
-  policy, 4 ms when no reflection shows). The reverberant part does not follow the axis, and
-  left in, it dilutes the bearing dependence so the fit reads smaller errors than are there.
-  The tilt bands are 1 to 3 kHz against 3 kHz up, not the 300 Hz and 3 kHz level bands: a gate
-  of a few ms smears the spectrum over about 1/gate (250 Hz at 4 ms), and the gate changes with
-  the mic position, so a band edge at 300 Hz would carry a position-dependent window error into
-  exactly what the fit compares. That costs contrast: on the 4410A the tilt at 45 degrees is
-  2.8 dB instead of 3.8. The report fits the whole-response tilt too, in its own column and in
-  a summary line beside the gated median, so the dilution is visible on every run.
-  `calib_check_aim` grid-searches the direction that explains the tilts
-  best and reports it against the layout's `aim`, with the residual before and after. A speaker
-  over 15 degrees out with a clearly better fit is flagged: the mount is aimed wrong, or the
-  layout's `aim` is. Resolution is set by the bearing spread the positions give it, roughly
-  10 degrees over a 3 m working area, so it refuses under 8 degrees of spread rather than
-  guess, and it never fits the balloon itself. The run also prints the residual every speaker
-  shares as a function of bearing: a slope there is a loss the model does not carry, the screens
-  being the obvious one, and not an aim error. Diagnostic only, nothing is written back.
-  `--simulate --sim-aim-error 20` rotates every simulated speaker's true axis by 20 degrees, so
-  the check has a known error to recover; that is how you know it is measuring anything. Add
-  `--sim-room` and the capture has a room to dilute it: on the 26-speaker example with the
-  4410A model and 7 positions, the gated fit still reads a median 21.0 degrees while the
-  whole-response fit reads 13.6. The `calibrate_sim_room_aim` ctest pins both.
+  speaker's acoustic axis from the captures `--localize` already took. Diagnostic only: nothing is
+  written back.
+  - **What it reads.** Each mic position sees each speaker at a known bearing. The response's
+    high-to-mid tilt changes with that bearing the way the model says, and the speaker's own
+    response cancels out as a per-speaker constant. The tilt is the DIRECT sound's:
+    `measure_response` gates the impulse response from 1 ms before its peak to just before the
+    first reflection (the `--eq` gate policy, 4 ms when no reflection shows). Left in, the
+    reverberant part dilutes the bearing dependence, and the fit reads smaller errors than are
+    there.
+  - **Why these bands.** The tilt bands are 1 to 3 kHz against 3 kHz up, not the 300 Hz and 3 kHz
+    level bands. A gate of a few ms smears the spectrum over about 1/gate (250 Hz at 4 ms), and the
+    gate changes with the mic position, so a band edge at 300 Hz would put a position-dependent
+    window error into exactly what the fit compares. That costs contrast: on the 4410A the tilt at
+    45 degrees is 2.8 dB instead of 3.8.
+  - **What it flags.** `calib_check_aim` grid-searches the direction that explains the tilts best
+    and reports it against the layout's `aim`, with the residual before and after. A speaker over
+    15 degrees out with a clearly better fit is flagged: the mount is aimed wrong, or the layout's
+    `aim` is. Resolution comes from the bearing spread, roughly 10 degrees over a 3 m working area,
+    so it refuses under 8 degrees of spread. It never fits the balloon itself.
+  - **What else it prints.** The whole-response fit, in its own column and in a summary line
+    beside the gated median, so the dilution shows on every run. And the residual every speaker
+    shares as a function of bearing: a slope there is a loss the model does not carry (the screens
+    are the obvious one), not an aim error.
+  - **How to self-check.** `--simulate --sim-aim-error 20` rotates every simulated speaker's true
+    axis by 20 degrees, so the check has a known error to recover. Add `--sim-room` for a room that
+    dilutes it: on the 26-speaker example with 7 positions, the gated fit reads a median 21.0
+    degrees and the whole-response fit 13.6. The `calibrate_sim_room_aim` ctest pins both.
 - **`--simulate --sim-room [absorption]`**: the simulator's room. Without it a simulated capture
   is anechoic, so the direct-sound gate and everything built on it (`--check-aim`'s tilt, the
   trims' directivity correction) have nothing to act on. With it, the array sits in a shoebox
-  0.5 m larger than the speakers on every side. Each speaker adds image sources of orders 1
-  and 2 (24 of them), each leaving at its own departure angle off the speaker's axis and so
-  carrying the directivity model's loss at that angle, plus 1/r and `sqrt(1 - absorption)` per
-  bounce, generated as the same analytic delayed sweep the direct sound is. Past order 2 a
-  deterministic noise tail stands in: Sabine RT60 for the box, the room equation's diffuse
-  level for what orders 1 and 2 did not already deliver, shaped by the model's power response,
-  starting two mean free paths after the direct sound. Absorption defaults to 0.3 (RT60
-  0.36 s on the 26-speaker example). The whole `--localize --check-aim` run above, 182
-  captures, takes 18 s instead of 11 s anechoic. It is a test fixture, not a room model: no
+  0.5 m larger than the speakers on every side. It is a test fixture, not a room model: no
   frequency-dependent absorption, no scattering, no air absorption.
+  - **Early reflections.** Each speaker adds image sources of orders 1 and 2 (24 of them). Each
+    leaves at its own departure angle off the speaker's axis, so it carries the directivity
+    model's loss at that angle, plus 1/r and `sqrt(1 - absorption)` per bounce. Each is the same
+    analytic delayed sweep the direct sound is.
+  - **Late tail.** Past order 2 a deterministic noise tail stands in: Sabine RT60 for the box, the
+    room equation's diffuse level for what orders 1 and 2 did not already deliver, shaped by the
+    model's power response, starting two mean free paths after the direct sound.
+  - **Defaults and cost.** Absorption defaults to 0.3 (RT60 0.36 s on the 26-speaker example). The
+    whole `--localize --check-aim` run above, 182 captures, takes 18 s instead of 11 s anechoic.
 - **`--simulate --sim-truth f.json`**: the simulated speakers stand where `f.json` says (its
   `position` and `aim` per index), not where `--layout` says. Without it the simulator builds
   every capture from the layout it was given, so a survey can only measure the plan back. With
@@ -916,16 +1016,14 @@ nineteenth of its weight (one capsule 1 dB hot moves the mean by 0.06 dB), so ru
 
 ### Getting the ZM-1 onto Dante
 
-The obstacle to `--zylia` on hardware was never the DSP: the sweep plays out of the **Digiface**
-and the ZM-1 is a **different** USB device. The ASIO SDK has one process-wide
-current-driver slot (why `asio_session.cpp` exists). Two drivers at once is not a flag, it's a
-rewrite.
+The sweep plays out of the **Digiface**, and the ZM-1 is a **different** USB device. The ASIO SDK
+has one process-wide current-driver slot (why `asio_session.cpp` exists), so the tool cannot open
+two drivers at once.
 
-**Put the ZM-1 on the Dante network and the problem dissolves.** Dante Via transmits the ZM-1's
-19 capsules as Dante channels. The Digiface receives them as 19 **inputs on the same ASIO device
-that already owns the array's outputs**. One driver, one clock domain, sample-locked:
-`calib_capture.cpp` went from "N outs + 1 mic input" to "N outs + 19 inputs", a parameter, not an
-architecture (`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
+**Put the ZM-1 on the Dante network.** Dante Via transmits the ZM-1's 19 capsules as Dante
+channels. The Digiface receives them as 19 **inputs on the same ASIO device that already owns the
+array's outputs**. One driver, one clock domain, sample-locked. The capture opens N outputs plus
+19 inputs (`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
 ([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/)
 is the recipe; Dante Via has a trial, so you can prove the route first.)
 
@@ -992,9 +1090,7 @@ all three survive every structural check above:
   discrepancy *is* the offset.
 - **Handedness**: a mirrored capsule numbering survives the structural checks too, because a reflected
   dodecahedron is still a dodecahedron with the same rings. It survives the azimuth check as well: a
-  clap fits a rotation and cannot see a mirror. The collaborators' AES 161 measurements fit exactly
-  this, a fixed azimuth-handedness reflection present on every recording day, and it dominated their
-  mount fit.
+  clap fits a rotation and cannot see a mirror. This error has been seen in practice.
 
 Pin all three at the rig, or skip the question entirely and **measure the geometry** (below), which
 hands you the order and the orientation as a side effect.
@@ -1064,9 +1160,10 @@ mount**, so re-survey if either changes.
 transient trigger, snapshot publish):
 
 - `bwa_zylia_probe` (built with `-DBWA_BUILD_CALIBRATE=ON`): console meter. `--list` enumerates
-  the ASIO drivers + channel counts (look for the Zylia driver, or ASIO4ALL over its USB-audio
-  interface, showing `in=19`; it auto-picks a name containing "zylia", else `--driver` it). Tap a
-  capsule and watch its channel jump; a channel stuck at digital silence is dead or unmapped.
+  the ASIO drivers and their channel counts. With no `--driver` it picks a driver whose name
+  contains "zylia". On the rig the ZM-1 arrives through the Digiface's driver, so pass
+  `--driver "<Digiface driver>"`; the probe reads inputs 0 to 18. Tap a capsule and watch its
+  channel jump. A channel stuck at digital silence is dead or unmapped.
 - **Live DOA view**: `bwa_calib_view`'s **Zylia tab** (built with `-DBWA_BUILD_CALIBVIEW=ON`;
   live capture needs the ASIO SDK too): CLAP anywhere around the array and a dot appears on the
   capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed cross-correlation against
@@ -1101,19 +1198,22 @@ verified. So the tool asks for stillness instead. Every tip position in the 300 
 50 ms before the clap must sit within 4 mm of the window's mean, and that mean is the clap position. A
 clap made while the clicker moves is refused, with the reason.
 
-The clock pairing that is left is coarse. Each pose is stamped on the host's monotonic clock (QPC)
-when it arrives. The clap's onset is stamped on the same clock where it happens: the capture callback
-finds the first sample past the trigger level in its ASIO block and dates it from that block's buffer
-switch, less the driver's input latency. The switch time is the driver's own `systemTime` when that
-runs on QPC. The ASIO SDK says `systemTime` comes from `timeGetTime`, which ticks at 1 to 15.6 ms and
-ran 27 ms off QPC on the development box, so the callback checks which clock the driver's stamps follow.
-Unless it is QPC, the callback uses its own QPC read at entry instead. Either way the stamp is late by
-the callback's dispatch delay plus any latency the driver does not report, a few milliseconds, and the
-50 ms guard covers that. So the window ends before the click however late the tab notices the
-snapshot. What is left is the window's spread plus the drift in the 50 ms before the click: about 5 mm
-at worst, 0.1° at 2.5 m.
+The clock pairing that is left is coarse, and the 50 ms guard covers it:
 
-Without a stamp, the tab falls back to the old estimate: the frame that saw the snapshot, minus the
+- **The pose stamp.** Each pose is stamped on the host's monotonic clock (QPC) when it arrives.
+- **The onset stamp.** The capture callback finds the first sample past the trigger level in its
+  ASIO block and dates it from that block's buffer switch, less the driver's input latency.
+- **The switch time.** The driver's own `systemTime`, but only when its stamps follow QPC. The ASIO
+  SDK says `systemTime` comes from `timeGetTime`, which ticks at 1 to 15.6 ms and can sit tens of
+  ms off QPC. So the callback checks which clock the stamps follow, and otherwise uses its own QPC
+  read at entry.
+- **What is late.** Either way the stamp is late by the callback's dispatch delay plus any latency
+  the driver does not report: a few milliseconds, inside the guard. So the window ends before the
+  click however late the tab notices the snapshot.
+- **What is left.** The window's spread plus the drift in the 50 ms before the click: about 5 mm at
+  worst, 0.1° at 2.5 m.
+
+Without a stamp, the tab falls back to an estimate: the frame that saw the snapshot, minus the
 capture's post-roll (3584 samples, 75 ms at 48 kHz). That is late by one ASIO block plus one UI frame on
 a good day, and by any UI stall on a bad one. Past about 20 ms of stall the window reaches the click,
 and the hand's next move gets a still clap refused. The last-clap line says which onset it used,
@@ -1126,11 +1226,10 @@ Placement panel and the clicker each listen on the data port with their own sock
 `SO_REUSEADDR` and join the multicast group, so each gets every frame. That needs multicast: a unicast
 stream reaches one socket only.
 
-**What a wrong tip costs.** In simulation, a tip offset left at 0 on a clicker whose tip is 11.6 cm out
-put every clap 11.6 cm off, in a different direction each time, because the clicker is held at a
-different angle at every spot. The survey still solved: residual 3.2 µs against 0.035 µs, capsules
-off by up to 3.2 mm against 0.04 mm. The residual flags it, but weakly, so treat a few microseconds as a
-warning.
+**What a wrong tip costs.** A wrong tip offset puts every clap off by that much, in a different
+direction each time, because you hold the clicker at a different angle at every spot. The survey
+still solves. In simulation an 11.6 cm error raised the residual to only 3.2 µs and moved the
+capsules up to 3.2 mm. So treat a residual of a few microseconds as a warning.
 
 **Rehearse without Motive.** Tick *simulate* beside the clicker's **Connect**, with *simulate claps*
 on. A scripted clicker walks to 10 spots high and low around the array, holds still at each, and
@@ -1138,15 +1237,9 @@ clicks. Once on the way it clicks while waving, and that clap must be refused. *
 clicks in a ring at the array's height instead. The script keeps its own clock and steps it once per
 frame, so a busy machine slows the script down rather than changing what it does. Each scripted clap
 carries its onset stamp on that clock, and the tab notices it 80 ms after the capture would have
-published it, as a UI stall does, so every simulated run goes through the stamp. `--tests clicker` runs
-seven checks: with the stand
-tracked, every banked clap is the clicker's true tip against the stand's measured center (not either
-typed field) and the survey recovers the capsule table; a tip left at 0 makes the residual and the
-geometry measurably worse; the ring is refused; an interferer is refused by the arm window or the
-direction check; one that slips past both is flagged by leave-one-out and dropped; with the 80 ms
-stall, every still click banks at its true tip when judged at its stamp; and judged at the old
-estimate instead, every click that is followed by a move is refused. `--tests onset_stamp_math` feeds
-the callback's arithmetic and its clock check the three bases a driver can stamp on.
+published it, as a UI stall does, so every simulated run goes through the stamp. `calib_view
+--tests clicker` drives the tracked survey, a wrong tip, the ring, interferers and the late notice.
+`--tests onset_stamp_math` pins the onset arithmetic and the clock check.
 
 Nothing here has met live Motive or a real clap. The 4 mm stillness limit is a guess at a held hand: if
 real claps get refused, that is the number to revisit.
@@ -1199,10 +1292,8 @@ one snapshot are timed as one, and the direction check or leave-one-out has to c
 
 Rehearse it: tick *interferers* beside *coplanar ring* in simulate. Two sounds from 60° away fire
 while the clicker holds still: one right after the second click, one timed like the eighth click.
-`--tests zylia` checks that both are refused and the geometry lands within 0.2 mm of the capsule
-table the claps came from, as a clean run's does. It also checks
-one timed like the third click, before any provisional survey: it banks, leave-one-out flags it, and
-dropping it restores the geometry. `typed_arm` drives the typed window.
+Both must be refused. The `clicker_interferer`, `clicker_interferer_slip` and `typed_arm` UI tests
+pin this.
 
 None of this has met a real clap or a real interferer. The 2 s window, the 10° tolerance and the
 leave-one-out thresholds are set from the simulation and the error budget above, not from the rig.
@@ -1327,12 +1418,16 @@ under 4 speakers or under the spread floor. Two rules:
   position is off, so the rest is no longer known to be good, and since every position comes from one
   layout, the layout itself is the suspect. Choose the set yourself with `--speakers`.
 
-Read the limits. An error every speaker shares, like a wrong frame or a wrong center, flags nothing.
-Two bad speakers can hide each other from leave-one-out: in simulation, a second speaker 80 mm off read
-4.4 µs held out but was not flagged while the first was still in the set, because the rest's residual
-was 0.9 µs. The range check saw both (about 36 and 38 mm), and the run stopped after the first drop. And a small error passes: the floor is about 2° of direction
-from the array, 5 cm across at 1.5 m. One speaker 80 mm off at 1.39 m (2.9° across, 35 mm in
-range) read 4.3 µs, and the good speakers beside it under 0.6 µs.
+Read the limits. Three kinds of error get past the checks:
+
+- **A shared error flags nothing.** A wrong frame or a wrong center moves every speaker alike.
+- **Two bad speakers can hide each other from leave-one-out.** In simulation, a second speaker
+  80 mm off read 4.4 µs held out but was not flagged while the first was still in the set, because
+  the rest's residual was 0.9 µs. The range check saw both (about 36 and 38 mm), and the run
+  stopped after the first drop.
+- **A small error passes.** The floor is about 2° of direction from the array, 5 cm across at
+  1.5 m. One speaker 80 mm off at 1.39 m (2.9° across, 35 mm in range) read 4.3 µs, and the good
+  speakers beside it under 0.6 µs.
 
 **Tracked, it writes a BODY-FRAME survey.** The table is rotated into the stand's axes at the take's
 orientation, `caps_body = Rᵀ caps_room`, the form `--survey` and `bwa_validate --track` read. Its mount
@@ -1361,15 +1456,10 @@ to pass as `--mic` to the runs that use it. A taped `--mic` only has to be close
 
 **In simulation** the captures come from a simulated PHYSICAL ZM-1, never from a table any solve reads:
 the built-in table scaled to 49.5 mm and turned 40° and tilted 3° inside its mount, then turned by the
-scripted stand (`calib_sim_zm1_room`, with its own rotation code). On the 26-speaker example in the
-simulated room, tracked and told an offset 18.1 mm from the stand's true one (`--track-sim-offset`):
-residual 0.04 µs, radius 49.50 mm, every capsule within 0.03 mm of the truth after a reload and a
-re-aim, and the acoustic offset within 0.1 mm of the true one. Untracked and anechoic, every capsule
-within 0.01 mm. Leave-one-out held every speaker under 0.1 µs on both. The `calibrate_capsule_survey`
-ctest pins 0.1 mm and 1 mm, a refusal by name for one speaker moved 80 mm in the layout, the clean
-table and center after `--drop-outliers` drops it, the stop on a second one, the refusal of a speaker
-40 mm out radially by its range alone, a `--latency` 20 mm off that flags nobody, and the range check on
-the dome's upper side with the latency poorly pinned.
+scripted stand (`calib_sim_zm1_room`, with its own rotation code). Tracked and told a wrong offset
+(`--track-sim-offset`), the survey recovers every capsule within 0.03 mm and the acoustic offset
+within 0.1 mm. The `calibrate_capsule_survey` ctest pins the table, the center, and every refusal
+above.
 
 **What simulation cannot show: the rigid sphere.** Every simulated capsule is a free-field omni. The
 real ZM-1's capsules sit on a rigid sphere, and sound bends around it: a capsule in the shadow hears a
@@ -1966,15 +2056,13 @@ against the plan.
 
 Position: over seven speakers, with and without the simulated room, the direction reads 0.01 to
 0.06 degrees off the truth and the position within 1.6 mm. A 10 cm move reads back as 100.7 mm with
-nothing sideways. Before the capsules were cross-correlated, the direction read up to 0.6 degrees
-off (20 mm at 2 m) and the same move read 89 mm with 13 mm sideways. The rig will do worse than
+nothing sideways. The rig will do worse than
 the simulation by whatever the sphere's scattering and the capsule survey leave, which nothing here
 has measured. So read a delta under about 1 cm as "where the layout says" until the rig shows
 otherwise.
 
-The `calibrate_live_zylia` ctest pins the 10 cm move, the 25 degree estimate with the reference,
-the file's larger error behind the screen, and the peak at 0 degrees. The `aim/sim_live` test in
-`calib_view --tests` turns a simulated box away and back through the real UI.
+The `calibrate_live_zylia` ctest pins these numbers. The `aim/sim_live` test in `calib_view
+--tests` drives the same loop through the UI.
 
 Unverified on hardware: all of it, the short sweep through the ASIO shell included. The
 simulator's capsules are free-field omnis on no sphere, so the ZM-1's own scattering, and how
@@ -2018,7 +2106,7 @@ the session's own outputs. Load `grid.json` (or `trims.json`) into the engine wh
 | 5 | trims | `bwa_calibrate --layout as_built.json --out trims.json --zylia --trims --room --survey capsules.json` | `as_built.json`, `capsules.json` | `trims.json` | exit 0 |
 | 6 | verify | `bwa_calibrate --layout trims.json --zylia --verify --survey capsules.json` | `trims.json` | a status | exit 0; exit 3 means flagged speakers |
 | 7 | grid | `bwa_calibrate --layout trims.json --out grid.json --zylia --room-eq-grid <rows>` | `trims.json`, the grid rows | `grid.json` | exit 0 |
-| 8 | validate | `bwa_validate --layout grid.json --survey capsules.json --out validate.csv` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
+| 8 | validate | `bwa_validate --layout grid.json --survey capsules.json --out validate.csv --azimuths <n> [--positions <file>]` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
 
 Every `bwa_calibrate` step also gets the device (`--driver`, `--input`) or `--simulate`, the
 tracker (`--track`, `--natnet-server`, `--natnet-multicast`, `--place-timeout`) or `--track-sim`,
@@ -2121,15 +2209,15 @@ that make a rehearsal quick are inputs, not test switches: 3 validate azimuths, 
 placement, two grid rows, the capsule speakers you list. On a 10-speaker dome the whole session
 takes about 40 s.
 
-`calib_view_session` (`bwa_calib_view --tests session`) runs three sessions through the tab:
+`calib_view_session` (`bwa_calib_view --tests session`) drives the tab:
 
-- **full_sim**: every step in order with the truth 72 to 100 mm off the plan on five speakers.
-  `as_built.json` lands within 3.5 mm of the truth. `trims.json` carries `as_built.json`'s positions,
-  and its gains match the simulator's sensitivities within 0.013 dB, where a solve against the
-  plan's positions would miss by 0.39 dB. Every step read its predecessor's file in its current
-  run, and the plan is byte for byte what it was.
+- **full_sim**: every step in order, with the simulated truth off the plan. `as_built.json` lands
+  on the truth, `trims.json` carries its positions, and the plan is left byte for byte as it was.
 - **resume**: the session reopens equal in every field, and running localize again marks every
   step after it stale.
+- **finish_rules**: exit 0 with the step's file missing, and a canceled run, both fail.
+- **baffle_offset**: the typed value reaches the frame check and `session.json`, and a change
+  marks the frame step stale.
 - **failure_blocks**: a 3-speaker capsule survey exits 2, and aim, trims, verify, grid and validate
   refuse to run, each with its reason.
 

@@ -1,10 +1,11 @@
 /*
  * bw_audio.h - public C ABI for the spatial audio core.
  *
- * Self-hosted native audio engine. It drives a 26-speaker CAVE array via
- * ASIO/Dante. A second path does binaural (HRTF) headphone rendering: a
- * first-class direct render (BWA_PROFILE_BINAURAL) and an array-audition monitor
- * (BWA_PROFILE_CAVE_SIM). Engines (Unity/Unreal) are thin control clients. No
+ * Self-hosted native audio engine. It drives a speaker array (up to
+ * BWA_MAX_CHANNELS; the CAVE starts with 24) via ASIO/Dante. A second path
+ * does binaural (HRTF) headphone rendering: a first-class direct render
+ * (BWA_PROFILE_BINAURAL) and an array-audition monitor (BWA_PROFILE_CAVE_SIM).
+ * Engines (Unity/Unreal) are thin control clients. No
  * audio buffers cross this boundary, only control (sound triggers, source
  * positions, the listener pose).
  *
@@ -218,7 +219,7 @@ typedef struct {
      * It names the PRIMARY device only. Under CAVE_BOTH that is the array; the monitor opens the
      * platform default on its own, because a name that belongs to the array's driver would be
      * skipped by every backend the monitor could use and leave it silent. Pinning the monitor's
-     * endpoint wants a field of its own and does not have one yet (docs/backends.md).
+     * endpoint wants a field of its own and does not have one yet (docs/backend-development.md).
      * `asio_driver` is the legacy spelling of the same field and still compiles. */
     union {
         const char* device;
@@ -1054,7 +1055,7 @@ BWA_API void     bwa_source_set_extent(bwa_engine* e, bwa_source s, float width,
 BWA_API void     bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m);
 
 /* ---- source configuration: every per-source knob at once ------------------------------------
- * There are 24 bwa_source_set_* calls above and configuring one source fully takes eighteen of
+ * There are 26 bwa_source_set_* calls above and configuring one source fully takes eighteen of
  * them. This is
  * the same fill-then-apply shape bwa_tuning uses for the ENGINE knobs, applied to a SOURCE:
  * `bwa_source_kind` names what the source IS, bwa_source_preset fills a complete configuration for
@@ -1310,13 +1311,15 @@ BWA_API void     bwa_set_panner(bwa_engine* e, bwa_panner panner);
  * kernel that de-biases a clustered array; 2.0 is the default and it is rarely worth moving.
  * Pass <= 0 for EITHER argument to revert that one to the default: focus falls back to a value
  * DERIVED from the array geometry (the exponent that puts the lobe 6 dB down at the mean
- * nearest-neighbor speaker angle - about 12.7 on the 26-speaker cube grid, wider on a sparse array),
+ * nearest-neighbor speaker angle, seen from the layout's listening point - about 12.7 on the
+ * 26-speaker default grid, wider on a sparse array),
  * density to 2.0. Live and per-frame-safe: every source re-solves on the next block, static ones
  * included, and the gains ramp. A runtime knob like the other live A/B toggles, so it lives nowhere
  * on disk - persisting a dialed value is your application's business, not the layout file's. */
 BWA_API void     bwa_set_spcap_focus(bwa_engine* e, float focus, float density);
 /* The focus value bwa_set_spcap_focus reverts to, for an array given as `n` speaker positions
- * (3 floats each, the bwa_panner_gains_batch convention). Pure, not engine state: a tool can show
+ * (3 floats each, the bwa_panner_gains_batch convention), measured from their centroid: it matches
+ * the engine's value when the layout declares no listening_point_m. Pure, not engine state: a tool can show
  * what an in-progress layout implies before you override it. Returns 0 on bad arguments or when
  * its scratch allocation fails (it allocates; do not call it from an audio callback). */
 BWA_API float    bwa_spcap_focus_default(const float* positions, uint32_t n);
@@ -1572,7 +1575,7 @@ typedef struct {
     float            align_dead_zone_m;      /* 0 = the 5 cm default. */
     float            align_slew_frames_per_s;/* 0 = the ~63 at 48 kHz default. */
     bool             tracked_directivity;    /* on both; a no-op without a directivity model in the layout.
-                                              * Took one reserved slot (0.18), so struct_size is unchanged;
+                                              * Took one reserved slot (0.17), so struct_size is unchanged;
                                               * a client built against an older header that zeroes
                                               * reserved[] after bwa_tuning_preset turns this OFF. */
     uint32_t         reserved[3];    /* zero; reserved so the struct can grow without an ABI break */

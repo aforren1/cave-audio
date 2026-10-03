@@ -7,9 +7,10 @@ engine, only control calls on the main thread. The one inbound exception is the 
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
 on the same control thread. It is a source feed, not a render path.
 
-[Python](#python) and [MATLAB and Octave](#matlab-and-octave) are the two bindings here that are
-not game engines. Neither has a transform to convert or a frame to ride, so the sections below on
-coordinates and per-frame pushing do not apply to them. Everything else does.
+[Python](#python), [MATLAB and Octave](#matlab-and-octave) and [Web](#web) are the three bindings
+here that are not game engines. None of them has a transform to convert, so the sections below on
+coordinates do not apply to them. Python and MATLAB also have no frame to ride; the web binding
+batches its frame itself. Everything else applies to all of them.
 
 If a term in the binding surface is unfamiliar, [glossary.md](./glossary.md) defines it in one
 line and points at the doc that owns it.
@@ -39,8 +40,9 @@ languages' generators agree. [`examples/minimal.c`](../examples/minimal.c) is th
 | MATLAB or Octave | [`bindings/matlab/examples/minimal.m`](../bindings/matlab/examples/minimal.m) | `minimal` |
 | Web | [`bindings/web/example/index.html`](../bindings/web/example/index.html) | `node bindings/web/example/serve.mjs`, then open the page and press Start |
 
-Every copy also takes `--tests`, which forces the offline sink and self-checks, so ctest runs the
-lot with no audio device attached.
+The C, Godot, Python and MATLAB/Octave copies also take `--tests`, which forces the offline sink
+and self-checks, so ctest runs them with no audio device attached. The Unity sample and the web page
+are checked by hand.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
@@ -84,8 +86,8 @@ didn't load. Then the error names the layout file instead of the start call.
 
 ## There are two speeds of sound
 
-Both bindings expose one (`speed_of_sound` in Godot, `speedOfSound` in Unity), and the layout
-file carries another (`reference.speed_of_sound_mps`). They are both in meters per second and
+The engine exposes one (`bwa_set_speed_of_sound`: `speed_of_sound` in Godot, `speedOfSound` in
+Unity), and the layout file carries another (`reference.speed_of_sound_mps`). They are both in meters per second and
 they are not the same quantity. Setting either does nothing to the other.
 
 - **The binding property** is `bwa_set_speed_of_sound`, the **propagation medium**. Doppler and
@@ -116,21 +118,29 @@ Four core pieces:
 - **`Engine`**: the singleton manager + centralized per-frame push.
 - **`Emitter`**: the per-source component.
 
-The rest of the Runtime folder: `AmbisonicBed` (a world-locked AmbiX soundfield
-component over `bwa_bed_*`), `AcousticGeometry` (marks a mesh as
-occluding/reflecting geometry with a material; `Engine` bakes them all into one
-engine mesh at load), `MaterialAsset` (an acoustic material as a Project asset:
-an engine preset or custom 3-band coefficients), `RoomConstraints` (draws the
-surveyed room (truss, screen cube, projectors) in the scene view, from the same
-`constraints.json` the C++ tools read; scene-view only, no audio), and
-`ClipAttribute` (marks a string field as a StreamingAssets path). Editor-side:
-`ProjectCheck` (warns when Unity's built-in audio is still enabled, with
-one-click disable), `ClipDrawer` (the `[Clip]` file picker), and custom
-inspectors for `Engine` / `Emitter` / `MaterialAsset` that hide settings which
-don't apply and surface the engine's *survivable* mistakes (a layout file that
-isn't where the engine will look, both reverb beds contending for the one tap, a
-tracked listener with nothing to track), plus live backend / meters / voice count
-while playing.
+The rest of the Runtime folder:
+
+- `AmbisonicBed`: a world-locked AmbiX soundfield component over `bwa_bed_*`.
+- `PushEmitter`: a positional source you feed PCM (see "Procedural (push) sources" below).
+- `AcousticGeometry` and `DynamicAcousticGeometry`: mark a mesh as occluding and reflecting
+  geometry with a material. `Engine` bakes the static ones into one engine mesh at load.
+- `MaterialAsset`: an acoustic material as a Project asset, an engine preset or custom 3-band
+  coefficients.
+- `RoomConstraints`: draws the surveyed room (truss, screen cube, projectors) in the scene view,
+  from the same `constraints.json` the C++ tools read. Scene view only, no audio.
+- `SpeakerView`: one unlit marker per speaker, lit by its live output, for use inside the CAVE.
+- `ClipAttribute`: marks a string field as a StreamingAssets path.
+
+Editor side:
+
+- `ProjectCheck`: warns when Unity's built-in audio is still enabled, with one-click disable.
+- `ClipDrawer`: the `[Clip]` file picker.
+- Custom inspectors for `Engine`, `Emitter` and `MaterialAsset`. They hide settings that do not
+  apply and surface the engine's *survivable* mistakes: a layout file that is not where the
+  engine will look, both reverb beds contending for the one tap, a tracked listener with nothing
+  to track. While playing they show the live backend, meters and voice count.
+- A `RoomConstraints` inspector that shows what the constraints file actually loaded, because a
+  missing or empty file otherwise looks like an empty room.
 
 **The settings that fail quietly are the ones to watch.** An unknown material name is
 not an error to the engine (`bwa_material_preset` returns the generic default and
@@ -155,19 +165,21 @@ internal static class Bwa {
     // C ABI's bwa_desc.profile is an enum, so marshalling it as a string would push a
     // pointer where the engine expects an int (undefined behavior / crash). Mirror ALL four
     // values and their numbering: a short enum here silently renumbers the rest.
-    public enum bwa_profile : int { Cave = 0, Binaural = 1, CaveSim = 2, CaveBoth = 3 }
+    public enum BwaProfile : int { Cave = 0, Binaural = 1, CaveSim = 2, CaveBoth = 3 }
 
+    // TRUNCATED for the page: the shipped BwaDesc mirrors EVERY bwa_desc field, through
+    // reserved[3]. Marshal a short struct by `in` and the engine reads past its end.
     [StructLayout(LayoutKind.Sequential)]
-    public struct Config {
-        public bwa_profile profile;                                      // matches bwa_profile (int) in the header
+    public struct BwaDesc {
+        public BwaProfile profile;                                       // matches bwa_profile (int) in the header
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string layoutPath; // const char* - string marshalling is correct here
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string hrtfPath;   // const char* or null
         public uint sampleRate, blockSize;
     }
 
-    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bwa_create(in Config c);
-    [DllImport(DLL, CallingConvention=CC)] public static extern int  bwa_start(IntPtr e);
-    [DllImport(DLL, CallingConvention=CC)] public static extern int  bwa_stop(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bwa_create(in BwaDesc c);
+    [DllImport(DLL, CallingConvention=CC)] public static extern BwaResult bwa_start(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern BwaResult bwa_stop(IntPtr e);
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_destroy(IntPtr e);
     [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bwa_last_error(IntPtr e); // Marshal.PtrToStringUTF8(...) to read; null => no error
     [DllImport(DLL, CallingConvention=CC)] public static extern uint bwa_load_sound(IntPtr e,[MarshalAs(UnmanagedType.LPUTF8Str)] string p);
@@ -271,13 +283,14 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   stays as a wrapper. The chosen string goes in `bwa_desc.device`, the field both
   bindings also still expose under its old name `asioDriver` / `asio_driver`, since it
   is one field with two spellings. Prefer the **id** when you persist a choice:
-  friendly names collide between a headset and its dock. `sink_flags` carries three bits, all off
-  by default and all exposed in both bindings (Unity's `[Flags] BwaSinkFlags` on
+  friendly names collide between a headset and its dock. `sink_flags` carries four bits, all off
+  by default. Three are exposed in both bindings (Unity's `[Flags] BwaSinkFlags` on
   `Engine.sinkFlags`, Godot's `BwaEngine.SINK_FLAG_*` on the inspector's `sink_flags`):
   `Exclusive` takes a WASAPI endpoint from every other application, including the VR runtime, so
   leave it off in a headset build; `ExactRate` fails the open rather than letting the OS resample;
-  `TightBuffer` takes the smallest device buffer the backend can. See api.md's "Latency classes",
-  which maps PsychPortAudio's classes 0 to 4 onto them.
+  `TightBuffer` takes the smallest device buffer the backend can. The fourth, `DEEP_BUFFER`, is for
+  the browser's AudioWorklet sink only, and neither game binding exposes it. See api.md's "Latency
+  classes", which maps PsychPortAudio's classes 0 to 4 onto them.
 - **Assets**: `bwa_sound_acquire` / `bwa_sound_release` (the shared, refcounted
   by-path tier) drive `Engine.Acquire`, and `Load` / `LoadStreaming` / `LoadAmbix` /
   `LoadFuma` are one call each over it with the matching `BwaLoadFlags`. The binding
@@ -479,13 +492,51 @@ counter is the gate that drops a completion straggling in from the previous play
 moves the straggler is still deliverable and the latch is the only thing standing in its way.
 Both bindings therefore keep the latch armed across a held play and clear it on the frame the
 data lands. The case to picture is a stop that lands on the block a clip runs out in: the engine
-posts a completion for that stopped voice anyway, and a play issued before the next drain used to
-open the way for it.
+posts a completion for that stopped voice anyway, and without the latch a play issued before the
+next drain would let it through.
 
 Both rings are bounded and drop the OLDEST entry when nothing reads them, so a rising
 `EndedEventsDropped` means that many `onFinished` callbacks never fired. `LoopEventsDropped`
 can rise for a second, harmless reason: a loop region shorter than a frame wraps more often
 than any frame rate can read it. Pace trials off the wraps you receive.
+
+### Driving rig-day trials from a Unity scene
+
+The by-ear trials are the
+[Stage 5 list in hardware-validation.md](./hardware-validation.md#stage-5-by-ear-checks). Build the
+scene to mirror that list: one row per trial, a blind A/B, a recorded verdict. Every knob is on the
+Unity binding; two cost a scene restart. The live ones are `Engine` fields that `OnValidate`
+re-pushes in Play mode.
+
+| Trial | Unity control | Cost |
+| --- | --- | --- |
+| Phantom against a real speaker | `Emitter.Channel` (`Bwa.CHANNEL_AUTO` to go back) | live |
+| Preset baseline | `Engine.situation` + `ApplySituation()` | live |
+| SPCAP focus | `spcapFocus` / `spcapDensity` | live |
+| Hole-aware floor | `holeSpread`, 0 against 1 | live |
+| CAP | `dualBandCap` (needs `dualBand`) | live |
+| Tracked alignment | `trackedAlign` + dead zone / slew | live |
+| Tracked directivity | `trackedDirectivity` | live |
+| Tracked room EQ | `trackedRoomEq` | live |
+| Panner | `panner` | live |
+| max-rE and its band split | `maxRe`, `maxReSplit` | live |
+| Air absorption | `Emitter.airAbsorption` | live |
+| Spread mode, decorrelation | `spreadMode`, `decorrelation` | live |
+| Bed decoder, AllRAD vs EPAD | `bedDecoder` | restart |
+| HRTF monitor quality | profile `Binaural` | restart |
+
+- **Load twice, not four times**: `bedDecoder` is the only load-time half of the decoder and taper
+  pair. Load AllRAD, then EPAD, and toggle `maxRe` inside each.
+- **Build the reference row first**, then the three trials no instrument settles: SPCAP focus, the
+  hole-aware floor, and CAP.
+- **Encode the ordering rules**: refuse the tracked alignment trial before
+  [Stage 2](./hardware-validation.md#stage-2-calibration-the-session) is accepted, and show its
+  listening-point row as a null check.
+- **Record the configuration beside every verdict** with `Engine.TryGetEngineTuning`, which reads
+  what the engine has rather than what the inspector claims.
+- Put spread mode and decorrelation last:
+  [Stage 4b](./hardware-validation.md#stage-4b-instrumental-phantom-accuracy-bwa_validate) already
+  settled them.
 
 ### Tests
 
@@ -608,8 +659,8 @@ array: `dome_24.json`, the same generated 24-speaker dome the native and web pla
 Pass a surveyed file as a user argument (`godot ... -- my_layout.json`) or put a
 `cave_layout.json` beside the executable or in the project root to use that instead.
 
-The 0.12.0 convenience tier lands as three things. Assets: `BwaEngine` no longer keeps a cache
-of its own. It acquires through the core's `(path, flags)` cache, and keeps only a record of
+The convenience tier is three things. Assets: `BwaEngine` keeps no cache of its own. It acquires
+through the core's `(path, flags)` cache, and keeps only a record of
 the keys it acquired, so that `unload_sound_path` releases the references **this node** holds
 and no others. `sound_get_frames` and `sound_get_channels` do not use that record at all: they
 go through `bwa_sound_find`, the ABI's by-path lookup, which never loads on a miss.
@@ -745,8 +796,8 @@ Two layers, unlike Unity's one and Godot's one:
 engine runs on the **audio thread**, and an interpreter must never run there: taking the GIL inside
 a device callback allocates, blocks on a lock, and runs arbitrary bytecode. The offline path is the
 manual sink and `render_block`, which hands back the same post-limiter samples on the caller's own
-thread. No other binding has this exclusion, because no other binding has a global interpreter
-lock to take.
+thread. Every binding excludes this call, because its callback runs on the audio thread; Python
+adds one more reason, a global interpreter lock to take.
 
 **The threading contract is stricter to state and easier to break here**, because Python makes
 threads cheap. Unity and Godot get the one-control-thread rule for free from their main loop;
@@ -839,6 +890,26 @@ objects and cannot collect a cycle, so `Engine.listener` is a DEPENDENT property
 `Listener` on demand rather than a stored object pointing back at the engine. Stored, the engine
 would outlive its variable and hold its device until the interpreter exited.
 
+## Web
+
+**Implemented as an ES module: [`bindings/web/`](../bindings/web/).** Its
+[README](../bindings/web/README.md) is the manual: build, the two layers, the two topologies, the
+per-frame path, the playground and XR pages. [web.md](./web.md) holds the decisions and the
+measurements behind them. Start with [`example/index.html`](../bindings/web/example/index.html),
+the orbiting click on a push source.
+
+Two layers, like Python's: `src/raw.js` is the raw ABI, generated from the header, and
+`src/engine.js` is the idiomatic layer with Python's auto-commit model. A page reaches both through
+`src/client.js`, because the engine lives on a control Worker by default. Only the `"main"`
+topology can open the AudioWorklet sink, because `new AudioContext()` needs a `Window`.
+
+There is no host engine, so there is no coordinate seam: you pass room coordinates. The XR page
+converts the WebXR reference space itself (a 180 degree yaw, not a mirror). There IS a frame: the
+page stages the pose and every moved source in a `SharedArrayBuffer` slab, and `pushFrame()` sends
+one message that the control side applies as one commit.
+
+`bwa_set_output_capture` is absent from both layers. Tap the output with `outputNode()` instead.
+
 ## Unreal (notes, not yet implemented)
 
 Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
@@ -851,10 +922,10 @@ Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
   matrix, and pushes through the same calls.
 - No FMOD/Unreal-audio involvement; the engine is purely a control client.
 
-## Profile = desk-vs-CAVE, from the engine's view
+## Profile: desk or CAVE, from the engine's view
 
 At the desk: run `binaural` with `feedListener = true` and `listener` pointed at
 the XR camera, and drive the same emitters and calls. In the CAVE: run `cave` (or
-`both`) with `feedListener = false`. The core takes head pose straight from
+`cave_both`) with `feedListener = false`. The core takes head pose straight from
 OptiTrack. Same build, same components, same control path; only the profile
 changes.

@@ -10,7 +10,7 @@
  *
  *   - bwa_set_output_capture is NOT bound. Its callback runs on the AUDIO thread, and taking the GIL
  *     there would allocate, block on a lock and run arbitrary bytecode inside the device callback -
- *     CLAUDE.md invariant 1, and docs/backends.md's own rule for this binding. The offline path is
+ *     CLAUDE.md invariant 1, and docs/backend-development.md's own rule for this binding. The offline path is
  *     the manual sink plus render_block, which hands back the same post-limiter samples on the
  *     caller's own thread.
  *   - Out-parameters become return values: a `bool` + out-struct call returns None on false and the

@@ -1,5 +1,5 @@
 /*
- * alsa_sink.c — the ALSA backend (docs/backends.md, phase 5).
+ * alsa_sink.c — the ALSA backend (docs/backend-development.md, phase 5).
  *
  * WHY IT EXISTS. It is the no-server Linux path. Two cases want it. A headphone experiment on a
  * bare box, where onset precision is the measurement and the fewest layers between the engine and

@@ -10,8 +10,9 @@ Links below are relative to this file in the repository,
 from a checkout.
 
 It exists for two experiment shapes, described in
-[docs/backends.md](../../docs/backends.md#experiments-from-psychtoolbox-or-psychopy). PsychoPy is
-Python, so it uses this package directly. Psychtoolbox is MATLAB and gets its own MEX binding later.
+[docs/backends.md](../../docs/backend-development.md#experiments-from-psychtoolbox-or-psychopy). PsychoPy is
+Python, so it uses this package directly. Psychtoolbox is MATLAB and Octave, and uses the MEX
+binding in [`bindings/matlab`](../matlab/README.md).
 
 ```python
 import time
@@ -22,7 +23,7 @@ with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
     source = engine.create_source()
     source.set_pos(1.0, 1.5, 2.0)
     source.play(click)
-    while source.is_playing():   # leaving the block closes the engine, which cuts the sound
+    while source.is_playing:     # leaving the block closes the engine, which cuts the sound
         time.sleep(0.01)
 ```
 
@@ -31,7 +32,7 @@ with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
 From a wheel:
 
 ```
-uv pip install bw_audio-0.15.0-cp312-abi3-win_amd64.whl
+uv pip install bw_audio-<version>-cp312-abi3-win_amd64.whl
 ```
 
 Wheels cover **Python 3.10 and later** on all three desktops. A release carries nine of them: three
@@ -107,9 +108,9 @@ Three places where a literal binding cannot express the C:
 
 **`bw_audio` is the Pythonic layer.** Pure Python over the raw layer. It gives you an `Engine`
 context manager, `Sound`, `Source`, `PushSource`, `Bed`, `Listener` and `ClockBridge` objects,
-exceptions instead of return codes, and the one-control-thread guard below. It adds no semantics of its own, so when
-a method's behavior is in question, the header comment is the answer. It adds one semantic and
-only one: it commits for you. See "Commit model" below.
+exceptions instead of return codes, and the one-control-thread guard below. It adds one semantic
+and only one: it commits for you. See "Commit model" below. For any other behavior question, the
+header comment is the answer.
 
 Mix the layers freely. `Engine.raw` is the raw handle and `Source.handle` is the raw source, so
 anything the Pythonic layer does not wrap you can still call:
@@ -244,7 +245,7 @@ writing a wav with numpy alone.
 Before either shape, run [`examples/minimal.py`](examples/minimal.py). It orbits a click around the
 listener's head for six seconds and quits, which is the smallest realistic client and the fastest
 way to hear that the binding works. Every other binding of this engine ships the same demo with the
-same stimulus, so the four are comparable by ear. See `docs/integration.md`, "The minimal example".
+same stimulus, so you can compare them by ear. See `docs/integration.md`, "The minimal example".
 
 ## The live shape
 

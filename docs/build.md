@@ -29,7 +29,7 @@ manual sinks**. That is the whole platform surface there for now: there is no de
 nothing reaches a speaker. What it buys is the offline path (`bwa_render_block` renders
 bit-identically anywhere), a place to run ThreadSanitizer, and a CI gate that catches a Win32 call
 sneaking back into the core. CoreAudio is specified, not implemented, in
-[backends.md](./backends.md). Keep each backend's assumptions confined to its own `*_sink` file.
+[backend-development.md](./backend-development.md#coreaudio). Keep each backend's assumptions confined to its own `*_sink` file.
 
 Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os/os.h`, with
 `src/os/os_win.c` and `src/os/os_posix.c` behind it: threads, sleep, the monotonic clock, an
@@ -51,7 +51,7 @@ MSVC gates C11 atomics behind `/experimental:c11atomics`. CMake applies that fla
 file, and source properties are directory-scoped so one entry covers every target that compiles
 the file. The list is `rt.c`, `stream.c`, `assets.c`, `fdn.c`, `natnet.c`, `engine.c`,
 `null_sink.c`, `profile_self.c`, `steam_scene.c`, `steam_path.c` and `steam_reflect.c`, plus the
-three test sources that reach the atomics directly (`test/os_test.c`, `test/natnet_test.c`,
+test sources that reach the atomics directly (`test/os_test.c`, `test/natnet_test.c`,
 `test/audio_sink_test.c`, `test/rt_feature_test.c`).
 
 `src/tracking/pose.h` is the one HEADER that carries `stdatomic.h`, so `rt.h` and `natnet.h` forward-declare
@@ -68,7 +68,7 @@ off the real-time path (single-threaded, deterministic). It is what runs under
 `test/rt_test_util.h`. `test_os` adds the genuinely concurrent part: two threads on the mutex,
 and a writer and a reader hammering the `pose.h` seqlock with torn-read detection.
 
-ThreadSanitizer needs a Linux or clang build, which the port now makes possible:
+ThreadSanitizer needs a Linux or clang build:
 
 ```
 cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -99,14 +99,17 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_WITH_AAUDIO` | ON | the AAudio backend. Android only, and forced OFF elsewhere. Needs no SDK: the header ships with the NDK and it links `aaudio`. Fails the configure when `ANDROID_PLATFORM` is under `android-26`, which is AAudio's own floor |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
-| `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
+| `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate`, `bwa_validate` and `bwa_zylia_probe` (Windows only: they link the ASIO capture host) |
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavor (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
-| `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.10 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
-| `BWA_BUILD_MATLAB` | OFF | the MATLAB and Octave binding (`bwa_mex`, a classic C MEX gateway). Builds whichever of the two toolchains CMake finds, and both when both are there: MATLAB through `matlab_add_mex` (needs a configured C compiler, `mex -setup C`), Octave through `mkoctfile`. Adds up to four ctests per interpreter found. See `bindings/matlab/README.md` |
+| `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.10 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds `python_bindings` plus one ctest per example. `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
+| `BWA_BUILD_MATLAB` | OFF | the MATLAB and Octave binding (`bwa_mex`, a classic C MEX gateway). Builds whichever of the two toolchains CMake finds, and both when both are there: MATLAB through `matlab_add_mex` (needs a configured C compiler, `mex -setup C`), Octave through `mkoctfile`. Adds a test suite plus one ctest per example, for each interpreter found. See `bindings/matlab/README.md` |
 | `BWA_ENGINE_SDK` | empty | build ONLY the bindings, against a prebuilt engine installed at this prefix. Nothing under `src/` compiles, and no test or tool is registered. See [The engine SDK](#the-engine-sdk) |
-| `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
+| `BWA_ASAN` | OFF | builds the lifetime and misuse tests (`test_sound`, `test_assets`, `test_abuse`, `test_fuzz_api`) with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
+| `BWA_PROFILE_SELF` | OFF | the built-in in-process zone profiler (`bwa_prof_report`). Ignored when `BWA_TRACY` is on. See [profiling.md](./profiling.md) |
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
+| `BWA_WITH_WORKLET` | OFF | the Wasm Audio Worklet backend. Emscripten only, and off even there; `tools/wasm/build-web.sh` turns it on. See [web.md](./web.md) |
+| `BWA_BUILD_WEB` | OFF | the web binding (`bindings/web`, an ES module). Emscripten only; a desktop configure turns it off with a status line. See [web.md](./web.md) |
 
 Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits at
 `third_party/steam-audio-artifacts/` (see `third_party/README.md`). It is linked **statically**, as
@@ -128,9 +131,9 @@ the one flag it takes (`-DSTEAMAUDIO_ENABLE_AVX=OFF` on gcc 13 and older). The m
 Build the engine once, then link every binding against that one file.
 
 An ordinary build compiles the engine into whatever tree you configured. That is fine for one
-build, but each binding used to pull the engine in as a source dependency, so a job that built the
-engine, two Godot extension flavors and a wheel compiled the engine four times and shipped four
-files that were only meant to be the same. The SDK removes that.
+build. But a job that builds the engine, two Godot extension flavors and a wheel would otherwise
+compile the engine once per consumer and ship files that are only meant to be the same. The SDK
+removes that.
 
 **Install it.** Any build tree can produce one:
 
@@ -191,7 +194,7 @@ find_package(bw_audio CONFIG REQUIRED PATHS /path/to/sdk)
 target_link_libraries(my_app PRIVATE bwa::bw_audio)
 ```
 
-**The guard.** The gateway and the library can now come from different builds, so both scripted
+**The guard.** The gateway and the library can come from different builds, so both scripted
 bindings check at load. `+bwa/setup.m` compares the MEX gateway's compiled `BWA_VERSION` against
 `bwa_get_version()`; `bw_audio/__init__.py` does the same at import and raises `ImportError`. A
 package built from one tree cannot trip either one.
@@ -221,7 +224,7 @@ What the SDK adds, and what you lose without it:
 |----------------|---------------------------------------------|------------------------------------------|
 | Steinberg ASIO SDK | device output to the Digiface; timing hooks       | dual GPLv3 / proprietary (see below)     |
 | Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing - all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
-| dr_libs (dr_wav 0.14.5 / dr_flac 0.13.3 / dr_mp3 0.7.3) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
+| dr_libs (dr_wav 0.14.6 / dr_flac 0.13.4 / dr_mp3 0.7.4) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
 | libjack        | the Linux JACK backend                       | LGPL-2.1. Headers at build time, `libjack.so.0` loaded at run time (never linked); pipewire-jack's drop-in (MIT) answers the same ABI |
 | alsa-lib       | the Linux ALSA backend                       | LGPL-2.1. Headers at build time, `libasound.so.2` loaded at run time (never linked) |
@@ -359,7 +362,7 @@ pushing a `v*` tag. One number in the tree has to agree with it, and the release
 so:
 
 - **The tag** (`v0.3.0`) names the release. `tools/upm/pack.ps1` stamps it into the packaged
-  `package.json` and the Godot manifest at build time, so the committed manifests are a permanent
+  `package.json` and `tools/godot/pack.ps1` into the Godot manifest at build time, so the committed manifests are a permanent
   `0.0.0-dev` placeholder.
 - **`BWA_VERSION_*` in `include/bw_audio.h`** is what `bwa_get_version()` returns and what the
   Python wheels, the MEX gateways and the CMake package report. `tools/release.ps1` sets it to the
@@ -368,10 +371,7 @@ so:
   `bwa_get_version()` against the header sees the release number. Do not edit the defines by
   hand: a patch release moves them too.
 
-Before 0.16.0 the header carried its own ABI counter (0.15.0 at the last such release) beside the
-tag (v0.7.0), and a wheel's version could not be related to the release it came from. The two
-were merged by continuing the header's sequence, which is why the tags jump from v0.7.0 to
-v0.16.0.
+The tags jump from v0.7.0 to v0.16.0 because the header's version sequence became the tag's.
 
 Why not generate the header from CMake with a `.h.in` template? Because the header is consumed
 without CMake: `mkoctfile` compiles against it, a C client copies it, the engine SDK ships it. A
@@ -412,308 +412,351 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` builds and tests on `windows-latest`, `ubuntu-latest` and
-`macos-latest`. A separate `package` job is the distribution channel:
+`.github/workflows/ci.yml` has six jobs. `windows`, `android`, `linux` and `macos` build and test
+one platform each. `wheels` builds the release wheels. `package` packs the bindings and, on a tag,
+cuts the release. A second workflow, `.github/workflows/pages.yml`, publishes the browser demo.
+
+### Rules every build job follows
 
 - **One engine per platform.** Each desktop job builds the engine once, runs ctest on it, and
   installs it as an [engine SDK](#the-engine-sdk). Every binding in that job then configures with
   `-DBWA_ENGINE_SDK` against that tree: the MATLAB MEX, the Octave MEX, both Godot extension
   flavors and the wheel. So the binary a package ships is the binary that job tested, and each job
-  builds one engine where it used to build four. Every step that stages the engine somewhere
-  asserts the staged file against the SDK's, byte for byte where it can and by build id or UUID
-  where the copy is stripped, so the claim cannot rot quietly.
-- **The Linux engine is built inside the manylinux container.** A `manylinux_2_28` wheel needs an
-  engine built against glibc 2.28 and `ubuntu-latest` carries 2.39, so until this the repository
-  built two Linux engines: one on the runner for ctest, the MEX pair and the Godot addon, and a
-  second inside cibuildwheel for the release wheel. `tools/ci/build-engine-manylinux.sh` now
-  builds, tests and installs the one Linux engine inside that image, and everything else takes it
-  from there. Only the engine step runs in the container. MATLAB and the Godot toolchain do not
-  install in AlmaLinux 8 and do not need to: a binding compiled on the runner against a
-  glibc-2.28 shared object is an ordinary ABI client, and the reverse is what does not work.
-
-- **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
-  (cached between runs). The configure step fails loudly unless the log says
-  `ASIO backend ENABLED`: the artifact must contain the production device path.
+  builds one engine. Every step that stages the engine somewhere asserts the staged file against
+  the SDK's, byte for byte where it can and by build id or UUID where the copy is stripped, so the
+  claim cannot rot quietly.
 - **Steam Audio is built static, and cached.** The recipe from
-  [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal
-  core, `/MD`, `BUILD_SHARED_LIBS=OFF`) lives in the composite action
-  `.github/actions/build-phonon/`, which takes a platform, an arch, a toolchain and a
-  staging directory. All four jobs call it, the android job twice, once per ABI. CI caches
-  `third_party/steam-audio-artifacts/` keyed on the submodule sha + the patch hash, with
-  the platform and, on Android, the ABI in the key so no job restores another's archives (a cache
-  is scoped to the repository, not to the runner OS): the
-  first run pays the phonon build, every later run restores it. The five with-SDK tests
-  (`reflect`/`bake`/`path`/`dynmesh`/`steam_decode`) run, and binaural is the real HRTF
-  decode. One CI-only tweak: the pinned phonon build scripts hard-code the VS 2022
-  generator, so the action rewrites that to whatever Visual Studio the runner image has.
-- **Tests force the null sink (`bwa_desc.sink = BWA_SINK_NULL`).** Runners have no audio hardware; forcing the
-  null sink keeps runs deterministic instead of relying on fallback. The three GUI
-  test suites (`playground`/`layout_tool`/`calib_view`) are built but excluded from
-  the CI ctest run. They need a display and OpenGL, which runners don't have. Run
+  [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal core, `/MD`,
+  `BUILD_SHARED_LIBS=OFF`) lives in the composite action `.github/actions/build-phonon/`, which
+  takes a platform, an arch, a toolchain and a staging directory. All four build jobs call it, the
+  android job twice, once per ABI. CI caches `third_party/steam-audio-artifacts/` keyed on the
+  submodule sha + the patch hash, with the platform and, on Android, the ABI in the key so no job
+  restores another's archives (a cache is scoped to the repository, not to the runner OS). The
+  first run pays the phonon build; every later run restores it. The five with-SDK tests
+  (`reflect`/`bake`/`path`/`dynmesh`/`steam_decode`) run, and binaural is the real HRTF decode.
+  One CI-only tweak: the pinned phonon build scripts hard-code the VS 2022 generator, so the
+  action rewrites that to whatever Visual Studio the runner image has.
+- **Tests force the null sink (`bwa_desc.sink = BWA_SINK_NULL`).** Runners have no audio
+  hardware; forcing the null sink keeps runs deterministic instead of relying on fallback. The GUI
+  test suites (`playground`, `layout_tool`, `calib_view`, `calib_view_session`) are built but
+  excluded from the CI ctest run. They need a display and OpenGL, which runners don't have. Run
   them locally.
-- **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and
-  all. Debug builds the engine (`bw_audio` + `bwa_minimal`) and smoke-runs it, for
-  stepping through engine code unoptimized. It uses the **release** CRT, like every
-  other config in a with-SDK build: the staged phonon archive is built `/MD`, and a
-  static archive carries that choice. Your own application's CRT is unaffected, since
-  it only ever loads this DLL across a C ABI.
+- **Artifact names.** `<ver>` is the packed version (the tag on a release, a git-describe dev
+  version otherwise). The `r<N>` run number keeps re-runs of one commit from colliding on a name.
+  Each audience gets its own artifact, so downloading one does not drag in another.
+
+### `windows`
+
+The `windows` job builds and tests the Windows engine, both MEX gateways, both Godot extension
+flavors and the Python wheel, and it waits for nothing. It ends by uploading `windows-pack-input`,
+the fixed-name handoff the `package` job downloads.
+
+- **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL (cached between
+  runs). The configure step fails loudly unless the log says `ASIO backend ENABLED`: the artifact
+  must contain the production device path.
+- **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and all. Debug
+  builds the engine (`bw_audio` + `bwa_minimal`) and smoke-runs it, for stepping through engine
+  code unoptimized. It uses the **release** CRT, like every other config in a with-SDK build: the
+  staged phonon archive is built `/MD`, and a static archive carries that choice. Your own
+  application's CRT is unaffected, since it only ever loads this DLL across a C ABI.
 - **The tools are built and shipped.** CI configures with `BWA_BUILD_PLAYGROUND`,
-  `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries
-  `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display),
-  plus `bwa_calibrate` and `bwa_zylia_probe` (console).
-- **The Godot binding is built AND tested.** Unlike the imgui tools, Godot's
-  `--headless` needs no display, so its scene tests run on the runner (against a
-  cached editor download). The addon packs as its own artifact and, on a tag, its
-  own release asset, plus the `unity`/`godot` distribution branches
-  (installable git refs; see `bindings/godot/README.md` and the workflow header).
-- **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
-  (engine + tools) and `Debug/` (engine) plus `bw_audio.h`, the
-  example layout + `constraints.json`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, a
-  `DIST.txt` naming the commit, and `asio-sdk-src.zip` (the statically linked ASIO
-  SDK source, so the GPLv3 corresponding source travels with the binary rather
-  than living behind a fetch URL).
-- **`bw_audio.dll` stands alone.** Steam Audio is linked statically, so a with-SDK build
-  and a no-SDK build ship the same one file and there is nothing to keep beside it. This
-  used to be the opposite rule (a `phonon.dll` the loader needed in the same directory),
-  so delete any stale copy you find next to an engine build: it is dead weight, and the
-  DLL never looks for it.
-- **Android is cross-built in its own job.** `android` on `ubuntu-latest` configures with the
-  runner's NDK (`ANDROID_NDK_ROOT`, the image's pinned default, with `ANDROID_NDK_LATEST_HOME` as
-  the fallback) for `arm64-v8a` and `x86_64` at `android-26`, asserts the configure log says
-  `AAudio backend ENABLED` and `Steam Audio ENABLED`, and builds the library, the examples and the
-  tests. It builds a static phonon per ABI first, through the same composite action, so that second
-  assertion is also what proves the staging survived. Nothing runs
-  there: the binaries are the device's, which is what `tools\android\run-tests.ps1` is for. The
-  job also builds the Godot GDExtension for `arm64-v8a` and hands both libraries to the `package`
-  job, which is the only place that packs the bindings. It uploads
-  `bw_audio-android-<ver>-r<N>`: `lib/arm64-v8a/libbw_audio.so`, `lib/x86_64/libbw_audio.so`,
-  `include/bw_audio.h`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, and a `DIST.txt` naming the commit.
-- **Two audiences, separate artifacts.** Every run uploads them separately: the engine
-  (`bw_audio-win64-<ver>-r<N>`: dll/lib/pdb + tools + header), the Unity package
-  (`unity-package-<ver>-r<N>`: one `.tgz`) and the Godot addon (`godot-addon-<ver>-r<N>`), plus
-  the Android, Linux and macOS engine artifacts their own jobs upload. `<ver>` is the packed version (the tag on a release,
-  a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
-  colliding on a name. Downloading one no longer drags in the other.
-- **A Python wheel is built and tested on all three desktops, as the fast gate.** The `windows`,
-  `linux` and `macos` jobs each run `uv build --wheel --python 3.12` in `bindings/python`, assert
-  the filename is tagged `cp312-abi3` (a version-specific tag means nanobind's stable ABI did not
-  engage, which would mean a wheel per Python on 3.12 and later too), install it into a fresh venv,
-  and run the pytest suite and both examples **from the installed wheel** rather than from the
-  source tree. Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine
-  library inside the package, so it is that job's own build. These three prove the binding still
-  builds and tests where the engine was just built, and they tag for the machine that built them,
-  which is why **none of them is a release asset**: the release wheels all come from the `wheels`
-  job below. The Android job builds no wheel: there is no Python there.
-  `bindings/python/README.md` is the manual.
-- **Both MEX files are built inside each desktop job, and the six become one toolbox.** A MEX is
-  per platform and per interpreter, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
-  [matlab-actions/setup-matlab](https://github.com/matlab-actions/setup-matlab) (no license token
-  is needed on a GitHub-hosted runner for a public repository), reconfigure **the same bindings
-  tree** the Octave MEX used, build only the MEX target, and run the suite and all three examples
-  through `matlab-actions/run-command`. Linking the job's own engine is the point: the MEX loads
-  the SDK's library, with ASIO and WASAPI on Windows, JACK and ALSA on Linux, and the universal
-  dylib on macOS, and no engine is compiled there at all. Each job asserts the configure log says
-  `MATLAB MEX enabled`, because the option skips silently when it finds no toolchain and a job that
-  built nothing would otherwise pass.
-  The `package` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
-  licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64` each holding that platform's two MEX
-  files plus the one engine library both of them load. It asserts all six are present before
-  zipping. That folder uploads as `bw_audio-matlab-<ver>-r<N>` and, on a tag, as
-  `bw_audio-matlab-<tag>.zip`.
-  The macOS runner is Apple silicon, so its MEX files are arm64 against the universal dylib; an
-  Intel Mac would need MEX files built on one, which nothing here has.
-  **Octave is built and tested in all three desktop jobs.** Each installs its own: `octave` and
-  `octave-dev` from apt on Linux, `octave.portable` from Chocolatey on Windows, `octave` from
-  Homebrew on macOS. The Windows package is `octave.portable` and not the `octave` meta package,
-  because the meta package pulls `octave.install`, which drives the vendor GUI installer through
-  AutoHotkey. The portable one unzips the official archive from `ftp.gnu.org` and cannot hang.
-  Each job configures its own bindings tree with `BWA_BUILD_MATLAB=ON` against the engine SDK,
-  builds the Octave MEX there and runs the four `octave_*` ctests. Each job asserts the configure
-  log says both `SDK MODE` and `Octave MEX enabled`, and that the MEX file staged, because
-  `octave_tests` exits 77 (SKIPPED) when no MEX is there for the running interpreter and a silent
-  miss would otherwise read as a pass. Only the MATLAB half waits for the `matlab-actions` steps,
-  because only MATLAB needs an action to install it and a licensed `run-command` step to drive it.
-  **Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so every MATLAB step was
-  written from
-  [mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
-  rather than from a run, and the macOS Octave steps are unverified for the same reason the rest of
-  that job is: nobody here has a Mac. The Windows and Linux Octave halves are verified locally.
-  `bindings/matlab/README.md` is the manual.
-- **The `wheels` job builds the nine wheels a release ships.** A wheel `uv build` produces on a
-  runner is tagged for that runner and for one interpreter: the image's glibc on Linux, the
-  runner's own architecture on macOS, and cp312 everywhere because that is what the step pins. None
-  of that is what a release hands a stranger. So a separate job runs
-  [cibuildwheel](https://cibuildwheel.pypa.io/) on `windows-latest`, `ubuntu-latest` and
-  `macos-latest`, and every release wheel comes from there.
-  - **Three wheels per platform: `cp310`, `cp311` and `cp312-abi3`.** nanobind's `STABLE_ABI`
-    targets the 3.12 limited API, so the cp312 build is tagged `abi3` and one file covers Python
-    3.12 and every later version. 3.10 and 3.11 predate that limited API, so each needs a
-    version-specific wheel. 3.10 is the floor, set by the pinned nanobind, which declares
-    `Requires-Python >=3.10`. Building cp313 or cp314 would produce the cp312 file again under
-    another name, so `pyproject.toml`'s `build` selector names exactly those three.
-  - **Windows is in this job.** It used to be left out because a Windows wheel already names one
-    ABI and one architecture. That was true and beside the point: the argument was about the
-    platform tag, and what one wheel could not cover was the interpreter. Nothing containerizes
-    there; cibuildwheel installs each CPython with nuget and builds in place.
-  - **cibuildwheel's Windows repair is turned off.** `delvewheel repair` is the default, and it
-    fails on this wheel (`Unable to find library: bw_audio.dll`, because the engine sits inside the
-    package beside the extension rather than on the search path). A repair that worked would be
-    worse: delvewheel renames every library it vendors, which breaks both the byte-identical
-    engine check and the `os.add_dll_directory` rule the package's Windows half relies on. There is
-    nothing to graft anyway, which is the same answer auditwheel and delocate give.
-  - **No wheel builds an engine.** The job downloads the engine SDK each desktop job installed and
-    hands cibuildwheel the path, so it compiles the nanobind extension and nothing else, and builds
-    no phonon at all. The cost is that the job `needs: [windows, linux, macos]` instead of running
-    beside them; what it gives back is a phonon build and an engine build per platform.
-  - **The SDK path is passed with forward slashes on Windows.** cibuildwheel parses
-    `CIBW_CONFIG_SETTINGS` with `shlex.split` in POSIX mode, where a backslash is an escape
-    character, so `D:\a\cave-audio\engine-sdk` reaches scikit-build-core as
-    `D:acave-audioengine-sdk` with no error anywhere. CMake takes forward slashes on Windows.
-  - **Linux is `manylinux_2_28`** (AlmaLinux 8, glibc 2.28: RHEL 8, Debian 10, Ubuntu 18.10 and
-    later). The floor is set by the C++ toolchain, not by the engine: a static phonon is a C++
-    link, and `manylinux_2_28` carries a `gcc-toolset` new enough to compile it where
-    `manylinux2014` does not. It is also the image whose repositories still carry the two device
-    backends' headers.
-  - **Everything the Linux wheel links is built in that image**, phonon included, but the
-    `linux` job is where it happens now. `tools/phonon/cibw-before-all-linux.sh` installs
-    `alsa-lib-devel` and `jack-audio-connection-kit-devel`, then runs
-    `tools/phonon/build-phonon.sh`, the same one recipe the composite action runs. It writes a
-    stamp beside the staged archives naming the image and compiler that produced them, and
-    rebuilds when the stamp does not match, so a developer's own `lib/linux-x64` cannot ride into
-    a wheel on the project copy cibuildwheel puts in the container. The `wheels` job overrides
-    cibuildwheel's `before-all` to nothing, because the engine arrives prebuilt. Run cibuildwheel
-    by hand from a checkout and the `pyproject.toml` before-all still does the full job.
-  - **auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`.** The engine
-    loads both at run time, so neither is in its `NEEDED` list and auditwheel would not see them
-    anyway; the flags stay as GUARDS, and the job still asserts that no `libasound` or `libjack`
-    landed in the wheel. Bundling either one was always wrong: `libjack` has to be the library the
-    running JACK server uses, and `libasound` is on every Linux desktop already. Everything else
-    the engine needs is in the manylinux policy, so a correct repair grafts nothing at all, which
-    is also what keeps the extension's `$ORIGIN` runpath intact. The wheel imports on a machine
-    with NEITHER library; each backend simply reports itself unavailable.
-  - **macOS is one `universal2` wheel** for x86_64 and arm64, with
-    `MACOSX_DEPLOYMENT_TARGET=10.13`. That is the only deployment target anything in this tree
-    names (phonon's own `CMakeLists.txt`), and it is cibuildwheel's universal2 default, so the
-    wheel's tag is predictable. Clang raises the arm64 slice to 11.0 by itself. The `macos` job
-    now builds the engine with `CMAKE_OSX_DEPLOYMENT_TARGET=10.13` to match, and asserts it: a
-    `macosx_10_13_universal2` wheel carrying a dylib built for the runner's own macOS installs
-    anywhere and loads nowhere older.
-  - **The suite runs against the installed wheel**, inside the container on Linux, the same rule
-    the three per-runner jobs follow. Nothing in it opens a device, so a container is enough.
-  - The `linux` job caches the container-built phonon under a key that names the image, and the
-    `wheels` job pins the same image. They have to agree: the engine the wheel carries is that
-    job's, and a wheel whose extension is compiled in one image against an engine from another is
-    the mismatch a manylinux tag promises is absent. Bump the two pins together.
-- **The Unity package is packed every run, and released on a tag.**
-  `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
-  binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
-  plugin) fails the *build*, not a release. A `v*` tag cuts a GitHub Release, and
-  **the Release is the distribution**: no registry, no token. Unity installs the
-  tarball directly (Package Manager → `+` → *Install package from tarball…*). The
-  tag stamps the version into the packaged manifest (the committed `package.json`
-  stays `0.0.0-dev`), so a tarball can never claim a version it isn't. See
-  [Releasing](#releasing).
-- **Two more jobs guard the port, and they ship too.** `linux` on `ubuntu-latest` and `macos`
-  on `macos-latest` build phonon, configure, build RelWithDebInfo, and run the whole engine ctest
-  suite on the null and manual sinks: **38 tests**, the 33 a default off-Windows build registers
-  plus the five SDK-gated ones. The binding tests are not in that count any more: they run in each
-  job's own bindings tree against the SDK. On Linux the engine half of that happens inside the
-  manylinux container. Both jobs exist to catch a Win32 call sneaking back into the core, so they
-  assert on the configure log rather than trusting the build to fail on its own: `linux` wants
-  `JACK backend ENABLED` and `ALSA backend ENABLED`, `macos` wants `null and manual sinks only`,
-  and both want `Steam Audio ENABLED`. That last assertion is the one that matters after a cache
-  round trip, because a build that quietly lost its phonon staging still passes every test.
-  Neither job fetches ASIO, which is Windows-only. A cold run pays for the phonon build the way the
-  Windows job does; a warm one restores the archives and costs a few minutes. The macOS job is
-  UNVERIFIED locally in both halves, since no Mac was at hand: it is the first thing that will ever
-  execute either the shim's Apple paths or a macOS phonon build.
-- **Each of those two also builds a Godot GDExtension and ships an engine artifact**, the same way
-  the android job does. Both flavors (`editor` and `template_release`) build in their own trees,
-  cached on the pinned godot-cpp commit, and the copies bound for the bindings are stripped. The
-  standalone artifact ships its library stripped too, with the symbols beside it as a separate
-  file (`libbw_audio.so.debug` on Linux and Android, found through the gnu_debuglink;
-  `libbw_audio.dylib.dSYM` on macOS), which is the split Windows already has with its `.pdb`: a
-  consumer copies the 7 MB of code and a debugger finds the symbols when the two sit together.
-  Uploads:
+  `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries `bwa_playground`,
+  `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display), plus `bwa_calibrate` and
+  `bwa_zylia_probe` (console).
+- **The Godot binding is built AND tested.** Unlike the imgui tools, Godot's `--headless` needs
+  no display, so its scene tests run on the runner (against a cached editor download).
+- **`bw_audio.dll` stands alone.** Steam Audio is linked statically, so a with-SDK build and a
+  no-SDK build ship the same one file and there is nothing to keep beside it. The DLL never looks
+  for a `phonon.dll`, so delete any copy you find next to an engine build.
+- **The engine artifact is a GPLv3 distribution.** `bw_audio-win64-<ver>-r<N>` carries
+  `RelWithDebInfo/` (engine + tools: dll, lib, pdb) and `Debug/` (engine) plus `bw_audio.h`, the
+  example layout + `constraints.json`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, a `DIST.txt` naming
+  the commit, and `asio-sdk-src.zip` (the statically linked ASIO SDK source, so the GPLv3
+  corresponding source travels with the binary rather than living behind a fetch URL).
+
+### `android`
+
+`android` runs on `ubuntu-latest` and cross-builds. It configures with the runner's NDK
+(`ANDROID_NDK_ROOT`, the image's pinned default, with `ANDROID_NDK_LATEST_HOME` as the fallback)
+for `arm64-v8a` and `x86_64` at `android-26`, and builds the library, the examples and the tests.
+
+- It builds a static phonon per ABI first, through the same composite action.
+- It asserts the configure log says `AAudio backend ENABLED` and `Steam Audio ENABLED`. The
+  second assertion is also what proves the phonon staging survived.
+- Nothing runs there: the binaries are the device's, which is what `tools\android\run-tests.ps1`
+  is for.
+- It builds the Godot GDExtension for `arm64-v8a` and hands both libraries to the `package` job
+  through `android-pack-input`. `package` is the only place that packs the bindings.
+- It uploads `bw_audio-android-<ver>-r<N>`: `lib/arm64-v8a/libbw_audio.so`,
+  `lib/x86_64/libbw_audio.so`, `include/bw_audio.h`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, and a
+  `DIST.txt` naming the commit.
+
+### `linux` and `macos`
+
+`linux` on `ubuntu-latest` and `macos` on `macos-latest` build phonon, configure, build
+RelWithDebInfo, and run the whole engine ctest suite on the null and manual sinks, the SDK-gated
+tests included. The binding tests run separately, in each job's own bindings tree against the SDK.
+Neither job fetches ASIO, which is Windows-only. A cold run pays for the phonon build the way the
+Windows job does; a warm one restores the archives and costs a few minutes.
+
+- **They guard the port.** Both jobs exist to catch a Win32 call sneaking back into the core, so
+  they assert on the configure log rather than trusting the build to fail on its own: `linux`
+  wants `JACK backend ENABLED` and `ALSA backend ENABLED`, `macos` wants
+  `null and manual sinks only`, and both want `Steam Audio ENABLED`. That last assertion is the
+  one that matters after a cache round trip, because a build that quietly lost its phonon staging
+  still passes every test.
+- **The Linux engine is built inside the manylinux container.** A `manylinux_2_28` wheel needs an
+  engine built against glibc 2.28, and `ubuntu-latest` carries 2.39. So
+  `tools/ci/build-engine-manylinux.sh` builds, tests and installs the one Linux engine inside that
+  image, and everything else (ctest, the MEX pair, the Godot addon, the release wheel) takes it
+  from there. Only the engine step runs in the container. MATLAB and the Godot toolchain do not
+  install in AlmaLinux 8 and do not need to: a binding compiled on the runner against a glibc-2.28
+  shared object is an ordinary ABI client, and the reverse is what does not work.
+- **Each builds a Godot GDExtension.** Both flavors (`editor` and `template_release`) build in
+  their own trees, cached on the pinned godot-cpp commit, and the copies bound for the bindings
+  are stripped.
+- **Each ships an engine artifact**, the same way the android job does:
   `bw_audio-linux-x64-<ver>-r<N>` (`lib/libbw_audio.so`, `include/bw_audio.h`, `LICENSE`,
   `THIRD_PARTY-NOTICES.md`, `DIST.txt`) and `bw_audio-macos-universal-<ver>-r<N>` (the same tree
   with `lib/libbw_audio.dylib`), plus the fixed-name pack inputs `linux-pack-input` and
-  `macos-pack-input` that the `package` job downloads. The macOS build is **universal**
-  (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`, and the composite action passes the same pair to
-  phonon's own configure, because phonon's CMake does not make itself universal despite appearing
-  to; see `third_party/README.md`) and both the action and the job fail on a `lipo -info` that
-  does not show both architectures.
-- **Building and packing are two jobs.** The `windows` job builds and tests the Windows engine,
-  both MEX gateways, both Godot extension flavors and the Python wheel, and it waits for nothing.
-  It ends by uploading `windows-pack-input`, the same fixed-name handoff the other three jobs make.
-  The `package` job compiles nothing: it waits for all five build jobs
-  (`needs: [windows, android, linux, macos, wheels]`), downloads the four pack inputs and the
-  release wheels, packs the Godot addon, the Unity package and the MATLAB toolbox, and on a tag
-  creates the release. Each package carries every platform's engine library, which is why one job
-  has to see them all. Splitting it out is what lets the longest job in the matrix start at once
-  instead of behind the cross-builds, and it keeps the per-platform engine artifacts available
-  when packing fails, because the job that built each one uploads it.
-- **A release carries EIGHTEEN assets**, because workflow artifacts expire (30 days) and a
-  release doesn't:
-  - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
-  - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
-  - `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb`,
-    `bw_audio.h`, and the tools). This is the durable download for a C/C++
-    consumer or the CAVE machine.
-  - `bw_audio-android-<tag>.zip`: the Android engine, `libbw_audio.so` for `arm64-v8a` and
-    `x86_64` plus `bw_audio.h`. For a native consumer only: the Unity package and the Godot
-    addon already carry the `arm64-v8a` library.
-  - `bw_audio-linux-x64-<tag>.zip`: the Linux engine, `libbw_audio.so` plus `bw_audio.h`.
-    JACK and ALSA, no ASIO.
-  - `bw_audio-macos-universal-<tag>.zip`: the macOS engine, one universal `libbw_audio.dylib`
-    (x86_64 and arm64) plus `bw_audio.h`. No device backend yet, so it is the offline path.
-    It is **not code-signed and not notarized**: Gatekeeper blocks a downloaded unsigned library,
-    so clear the quarantine flag (`xattr -dr com.apple.quarantine <folder>`) after unzipping.
-    Distribution outside the lab would need a Developer ID signature and notarization.
-  - `bw_audio-matlab-<tag>.zip`: the MATLAB and Octave toolbox. `+bwa`, the examples, the
-    README and the licenses, plus `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that
-    platform's two MEX files and the one engine library both of them load. Unzip it and `addpath`
-    the folder; there is nothing to build. Every MEX is built inside that platform's own desktop
-    job, MATLAB's and Octave's alike, and `bwa.setup` picks the one for the interpreter you are
-    in. Octave's extension is `.mex` on every platform, which costs nothing here: the layout is one
-    directory per architecture, so what shares a directory is one `.mexw64` and one `.mex`. The
-    macOS MEX files are arm64 and unsigned, so they take the same quarantine step as the macOS
-    engine above.
-  - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
-    kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
-    without bloating either the engine `.zip` or the `.tgz`.
-  - `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the
-    same DLL, at its pinned commit, with the in-repo patch and a README naming the commit.
-    Same reason as the asset above, applied to the other statically linked dependency.
-  - `bw_audio-<abi>-<python>-<platform>.whl`, **nine** of them, all from the `wheels` job: three
-    Pythons (`cp310-cp310`, `cp311-cp311`, `cp312-abi3`) on each of `win_amd64`,
-    `manylinux_2_28_x86_64` and macOS `universal2`. The Python binding, with the engine library
-    inside each wheel. Attached as wheels rather than zipped, because `pip` and `uv` install a
-    `.whl` straight from a URL. `<abi>` is `BWA_VERSION` from `bw_audio.h`, which is the tag's
-    number. Together
-    they cover Python 3.10 and later: `abi3` means the cp312 wheel serves 3.12 and every later
-    version, and 3.10 and 3.11 get their own files. The release step asserts three wheels per
-    platform and the tag each one carries.
+  `macos-pack-input` that the `package` job downloads.
+- **Symbols ship beside the library.** The standalone artifact's library is stripped, with the
+  symbols in a separate file: `libbw_audio.so.debug` on Linux and Android (found through the
+  gnu_debuglink), `libbw_audio.dylib.dSYM` on macOS. That is the split Windows already has with
+  its `.pdb`: a consumer copies the 7 MB of code, and a debugger finds the symbols when the two
+  sit together.
+- **The macOS build is universal** (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`). The composite
+  action passes the same pair to phonon's own configure, because phonon's CMake does not make
+  itself universal despite appearing to (see `third_party/README.md`). Both the action and the job
+  fail on a `lipo -info` that does not show both architectures.
+- **The macOS job is UNVERIFIED locally** in both halves, since no Mac was at hand: it is the
+  first thing that will ever execute either the shim's Apple paths or a macOS phonon build.
 
-  All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
-  `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
-  the same inside it, and both point at the two source assets for the third-party code the
-  repo fetches rather than vendors): an app that ships this DLL to third
-  parties inherits GPLv3; see the ASIO section.
+### Python wheels in the desktop jobs (the fast gate)
 
-  Two constraints worth knowing before changing any of this:
+The `windows`, `linux` and `macos` jobs each run `uv build --wheel --python 3.12` in
+`bindings/python`.
 
-  1. **The package's `.meta` files are committed on purpose**
-     (`tools/upm/gen-meta.ps1`): an installed package is immutable, so assets without a
-     `.meta` get a fresh GUID per project and scenes lose their script references. The
-     native plugins' import settings (Windows x64, Editor on) ship the same way; they
-     cannot be fixed in the Inspector afterwards.
-  2. **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.**
-     A UPM registry (they all speak the npm protocol) keys on a single publishable
-     tarball. Nothing is listed on one today (the audience already has the repo, and a
-     public listing would invite installs into projects the GPLv3 would surprise). But
-     the tarball IS what a registry would serve, so listing it later stays a config
-     change rather than a rebuild. Preserving that costs nothing.
+- Each asserts the filename is tagged `cp312-abi3`. A version-specific tag means nanobind's stable
+  ABI did not engage, which would mean a wheel per Python on 3.12 and later too.
+- Each installs the wheel into a fresh venv and runs the pytest suite and the examples **from the
+  installed wheel** rather than from the source tree.
+- Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine library
+  inside the package, so it is that job's own build.
+
+These three prove the binding still builds and tests where the engine was just built. They tag for
+the machine that built them, which is why **none of them is a release asset**: the release wheels
+all come from the [`wheels`](#wheels) job. The Android job builds no wheel: there is no Python
+there. `bindings/python/README.md` is the manual.
+
+### MATLAB and Octave in the desktop jobs
+
+A MEX is per platform and per interpreter, so both MEX files are built inside each desktop job.
+Linking the job's own engine is the point: the MEX loads the SDK's library, with ASIO and WASAPI
+on Windows, JACK and ALSA on Linux, and the universal dylib on macOS, and no engine is compiled
+there at all. `bindings/matlab/README.md` is the manual.
+
+**Octave.** Each job installs its own: `octave` and `octave-dev` from apt on Linux,
+`octave.portable` from Chocolatey on Windows, `octave` from Homebrew on macOS. The Windows package
+is `octave.portable` and not the `octave` meta package, because the meta package pulls
+`octave.install`, which drives the vendor GUI installer through AutoHotkey. The portable one
+unzips the official archive from `ftp.gnu.org` and cannot hang.
+
+- Each job configures its own bindings tree with `BWA_BUILD_MATLAB=ON` against the engine SDK,
+  builds the Octave MEX there and runs the `octave_*` ctests.
+- Each job asserts the configure log says both `SDK MODE` and `Octave MEX enabled`, and that the
+  MEX file staged. `octave_tests` exits 77 (SKIPPED) when no MEX is there for the running
+  interpreter, and a silent miss would otherwise read as a pass.
+
+**MATLAB.** Each job sets up MATLAB with
+[matlab-actions/setup-matlab](https://github.com/matlab-actions/setup-matlab) (no license token
+is needed on a GitHub-hosted runner for a public repository), reconfigures **the same bindings
+tree** the Octave MEX used, builds only the MEX target, and runs the suite and every example
+through `matlab-actions/run-command`. Only the MATLAB half waits for the `matlab-actions` steps,
+because only MATLAB needs an action to install it and a licensed `run-command` step to drive it.
+
+- Each job asserts the configure log says `MATLAB MEX enabled`, because the option skips silently
+  when it finds no toolchain and a job that built nothing would otherwise pass.
+- The macOS runner is Apple silicon, so its MEX files are arm64 against the universal dylib. An
+  Intel Mac would need MEX files built on one, which nothing here has.
+
+**Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so every MATLAB step was
+written from
+[mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
+rather than from a run. The macOS Octave steps are unverified for the same reason the rest of that
+job is: nobody here has a Mac. The Windows and Linux Octave halves are verified locally.
+
+The `package` job assembles the six MEX files into one toolbox; see [`package`](#package).
+
+### `wheels`
+
+The `wheels` job builds the nine wheels a release ships. A wheel `uv build` produces on a runner
+is tagged for that runner and for one interpreter: the image's glibc on Linux, the runner's own
+architecture on macOS, and cp312 everywhere because that is what the step pins. None of that is
+what a release hands a stranger. So this job runs [cibuildwheel](https://cibuildwheel.pypa.io/)
+on `windows-latest`, `ubuntu-latest` and `macos-latest`, and every release wheel comes from there.
+
+- **Three wheels per platform: `cp310`, `cp311` and `cp312-abi3`.** nanobind's `STABLE_ABI`
+  targets the 3.12 limited API, so the cp312 build is tagged `abi3` and one file covers Python
+  3.12 and every later version. 3.10 and 3.11 predate that limited API, so each needs a
+  version-specific wheel. 3.10 is the floor, set by the pinned nanobind, which declares
+  `Requires-Python >=3.10`. Building cp313 or cp314 would produce the cp312 file again under
+  another name, so `pyproject.toml`'s `build` selector names exactly those three.
+- **No wheel builds an engine.** The job downloads the engine SDK each desktop job installed and
+  hands cibuildwheel the path, so it compiles the nanobind extension and nothing else, and builds
+  no phonon at all. The cost is that the job `needs: [windows, linux, macos]` instead of running
+  beside them; what it gives back is a phonon build and an engine build per platform.
+- **The suite runs against the installed wheel**, inside the container on Linux, the same rule
+  the three per-runner builds follow. Nothing in it opens a device, so a container is enough.
+
+**Windows.**
+
+- Windows is in this job. A Windows wheel names one ABI and one architecture, but one wheel still
+  cannot cover every interpreter. Nothing containerizes there; cibuildwheel installs each CPython
+  with nuget and builds in place.
+- cibuildwheel's Windows repair is turned off. `delvewheel repair` is the default, and it fails on
+  this wheel (`Unable to find library: bw_audio.dll`, because the engine sits inside the package
+  beside the extension rather than on the search path). A repair that worked would be worse:
+  delvewheel renames every library it vendors, which breaks both the byte-identical engine check
+  and the `os.add_dll_directory` rule the package's Windows half relies on. There is nothing to
+  graft anyway, which is the same answer auditwheel and delocate give.
+- The SDK path is passed with forward slashes. cibuildwheel parses `CIBW_CONFIG_SETTINGS` with
+  `shlex.split` in POSIX mode, where a backslash is an escape character, so
+  `D:\a\cave-audio\engine-sdk` reaches scikit-build-core as `D:acave-audioengine-sdk` with no
+  error anywhere. CMake takes forward slashes on Windows.
+
+**Linux.**
+
+- Linux is `manylinux_2_28` (AlmaLinux 8, glibc 2.28: RHEL 8, Debian 10, Ubuntu 18.10 and later).
+  The floor is set by the C++ toolchain, not by the engine: a static phonon is a C++ link, and
+  `manylinux_2_28` carries a `gcc-toolset` new enough to compile it where `manylinux2014` does
+  not. It is also the image whose repositories still carry the two device backends' headers.
+- Everything the Linux wheel links is built in that image, phonon included, in the `linux` job.
+  `tools/phonon/cibw-before-all-linux.sh` installs `alsa-lib-devel` and
+  `jack-audio-connection-kit-devel`, then runs `tools/phonon/build-phonon.sh`, the same one recipe
+  the composite action runs. It writes a stamp beside the staged archives naming the image and
+  compiler that produced them, and rebuilds when the stamp does not match, so a developer's own
+  `lib/linux-x64` cannot ride into a wheel on the project copy cibuildwheel puts in the container.
+- The `wheels` job overrides cibuildwheel's `before-all` to nothing, because the engine arrives
+  prebuilt. Run cibuildwheel by hand from a checkout and the `pyproject.toml` before-all still does
+  the full job.
+- auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`. The engine loads both
+  at run time, so neither is in its `NEEDED` list and auditwheel would not see them anyway; the
+  flags stay as GUARDS, and the job still asserts that no `libasound` or `libjack` landed in the
+  wheel. Bundling either one was always wrong: `libjack` has to be the library the running JACK
+  server uses, and `libasound` is on every Linux desktop already. Everything else the engine needs
+  is in the manylinux policy, so a correct repair grafts nothing at all, which is also what keeps
+  the extension's `$ORIGIN` runpath intact. The wheel imports on a machine with NEITHER library;
+  each backend simply reports itself unavailable.
+- The `linux` job caches the container-built phonon under a key that names the image, and the
+  `wheels` job pins the same image. They have to agree: the engine the wheel carries is that
+  job's, and a wheel whose extension is compiled in one image against an engine from another is
+  the mismatch a manylinux tag promises is absent. Bump the two pins together.
+
+**macOS.**
+
+- macOS is one `universal2` wheel for x86_64 and arm64, with `MACOSX_DEPLOYMENT_TARGET=10.13`.
+  That is the only deployment target anything in this tree names (phonon's own
+  `CMakeLists.txt`), and it is cibuildwheel's universal2 default, so the wheel's tag is
+  predictable. Clang raises the arm64 slice to 11.0 by itself.
+- The `macos` job builds the engine with `CMAKE_OSX_DEPLOYMENT_TARGET=10.13` to match, and
+  asserts it: a `macosx_10_13_universal2` wheel carrying a dylib built for the runner's own macOS
+  installs anywhere and loads nowhere older.
+
+### `package`
+
+`package` compiles nothing. It waits for all five build jobs
+(`needs: [windows, android, linux, macos, wheels]`), downloads the four pack inputs and the
+release wheels, packs the Godot addon, the Unity package and the MATLAB toolbox, and on a tag
+creates the release. Each package carries every platform's engine library, which is why one job
+has to see them all. Keeping it apart from the build jobs lets the longest job in the matrix start
+at once instead of behind the cross-builds, and it keeps the per-platform engine artifacts
+available when packing fails, because the job that built each one uploads it.
+
+- **The Unity package is packed every run, and released on a tag.** `tools/upm/pack.ps1`
+  produces `com.brainworks.bw_audio-<version>.tgz`, the C# binding with every platform's engine
+  library inside it, so a broken package (a missing `.meta`, a lost plugin) fails the *build*,
+  not a release. It uploads as `unity-package-<ver>-r<N>`. Unity installs the tarball directly
+  (Package Manager → `+` → *Install package from tarball…*). The tag stamps the version into the
+  packaged manifest (the committed `package.json` stays `0.0.0-dev`), so a tarball can never claim
+  a version it isn't. See [Releasing](#releasing).
+- **The Godot addon packs every run** as `godot-addon-<ver>-r<N>` and, on a tag, as its own
+  release asset. A tag also updates the `unity` and `godot` distribution branches (installable
+  git refs; see `bindings/godot/README.md` and the workflow header).
+- **The MATLAB toolbox** is assembled as `bw_audio-matlab/`: `+bwa`, the examples, the README,
+  the licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that platform's two
+  MEX files plus the one engine library both of them load. The job asserts all six MEX files are
+  present before zipping. It uploads as `bw_audio-matlab-<ver>-r<N>` and, on a tag, as
+  `bw_audio-matlab-<tag>.zip`.
+- **A `v*` tag cuts a GitHub Release, and the Release is the distribution**: no registry, no
+  token.
+
+#### Release assets
+
+A release carries EIGHTEEN assets, because workflow artifacts expire (30 days) and a release
+doesn't:
+
+- `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
+- `bw_audio-godot-<ver>.zip`: the installable Godot addon.
+- `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb`, `bw_audio.h`, and
+  the tools). This is the durable download for a C/C++ consumer or the CAVE machine.
+- `bw_audio-android-<tag>.zip`: the Android engine, `libbw_audio.so` for `arm64-v8a` and `x86_64`
+  plus `bw_audio.h`. For a native consumer only: the Unity package and the Godot addon already
+  carry the `arm64-v8a` library.
+- `bw_audio-linux-x64-<tag>.zip`: the Linux engine, `libbw_audio.so` plus `bw_audio.h`. JACK and
+  ALSA, no ASIO.
+- `bw_audio-macos-universal-<tag>.zip`: the macOS engine, one universal `libbw_audio.dylib`
+  (x86_64 and arm64) plus `bw_audio.h`. No device backend yet, so it is the offline path. It is
+  **not code-signed and not notarized**: Gatekeeper blocks a downloaded unsigned library, so clear
+  the quarantine flag (`xattr -dr com.apple.quarantine <folder>`) after unzipping. Distribution
+  outside the lab would need a Developer ID signature and notarization.
+- `bw_audio-matlab-<tag>.zip`: the MATLAB and Octave toolbox. `+bwa`, the examples, the README
+  and the licenses, plus `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that
+  platform's two MEX files and the one engine library both of them load. Unzip it and `addpath`
+  the folder; there is nothing to build. Every MEX is built inside that platform's own desktop
+  job, MATLAB's and Octave's alike, and `bwa.setup` picks the one for the interpreter you are in.
+  Octave's extension is `.mex` on every platform, which costs nothing here: the layout is one
+  directory per architecture, so what shares a directory is one `.mexw64` and one `.mex`. The
+  macOS MEX files are arm64 and unsigned, so they take the same quarantine step as the macOS
+  engine above.
+- `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL, kept as
+  its own asset so it accompanies the binaries (GPLv3 corresponding source) without bloating
+  either the engine `.zip` or the `.tgz`.
+- `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the same
+  DLL, at its pinned commit, with the in-repo patch and a README naming the commit. Same reason as
+  the asset above, applied to the other statically linked dependency.
+- `bw_audio-<abi>-<python>-<platform>.whl`, **nine** of them, all from the `wheels` job: three
+  Pythons (`cp310-cp310`, `cp311-cp311`, `cp312-abi3`) on each of `win_amd64`,
+  `manylinux_2_28_x86_64` and macOS `universal2`. The Python binding, with the engine library
+  inside each wheel. Attached as wheels rather than zipped, because `pip` and `uv` install a
+  `.whl` straight from a URL. `<abi>` is `BWA_VERSION` from `bw_audio.h`, which is the tag's
+  number. Together they cover Python 3.10 and later: `abi3` means the cp312 wheel serves 3.12 and
+  every later version, and 3.10 and 3.11 get their own files. The release step asserts three
+  wheels per platform and the tag each one carries.
+
+All ship under GPLv3. The `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and `DIST.txt`,
+which names the commit and links the complete source; the `.tgz` carries the same inside it, and
+both point at the two source assets for the third-party code the repo fetches rather than
+vendors. An app that ships this DLL to third parties inherits GPLv3; see the ASIO section.
+
+Two constraints to know before you change any of this:
+
+1. **The package's `.meta` files are committed on purpose** (`tools/upm/gen-meta.ps1`): an
+   installed package is immutable, so assets without a `.meta` get a fresh GUID per project and
+   scenes lose their script references. The native plugins' import settings (Windows x64, Editor
+   on) ship the same way; they cannot be fixed in the Inspector afterwards.
+2. **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.** A UPM
+   registry (they all speak the npm protocol) keys on a single publishable tarball. Nothing is
+   listed on one today (the audience already has the repo, and a public listing would invite
+   installs into projects the GPLv3 would surprise). But the tarball IS what a registry would
+   serve, so listing it later stays a config change rather than a rebuild. Preserving that costs
+   nothing.
+
+### Pages
+
+`.github/workflows/pages.yml` builds the browser demo with Emscripten and publishes it to GitHub
+Pages on every push to `main`. It is a separate workflow so a red demo never blocks a release, and
+nothing it produces is a release asset. [web.md](./web.md) has the hosting details.
 
 ## Linux notes
 
@@ -792,8 +835,8 @@ routes reach the array (24 speakers, possibly 36 later), and the sink sees an or
   presents a virtual ALSA card, and Dante devices in AES67 mode receive its multicast flows. The
   configuration is on the Dante side, in Dante Controller. Nothing in a backend knows about AES67.
 
-[backends.md](./backends.md) has the full statement, including the hardware questions that are
-still open.
+[backend-development.md](./backend-development.md#linux-and-the-array) has the full statement,
+including the hardware questions that are still open.
 
 ## Android
 
@@ -966,9 +1009,9 @@ measurements from runs on an API 34 `google_apis` x86_64 image:
   `clock_nanosleep(TIMER_ABSTIME)` either way, a Windows desk box measures 0.43 ms and WSL2
   0.13 ms, and a bound that a real device has never been measured against should not be widened to
   fit an emulator. A physical headset measurement is on the verify list in
-  [backends.md](./backends.md).
+  [backend-development.md](./backend-development.md#verify-before-relying-on-it).
 
-The other 32 tests of the 33-test suite pass on the emulator, every run.
+Every other test in the suite passes on the emulator, every run.
 
 ## Dante configuration
 
@@ -998,7 +1041,7 @@ isolation bullets.
   the net. Either let the Digiface lead, or point it at whichever hardware node you prefer as
   leader. Pick deliberately and check it in Dante Controller: an unlocked domain
   shows up as a sample rate that wanders between runs (Stage 0 of the runbook measures this).
-- **Latency:** start ASIO buffer ~512–1024 and Dante latency 4–10 ms, then tighten
+- **Latency:** start ASIO buffer ~512 to 1024 and Dante latency 4 to 10 ms, then tighten
   empirically against measured dropouts.
 - **Isolation:** less of a concern than with a software endpoint. A software Dante driver
   packetizes on the host CPU, so it competes with engine frame-rate spikes and is worth
@@ -1054,11 +1097,12 @@ Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md
 
 This sequence lives in `src/sink/asio_sink.cpp`, behind the device-agnostic `src/sink/sink.h`
 seam, so ASIO types never leak into the engine. It compiles only when the ASIO SDK is
-vendored. Fetch the SDK per [`../third_party/README.md`](../third_party/README.md);
+in place. Fetch the SDK per [`../third_party/README.md`](../third_party/README.md);
 CMake auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without
 the SDK, the offline `null_sink.c` backend builds instead: the library always builds
-and the audio loop is testable with no hardware. Pick a backend with `bwa_desc.sink`
-(`null` | `asio`; default is ASIO with null fallback). The ASIO backend rejects any
+and the audio loop is testable with no hardware. Pick a backend with `bwa_desc.sink`. The
+default, `BWA_SINK_AUTO`, tries the platform's backends in order and falls back to the null sink;
+see [backends.md: AUTO order](./backends.md#auto-order). The ASIO backend rejects any
 driver that exposes fewer output channels than the layout needs (24 for the CAVE array now).
 
 ## Verify before shipping

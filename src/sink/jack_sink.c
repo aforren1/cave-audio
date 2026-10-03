@@ -1,5 +1,5 @@
 /*
- * jack_sink.c — the JACK backend (docs/backends.md, phase 5).
+ * jack_sink.c — the JACK backend (docs/backend-development.md, phase 5).
  *
  * WHY IT EXISTS. JACK is the Linux production path. The same binary talks to a JACK2 server
  * (libjack, LGPL-2.1) and to PipeWire (pipewire-jack's drop-in libjack, MIT); which one answers is

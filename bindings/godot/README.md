@@ -21,7 +21,7 @@ This directory is both things at once:
 
 The shortest thing to run first is `demo/minimal.tscn`: a click orbits the listener's head for
 six seconds and the scene quits. Every other binding of this engine ships the same demo with the
-same stimulus, so the four are comparable by ear.
+same stimulus, so you can compare them by ear.
 
 ## Build
 
@@ -103,6 +103,32 @@ editor and a template_release library for each, so the extension loads in the ed
   library, so clear the quarantine flag once after unzipping:
   `xattr -dr com.apple.quarantine addons/bw_audio`.
 
+## Quickstart
+
+The smallest scene that makes sound. Build this tree:
+
+```
+Main (Node3D)
+  BwaEngine    profile = Binaural, listener = ../Listener
+  Listener     a Node3D at (0, 1.5, 0), or your Camera3D
+  BwaEmitter   clip = "res://click.wav", loop = on, at (0, 1.5, 2)
+```
+
+Press play. `BwaEmitter.autoplay` is on by default, so the clip starts when the emitter is ready,
+2 m in front of the listener. Move the emitter and the sound follows: `BwaEngine` pushes every
+source and the listener each frame.
+
+Keep `BwaEngine` ABOVE every source in the tree. Godot runs siblings' `_ready` top to bottom, the
+engine starts in its own `_ready`, and a source that is ready first finds no running engine and
+stays silent (it warns). To start a sound from a script instead, turn `autoplay` off and call:
+
+```gdscript
+$BwaEmitter.play_clip("res://click.wav")
+```
+
+`res://` paths work in the editor only; see "Asset paths" below before you export.
+`demo/minimal.tscn` in the repository is this scene with a synthesized click orbiting the head.
+
 <!-- dev -->
 ## Distribution
 
@@ -124,8 +150,8 @@ hash, and rewriting history would eventually orphan a published one. The standin
 that the branch grows by roughly the addon's size per release; that is inherent to in-repo
 distribution.
 
-A release also attaches the zip beside the Unity `.tgz`, the engine bundle and the ASIO SDK
-source, for anyone who would rather not use the AssetLib.
+A release also attaches the zip beside its other assets, for anyone who would rather not use the
+AssetLib. [docs/build.md](../../docs/build.md#continuous-integration) lists them.
 
 ### Submitting a store listing
 
@@ -409,8 +435,6 @@ holders keep theirs, so nothing is pulled out from under a playing voice.
 `sound_get_frames(path)` and `sound_get_channels(path)` are **cached-only** on purpose. They
 ask the core through `bwa_sound_find`, a pure lookup that never loads and never takes a
 reference, so a path the engine has not loaded reports 0 instead of decoding as a side effect.
-An earlier version decoded on the miss, and it always decoded MONO, so an ambisonic bed
-answered 1 channel forever.
 
 `BwaEngine` still records the `(path, flags)` keys it acquired, but only to know which
 references are **its own**: `unload_sound_path` releases exactly those, and `sound_is_ready`
@@ -438,9 +462,9 @@ whose entry resolves at bind time.
 
 ### Configuring a source in one value
 
-Twenty-plus setters describe a source, and until now nothing read your settings back. The two
-getters that existed report what the simulation is currently doing, not what you asked for. `get_desc()`
-returns the whole configuration as a Dictionary, so you can print it, diff two sources, and
+Twenty-plus setters describe a source. The per-property getters report what the simulation is
+currently doing, not what you asked for. `get_desc()` returns the whole configuration as a
+Dictionary, so you can print it, diff two sources, and
 find the one that sounds wrong:
 
 ```gdscript
@@ -478,16 +502,18 @@ Whatever you pick, `get_audio_backend()` reports what actually happened, decode 
 print($BwaEngine.get_audio_backend())   # asio:RME Digiface Dante (steam HRTF direct)
 ```
 
-To fill a device picker, ask for the drivers in one call. These are static, need no engine,
-and return the exact strings `asio_driver` accepts (empty picks the first usable device):
+To fill a device picker, ask a backend for its devices in one call. `get_devices(backend)` is
+static, needs no engine, and returns the exact strings the `device` property accepts (empty picks
+the first usable device):
 
 ```gdscript
-for name in BwaEngine.get_asio_drivers():
+for name in BwaEngine.get_devices(BwaEngine.SINK_WASAPI):
     print(name)
 ```
 
-`get_asio_driver_count()` and `get_asio_driver_name(i)` are still there for a caller that
-wants a single name without building the array.
+Prefer the id (`get_device_id(backend, i)`) when you persist a choice: friendly names collide
+between a headset and its dock. The ASIO-only spelling (`get_asio_drivers()`,
+`get_asio_driver_count()`, `get_asio_driver_name(i)`) stays as a wrapper.
 
 ### Is the device being starved?
 
@@ -559,8 +585,8 @@ ctest --test-dir build-godot -C RelWithDebInfo -R godot_
   node's Godot forward equals the converted quaternion's room facing) rather than
   restating the conversion, over cardinal and random orientations. Pure float math, no
   godot-cpp, so it always builds.
-- **`godot_smoke`**, **`godot_frame`**, **`godot_api_manual`**, **`godot_api_null`**,
-  **`godot_scene`**, **`godot_scene_no_room`**, **`godot_playground`** - the demo scenes and
+- **`godot_smoke`**, **`godot_frame`**, **`godot_minimal`**, **`godot_api_manual`**,
+  **`godot_api_null`**, **`godot_scene`**, **`godot_scene_no_room`**, **`godot_playground`** - the demo scenes and
   the playground self-test, self-checking and headless. These need an editor binary, which is
   not a build dependency, so point CMake at one:
   `-DBWA_GODOT_EXE=".../Godot_v4.7.1-stable_mono_win64_console.exe"`. Without it they are

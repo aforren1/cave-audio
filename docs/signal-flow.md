@@ -22,7 +22,7 @@ flowchart TD
 
   subgraph SIM["off-thread producers"]
     POSE["OptiTrack → pose seqlock<br/>natnet.c → pose_write_t<br/><i>bwa_tracker_connect · bwa_set_pose_prediction</i>"]
-    SCENE["scene sim 30 Hz: occlusion · transmission tilt ·<br/>directivity (steam_scene.c → rt_set_direct)<br/><i>bwa_scene_set_mesh_mat/_box · bwa_source_set_occlusion ·<br/>_set_directivity · _set_occlusion_manual (no-SDK path)</i>"]
+    SCENE["scene sim 30 Hz: occlusion · transmission tilt ·<br/>directivity (steam_scene.c → rt_set_direct)<br/><i>bwa_scene_set_mesh_mat · bwa_scene_set_box · bwa_source_set_occlusion ·<br/>_set_directivity · _set_occlusion_manual (no-SDK path)</i>"]
     PATHS["path sim 10 Hz: per-voice shCoeffs + bending tilt<br/>steam_path.c → rt_set_pathing<br/><i>bwa_desc.enable_pathing · bwa_source_set_pathing</i>"]
   end
 
@@ -58,7 +58,7 @@ flowchart TD
   OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/>(direct mode: per-image direct_gains_at)<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_set_early_reflections_gain</i>" .-> BUS
   PROP -. "decor split × √spread<br/><i>bwa_set_decorrelation</i>" .-> DECOR
   PAN --> BUS
-  PAN -- "BINAURAL profile: direct_gains_at -<br/>16 SH gains at the TRUE direction<br/>(ambi_encode_phonon; voice + ISM images<br/>land here INSTEAD of the bus)" --> DIRECT
+  PAN -- "BINAURAL profile: direct_gains_at -<br/>16 SH gains at the TRUE direction<br/>(ambi_encode_phonon; voice + ISM images<br/>land here INSTEAD of the bus;<br/>mode 2 with the SDK: the point share √(1−s)<br/>goes to the voice's own HRTF tap, the wide<br/>share √s to the field)" --> DIRECT
 
   subgraph BEDV["bed voice: mix_bed, per sample (inside rt_render)"]
     SH["SH frames (world-locked soundfield)<br/><i>bwa_bed_play · bwa_bed_set_gain</i>"]
@@ -82,7 +82,7 @@ flowchart TD
   PACC --> PTAP["path tap (rt_set_path_tap):<br/>steam_path_tap: phonon's own ambisonics decode"] --> BUS
   PACC -- "BINAURAL profile: summed raw<br/>(already phonon-basis SH; tap skipped)" --> DIRECT
 
-  BUS --> MG["× master gain (ramped)<br/><i>bwa_set_master_gain</i>"]
+  BUS --> MG["× master gain (ramped; in BINAURAL also<br/>the DIRECT field and the point taps)<br/><i>bwa_set_master_gain</i>"]
   MG --> ALIGN["align_process + room_eq_track + listener_align_track + directivity_track:<br/>per-speaker correction FIR · room-EQ biquads<br/>(re-aimed at the tracked pose) · directivity comp (gain + HF shelf) ·<br/>gain trim · delay (delay+trim re-referenced onto the tracked head, slewed)<br/>BINAURAL profile: skipped whole<br/><i>trims/EQ written by bwa_calibrate · bwa_set_tracked_room_eq ·<br/>bwa_set_tracked_directivity · bwa_set_tracked_align</i>"]
   ALIGN --> TSIG["+ test signal (raw channel, post-align)<br/><i>bwa_set_test_signal</i>"]
   TSIG --> LIM["linked limiter → per-channel peak meters<br/><i>bwa_set_limiter · _limiter_ceiling · bwa_get_bus_levels</i>"]

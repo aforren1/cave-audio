@@ -952,3 +952,505 @@ the suite's own mexLock-based leak check is what caught it. And MinGW's `ld` as 
 object with no sort order requested, which `-Wl,--sort-section=name` fixes outright; the same
 mkoctfile needs `-Wl,-rpath,\$ORIGIN` escaped on Linux, because it hands its link line to a shell
 that would otherwise expand it to an empty runpath.
+
+---
+
+## Moved out of the user docs (2026-10-03)
+
+Development history, war stories and dated run logs removed from `README.md`, `docs/*.md` and
+`bindings/*/README.md` in the 2026-10-03 accuracy and voice pass. Each doc now states the
+present-tense rule; the story is kept here. Grouped by the doc it came from.
+
+---
+
+**Streaming thread wait cap is the old flat cadence (from docs/concurrency.md).** The streaming thread waits with a timeout: the shortest time any fillable ring could drain to empty at the engine rate, floored at 1 ms and capped at 3 ms. The cap is the flat cadence it used to sleep on, so an active stream is never served later than it was before the refill loop became an event wait. (The doc now states only the present rule: capped at 3 ms, `STREAM_POLL_MS`.)
+
+---
+
+**limiter_ceiling went from dB to linear (0.4.0; from docs/api.md).** `limiter_ceiling` changed from dB to linear in 0.4.0, and only its parameter name records it. This is the case behind the rule that a decibel value must say `_db`.
+
+---
+
+**Configuration env vars removed (from docs/api.md).** The output device (`bwa_desc.sink`/`device`), Embree (`bwa_desc.embree`), pathing (`bwa_desc.enable_pathing`), reflection baking (`bwa_reflections_desc.bake`) and the OptiTrack connection (`bwa_tracker_connect`) all used to be `BWA_*` environment variables. The engine reads none now.
+
+---
+
+**AUTO order change for headphone profiles (from docs/api.md).** A headphone profile now opens the Windows default output. That was the one behavior change from earlier versions: the old order picked the first registered ASIO driver, which on a rig machine could be the Digiface, and played the monitor into Dante channels 1 and 2. With WASAPI in the order, `cave_both` finally opens both devices at once (array on ASIO, monitor on WASAPI). The ASIO SDK holds one driver per process, which is why it could not before.
+
+---
+
+**Testing the async held window (from docs/api.md).** A test that means to cover the held window has a problem: a small asset usually decodes before the first render, so the play binds at once, the held path never runs, and the test passes anyway.
+
+Ordering solves it, without any test hook. A finished decode is adopted only at a pump point: `bwa_sound_acquire`, `bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, and `bwa_commit`. `bwa_source_play` is not one. So a play issued straight after `bwa_sound_acquire_async`, with nothing pumping in between, is guaranteed to be held. Check it with `bwa_sound_get_channels`, which reads 0 while the slot is still reserved and does not pump.
+
+Slipping a readiness check in before the play is what breaks this, and it breaks it silently: the decode gets adopted and the case turns into an ordinary bind while every assertion still passes. `test/assets_test.c` does it in the guaranteed order and says so.
+
+Cancelling an in-flight load cannot be pinned down this way, because `bwa_sound_release` pumps on entry. Both outcomes are safe, so that test covers the behavior without being able to claim which branch ran.
+
+---
+
+**max-rE default and the rig trial (from docs/api.md).** max-rE has been ON by default since the offline bed sweep, which had the taper winning every axis under both decoders and both observer models. The rig trial confirms rather than gates; if it disagrees, revert the default.
+
+---
+
+**Box and custom mesh used to be alternatives (from docs/api.md).** Before `bwa_scene_set_ism_room` and `bwa_box_mesh`, `bwa_scene_set_box` replaced the static mesh, so the box and your own occluders were alternatives rather than layers. The workaround then was: call `_set_box` first (nothing else captured the ISM room), then ONE `_set_mesh_mat` carrying the box's 12 inward-facing triangles alongside your own geometry.
+
+---
+
+**Source desc: what it added (from docs/api.md).** `bwa_source_get_desc` let you print what a source is set to, which nothing could do before (only occlusion and directivity had getters, reporting the sim's live value). The preset also gave a source a reset, which the API had no way to express.
+
+---
+
+**peak_load windowing (0.16.0, 2026-09-23; from docs/api.md).** Up to 0.16.0 `bwa_health.peak_load` was a since-start maximum. It is now the worst block over the last 4 to 5 s of stream time; the field and the struct layout did not change, so no ABI bump.
+
+---
+
+**Default grid and capacity were once the same number (from docs/api.md).** `BWA_DEFAULT_GRID` (26) and the channel capacity were the same number before the capacity rose to 64, which is why the docs warn not to use one where you mean the other.
+
+---
+
+**Failed-layout start refusal (from docs/api.md).** "The old sharp edge here is now fenced": a failed explicit layout load used to leave the engine silently rendering the default grid's 26 channels. `bwa_start` now refuses it with `BWA_ERR_LAYOUT`.
+
+---
+
+**Tuning preset count asserted in smoke (from docs/api.md).** Seated and roaming differ in exactly three fields, and the `smoke` test asserts the count so a fourth opinion cannot arrive unannounced.
+
+---
+
+**FDN made reverb SDK-free (from docs/api.md).** The directional FDN meant the reverb path no longer required the Steam Audio SDK.
+
+---
+
+**The backend problems as first stated (from docs/backends.md, "Why").** Three problems motivated the backend work, in order of pain. Headphones on Windows needed an ASIO driver: the `binaural` and `cave_sim` profiles opened a 2-channel ASIO device, so a desk machine without a pro interface ran ASIO4ALL or FlexASIO. `cave_both` could not open its second device: the ASIO SDK holds one current driver per process, the sink refuses a second open (the `g_sink` check at the top of `bwa_asio_sink_open`), and `bwa_start` opened the monitor through the same path with the same driver name, so under `BWA_SINK_AUTO` the monitor fell to the silent null sink and under `BWA_SINK_ASIO` the start failed. The profile had never had a live monitor on hardware. And the engine was Windows-only, so a collaborator on a Mac could not run the headphone profiles and a standalone headset could not run the engine. The ABI for the backends (appended `bwa_sink_type` values, `bwa_desc.device` and `sink_flags`, the device query, `bwa_health.device_lost`) landed in one minor bump, `BWA_VERSION_MINOR` 13 to 14 (0.14). `bwa_get_sink_type` used to match `"asio"` by prefix on the backend string; the vtable gained `bwa_sink_type type` to replace it, and `bwa_sink_open` changed from `(sink_type, asio_driver)` to `(sink_type, device, flags, exact_rate)`. The ASIO sink's `convert_out` and `to_i32` moved out to `sink_convert.h` and gained interleaved variants.
+
+---
+
+**The bindings were once future work (from docs/backends.md, "Experiments from Psychtoolbox or PsychoPy").** The Python nanobind extension and the MATLAB/Octave classic C MEX were both described in backends.md as future work before they existed. The offline experiment shape (manual sink render, PsychPortAudio playback) was stated as "works on Windows today and on Linux after phase 2".
+
+---
+
+**AudioWorklet `os_monotonic_ns` read stack garbage (2026-09-23; from docs/backends.md, rule 3 table).** `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. Until 2026-09-23 `os_monotonic_ns` ignored that and returned uninitialized stack there (measured: one constant, so render times read 0 and the first one read a whole second). It now falls back to `emscripten_get_now`.
+
+---
+
+**Phase 2 OS shim: what the inventory did not predict (from docs/backends.md, the OS shim section).** Six things the Win32 inventory did not predict. Four were found while implementing phase 2, and two more came out of the macOS CI runner after it.
+
+- `SRWLOCK` is not `CRITICAL_SECTION`: `steam_scene.c` guards the committed `IPLScene` with a reader/writer lock, so the shim gained `os_rwlock` beside `os_mutex`.
+- `pose.h` stopped being a C++-visible header when its payload fields became `_Atomic`. `examples/validate.cpp` reached the seqlock through `natnet.h`, so `natnet.h` gained `natnet_read_pose`.
+- `bwa_null_sink_skip_blocks` stayed a plain `volatile int` because `sink.h` is included by the C++ sinks.
+- Path normalization was a Windows fact: `assets.c` folded case and backslashes into the cache key; both folds became `_WIN32`-only.
+- Priority is not one call with three spellings. The WASAPI sink used to ask for MMCSS "Pro Audio" inline; `os_thread_set_realtime(period_ns)` replaced it. On Apple, Darwin coalesces timers for threads without `THREAD_TIME_CONSTRAINT_POLICY`: the macOS CI runner measured p50 2.749 ms and p99 9.759 ms against a 2 ms deadline, and `os_sleep_ms(50)` taking 100.7 ms, with the timebase conversions verified correct in both directions. The Windows effect was measured too: on a desk machine pinned at 100 percent CPU by unrelated work, the same 200-wake measurement gave p50 12 to 18 ms on an ordinary thread and p50 0.407 ms with p99 0.811 ms on the MMCSS thread.
+- The null sink stamped its own epoch, and a zero stamp reads as no stamp. It used `os_monotonic_ns() - base`, with `base` captured a few instructions earlier on the same thread; every other backend stamps the platform clock. On Apple Silicon (`mach_absolute_time` at 41.67 ns) the FIRST block's stamp came out exactly 0, which `rt.c`'s publish gate reads as "no stamp": `bwa_get_clock` had nothing until block 1, and a late wake pushed that past the 30 ms window `test_smoke` allows. Windows and Linux avoided it by clock resolution, not by design.
+
+The migration also moved `test/` and `examples/` off their own `Sleep`, `GetTickCount64` and `<windows.h>` (13 test files, 14 examples): around 300 lines of shim plus a mechanical pass over about 40 files. `test_idle`: putting the loader and stream-thread sleeps back measured 35 and 35 loop iterations in 500 ms on a Windows desk box (bound: under 5), and more on a machine whose timer resolution something else has raised. The null sink used to call `timeBeginPeriod(1)`, holding the whole machine at a 1 ms timer tick for as long as a visual-only tool had the offline sink open.
+
+---
+
+**Phase 2 CMake changes (from docs/backends.md, "CMake").** Phase 2 removed the `if(NOT WIN32) message(WARNING ...)` in favor of a status line, moved `ws2_32` and `winmm` behind one `bwa_link_os` helper, and gave two auto-detects a platform guard (`BWA_WITH_ASIO` requires `WIN32`; Steam Audio requires the platform's own `lib/<platform>/`). The `/experimental:c11atomics` list grew with the files that became atomic.
+
+---
+
+**Steam Audio CI on Linux and macOS: three fixes (from docs/backends.md, "CMake").** The follow-up that built phonon in CI for Linux and macOS turned out as small as predicted, because phonon links statically, but it cost three fixes. `-t` is a Windows-only argument in both pinned build scripts, so the composite action's `make` default was an argparse error rather than a no-op. `enable_language(CXX)` had to move into the phonon block: `project()` declares `LANGUAGES C` and the other `enable_language(CXX)` calls sat under Windows-only features, so a Linux configure set `LINKER_LANGUAGE CXX` on a project with no CXX link rule; CMake emitted an EMPTY link rule, the build reported "Linking CXX shared library libbw_audio.so", exited 0 and wrote no library, and every test still passed. `-Wl,--exclude-libs,ALL` went on the library because phonon's `IPLAPI` re-exported every `ipl*` entry point despite `-fvisibility=hidden`.
+
+---
+
+**Worklet host-thread quiet window flapped under a deep buffer (from docs/backends.md, "Wasm Audio Worklet").** The old fixed quiet window of eight blocks is only 43 ms at 256 frames. When the XR page moved to a 0.05 latencyHint, the browser rendered quanta in 50 ms bursts, the heartbeat went quiet inside every burst gap, the host thread took over, `device_lost` flapped, and the two pullers alternated on one adapter (`run-xr` caught it at block 128). The window became `max(8 blocks, 3 x baseLatency)`; putting the fixed eight back turns that check red again.
+
+---
+
+**Render ahead tried and rejected for the worklet sink (2026-09-24; from docs/backends.md, "Wasm Audio Worklet").** Rendering a 256-frame block inside a 128-frame `process()` puts 5.3 ms of work inside a 2.7 ms deadline, and a Galaxy XR headset chopped. On 2026-09-24 the obvious fix was built, tested and measured: a render thread (a pthread Worker) filling a ring of blocks while `process()` only copied, then a hybrid in which `process()` rendered a rescue block when the ring ran dry and the render thread was idle. It lost, for one reason: a Worker has NO priority, and the AudioWorklet thread is the one thread a page owns that the OS treats as audio. On a busy laptop (a 12-core hybrid i7-1360P running several CPU-bound jobs) the render thread was descheduled mid-render for 40 to 200 ms, and it held the non-reentrant render at exactly the moments a rescue would have helped (14 rescues against about 380 starves over eight hybrid runs). Paired runs, builds alternated at one pinned load, 3 s each:
+
+| sources (mean block) | render in `process()`: device underrun | render ahead alone: ring starve | hybrid (rescue): ring starve |
+|----------------------|----------------------------------------|---------------------------------|------------------------------|
+| 64 (2.2 to 3.7 ms)   | 0, 0, 0, 0 s                           | 0.13, 0.03, 0, 0.03 s           | 0.20, 0, 0, 0.11 s           |
+| 96 (3.1 to 5.3 ms)   | 0.18, 0.30 s                           | 0.31, 0.10 s                    | 0.11, 0.59 s                 |
+
+Render ahead never beat rendering in `process()` at any load. The slack an overrun needs has to come from the BROWSER'S output buffer, which the priority thread already owns, and that is what `BWA_SINK_FLAG_DEEP_BUFFER` asks for.
+
+---
+
+**Worklet main-thread audit (2026-09-24; from docs/backends.md, "Wasm Audio Worklet").** "Nothing on the audio path waits on the main thread" was audited on 2026-09-24 after a headset froze with its window (cause still unknown).
+
+---
+
+**Android packaging and phonon landed in steps (from docs/backends.md, "AAudio").** Phase 2's shim covered the code, the NDK toolchain wiring landed with phase 3, the packaging with the follow-up, and phonon for Android after that. The phase table still said "done, except phonon" after phonon landed.
+
+---
+
+**Phase ordering (from docs/backends.md, "Phases").** Phase 1 went first because it fixed a live defect, removed a dependency for every desk user, and is the PC VR path. Phase 2 was independent of it and could run in parallel; it is mechanical and touches many files, so it wanted its own review. Phases 3 to 5 depend only on phase 2 and not on each other, so their order was a scheduling choice. Phase 5 went first of the three, because a Linux box with both a JACK server and an ALSA card was the hardware at hand, and phase 3 second, because an Android emulator is a download rather than hardware.
+
+---
+
+**Original "What to update when implementing" checklist (from docs/backends.md; all done as of 2026-10-03).** `include/bw_audio.h` (the enum, the desc union and `sink_flags`, the device query, `bwa_health`, the `BWA_VERSION_MINOR` bump, the `bwa_desc.block_size` comment "the device period hint"); `docs/api.md` (desc table, sink policy, "Device query", profile table wording, health); `docs/build.md` (Platform, options, libjack and alsa-lib, CI, Linux notes); `docs/architecture.md` ("ASIO for the array on Windows; any system backend for a stereo monitor"); `CLAUDE.md` (repo layout, the `*_sink` trap); `docs/integration.md`; `docs/hardware-validation.md` (desk day); `bindings/unity/Runtime/Bwa.cs`, `Engine.cs`, `Editor/EngineEditor.cs` (the `"asio:"` prefix check); `bindings/godot/src/bwa_engine_node.{h,cpp}` (the `Sink` enum, `asio_driver` -> `device`); `third_party/README.md` (sink selection); `examples/` (`playground.cpp` and `layout_tool.cpp` `asio` prefix checks, the ASIO-only picker and `--list-drivers`, `--driver` and ASIO4ALL wording in `minimal.c`); `NOTES.md` (the `engine.c` "WASAPI is future" comment). The deferred follow-up "the examples' backend awareness" pointed at the examples item and is also done (`playground.cpp` enumerates through `bwa_get_device_count`).
+
+---
+
+**Backend test history (from docs/backends.md, "Tests").** `test_sink_convert` and `test_sink_quant` shipped with phase 0, with the pop arithmetic broken on purpose and confirmed red before being trusted green. `test_os` shipped with phase 2. The WASAPI section of `test_audio_sink` shipped with phase 1, the JACK and ALSA sections with phase 5, and the AAudio section with phase 3. The WASAPI EXCLUSIVE subsection's queued-depth rule was the first live exercise of that rule; every earlier live dropout came through the shared-mode release-interval rule or the null sink. A 36 ms stall ("two buffers plus slack") tripped the exclusive depth rule at one block size out of three, which is why the stall is 150 ms. The EXACT_RATE subsection's first draft asked the strict open first, and a build with the fold removed came out SKIP rather than red. At the time of writing, a default no-SDK, no-tool Android build had 33 tests (32 passing every run on an emulator, `test_os` flaky), and the Linux and macOS CI jobs ran 38 tests (33 off-Windows defaults plus 5 SDK-gated; Windows had 45; a Linux tree with `BWA_BUILD_PLAYGROUND=ON` had 40 with phonon and 35 without, measured on Ubuntu 22.04, gcc 11.4, software GL). Current counts: CLAUDE.md, or `ctest -N` in the build tree.
+
+---
+
+**Verify-list history (from docs/backends.md, "Verify before relying on it").** WASAPI exclusive mode had been written and compiled and never opened until `test_audio_sink`'s exclusive subsection. Static phonon for Linux: 38 of 38 under WSL (NixOS, gcc 14.3.0). Static phonon for Android: 37 of 38 every run on an x86_64 API 34 emulator (the red was `os`). Static phonon for macOS: the job's `stage-dir: osx-universal` was first read off phonon's `core/CMakeLists.txt`, and that reading was wrong: its `set(CMAKE_OSX_ARCHITECTURES ...)` comes after `project()` and does nothing, so the first CI run staged an arm64-only core archive and the universal engine link failed. Two open items were removed as contradicted by the `[x]` exclusive-mode entry: "Exclusive mode on a real interface ... has only ever run in shared mode", and "The EXCLUSIVE-mode depth rule against a deliberately starved stream ... has never been run at all". The second carried the shared-mode measurement: a render stalled past two full buffers on a 1056-frame buffer with a 480-frame period counted exactly one dropout of about 2860 frames, and a healthy run counted none.
+
+---
+
+**Engine SDK and CI history (from docs/build.md).** Each binding used to pull the engine in as a source dependency, so a job that built the engine, two Godot extension flavors and a wheel compiled the engine four times and shipped four files that were only meant to be the same. Before the manylinux engine step, the repository built two Linux engines: one on the runner for ctest, the MEX pair and the Godot addon, and a second inside cibuildwheel for the release wheel. `bw_audio.dll` used to need a `phonon.dll` beside it before phonon was linked statically. The `wheels` job used to leave Windows out because a Windows wheel already names one ABI and one architecture; that was beside the point, since what one wheel could not cover was the interpreter. The binding tests used to be in the Linux and macOS ctest count.
+
+---
+
+**Release version merge (from docs/build.md, "Releasing").** Before 0.16.0 the header carried its own ABI counter (0.15.0 at the last such release) beside the tag (v0.7.0), and a wheel's version could not be related to the release it came from. The two were merged by continuing the header's sequence, which is why the tags jump from v0.7.0 to v0.16.0.
+
+---
+
+**Null sink timer resolution (from docs/profiling.md).** The null sink used to bracket its render loop with `timeBeginPeriod(1)`, which is system-wide in effect, so any tool that happened to open the offline sink held the whole machine at a 1 ms timer tick for as long as it ran.
+
+---
+
+**Sweeps used to be single and unwindowed (from docs/calibration.md, "Sweep quality").** Each speaker used to be swept once, and the arrival was the strongest tap anywhere in the IR. One loud event during a sweep could move a level, an EQ band, or, rarely, the arrival, and nothing said so. The expected-arrival window, the SNR floor and the re-sweep replaced that.
+
+---
+
+**Collaborators' over-screen elevation signature (from docs/calibration.md, "What the screens do").** The collaborators' 24-speaker array has the over-screen versus through-screen split and measured that signature, a median +12° of upward elevation displacement, which the paper attributes to speaker density. Both mechanisms (speaker density and over-screen speakers running hot) push the same way, so their data cannot separate them.
+
+---
+
+**The ZM-1 on Dante was the unblock, not the DSP (from docs/calibration.md, "Getting the ZM-1 onto Dante").** The obstacle to `--zylia` on hardware was never the DSP: the sweep plays out of the Digiface and the ZM-1 is a different USB device, and the ASIO SDK has one process-wide current-driver slot. Two drivers at once is not a flag, it's a rewrite. Putting the ZM-1 on the Dante network "dissolved" the problem: `calib_capture.cpp` went from "N outs + 1 mic input" to "N outs + 19 inputs", a parameter, not an architecture (`calib_asio_open_multi`).
+
+---
+
+**Collaborators' AES 161 handedness reflection (from docs/calibration.md, "The capsule geometry").** The collaborators' AES 161 measurements fit exactly the mirrored-capsule-numbering case: a fixed azimuth-handedness reflection present on every recording day, and it dominated their mount fit.
+
+---
+
+**ASIO systemTime on the development box (from docs/calibration.md, "Clap positions from a tracked clicker").** `systemTime` (documented as `timeGetTime`-derived) ran 27 ms off QPC on the development box. The onset path's fallback estimate (snapshot frame minus post-roll) was called "the old estimate" in the doc.
+
+---
+
+**Wrong clicker tip offset, full simulation numbers (from docs/calibration.md, "Clap positions from a tracked clicker").** In simulation, a tip offset left at 0 on a clicker whose tip is 11.6 cm out put every clap 11.6 cm off, in a different direction each time. The survey still solved: residual 3.2 µs against 0.035 µs, capsules off by up to 3.2 mm against 0.04 mm.
+
+---
+
+**`calib_view --tests clicker`, the seven checks (from docs/calibration.md, "Clap positions from a tracked clicker").** With the stand tracked, every banked clap is the clicker's true tip against the stand's measured center (not either typed field) and the survey recovers the capsule table; a tip left at 0 makes the residual and the geometry measurably worse; the ring is refused; an interferer is refused by the arm window or the direction check; one that slips past both is flagged by leave-one-out and dropped; with the 80 ms stall, every still click banks at its true tip when judged at its stamp; and judged at the old estimate instead, every click that is followed by a move is refused. `--tests onset_stamp_math` feeds the callback's arithmetic and its clock check the three bases a driver can stamp on.
+
+---
+
+**Clap interferer rehearsal, test detail (from docs/calibration.md, "Which transient is the clap?").** `--tests zylia` checks that both simulated interferers (one right after the second click, one timed like the eighth) are refused and the geometry lands within 0.2 mm of the capsule table the claps came from, as a clean run's does. It also checks one timed like the third click, before any provisional survey: it banks, leave-one-out flags it, and dropping it restores the geometry. `typed_arm` drives the typed window.
+
+---
+
+**Speaker-sweep capsule survey, simulation numbers and ctest pins (from docs/calibration.md, "The speaker-sweep capsule survey").** On the 26-speaker example in the simulated room, tracked and told an offset 18.1 mm from the stand's true one (`--track-sim-offset`): residual 0.04 µs, radius 49.50 mm, every capsule within 0.03 mm of the truth after a reload and a re-aim, and the acoustic offset within 0.1 mm of the true one. Untracked and anechoic, every capsule within 0.01 mm. Leave-one-out held every speaker under 0.1 µs on both. The `calibrate_capsule_survey` ctest pins 0.1 mm and 1 mm, a refusal by name for one speaker moved 80 mm in the layout, the clean table and center after `--drop-outliers` drops it, the stop on a second one, the refusal of a speaker 40 mm out radially by its range alone, a `--latency` 20 mm off that flags nobody, and the range check on the dome's upper side with the latency poorly pinned.
+
+---
+
+**Live aiming before capsule cross-correlation (from docs/calibration.md, "Accuracy, in simulation").** Before the capsules were cross-correlated, the live position direction read up to 0.6 degrees off (20 mm at 2 m) and a 10 cm move read 89 mm with 13 mm sideways (now 100.7 mm with nothing sideways).
+
+---
+
+**`calibrate_live_zylia` pins (from docs/calibration.md, "Accuracy, in simulation").** The ctest pins the 10 cm move, the 25 degree estimate with the reference, the file's larger error behind the screen, and the peak at 0 degrees. The `aim/sim_live` test turns a simulated box away and back through the real UI.
+
+---
+
+**Session tab full_sim numbers (from docs/calibration.md, "Simulate").** full_sim runs every step in order with the truth 72 to 100 mm off the plan on five speakers. `as_built.json` lands within 3.5 mm of the truth. `trims.json` carries `as_built.json`'s positions, and its gains match the simulator's sensitivities within 0.013 dB, where a solve against the plan's positions would miss by 0.39 dB. Every step read its predecessor's file in its current run, and the plan is byte for byte what it was.
+
+---
+
+**SPCAP focus NaN when the default stopped being an integer (from docs/glossary.md, Focus).** Trap: the moment the default stopped being the integer 12, `powf` of a slightly negative lobe with a fractional exponent returned NaN and silenced whole gain vectors. The code clamps the lobe at 0 now (`src/spatial/spcap.c:64`). Any future non-integer exponent reopens that class of bug.
+
+---
+
+**DC-driven laterality assertion shipped a left/right mirror (from docs/glossary.md, Laterality check).** A DC-driven `steam_decode` assertion had inverted polarity, because the default HRTF's per-ear DC gains oppose its audible ILD, so the assertion passed exactly when the field was mirrored. It mis-diagnosed a correct encode and shipped a left/right mirror that only a by-ear report caught. The current test drives a 660 Hz tone.
+
+---
+
+**Pooled physical-versus-phantom contrast read as "no effect" (from docs/validation.md, The physical reference arm; and docs/glossary.md, Matched-cell contrast).** Pooling the physical-versus-phantom contrast across placements happened during development: pooling one centered placement with one off-center one produced 0.13°, against 1.8° for the off-center placement alone. The distribution is bimodal (about 0 centered, degrees off-center), so a pooled median lands in the empty middle.
+
+---
+
+**The harness used to multiply a stimulus by panner gains (from docs/validation.md, What the phantom is rendered by).** "A harness that multiplied a stimulus by panner gains could sweep every one of those flags and measure nothing. That is exactly what it used to do." The phantom arm now renders through a real engine core.
+
+---
+
+**`--track` placement hook was passed in and never called (from docs/validation.md, Two safety behaviors).** The `--track-sim` exit-5 check exists because the hook was once passed into the session loop and never called. `--track` stayed inert while it announced the tracker was measuring. Asserting on the result would not have caught it: in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong table cancels out and looks healthy.
+
+---
+
+**"Which is the old shape" (from docs/validation.md, The session shape).** With no sweep flags there is one condition per panner, "which is the old shape" (the session before render-knob sweeps existed).
+
+---
+
+**Stale validation.md figures replaced (2026-10-03; from docs/validation.md, Reading the output / What it has found so far).** The doc previously quoted SPCAP fixed-minus-tracked +10.2° CI [+6.4, +11.2] at 0.7 m horizontal, height "SPCAP 1.9° → 7.9°", SPCAP Spearman rho 0.44 (rE direction, within position) and 0.23 (Frank spread), and one-odd-capsule comb quality 1.00 to 0.58. Re-measured 2026-10-03 with the current binaries: the `valid` ctest prints +9.9 [+6.1, +11.1], 2.0° to 7.7°/7.8°, 0.40 / 0.22, and q 0.62; `bwa_validate --simulate --no-reference` prints SPCAP +10.1 [+5.8, +11.5], VBAP +4.4 [+2.0, +6.6] (ctest +4.6), and SPCAP sweet-spot/seated tracked misses 0.9°/6.8°. The doc now quotes the ctest and names it.
+
+---
+
+**Trimmed glossary procedure that lives in docs/calibration.md (2026-10-03; from docs/glossary.md).** Removed from the glossary as duplicate procedure, all still in calibration.md:
+- Placement gate: "1 cm is up to 29 µs of arrival error", "a stand reads still the moment a hand pauses", "For `--localize` and the `--room-eq-grid` rows the tolerance is a loose 100 mm: trilateration and the grid key need each position known, not hit, but a gate on stillness alone would open at the previous row", "the window's mean orientation is what the run takes".
+- Bump check: the 0.3° floor is "for Motive's single-frame jitter"; "The center-only modes do not check the turn"; cited `place_bump_pose`, `placement.c`.
+- Capsule survey: "Clap positions are typed, or measured by a tracked clicker whose tip must hold still before each clap, against the tracked stand's center when there is one." "A clap banks only inside an armed window, and only the first transient in it. From the sixth clap on, its direction must also agree with a provisional survey. After Solve, leave-one-out (`zylia_survey_loo`) scores each clap against the geometry the others solve to and flags one that does not fit."
+- Mount offset: "(11.5 mm for 0, 90, 180 and 225 degrees on a 60 mm ring)"; "With a zero offset the center does not depend on the body's orientation at all."
+- Tracked directivity compensation: "The array-sim room applies the same model at full resolution as each virtual speaker's ABSOLUTE loss toward the listener, so the audition hears the comp's two-band residual against the loss it corrects." (shortened, not removed)
+- Array-sim room: "(gains from a precomputed interaction matrix, Liski and Valimaki 2017)" shortened to the citation; the interaction matrix is in spatialization.md.
+- Imaginary loudspeaker: "The cube grid's roughly 55 degree nadir gap stays under the threshold" was wrong (the default grid has a speaker directly below and above `ref`); replaced.
+
+---
+
+**SPCAP focus was a compile-time constant (2026-08-07; from docs/spatialization.md).** `focus` used to be a compile-time 12: right for the 26-speaker grid, arbitrary anywhere else. The default now comes from the geometry (the -6 dB-at-mean-nearest-neighbor-angle exponent). The cube grid sits at 37.5 degrees of mean spacing and lands on 12.7, close to the constant it replaced.
+
+---
+
+**The phonon m<0 sign flip that mirrored the field (2026-07-24; from docs/spatialization.md).** A negation of ACN 1, 4, 5, 9, 10, 11 lived in `steam_decode.c` briefly, added to satisfy a DC-driven laterality test. The default HRTF's per-ear DC gains are laterally opposite its audible ILD, so the DC assertion passed exactly when the field was mirrored. phonon's real-SH m<0 convention matches the engine's encode on every channel (the xval golden pins it), so no fix-up belongs there. The `steam_decode` laterality test now drives a 660 Hz tone.
+
+---
+
+**Layout tool scoring moved from sweet spot to the listener grid (from docs/layout-schema.md).** "Expect worst-case numbers to be higher than they used to be. Those are the off-center and off-height cells that were previously never evaluated. A layout optimized for SPCAP or VBAP before this change was tuned against an objective that could not move, and is worth re-running." Related phrasing removed at the same time: `3d` was "the historical default" condition; `bed=0` "keeps the historical point-source-only objective"; the AMBI row grades AllRAD with max-rE, "which is what the engine now defaults to".
+
+---
+
+**Panner metric versus acoustic measurement, rank correlations (2026-07-21; from docs/layout-schema.md).** Against the acoustic measurement in validation.md, rE direction error ranks DBAP cells well (Spearman 0.82) and VBAP cells barely at all (0.19), where the Frank spread is the strong predictor (0.77). This is why the badness map's metric and the optimizer's focus wt default follow the panner. The pins section cited the same numbers: "the Frank spread is VBAP's strong predictor (Spearman 0.77 vs 0.19 for direction error)".
+
+---
+
+**Narrow conditions, measured on the default dome (from docs/layout-schema.md).** DBAP: a wedge-only `visual` climb reached 4.3°/18.3° inside the wedge. A plain `3d` run scored the same wedge at 4.3°/15.6° while staying usable everywhere else (26.8° vs 84.1° full-sphere worst). VBAP: `visual,3d` staged beat the direct run inside the wedge (3.4°/14.3° vs 3.9°/20.0°) for about 3° of full-sphere worst. The wedge-only run still collapsed everywhere else (74.5° worst).
+
+---
+
+**Observer-model asymmetry, measured (from docs/layout-schema.md).** A sweet-spot-optimized layout scored under the roam came out WORSE than the unoptimized dome (12.6°/82.3° vs 10.2°/75.2° for DBAP). A roam-optimized layout at the sweet spot (2.6°/15.6° SPCAP) sat near the dedicated seated optimum (0.9°/3.9°).
+
+---
+
+**Guarded two-panner recipe, measured (from docs/layout-schema.md).** On the default dome, `--optimize L.json vbap 3d guard=dbap` from the DBAP optimum was the best two-panner result of every mechanism tried: it matched the pure-VBAP mean (4.5°), beat the pure-VBAP worst by 7° (28.9° vs 35.6°, the warm start plus the constraint acting as a regularizer), and held DBAP within 0.3° of its own optimum.
+
+---
+
+**Greedy climb versus anneal and restarts, measured (from docs/layout-schema.md).** The greedy climb is basin-limited: identical inputs landed 26.8° and 31.2° worst on different random paths; stiff seeds barely improved at all. On the default dome the anneal/restarts upgrade was a wash (4.8°/28.8° vs greedy's 26.8-31.2° spread, at 7x the iterations), but it rescued a stiff seed outright: the clamped r=3.2 sphere that greedy left at 28.3° worst reached 4.5°/24.1°, the best moving-listener result measured on that array. VBAP saw no rescue anywhere (eight restarts across two very different seeds landed within 2% of one cost: a flat-bottomed landscape). The doc called the anneal mode "Metropolis acceptance".
+
+---
+
+**Beds in the optimizer cost, measured on the dome (from docs/layout-schema.md).** Point-source optimization already did most of the bed's work (bed 23.9°/126.8° at the seed, 17.0°/54.0° after a plain DBAP climb). A naive `bed=1` co-optimization traded 2° of bed mean for 17° of DBAP worst. From the DBAP optimum, `--optimize L.json dbap 3d bed=3 guard=dbap` reached the best bed mean measured (14.1°) while DBAP improved to 4.8°/24.6°.
+
+---
+
+**Shared layout cost to a seated user (from docs/layout-schema.md).** Measured, the shared multi-consumer layout cost the seated user about 1.5° mean against a dedicated seated-only array.
+
+---
+
+**Leash versus free optimization, measured (from docs/layout-schema.md).** With the real constraints file, a 0.75 m leash scored the same as a free one (6.5°/42.5° vs 6.4°/41.1°) while the free run wandered speakers up to 1.4 m further along the truss. Projection of the incoming layout into the constraints and pin slabs at every optimize start was added later ("now also projects").
+
+---
+
+**Pins, measured on the then-default 26-speaker dome (from docs/layout-schema.md).** Without pins, across a `horizontal,3d` staged run, DBAP's in-slab population went 10 speakers to 5; VBAP's went 15 to 7, and a direct `3d` run left 3. With 12 pinned both panners matched or beat their plane-only run in-band (DBAP 3.8°/19.4° vs 3.9°/19.6°; VBAP 3.0°/16.3° with the best in-band spread, 18.0°). Full-sphere mean stayed within 0.2° of the unpinned result for both panners; the worst case gave up 3 to 5°. More pins: full-sphere mean DBAP 4.9° unpinned, 5.1° at 12 pins, 5.4° at 16; VBAP 4.6°, 4.6°, 5.1°. Plane gain past 12 was small and panner-dependent (DBAP 3.8° to 3.5°, VBAP 3.0° to 3.5°, so VBAP regressed). Single runs of a stochastic climb. On that dome 12 pins bought the plane ceiling.
+
+---
+
+**Runtime scene geometry used to be locked (from docs/materials.md).** The borrowing reflection and pathing sims now take the scene lock shared around their ray traces, so an `iplSceneCommit` "can no longer race" a `RunReflections`/`RunPathing` (the doc named the lock an `SRWLOCK`; it is `os_rwlock`). `scene_locked` in `src/engine.c` "now only means" no scene (no SDK or a failed create). Also from materials.md: "Two implementations now exist", "The array render no longer needs Steam Audio", "No-SDK builds are now fully viable".
+
+---
+
+**Old box-plus-mesh recipe (from docs/materials.md).** Before `bwa_scene_set_ism_room` and `bwa_box_mesh` existed, the doc said: "Want both? Call `bwa_scene_set_box` first, because nothing else captures the ISM room. Then call `bwa_scene_set_mesh_mat` once, with the box walls plus your geometry. (The Godot binding does exactly this; see `bindings/godot/src/bwa_geometry.h`.)" Godot now calls `scene_set_ism_room` and merges the box walls into one `set_mesh_mat`.
+
+---
+
+**Web playground stimuli moved from a push feed to loaded sounds (2026-09-22; from bindings/web/README.md).** The playground fed its stimuli as a push source from a 20 ms timer on the main thread with 100 ms queued ahead of the audio clock, and that was wrong in both directions. A stall longer than the queue was a hole in the sound, which is what "the click train becomes inaudible for short periods" was (reported 2026-09-22; headless Chrome on a fast desktop collected 31 to 37 stream starves in one ordinary check run before anyone stalled anything on purpose). And the queue was also the switch latency: a menu change waited for the old signal to drain. After the move to loaded sounds a stimulus switch is heard after 6 to 16 ms, where the feed took 97 to 170, and a deliberate 400 ms main-thread stall produces zero starves, where the feed produced 45 to 59.
+
+---
+
+**Web playground bus meter read silent at a 120 ms poll (from bindings/web/README.md).** The page used to read `bwa_get_bus_levels` every 120 ms. That readback is the last block's peak (5.3 ms), so it saw one block in 22, and the default click train's 2 ms burst in every 250 ms meant the meter read "silent" and the cones stayed dark while the click was plainly audible. Fixed with a 4 ms sampling tick that holds the peak for the frame loop.
+
+---
+
+**XR page drew the phone gaze as a hand (from bindings/web/README.md).** The first build drew a Cardboard-style `gaze` input as a hand, which put the grip sphere on the user's face. Now a gaze draws only a 1.2 cm dot at the end of its ray while the ray is on the menu, and a screen tap draws nothing.
+
+---
+
+**Godot convenience tier landed in 0.12.0 (from docs/integration.md).** The 0.12.0 convenience tier landed in the Godot binding as three things: assets (`BwaEngine` stopped keeping a cache of its own and acquires through the core's `(path, flags)` cache), opt-in `async_load`, and `get_desc` / `apply_desc` / `reset_to_preset` / `BwaSource.get_preset`.
+
+---
+
+**Web runtime changelog: what the runtime added (2026-09-22 to 2026-09-24; from docs/web.md).** The section as it stood, verbatim:
+
+On top of [What the spike changed](#what-the-spike-changed) below.
+
+- `src/sink/worklet_sink.c`: the backend, and the only new file in `src/`.
+- `src/sink/sink.h`, `src/sink/sink.c`: the declarations, the dispatch, the device query and the
+  browser AUTO entry. One `#elif defined(__EMSCRIPTEN__)` branch, placed BEFORE the `__linux__` and
+  `__APPLE__` ones because Emscripten's sysroot defines `__unix__` and a plain chain would offer a
+  backend no browser carries.
+- `include/bw_audio.h`: `BWA_SINK_WORKLET = 9`, appended.
+- `CMakeLists.txt`: the `BWA_WITH_WORKLET` block. OFF by default even on Emscripten, because
+  `-sAUDIO_WORKLET` pulls in `-sWASM_WORKERS` and changes `emscripten_get_now` for every target
+  that links the library, and the CI leg must not pay for that.
+- `cmake/bwa_bindings.cmake`, `bindings/web/CMakeLists.txt`: a fourth binding, opt-in and
+  Emscripten-only.
+- `bindings/web/`: the two layers, the transport, the example page, the node suite, the README.
+- `bindings/web/playground/`: the browser port of `examples/playground.cpp`, with three.js visuals
+  and six scenes, on the generated 24-speaker dome (`examples/dome_24.json`, staged into `dist/`
+  by `build-web.sh`) until you upload a layout, plus `tests/run-playground.mjs` that drives it in headless Chromium. Its check
+  measures the AUDIBLE output now, through an AnalyserNode pair on `engine.outputNode()`: the
+  speaker cones and the meter strips have to move while the default click train plays, a stimulus
+  change has to reach the output inside 150 ms, and a profile rebuild has to keep `device_lost` at
+  0 and still put a `+x` source in the left ear. Each of those replaced a check that a silent page
+  passed.
+- `bindings/web/xr/`: the head-tracked sibling of that page. In an `immersive-vr` session the
+  viewer pose becomes the engine's listener pose every XR animation frame, which is the one thing
+  headphones and a mouse cannot demonstrate. It imports the playground's rig, scenes, gizmos and
+  control builder, and adds four things of its own: `frame_xr.js`, the XR reference space to room
+  seam (a 180 degree yaw, derived and tested, NOT the mirror the two "+x" conventions suggest);
+  `session.js`, whose pose path deliberately does not depend on the renderer binding; `panel.js`,
+  the in-world menu, because DOM Overlay is an AR-only feature in practice; and a page-side
+  prediction lead, because `bwa_set_pose_prediction` only leads the engine's own tracker and is
+  inert for a pushed pose. `tests/run-xr.mjs` and `tests/xr_frame.test.mjs` are its checks, and
+  `bindings/web/README.md` has the derivation in full.
+
+  The XR page opens the engine at block 256 on an AudioContext it creates with `latencyHint: 0.05`,
+  the page's side of `BWA_SINK_FLAG_DEEP_BUFFER` (the engine adopts the page's context, so the page
+  sets the hint). Block 128 was tried first (2026-09-23), when the crackle looked like a 256 block
+  landing whole in every other callback; the fix for a render that overruns its quantum turned out to
+  be the browser's output buffer, so the page takes the block with half the per-block overhead. On
+  the Windows desktop the deep context reports baseLatency 50 ms and the engine 2656 frames
+  (55.3 ms) of output latency; the standard `"interactive"` context 10 ms and 736 frames (15.3 ms).
+  The panel offers 128, 256 and 512, and deep or standard for the buffer. Either rebuilds the engine
+  and the AudioContext. No new gesture is needed, because the Enter VR press already unlocked audio
+  for the document. The flat playground stays `"interactive"`.
+
+  **The diagnostics dump** is for the headset, where nobody can attach a debugger. `xr/diag.js`
+  keeps the last 30 s at 1 Hz: device underruns and their ms (playbackStats through the health
+  block), the browser's average output latency, late blocks, the render peak against the block
+  period, the output latency, the slip, the context state and rate, the JS heap
+  (`performance.memory`, Chromium only), frames that second with the longest frame interval, how
+  long ago the last frame ran, how long ago a health poll came back (or "poll STUCK" after 2 s), and
+  any page error. It shows as plain text in a textarea when the session ends, or on the "copy
+  diagnostics" button in the flat view. No network, no storage. If the page freezes, the 1 Hz timer
+  stops with it, so the LAST line is the state just before: a stopped frame loop reads as a growing
+  `lastframe`, a poll that never returned as `poll STUCK`, memory growth as a climbing `heap`.
+
+  What to read on the headset: the panel's "audio health" line, two lines, numbers first. The
+  first number is the **device underrun count** since start, with the silence it cost in ms: the
+  browser's own `playbackStats`, which the sink reads into `bwa_health` (dropouts and dropped
+  frames). Then the render peak against the block period and the late blocks in the window. The
+  second line leads with the **audio clock slip**: over the last 5 s, wall time from
+  `performance.now()` minus audio time from `AudioContext.currentTime`, both read on the main
+  thread every animation frame (`xr/slip.js`). It is the cruder estimate of the same silence, and
+  the only one on a browser without playbackStats. When the render thread
+  misses a deadline Chrome plays fallback silence and the graph does not advance, so the audio
+  clock falls behind: 0 is healthy, positive is the audio thread not keeping up. Beside it is the
+  count of animation frames over 30 ms in the same window, which tells a stalled main thread (long
+  frames, no slip; the main thread samples both clocks late, not apart) from a stalled audio thread
+  (slip, no long frames). Then late blocks in the window, then the render peak in milliseconds
+  against the block budget, marked "(1 ms clock)" because on the worklet that is what it is. There
+  is no percentage and no "per process() call" figure any more: both multiplied a 1 ms reading.
+  Headless desktop Chrome, measured by `run-xr.mjs`: in the first 5 s after a start the slip reads
+  2 to 3 percent (the context's clock sits at 0 for its first few hundred ms) and the render peak
+  7 to 13 ms (the first blocks pay for wasm compilation); once the start is out of the window it
+  reads 0.1 percent (3 ms) and 1 ms. A plain oscillator page reads the same 0.1 percent, so that is
+  the resolution of `currentTime` on the main thread, not a loss. The direction and the scale
+  were checked with a worklet that busy-waits on purpose, headless Chrome 153, 5 s windows: no
+  stall reads -0.1 percent, a 20 ms stall once a second reads 0.1 percent (the device buffer
+  absorbs it), a 100 ms stall once a second reads +2.4 percent (119 ms). So the slip counts the part
+  of a stall that outlasted the buffer, which is the silence you hear, not the stall itself. The 330 to 480 percent peaks this
+  section used to quote were not start-up cost at all: they were the worklet's uninitialized clock
+  (see "The clock, and a trap that is invisible" above).
+
+  **Why a bigger block gives fewer but longer glitches here.** The adapter renders a whole engine
+  block synchronously inside ONE `process()` call, and the browser cannot hand the device that
+  quantum until the call returns. So a render that overruns stalls the output for the whole render,
+  not for the part that overran. At 512 a block renders once every four quanta and costs about four
+  times as much, so an overrun happens a quarter as often and stalls about four times longer: fewer,
+  longer bursts, which is what the Galaxy XR showed. At 128 the same cost is spread over every
+  call. Block size moves the glitches around; it does not remove them. The cure is render cost
+  (fewer voices, `binaural` instead of `cave_sim`, a cheaper scene), or a device buffer with more
+  headroom (the deep latencyHint, now the XR default; "What is verified" has what it bought on a
+  busy desktop). If the slip stays at 0 while the audio crackles, the render is keeping up
+  and the problem is downstream of it.
+
+  The page also asks for `hand-tracking` as an optional feature. A pinch is `select`, so
+  pinch-and-hold grabs the source and carries it on all three axes. A hand has no thumbstick, so
+  the panel has move buttons (left, right, up, down, ahead, back, 0.25 m each, relative to where
+  you look). Hand joints are not drawn. The playground's head gizmo is hidden in session, because
+  it sits at the tracked pose and its nose cone floated 22 cm in front of the eyes.
+
+  Both pages share one responsive layout, in CSS only. Side by side, the sidebar is
+  `clamp(16rem, 30vw, 22rem)`, so a small window gives up sidebar before it gives up view. Under
+  48rem (768 px) of width the pages stack: the view on top at 42 percent of the dynamic viewport
+  height, the controls scrolling under it. A landscape phone (under 30rem tall) stays side by side
+  with a 16rem sidebar. Wherever the start panel may not fit, its buttons come first, so Start and
+  Enter VR are on screen without scrolling; once the engine runs, the XR page keeps only Enter VR at
+  the top of the view (the start text used to stay over the scene, because `hidden` loses to the
+  panel's id selector). On a coarse pointer, buttons, selects and sliders are 44 px tall. Both page
+  runners check it at 390x844, 320x568, 844x390, 667x375, 1024x600, 800x500 and 1440x900, with a
+  touch pointer on the phone sizes (`tests/layout_cdp.mjs`). The Galaxy XR's 2D window size is not
+  measured, so the two middle sizes are guesses. Nobody has checked the layout on a real phone or in
+  the headset.
+- `bindings/web/src/host.js`, `client.js`: `invokeBuf`, which reaches the raw calls whose arguments
+  are pointers. A page cannot allocate wasm heap of its own, so the alloc, the copy and the free
+  happen around the one call on the control thread. Plus `writeFile` and `create({ files })` for
+  the two `bwa_desc` fields that are PATHS, `create({ module })` so a rebuild costs no second
+  module, and `outputNode()` so a page can tap what it is playing.
+- `tools/wasm/gen-abi.mjs`: the raw layer and the export list, generated from the header.
+- `tools/wasm/build-web.sh`: the one recipe for a shippable `dist/`.
+- `tools/wasm/build-wasm.sh`: `BWA_WASM_PROXY` for the `-sPROXY_TO_PTHREAD` measurement.
+
+---
+
+**Web spike changelog: what the spike changed (2026-09-21; from docs/web.md).** The section as it stood, verbatim:
+
+- `src/os/os_posix.c`: the three degradations above, behind `BWA_OS_NO_SCHED` and `__wasi__`.
+- `CMakeLists.txt`: a `BWA_WASM` flag near the top, one branch in the platform banner, a `wasm32`
+  entry in the phonon platform list, and `bw_audio` built STATIC on wasm. wasm32 has no
+  position-independent shared library in either toolchain's sysroot; asking for one gets
+  `relocation R_WASM_MEMORY_ADDR_LEB cannot be used against symbol 'mparams'; recompile with
+  -fPIC` out of wasi-libc's own `dlmalloc.o`.
+- `CMakeLists.txt`, again: when `BWA_WASM` and the SDK are both on, every executable in the root
+  directory takes `LINKER_LANGUAGE CXX`, for the reason the phonon section gives. The raylib
+  tools are refused on wasm (and Android) with a status line, since there is no window system.
+- `tools/wasm/wasi-sdk.toolchain.cmake` and `tools/wasm/build-wasm.sh`. The script forwards
+  `CMAKE_MAKE_PROGRAM` for hosts whose ninja is not on PATH, passes the two Emscripten stack
+  flags, and runs ctest with a 600 s per-test timeout because a wasm test that goes wrong hangs
+  rather than fails.
+- `tools/phonon/build-phonon.sh`: `wasm` as a first-class `BWA_PLATFORM`, the interpreter
+  resolution, the `-pthread` defaults and the dependency-patch step, plus
+  `third_party/patches/deps-flatbuffers-tablekeycomparator.patch`. The tree-matching rule there
+  also learned that osx, ios and wasm name their build tree without an architecture.
+
+Nothing in `src/` outside the OS shim was touched.
+
+---
+
+**Worklet clock read stack garbage (until 2026-09-23; from docs/web.md).** `os_monotonic_ns` did not check `clock_gettime`'s return in an AudioWorkletGlobalScope (no `performance` object, so Emscripten's CLOCK_MONOTONIC returns ENOSYS) and returned whatever the stack held. Measured through a debug export in headless Chrome: `clock_gettime` returned -1 with errno 52 on every quantum, and the value read back was the constant 1069547520. So every render time read 0 except the first, which read 1.07 s and pinned `peak_load` at 401 (40108 %), which is the "percentages with many digits" a Galaxy XR showed. The 330 to 480 percent XR start-up peaks web.md once quoted were this bug. Fixed by checking the return and falling back to `emscripten_get_now`.
+
+---
+
+**Web profile rebuild passed a health check over a silent page (2026-09-22; from docs/web.md).** When a second engine opened on an AudioContext that had already carried one, the worklet registration threw and the sink host-paced silence. "The rebuilt engine renders" was a green check over a silent page, because the host-paced fallback counts blocks exactly like a working sink. That is why `BwaEngine.outputNode()` exists and the playground check measures the rebuild through an AnalyserNode.
+
+---
+
+**Web push feed was the playground default until 2026-09-22 (from docs/web.md).** The push feed was the playground's default and it was the wrong one: a push feed puts the page in the audio path, and a page's main thread stalls. It was reported by ear ("the click train becomes inaudible for short periods"), and the engine had been counting it all along as a stream starve: 31 to 37 in one ordinary headless check run, and 45 to 59 more from a single deliberate 400 ms stall. Loading the same stimuli instead took both to zero, and took a stimulus switch from 97 to 170 ms down to 6 to 16 ms, because the queue was also the switch latency.
+
+---
+
+**Phonon wasm: simulator paths first untested (from docs/web.md).** An earlier pass of web.md said the `-pthread` phonon run exercised the HRTF decode only and that the simulator paths (`steam_scene.c`, `steam_reflect.c`, `steam_path.c`) run phonon's own threads and were not tried, "that is where kwaa's patch would matter". The later with-SDK suite run passed `reflect`, `bake`, `path` and `dynmesh`, so kwaa's synchronous-pool patch is not needed.
+
+---
+
+**Web open items closed on 2026-09-22 (from docs/web.md).** "A memory-buffer asset entry point, or the decision that the push feed is the answer" was answered by neither: a page writes a wav into MEMFS and calls `bwa_load_sound`, so the engine owns the samples and loops them itself; the push feed stays for audio a page generates or receives as it goes. "A way to put a file in the wasm file system" was built: `FS` is in `EXPORTED_RUNTIME_METHODS`, the binding writes through it (`create({ files })` and `engine.writeFile`), and the playground uploads a `cave_layout.json` with it. It cost one link flag and one method, as predicted.
+
+---
+
+**Web.md verification dates (from docs/web.md).** The verification runs recorded in "What is verified" date from 2026-09-22 (emcc 6.0.10 container; the web module then had 29 node tests), with XR pins added 2026-09-23 (Galaxy XR fixes) and 2026-09-24 (block 256 on a 0.05 context; the paired underrun table, run with ten to fourteen CPU-bound R jobs on a 16-thread laptop). The engine suite numbers (35 of 38, 36 of 38 with -sPROXY_TO_PTHREAD) are from 2026-09-22. XR block 128 was tried first (2026-09-23), when the crackle looked like a 256 block landing whole in every other callback; the fix turned out to be the browser's output buffer.
+
+---
+
+**Godot sound_get_channels answered 1 for every bed (from bindings/godot/README.md).** An earlier version of `sound_get_frames` / `sound_get_channels` decoded the path on a cache miss, and it always decoded MONO, so an ambisonic bed answered 1 channel forever. Both now go through `bwa_sound_find`, a pure lookup that never loads, and report 0 for a path the engine has not loaded. Before `get_desc()` existed, nothing in the binding read a source's settings back.
+
+---
+
+**Scene commit locking (from docs/api.md).** Static swaps and dynamic-mesh moves are runtime-safe because `iplSceneCommit` runs under an exclusive scene lock and every ray trace holds it shared, so a commit can never race a trace (phonon documents exactly this constraint).
+
+---
+
+**FDN feedback matrix (from docs/api.md).** The directional FDN uses Householder feedback: a lossless prototype in which the decay filters are the only loss.
+
+---
+
+**Dual-band panning lineage (from docs/api.md).** The engine's dual-band mode (amplitude normalization on the low band, power normalization on the high band) is SPAT's "VBP Dual-Band".
+
+---
+
+**NatNet bitstream pinning pointer (from docs/api.md).** If a future Motive outruns the parser's certified suffix layout, the unicast-only `Bitstream` command can pin the server to a known syntax; see `src/tracking/natnet.c`.

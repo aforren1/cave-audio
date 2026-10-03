@@ -1,5 +1,5 @@
 /*
- * aaudio_sink.c — the AAudio backend (docs/backends.md, phase 3).
+ * aaudio_sink.c — the AAudio backend (docs/backend-development.md, phase 3).
  *
  * WHY IT EXISTS. Standalone VR headsets (Meta Quest, Pico) run Android, and a headset's audio is
  * an AAudio stream. It is the same reach WASAPI buys on a PC headset: nothing here is VR-specific,

@@ -1,5 +1,5 @@
 /*
- * wasapi_sink.cpp — the Windows system-mixer backend (docs/backends.md, phase 1).
+ * wasapi_sink.cpp — the Windows system-mixer backend (docs/backend-development.md, phase 1).
  *
  * WHY IT EXISTS. The headphone profiles (binaural, cave_sim) and the cave_both monitor want the
  * device the user's headphones are actually on, which on Windows is a WASAPI endpoint, not an
