@@ -1,7 +1,7 @@
-/* dirstage.c: see dirstage.h. Moved out of align.c unchanged, so align's arithmetic is the same
- * sequence of float operations it always was. */
+/* dirstage.c: see dirstage.h. */
 #include "spatial/dirstage.h"
 #include "dsp/biquad.h"
+#include "dsp/vec.h"          /* vec_ramp_scale, vec_biquad8 */
 
 #include <math.h>
 #include <string.h>
@@ -56,6 +56,7 @@ void dirstage_process(DirStage* s, float* bus, uint32_t n) {
     if (!s || !s->live || n == 0) return;
     const float step = s->slew * (float)n;
     int settled = 1;
+    uint32_t shk[BWA_CHANNELS], nsh = 0;           /* the channels whose shelf runs this block */
     for (uint32_t k = 0; k < s->channels; ++k) {
         float g0 = s->gcur[k], g1 = g0;
         const float gt = s->gtgt[k];
@@ -67,33 +68,54 @@ void dirstage_process(DirStage* s, float* bus, uint32_t n) {
         if      (s1 < st - step) s1 += step;
         else if (s1 > st + step) s1 -= step;
         else                     s1  = st;
-        float* x = &bus[(size_t)k * n];
         if (g0 != 0.f || g1 != 0.f) {              /* broadband: linear ramp across the block */
             const float l0 = powf(10.f, g0 / 20.f), l1 = powf(10.f, g1 / 20.f);
-            const float dl = (l1 - l0) / (float)n;
-            float l = l0;
-            for (uint32_t i = 0; i < n; ++i) { x[i] *= l; l += dl; }
+            vec_ramp_scale(&bus[(size_t)k * n], n, l0, (l1 - l0) / (float)n);
         }
-        if (s0 != 0.f || s1 != 0.f) {              /* shelf: rebuild when its gain moved, then DF-I */
+        if (s0 != 0.f || s1 != 0.f) {              /* shelf: rebuild when its gain moved; run below */
             if (s1 != s->sco[k]) {
                 bwa_biquad_rbj(BWA_BIQUAD_HIGHSHELF, (double)s->cw0, (double)s->alpha,
                                pow(10.0, (double)s1 / 40.0), s->co[k]);
                 s->sco[k] = s1;
             }
-            const float* co = s->co[k];
-            float x1 = s->x1[k], x2 = s->x2[k], y1 = s->y1[k], y2 = s->y2[k];
-            for (uint32_t i = 0; i < n; ++i) {
-                float in = x[i];
-                float y  = co[0]*in + co[1]*x1 + co[2]*x2 - co[3]*y1 - co[4]*y2;
-                x2 = x1; x1 = in; y2 = y1; y1 = y; x[i] = y;
-            }
-            s->x1[k] = x1; s->x2[k] = x2; s->y1[k] = y1; s->y2[k] = y2;
+            shk[nsh++] = k;
         } else {
             s->x1[k] = s->x2[k] = s->y1[k] = s->y2[k] = 0.f;   /* flat: idle state */
         }
         s->gcur[k] = g1;
         s->scur[k] = s1;
         if (g1 != 0.f || s1 != 0.f || gt != 0.f || st != 0.f) settled = 0;
+    }
+    /* The shelves, eight channels per pass: one channel's biquad is latency-bound, eight interleaved
+     * are eight independent chains (vec_biquad8). A short last group pads with identity lanes. Each
+     * channel's shelf still runs after its own gain ramp, as it always did. */
+    for (uint32_t q0 = 0; q0 < nsh; q0 += 8) {
+        const uint32_t nl = (nsh - q0 < 8) ? nsh - q0 : 8;
+        float c[5][8], sv[4][8];
+        for (uint32_t l = 0; l < 8; ++l) {
+            if (l < nl) {
+                const uint32_t k = shk[q0 + l];
+                for (int t = 0; t < 5; ++t) c[t][l] = s->co[k][t];
+                sv[0][l] = s->x1[k]; sv[1][l] = s->x2[k]; sv[2][l] = s->y1[k]; sv[3][l] = s->y2[k];
+            } else {
+                c[0][l] = 1.f; c[1][l] = c[2][l] = c[3][l] = c[4][l] = 0.f;
+                sv[0][l] = sv[1][l] = sv[2][l] = sv[3][l] = 0.f;
+            }
+        }
+        for (uint32_t c0 = 0; c0 < n; c0 += DIRSTAGE_CHUNK) {
+            const uint32_t cn = (n - c0 < DIRSTAGE_CHUNK) ? n - c0 : DIRSTAGE_CHUNK;
+            float* v = s->lanes;
+            for (uint32_t l = 0; l < 8; ++l) {
+                if (l < nl) { const float* x = &bus[(size_t)shk[q0 + l] * n + c0]; for (uint32_t i = 0; i < cn; ++i) v[8*i + l] = x[i]; }
+                else        { for (uint32_t i = 0; i < cn; ++i) v[8*i + l] = 0.f; }
+            }
+            vec_biquad8(v, cn, (const float (*)[8])c, sv);
+            for (uint32_t l = 0; l < nl; ++l) { float* x = &bus[(size_t)shk[q0 + l] * n + c0]; for (uint32_t i = 0; i < cn; ++i) x[i] = v[8*i + l]; }
+        }
+        for (uint32_t l = 0; l < nl; ++l) {
+            const uint32_t k = shk[q0 + l];
+            s->x1[k] = sv[0][l]; s->x2[k] = sv[1][l]; s->y1[k] = sv[2][l]; s->y2[k] = sv[3][l];
+        }
     }
     if (settled) s->live = 0;                      /* landed on identity: resume the fast path */
 }

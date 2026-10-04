@@ -268,8 +268,8 @@ src/
                          copy of the bus before either decoder: per channel a graphic EQ fitted to the
                          directivity model at the speaker's angle to the listener (one peaking section per
                          model band, bandwidth in octaves, gains = a precomputed interaction-matrix
-                         inverse x the table, one mat-vec per retarget; Liski/Valimaki 2017; SSE/NEON four
-                         channels per vector, 150 us per 256-block at 26 ch x 27 bands), a distance gain
+                         inverse x the table, one mat-vec per retarget; Liski/Valimaki 2017; SSE/NEON eight
+                         channels per pass, 80-120 us per 256-block at 26 ch x 27 bands), a distance gain
                          r0/d (ABSOLUTE: the trims divide 1/r out, the room does not) and a propagation
                          delay (d - C)/c on a fractional line creeping at 3 m/s (the Doppler is physical;
                          ring sized for 4 m of excursion, clamps past it). Never writes the bus it reads:
@@ -288,6 +288,12 @@ src/
                          measurement and the Doppler probe. NEVER the audio thread.
     sos.h                speed of sound for the MEASUREMENT tools and the layout schema. Control
                          side only, never the audio thread.
+    vec.h                the audio thread's small SIMD kernels (SSE / AArch64 NEON / plain C), each over
+                         ONE contiguous bus row: closed-form gain-ramped MACs (ramp_mac, ramp_mat_mac),
+                         a decode-matrix row (mat_mac), the correction FIR over a linear history
+                         (vec_fir), the eight-lane biquad shared by the array-sim EQ and the directivity
+                         comp (vec_biquad8), and the limiter's abs-max + clamp. dsp_test pins every one
+                         against a double-precision reference. [profiling]
   tracking/
     natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
     natnet.c (survey)    besides the head tracker: the CONTROL-SIDE survey parsers natnet_parse_bodies
@@ -813,6 +819,17 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   inverted polarity (the default HRTF's per-ear DC gains oppose its audible ILD), mis-diagnosed a
   correct encode, and shipped a left/right mirror that only a by-ear report caught. Drive tones,
   never DC. See NOTES.md.
+- **Walk the planar bus CHANNEL-major, never frame-major.** Every large win of the 2026-10-03
+  profiling pass was this one shape: a per-sample loop whose inner loop runs over channels at a row
+  stride of n. `mix_voice` panned that way at 3 to 4 cycles per MAC (the bus may alias the voice, so
+  each ramped gain also round-tripped memory); the limiter's two frame-major passes were half an idle
+  block; and `align`'s correction FIR, a masked ring read per tap, took 1.9 ms of the 5.33 ms block at
+  24 speakers x 512 taps (156 us over a linear history). Write the serial per-sample chain into a
+  contiguous row first, then one vectorized pass per channel (`dsp/vec.h`), in chunks so the rows stay
+  in L1. Two corollaries: a ramp is the closed form `g0 + k*st`, not a running `g += st` (a loop-carried
+  add that cannot vectorize), and scratch rows are packed at the chunk stride, because rows 32 KB apart
+  all land in the same L1 sets. Measure with `bwa_bench_situations` interleaved against the old build
+  (docs/profiling.md, "Comparing two builds"): sequential runs on a laptop drift 2x.
 - **`isfinite()` is not a range check — finite-but-absurd is its own defect class.** `isfinite(3e38)`
   is TRUE, so the whole reject-non-finite guard family passes it, and then `bus * 3e38` OVERFLOWS to
   Inf. Gains are sticky, so every later block overflows too, and the Inf reaches the align delay line

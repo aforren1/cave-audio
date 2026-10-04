@@ -30,6 +30,7 @@
 #include "spatial/ambisonics.h"
 #include "core/frame.h"          /* BWA_ROOM_* identity basis + frame_qrot */
 #include "sink/sink.h"           /* BWA_CHANNELS */
+#include "dsp/vec.h"             /* ramp_mac: the virtual-speaker encode's coefficient ramps */
 
 #include <phonon.h>
 
@@ -186,12 +187,8 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float* dir
         for (uint32_t s = 0; s < m->channels; ++s) {
             const float* src = bus26 + (size_t)s * n;
             const float* g = m->encode[s];
-            for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
-                if (g[k] == 0.0f) continue;
-                float* a = m->ambi + (size_t)k * n;
-                float gk = g[k];
-                for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
-            }
+            for (uint32_t k = 0; k < BWA_AMBI_CH; ++k)
+                ramp_mac(m->ambi + (size_t)k * n, src, n, 0, g[k], 0.f);   /* skips a zero coefficient */
         }
     } else {
         /* parallax encode: each speaker's direction from the LIVE listener. Re-solved only when p
@@ -217,17 +214,11 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float* dir
             float* g0 = m->enc_cur[s];
             const float* g1 = m->enc_tgt[s];
             for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
-                float* a = m->ambi + (size_t)k * n;
-                if (g0[k] == g1[k]) {                     /* settled: the fixed path's arithmetic */
-                    if (g0[k] == 0.0f) continue;
-                    const float gk = g0[k];
-                    for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
-                } else {                                  /* moved: ramp the coefficient across the block */
-                    float gk = g0[k];
-                    const float dg = (g1[k] - gk) * inv_n;
-                    for (uint32_t i = 0; i < n; ++i) { a[i] += gk * src[i]; gk += dg; }
-                    g0[k] = g1[k];                        /* land exactly */
-                }
+                /* settled: the fixed path's arithmetic (st = 0); moved: the coefficient ramps across
+                 * the block in closed form (a running `g += dg` was a serial chain per sample) */
+                const float dg = (g0[k] == g1[k]) ? 0.f : (g1[k] - g0[k]) * inv_n;
+                ramp_mac(m->ambi + (size_t)k * n, src, n, 0, g0[k], dg);
+                g0[k] = g1[k];                            /* land exactly */
             }
         }
     }

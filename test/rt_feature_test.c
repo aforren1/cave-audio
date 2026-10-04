@@ -125,6 +125,14 @@ int main(void) {
                 rt_commit(cb); render2(cb);
                 CHECK(chan_energy(0) > 0.0 && fabs(chan_energy(25) / chan_energy(0) - 1.0) < 0.02,
                       "omni (W-only) bed decodes equally across speakers");
+                {   /* the bed's own gain scales its decode (render2: the ramp lands in block 1, block 2
+                     * is settled). Every other bed check runs at unity, which a mixer that dropped the
+                     * gain entirely also passed. */
+                    const double e1 = chan_energy(0);
+                    rt_source_set_gain(cb, b1, 0.5f); rt_commit(cb); render2(cb);
+                    CHECK(e1 > 0.0 && fabs(chan_energy(0) / e1 - 0.5) < 0.01, "bed gain scales the decode (0.5 -> half)");
+                    rt_source_set_gain(cb, b1, 1.0f); rt_commit(cb); render2(cb);
+                }
                 rt_source_stop(cb, b1); render2(cb);
 
                 int s_front = -1, s_back = -1;
@@ -1698,6 +1706,31 @@ int main(void) {
                 ISM_SUM(IMP_AT + 460, IMP_AT + 520, wet_px, envp);
                 ISM_SUM(IMP_AT + 460, IMP_AT + 520, wet_nx, envn);
                 CHECK(wet_px > wet_nx * 1.2, "the +x wall's reflection arrives from the +x side");
+                /* the +-z wall images (~909) are mirror twins of each other (the source sits at z = 0),
+                 * so they arrive together and balanced front to back. Losing one image (it happened to
+                 * the last, +z) left every check above green. */
+                {
+                    double pz = 0, nz = 0;
+                    rt_source_play(ci, hi, si, false);
+                    rt_source_set_pos(ci, hi, 2.5f, 1.5f, 0.f);
+                    rt_commit(ci);
+                    bwa_timestamp tz = { 0, 0 };
+                    for (int b = 0; b < KB; ++b) {
+                        rt_render(ci, bus, N, &tz);
+                        for (int i = 0; i < (int)N; ++i) {
+                            const int at = b * (int)N + i;
+                            if (at < IMP_AT + 880 || at >= IMP_AT + 940) continue;
+                            for (int ch = 0; ch < CH; ++ch) {
+                                const double v = fabs(bus[(size_t)ch * N + i]);
+                                if (LD.speakers[ch].pos[2] >  1.f) pz += v;
+                                if (LD.speakers[ch].pos[2] < -1.f) nz += v;
+                            }
+                        }
+                    }
+                    printf("ism: +-z wall pair at ~909: front %.4g back %.4g\n", pz, nz);
+                    CHECK(pz > 0 && nz > 0 && pz < 1.3 * nz && nz < 1.3 * pz,
+                          "the +z and -z wall reflections arrive balanced (all six images render)");
+                }
 
                 rt_source_set_ism(ci, hi, false);                /* opt out: the reflections ramp away */
                 rt_commit(ci);
@@ -1962,6 +1995,10 @@ int main(void) {
                 /* amplitude-norm gains have lower L2 than power-norm for a spread source (the LF relies on
                  * coherent summation at the listener), and the panning DIRECTION is unchanged. */
                 CHECK(l2_off > 0 && l2_on < 0.85 * l2_off, "dual-band LF uses amplitude norm (lower per-channel power)");
+                /* ...and RE-WEIGHTED, not removed. "Lower" alone also passes a mixer that drops the low
+                 * band's gain row (it did: the ratio fell from 0.47 to 0.26 and every check stayed green),
+                 * so bound it from below with margin on both sides. */
+                CHECK(l2_on > 0.35 * l2_off, "dual-band LF re-weighted, not dropped (L2 ratio ~0.47)");
                 CHECK(amax_on == amax_off, "dual-band preserves the localization direction");
                 /* the A/B toggle CROSSFADES (invariant 4): the first block after enabling lands BETWEEN
                  * single and dual, not straight at dual — a hard switch would step the LF re-weight in

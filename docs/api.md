@@ -2848,7 +2848,7 @@ Configuration is load-time; the sends are live:
   `bake` non-zero precomputes the reverb over a probe grid at `bwa_start`, so the sim thread looks
   it up instead of ray-tracing live (static scenes only, which the bed requires anyway).
 - **`bwa_set_reverb_gain`** is the wet level: the one control, live (a single atomic the
-  audio-thread tap reads), default 1. A value set before `bwa_start` seeds whichever reverb bed it
+  audio-thread tap reads), default 1. A change ramps across one block, like every gain. A value set before `bwa_start` seeds whichever reverb bed it
   creates (this bed or the FDN).
 - **`bwa_source_set_reverb`** opts a source into the bed's wet send. Per-frame, non-blocking;
   with the bed disabled (or no SDK) it gates a send that goes nowhere.

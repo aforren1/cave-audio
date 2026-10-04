@@ -18,6 +18,7 @@
 #include "spatial/align.h"
 #include "acoustics/ism.h"          /* image-source early reflections (shoebox geometry; phonon-free) */
 #include "dsp/biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
+#include "dsp/vec.h"          /* channel-major kernels: mix_voice's gain ramps, the limiter + meter */
 #include "spatial/ambisonics.h"   /* SH->26 decode for ambisonic beds (+ room_to_ambi, ambi_sad_decode) */
 #include "spatial/allrad.h"       /* robust SH->26 decode for irregular arrays */
 #include "spatial/epad.h"         /* energy-preserving SH->26 decode (bed_decoder = 2) */
@@ -42,6 +43,21 @@
 #define RING_CAP 4096          /* power of two; sized for a worst-case frame burst */
 #define EVT_CAP  1024          /* power of two */
 #define BWA_RT_MAX_BLOCK 8192   /* aux-send scratch cap; must be >= any device block (matches engine's BWA_MAX_BLOCK) */
+/* mix_voice renders a voice in two passes per chunk: the scalar source chain writes contiguous
+ * signal rows, then each destination channel takes one vectorized gain ramp over a row
+ * (dsp/vec.h). The chunk keeps those rows plus the bus rows they feed L1-resident at any device
+ * block size. The rows are packed at the CHUNK stride on purpose: at BWA_RT_MAX_BLOCK stride
+ * (32 KB) every row would map to the same L1 sets. */
+#define BWA_MIX_CHUNK 256u
+#define MIX_R_SIG  0                                   /* coherent signal (dual: s - the LF re-weight) */
+#define MIX_R_DL   1                                   /* dual-band: dmix-scaled low band */
+#define MIX_R_SD   2                                   /* decorrelated share */
+#define MIX_R_SP   3                                   /* pathing: the path-EQ'd raw signal */
+#define MIX_R_FS   4                                   /* spectral widening: BWA_FS_BANDS bands */
+#define MIX_R_ISM  (MIX_R_FS + BWA_FS_BANDS)           /* ISM: one damped read per image */
+#define MIX_ROWS_VOICE (MIX_R_ISM + ISM_IMAGES)
+/* mix_bed uses the same scratch for its (rotated, tapered, gained) SH rows, one per bed channel */
+#define MIX_ROWS   (MIX_ROWS_VOICE > BWA_AMBI_CH ? MIX_ROWS_VOICE : BWA_AMBI_CH)
 
 /* clock-drift fit (RtCore.fit_*): the exponential window and the point at which the slope is worth
  * reporting. TAU trades convergence against precision — 120 s is ~22k stamps at 256/48k, enough to
@@ -629,6 +645,7 @@ struct RtCore {
     float*   aux;                /* BWA_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
     StreamSet* streams;          /* background file-streaming thread + ring pool (control thread owns lifecycle) */
     float*   stream_scratch;     /* BWA_RT_MAX_BLOCK mono samples; a streaming voice's block, pulled before the mix */
+    float*   mix_scr;            /* MIX_ROWS * BWA_MIX_CHUNK; mix_voice's and mix_bed's per-chunk rows (audio thread) */
 
     /* pathing: rt_render SH-encodes pathing voices into path_accum, then path_tap decodes it to the bus.
      * Per voice the sim publishes shCoeffs via a handle-gated double buffer (path_pub[idx*2 + path_idx]). */
@@ -2423,135 +2440,162 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     uint32_t lbeg, lend;
     resolve_loop_region(v, streaming ? 0u : snd->frames, &lbeg, &lend);
     bool ended = false;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (i < start) continue;               /* scheduled start: this voice stays silent (and frozen) until the in-block offset */
-        if (!streaming && cur >= lend) {
-            if (v->loop && lend > lbeg) cur = loop_wrap(c, v, idx, cur, lbeg, lend);   /* pitch can overshoot the
-                                                                                        * seam, and a set_region can
-                                                                                        * leave cur far past it */
-            else {
-                const SoundData* nx = v->stopping ? NULL : queue_pop_valid(v);   /* never chain while stopping/
-                                                             * fading/steal-fading — the voice is on its way out */
-                if (nx) { snd = nx; v->sound = nx; cur = 0; v->cur_frac = 0.f; lbeg = 0; lend = snd->frames; }
-                else ended = true;                          /* queue empty (or stopping): natural end */
-            }
-        }
-        float s;
-        if (streaming)      s = c->stream_scratch[i];
-        else if (ended)     s = 0.f;
-        else if (use_pitch) {                  /* linear interp between cur and its successor */
-            uint32_t i2 = cur + 1;
-            if (v->loop) { if (i2 >= lend) i2 = lbeg; }      /* wrap the interp partner to the loop start */
-            else if (i2 >= snd->frames) i2 = snd->frames - 1;
-            s = snd->pcm[cur] + v->cur_frac * (snd->pcm[i2] - snd->pcm[cur]);
-        } else s = snd->pcm[cur];
-        s *= pg;                                               /* pause/seek gate (also gates the sends below) */
-        const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
-        if (v->eq.engaged) s = eq_block_apply(&v->eq, s, co_step);   /* 3 biquads (DF-I), coeffs interpolated per sample */
-        s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
-        if (do_send) { aux[i] += s * v->refl_g_cur; v->refl_g_cur += refl_step; }  /* reverb send: pre-propagation, distance/level-scaled */
-        if (ism_on) {                                           /* early reflections: each image is a delayed,
-                                                                 * damped, PANNED copy of the source (the
-                                                                 * reflections carry their own propagation, so
-                                                                 * they tap s BEFORE Doppler/air, like the send) */
-            iring[v->ism_w & imask] = s;
-            for (int m = 0; m < ism_n; ++m) {
-                uint32_t di = (uint32_t)v->ism_delay[m];        /* integer part; the read index stays integer */
-                float    df = v->ism_delay[m] - (float)di;
-                float newer = iring[(v->ism_w - di)     & imask];
-                float older = iring[(v->ism_w - di - 1) & imask];
-                float r = newer * (1.f - df) + older * df;      /* fractional read: no zipper as the path glides */
-                v->ism_lp[m] += ism_a[m] * (r - v->ism_lp[m]);  /* wall HF damping (one-pole) */
-                r = v->ism_lp[m];
-                for (uint32_t ch = 0; ch < nch; ++ch) {
-                    bus[(size_t)ch * n + i] += v->ism_g[m][ch] * r;
-                    v->ism_g[m][ch] += ism_gstep[m][ch];
+    /* Two passes per chunk. The source chain below is inherently serial (cursor, filters, delay
+     * lines), so it runs per sample and writes its outputs into contiguous rows of c->mix_scr. Every
+     * per-CHANNEL gain ramp then runs channel-major over those rows (ramp_mac). Done the other way,
+     * sample-major with a per-channel inner loop, each sample scattered one store per channel at a
+     * row stride and re-loaded every ramped gain through memory (the bus may alias the voice), which
+     * measured 3-4 cycles per MAC. Every ramp is the closed form g0 + st*k from the block's own
+     * start, so chunking changes nothing, and each gain still lands exactly on its target below. */
+    float* const scr = c->mix_scr;
+    for (uint32_t c0 = start; c0 < n; c0 += BWA_MIX_CHUNK) {
+        const uint32_t cn = (n - c0 < BWA_MIX_CHUNK) ? n - c0 : BWA_MIX_CHUNK;
+        float* const r_sig = scr + MIX_R_SIG * BWA_MIX_CHUNK;
+        float* const r_dl  = scr + MIX_R_DL  * BWA_MIX_CHUNK;
+        float* const r_sd  = scr + MIX_R_SD  * BWA_MIX_CHUNK;
+        float* const r_sp  = scr + MIX_R_SP  * BWA_MIX_CHUNK;
+        float* const r_fs  = scr + MIX_R_FS  * BWA_MIX_CHUNK;   /* band b at r_fs + b * BWA_MIX_CHUNK */
+        float* const r_ism = scr + MIX_R_ISM * BWA_MIX_CHUNK;   /* image m at r_ism + m * BWA_MIX_CHUNK */
+        for (uint32_t j = 0; j < cn; ++j) {
+            const uint32_t i = c0 + j;
+            if (!streaming && cur >= lend) {
+                if (v->loop && lend > lbeg) cur = loop_wrap(c, v, idx, cur, lbeg, lend);   /* pitch can overshoot the
+                                                                                            * seam, and a set_region can
+                                                                                            * leave cur far past it */
+                else {
+                    const SoundData* nx = v->stopping ? NULL : queue_pop_valid(v);   /* never chain while stopping/
+                                                                 * fading/steal-fading — the voice is on its way out */
+                    if (nx) { snd = nx; v->sound = nx; cur = 0; v->cur_frac = 0.f; lbeg = 0; lend = snd->frames; }
+                    else ended = true;                          /* queue empty (or stopping): natural end */
                 }
-                v->ism_delay[m] += (ism_dtgt[m] - v->ism_delay[m]) * ism_k;   /* glide toward the new path */
             }
-            v->ism_w++;
-        }
-        if (v->air_on) {                                        /* air absorption: distance one-pole LPF (direct path) */
-            v->air_y1 += v->air_a_cur * (s - v->air_y1); s = v->air_y1; v->air_a_cur += air_a_step;
-        }
-        if (use_ldc) {                                          /* loudness comp: one-pole LF shelf (direct path) */
-            v->ldc_lp += c->ldc_a * (s - v->ldc_lp);
-            s += (v->ldc_g_cur - 1.f) * v->ldc_lp;
-            v->ldc_g_cur += ldc_step;
-        }
-        if (use_nf) {                                           /* near-field proximity: one-pole LF shelf (direct path) */
-            v->nf_lp += c->nf_a * (s - v->nf_lp);
-            s += (v->nf_g_cur - 1.f) * v->nf_lp;
-            v->nf_g_cur += nf_step;
-        }
-        if (dring) {                                            /* Doppler: write, read at the gliding fractional delay */
-            dring[v->dop_w & dmask] = s;
-            uint32_t di = (uint32_t)v->dop_delay;               /* integer delay; (dop_w-di) stays integer (no float index) */
-            float    df = v->dop_delay - (float)di;             /* fractional delay [0,1) */
-            float newer = dring[(v->dop_w - di)     & dmask];   /* di samples ago */
-            float older = dring[(v->dop_w - di - 1) & dmask];   /* di+1 samples ago */
-            s = newer * (1.f - df) + older * df;
-            v->dop_w++;
-            v->dop_dtgt  += (dop_ds      - v->dop_dtgt)  * dop_k;   /* 2-pole, per sample: smooth the target ... */
-            v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
-        }
-        if (!streaming && !ended) {
-            if (use_pitch) {
-                v->cur_frac += pit; pit += pit_step;
-                while (v->cur_frac >= 1.f) { v->cur_frac -= 1.f; ++cur; }
-            } else ++cur;
-        }
-        pg += pg_step;
-        v->occ_cur += occ_step;
-        v->dir_cur += dir_step;
-        if (path_on) {                                         /* SH-encode the indirect field (decoded later by the tap) */
-            float sp = s_raw;                                  /* the indirect path is un-occluded (it bends around) ... */
-            if (v->path_eq.engaged) sp = eq_block_apply(&v->path_eq, sp, pco_step);   /* ... but takes the bending-loss tilt */
-            for (uint32_t k = 0; k < pac; ++k) {
-                c->path_accum[(size_t)k * n + i] += sp * v->path_sh_cur[k];
-                v->path_sh_cur[k] += path_step[k];
-            }
-        }
-        if (use_dc) {                                          /* decor split: incoherent share to dc_bus ... */
-            const float sd = s * dc_a;
-            const float cs = 1.f - dc_a * dc_a;                /* ... coherent share stays on the main path */
-            s *= cs > 0.f ? sqrtf(cs) : 0.f;                   /* (ramp float error can graze cs < 0) */
-            const float* dcg = fs ? v->fs_g[0] : v->gcur;      /* spectral mode: band 0 IS the source direction */
-            for (uint32_t ch = 0; ch < nch; ++ch)              /* (never direct: dc_on gated above) */
-                c->dc_bus[(size_t)ch * n + i] += dcg[ch] * sd;
-            dc_a += dc_step;
-        }
-        if (fs) {                                              /* spectral widening: band-split, each band on its
-                                                                * own gain vector (complementary one-poles sum to
-                                                                * s, so equal band gains == the single path) */
-            float bnd[BWA_FS_BANDS], prev = 0.f;
-            for (int x = 0; x < BWA_FS_XOVERS; ++x) {
-                v->fs_lp[x] += c->fs_xa[x] * (s - v->fs_lp[x]);
-                bnd[x] = v->fs_lp[x] - prev; prev = v->fs_lp[x];
-            }
-            bnd[BWA_FS_XOVERS] = s - prev;
-            for (uint32_t ch = 0; ch < nch; ++ch) {
-                float acc = 0.f;
-                for (int b = 0; b < BWA_FS_BANDS; ++b) {
-                    acc += v->fs_g[b][ch] * bnd[b];
-                    v->fs_g[b][ch] += fs_step[b][ch];
+            float s;
+            if (streaming)      s = c->stream_scratch[i];
+            else if (ended)     s = 0.f;
+            else if (use_pitch) {                  /* linear interp between cur and its successor */
+                uint32_t i2 = cur + 1;
+                if (v->loop) { if (i2 >= lend) i2 = lbeg; }      /* wrap the interp partner to the loop start */
+                else if (i2 >= snd->frames) i2 = snd->frames - 1;
+                s = snd->pcm[cur] + v->cur_frac * (snd->pcm[i2] - snd->pcm[cur]);
+            } else s = snd->pcm[cur];
+            s *= pg;                                               /* pause/seek gate (also gates the sends below) */
+            const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
+            if (v->eq.engaged) s = eq_block_apply(&v->eq, s, co_step);   /* 3 biquads (DF-I), coeffs interpolated per sample */
+            s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
+            if (do_send) { aux[i] += s * v->refl_g_cur; v->refl_g_cur += refl_step; }  /* reverb send: pre-propagation, distance/level-scaled */
+            if (ism_on) {                                           /* early reflections: each image is a delayed,
+                                                                     * damped copy of the source (the reflections
+                                                                     * carry their own propagation, so they tap s
+                                                                     * BEFORE Doppler/air, like the send); panned in
+                                                                     * the channel pass */
+                iring[v->ism_w & imask] = s;
+                for (int m = 0; m < ism_n; ++m) {
+                    uint32_t di = (uint32_t)v->ism_delay[m];        /* integer part; the read index stays integer */
+                    float    df = v->ism_delay[m] - (float)di;
+                    float newer = iring[(v->ism_w - di)     & imask];
+                    float older = iring[(v->ism_w - di - 1) & imask];
+                    float r = newer * (1.f - df) + older * df;      /* fractional read: no zipper as the path glides */
+                    v->ism_lp[m] += ism_a[m] * (r - v->ism_lp[m]);  /* wall HF damping (one-pole) */
+                    r_ism[(size_t)m * BWA_MIX_CHUNK + j] = v->ism_lp[m];
+                    v->ism_delay[m] += (ism_dtgt[m] - v->ism_delay[m]) * ism_k;   /* glide toward the new path */
                 }
-                bus[(size_t)ch * n + i] += acc;
+                v->ism_w++;
             }
+            if (v->air_on) {                                        /* air absorption: distance one-pole LPF (direct path) */
+                v->air_y1 += v->air_a_cur * (s - v->air_y1); s = v->air_y1; v->air_a_cur += air_a_step;
+            }
+            if (use_ldc) {                                          /* loudness comp: one-pole LF shelf (direct path) */
+                v->ldc_lp += c->ldc_a * (s - v->ldc_lp);
+                s += (v->ldc_g_cur - 1.f) * v->ldc_lp;
+                v->ldc_g_cur += ldc_step;
+            }
+            if (use_nf) {                                           /* near-field proximity: one-pole LF shelf (direct path) */
+                v->nf_lp += c->nf_a * (s - v->nf_lp);
+                s += (v->nf_g_cur - 1.f) * v->nf_lp;
+                v->nf_g_cur += nf_step;
+            }
+            if (dring) {                                            /* Doppler: write, read at the gliding fractional delay */
+                dring[v->dop_w & dmask] = s;
+                uint32_t di = (uint32_t)v->dop_delay;               /* integer delay; (dop_w-di) stays integer (no float index) */
+                float    df = v->dop_delay - (float)di;             /* fractional delay [0,1) */
+                float newer = dring[(v->dop_w - di)     & dmask];   /* di samples ago */
+                float older = dring[(v->dop_w - di - 1) & dmask];   /* di+1 samples ago */
+                s = newer * (1.f - df) + older * df;
+                v->dop_w++;
+                v->dop_dtgt  += (dop_ds      - v->dop_dtgt)  * dop_k;   /* 2-pole, per sample: smooth the target ... */
+                v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
+            }
+            if (!streaming && !ended) {
+                if (use_pitch) {
+                    v->cur_frac += pit; pit += pit_step;
+                    while (v->cur_frac >= 1.f) { v->cur_frac -= 1.f; ++cur; }
+                } else ++cur;
+            }
+            pg += pg_step;
+            v->occ_cur += occ_step;
+            v->dir_cur += dir_step;
+            if (path_on) {                                         /* the indirect field's source (SH-encoded in the channel pass) */
+                float sp = s_raw;                                  /* the indirect path is un-occluded (it bends around) ... */
+                if (v->path_eq.engaged) sp = eq_block_apply(&v->path_eq, sp, pco_step);   /* ... but takes the bending-loss tilt */
+                r_sp[j] = sp;
+            }
+            if (use_dc) {                                          /* decor split: incoherent share to dc_bus ... */
+                r_sd[j] = s * dc_a;
+                const float cs = 1.f - dc_a * dc_a;                /* ... coherent share stays on the main path */
+                s *= cs > 0.f ? sqrtf(cs) : 0.f;                   /* (ramp float error can graze cs < 0) */
+                dc_a += dc_step;
+            }
+            if (fs) {                                              /* spectral widening: band-split, each band on its
+                                                                    * own gain vector (complementary one-poles sum to
+                                                                    * s, so equal band gains == the single path) */
+                float prev = 0.f;
+                for (int x = 0; x < BWA_FS_XOVERS; ++x) {
+                    v->fs_lp[x] += c->fs_xa[x] * (s - v->fs_lp[x]);
+                    r_fs[(size_t)x * BWA_MIX_CHUNK + j] = v->fs_lp[x] - prev; prev = v->fs_lp[x];
+                }
+                r_fs[(size_t)BWA_FS_XOVERS * BWA_MIX_CHUNK + j] = s - prev;
+            } else if (use_dual) {
+                /* gcur*s + dmix*(gcur_lo - gcur)*lo == gcur*(s - dl) + gcur_lo*dl with dl = dmix*lo:
+                 * two plain ramps in the channel pass, no per-channel difference */
+                float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
+                const float dl = dmix * lo;
+                r_sig[j] = s - dl;
+                r_dl[j]  = dl;
+                dmix += dmix_step;
+            } else r_sig[j] = s;
+            if (pv_slot) { pv_slot[i] = pv_g * s; pv_g += pv_step; }   /* the point share (own slot: =, not +=) */
+        }
+        /* channel pass: every ramp is anchored at the block's own start (k0), see vec.h */
+        const uint32_t k0 = c0 - start;
+        float* const b0 = bus + c0;
+        if (fs) {
+            for (uint32_t ch = 0; ch < nch; ++ch)
+                for (int b = 0; b < BWA_FS_BANDS; ++b)
+                    ramp_mac(b0 + (size_t)ch * n, r_fs + (size_t)b * BWA_MIX_CHUNK, cn, k0, v->fs_g[b][ch], fs_step[b][ch]);
         } else if (use_dual) {
-            float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
-            for (uint32_t ch = 0; ch < nch; ++ch) {                                   /* single + dmix-scaled LF re-weight */
-                bus[(size_t)ch * n + i] += v->gcur[ch] * s + dmix * (v->gcur_lo[ch] - v->gcur[ch]) * lo;
-                v->gcur_lo[ch] += step_lo[ch]; v->gcur[ch] += step[ch];
-            }
-            dmix += dmix_step;
-        } else {
             for (uint32_t ch = 0; ch < nch; ++ch) {
-                bus[(size_t)ch * n + i] += v->gcur[ch] * s;
-                v->gcur[ch] += step[ch];
+                ramp_mac(b0 + (size_t)ch * n, r_sig, cn, k0, v->gcur[ch],    step[ch]);
+                ramp_mac(b0 + (size_t)ch * n, r_dl,  cn, k0, v->gcur_lo[ch], step_lo[ch]);
             }
+        } else {
+            for (uint32_t ch = 0; ch < nch; ++ch)
+                ramp_mac(b0 + (size_t)ch * n, r_sig, cn, k0, v->gcur[ch], step[ch]);
         }
-        if (pv_slot) { pv_slot[i] = pv_g * s; pv_g += pv_step; }   /* the point share (own slot: =, not +=) */
+        if (use_dc) {                                              /* (never direct: dc_on gated above) */
+            const float* dg = fs ? v->fs_g[0] : v->gcur;           /* spectral mode: band 0 IS the source direction */
+            const float* ds = fs ? fs_step[0] : step;
+            for (uint32_t ch = 0; ch < nch; ++ch)
+                ramp_mac(c->dc_bus + (size_t)ch * n + c0, r_sd, cn, k0, dg[ch], ds[ch]);
+        }
+        if (ism_on)                                            /* every image into each channel in ONE pass */
+            for (uint32_t ch = 0; ch < nch; ++ch) {
+                float g0[ISM_IMAGES], gs[ISM_IMAGES];
+                for (int m = 0; m < ism_n; ++m) { g0[m] = v->ism_g[m][ch]; gs[m] = ism_gstep[m][ch]; }
+                ramp_mat_mac(b0 + (size_t)ch * n, r_ism, BWA_MIX_CHUNK, (uint32_t)ism_n, g0, gs, k0, cn);
+            }
+        if (path_on)
+            for (uint32_t k = 0; k < pac; ++k)
+                ramp_mac(c->path_accum + (size_t)k * n + c0, r_sp, cn, k0, v->path_sh_cur[k], path_step[k]);
     }
     v->cursor = cur;
     if (ism_on) {                                               /* land the image gains exactly (invariant 4) */
@@ -2761,50 +2805,55 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     bool ended = false;
 
     if (!use_p) {                       /* pure matrix decode: the settled default stays this cheap */
-        for (uint32_t i = 0; i < n; ++i) {
-            if (i < start) continue;               /* scheduled start: silent until the in-block offset */
-            if (cur >= lend) { if (v->loop && lend > lbeg) cur = loop_wrap(c, v, idx, cur, lbeg, lend); else ended = true; }
-            if (!ended) {
-                const float* sh = &snd->pcm[(size_t)cur * nch];
-                float shr[BWA_AMBI_CH];
-                if (rot_mode == 1) {               /* turn the field, then advance the yaw phasor */
-                    const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
-                    const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
-                    bed_rotate_z(sh, nch, cm, sm, shr);
-                    sh = shr;
-                    const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
-                } else if (rot_mode == 2) {        /* full 3-axis: live matrix, glided toward the block target */
-                    ambi_rot_apply(v->rot_m, sh, nch, shr);
-                    sh = shr;
-                    for (int j = 0; j < rot_n; ++j) v->rot_m[j] += rot_step[j];
-                }
-                float shw[BWA_AMBI_CH];
-                if (use_re) {                      /* max-rE taper, crossfaded by rem; resm splits the band */
-                    for (int k = 0; k < nch; ++k) {
-                        const float lo = (v->re_lp[k] += re_xa * (sh[k] - v->re_lp[k]));
-                        shw[k] = sh[k] + rem * (rw[k] - 1.f) * (sh[k] - resm * lo);
+        /* Two passes per chunk, like mix_voice: the per-sample chain (cursor, rotation, taper, gain)
+         * writes one row per SH channel, then each output row takes one matrix-row MAC over them.
+         * Evaluating the decode per sample wrote every speaker at a row stride per sample. */
+        float* const scr = c->mix_scr;              /* nch rows at the BWA_MIX_CHUNK stride */
+        for (uint32_t c0 = start; c0 < n; c0 += BWA_MIX_CHUNK) {
+            const uint32_t cn = (n - c0 < BWA_MIX_CHUNK) ? n - c0 : BWA_MIX_CHUNK;
+            for (uint32_t j = 0; j < cn; ++j) {
+                if (cur >= lend) { if (v->loop && lend > lbeg) cur = loop_wrap(c, v, idx, cur, lbeg, lend); else ended = true; }
+                if (!ended) {
+                    const float* sh = &snd->pcm[(size_t)cur * nch];
+                    float shr[BWA_AMBI_CH];
+                    if (rot_mode == 1) {               /* turn the field, then advance the yaw phasor */
+                        const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
+                        const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
+                        bed_rotate_z(sh, nch, cm, sm, shr);
+                        sh = shr;
+                        const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
+                    } else if (rot_mode == 2) {        /* full 3-axis: live matrix, glided toward the block target */
+                        ambi_rot_apply(v->rot_m, sh, nch, shr);
+                        sh = shr;
+                        for (int q = 0; q < rot_n; ++q) v->rot_m[q] += rot_step[q];
                     }
-                    sh = shw;
-                }
-                const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
-                if (direct) {                      /* SH->SH: the (rotated) field, basis-converted */
-                    float* ad = c->ambi_direct;
-                    for (int k = 0; k < nch; ++k)
-                        ad[(size_t)k * n + i] += g * sh[k] * ambi_canon_to_phonon[k];
+                    float shw[BWA_AMBI_CH];
+                    if (use_re) {                      /* max-rE taper, crossfaded by rem; resm splits the band */
+                        for (int k = 0; k < nch; ++k) {
+                            const float lo = (v->re_lp[k] += re_xa * (sh[k] - v->re_lp[k]));
+                            shw[k] = sh[k] + rem * (rw[k] - 1.f) * (sh[k] - resm * lo);
+                        }
+                        sh = shw;
+                    }
+                    const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
+                    for (int k = 0; k < nch; ++k) scr[(size_t)k * BWA_MIX_CHUNK + j] = g * sh[k];
+                    ++cur;
                 } else {
-                    for (uint32_t s = 0; s < c->channels; ++s) {
-                        const float* D = c->bed_decode[s];
-                        float acc = 0.f;
-                        for (int k = 0; k < nch; ++k) acc += sh[k] * D[k];
-                        bus[(size_t)s * n + i] += g * acc;
-                    }
+                    for (int k = 0; k < nch; ++k) scr[(size_t)k * BWA_MIX_CHUNK + j] = 0.f;
                 }
-                ++cur;
+                pg += pg_step;
+                v->gcur[0] += g_step;
+                rem += rem_step;
+                resm += sm_step;
             }
-            pg += pg_step;
-            v->gcur[0] += g_step;
-            rem += rem_step;
-            resm += sm_step;
+            if (direct) {                              /* SH->SH: the (rotated) field, basis-converted */
+                for (int k = 0; k < nch; ++k)
+                    ramp_mac(c->ambi_direct + (size_t)k * n + c0, scr + (size_t)k * BWA_MIX_CHUNK, cn, 0,
+                             ambi_canon_to_phonon[k], 0.f);
+            } else {
+                for (uint32_t s = 0; s < c->channels; ++s)
+                    mat_mac(bus + (size_t)s * n + c0, scr, BWA_MIX_CHUNK, (uint32_t)nch, c->bed_decode[s], cn);
+            }
         }
     } else {
         /* block-rate parameter update from the SMOOTHED analysis state (last blocks' field): per band
@@ -3456,17 +3505,31 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     if (dc_live && c->dc_tail > 0) {
         BWA_ZONE_BEGIN(zdc, "decorrelate");
         const uint32_t hm = c->dc_hmask, hl = c->dc_histlen, w = c->dc_w, nt = c->dc_ntaps;
+        /* TAP-major: each tap is a scaled copy of a contiguous run of the history (two runs where it
+         * wraps), so it vectorizes; a per-sample masked gather over 30 taps did not. The ring holds a
+         * whole block past the filter span, and the block is written before any read, so every tap's
+         * run is already in place. acc sums the taps in the same order the per-sample loop did. */
+        float acc[BWA_MIX_CHUNK];
         for (uint32_t ch = 0; ch < c->channels; ++ch) {
             float* h = &c->dc_hist[(size_t)ch * hl];
             const float* in = &c->dc_bus[(size_t)ch * nframes];
-            for (uint32_t i = 0; i < nframes; ++i) h[(w + i) & hm] = in[i];
+            {
+                const uint32_t w0 = w & hm, r1 = (hl - w0 < nframes) ? hl - w0 : nframes;
+                memcpy(h + w0, in, sizeof(float) * r1);
+                memcpy(h, in + r1, sizeof(float) * (nframes - r1));
+            }
             const uint16_t* off = c->dc_off[ch];
             const float*    amp = c->dc_tamp[ch];
             float* out = &bus[(size_t)ch * nframes];
-            for (uint32_t i = 0; i < nframes; ++i) {
-                float acc = 0.f;
-                for (uint32_t t = 0; t < nt; ++t) acc += amp[t] * h[(w + i - off[t]) & hm];
-                out[i] += acc;
+            for (uint32_t c0 = 0; c0 < nframes; c0 += BWA_MIX_CHUNK) {
+                const uint32_t cn = (nframes - c0 < BWA_MIX_CHUNK) ? nframes - c0 : BWA_MIX_CHUNK;
+                memset(acc, 0, sizeof(float) * cn);
+                for (uint32_t t = 0; t < nt; ++t) {
+                    const uint32_t s0 = (w + c0 - off[t]) & hm, r1 = (hl - s0 < cn) ? hl - s0 : cn;
+                    ramp_mac(acc, h + s0, r1, 0, amp[t], 0.f);               /* st = 0: a plain scaled add */
+                    if (r1 < cn) ramp_mac(acc + r1, h, cn - r1, 0, amp[t], 0.f);
+                }
+                for (uint32_t j = 0; j < cn; ++j) out[c0 + j] += acc[j];
             }
         }
         c->dc_w = (w + nframes) & hm;
@@ -3585,41 +3648,42 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
      * align, test signal — passes through. One gain from the cross-channel peak (linked: engaging
      * never shifts the spatial image), attack/release one-poles, then a hard clamp at the ceiling
      * (the attack is not lookahead, so a transient's first ~ms can clip — protection, not mastering). */
+    /* The per-channel output meter rides along: this block's peak |sample| measured after align, the
+     * test signal and the limiter, that is exactly what the device channel receives (rt_bus_peaks).
+     * Channel-major per chunk: the cross-channel peak is a row-wise max into pk[], the gain recursion
+     * is the only serial part, and the apply walks each row once. Walking the bus frame-major (every
+     * channel per sample, twice) cost about half an idle block. */
+    float meter[BWA_CHANNELS];
+    for (uint32_t ch = 0; ch < c->channels; ++ch) meter[ch] = 0.f;
     if (atomic_load_explicit(&c->lim_on, memory_order_acquire)) {
         const float lim_c = atomic_load_explicit(&c->lim_ceiling, memory_order_relaxed);
         float g = c->lim_gain;
-        for (uint32_t i = 0; i < nframes; ++i) {
-            float peak = 0.f;
-            for (uint32_t ch = 0; ch < c->channels; ++ch) {
-                float a = bus[(size_t)ch * nframes + i];
-                a = a < 0.f ? -a : a;
-                if (a > peak) peak = a;
+        float pk[BWA_MIX_CHUNK], gv[BWA_MIX_CHUNK];
+        for (uint32_t c0 = 0; c0 < nframes; c0 += BWA_MIX_CHUNK) {
+            const uint32_t cn = (nframes - c0 < BWA_MIX_CHUNK) ? nframes - c0 : BWA_MIX_CHUNK;
+            memset(pk, 0, sizeof(float) * cn);
+            for (uint32_t ch = 0; ch < c->channels; ++ch)
+                vec_absmax_into(pk, &bus[(size_t)ch * nframes + c0], cn);
+            for (uint32_t j = 0; j < cn; ++j) {
+                const float want = (pk[j] > lim_c) ? lim_c / pk[j] : 1.f;
+                g += (want - g) * (want < g ? c->lim_att_a : c->lim_rel_a);
+                gv[j] = g;
             }
-            float want = (peak > lim_c) ? lim_c / peak : 1.f;
-            g += (want - g) * (want < g ? c->lim_att_a : c->lim_rel_a);
+            /* the hard clamp is the designated last line of defense, so it must not pass the two
+             * things a clamp can't see: NaN fails both compares, and an Inf bus sample drives `want`
+             * to 0 so g underflows and Inf * 0 = NaN right here. vec_scale_clamp scrubs both to 0
+             * (silence), never to the ceiling (a full-scale DC step). */
             for (uint32_t ch = 0; ch < c->channels; ++ch) {
-                float* p = &bus[(size_t)ch * nframes + i];
-                float s = *p * g;
-                /* the hard clamp is the designated last line of defense, so it must not pass the two
-                 * things a clamp can't see: NaN fails both compares, and an Inf bus sample drives
-                 * `want` to 0 so g underflows and Inf * 0 = NaN right here. Scrub to 0 (silence),
-                 * never to the ceiling (a full-scale DC step). */
-                if (!isfinite(s)) s = 0.f;
-                else if (s >  lim_c) s =  lim_c;
-                else if (s < -lim_c) s = -lim_c;
-                *p = s;
+                const float m = vec_scale_clamp(&bus[(size_t)ch * nframes + c0], gv, cn, lim_c);
+                if (m > meter[ch]) meter[ch] = m;
             }
         }
         c->lim_gain = g;
+    } else {
+        for (uint32_t ch = 0; ch < c->channels; ++ch) meter[ch] = vec_absmax(&bus[(size_t)ch * nframes], nframes);
     }
-    /* per-channel output meter: publish this block's peak |sample| — measured after align, the test
-     * signal, and the limiter, i.e. exactly what the device channel receives (rt_bus_peaks). */
-    for (uint32_t ch = 0; ch < c->channels; ++ch) {
-        const float* p = &bus[(size_t)ch * nframes];
-        float m = 0.f;
-        for (uint32_t i = 0; i < nframes; ++i) { float a = p[i] < 0.f ? -p[i] : p[i]; if (a > m) m = a; }
-        atomic_store_explicit(&c->chan_peak[ch], m, memory_order_relaxed);
-    }
+    for (uint32_t ch = 0; ch < c->channels; ++ch)
+        atomic_store_explicit(&c->chan_peak[ch], meter[ch], memory_order_relaxed);
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
     BWA_ZONE_END(zr);
 }
@@ -4712,6 +4776,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->pos_pub    = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->aux        = (float*)   calloc(BWA_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->stream_scratch = (float*)calloc(BWA_RT_MAX_BLOCK, sizeof(float));  /* per-block streaming pull scratch */
+    c->mix_scr    = (float*)calloc((size_t)MIX_ROWS * BWA_MIX_CHUNK, sizeof(float));   /* mix_voice's rows */
     c->path_accum = (float*)calloc((size_t)BWA_AMBI_CH * BWA_RT_MAX_BLOCK, sizeof(float));  /* pathing ambisonic accumulator */
     c->path_pub   = calloc((size_t)voice_cap * 2, sizeof *c->path_pub);  /* per-voice double-buffered path field */
     c->path_idx   = (_Atomic int*)calloc(voice_cap, sizeof(_Atomic int));
@@ -4814,7 +4879,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->nf_a  = 1.f - expf(-6.2831853f * BWA_NF_FC / (float)sample_rate);   /* near-field shelf corner */
     atomic_store_explicit(&c->sos, BWA_SPEED_OF_SOUND, memory_order_relaxed);
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->dir_pub || !c->play_pub || !c->pos_pub || !c->aux ||
-        !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
+        !c->stream_scratch || !c->mix_scr || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->group || !c->stealing || !c->push_sound || !c->retire_park ||
         !c->play_seq || !c->ended || !c->looped || !c->freelist || !c->sounds || !c->sfreelist ||
         !c->dop_ring || !c->dc_bus || !c->dc_hist || !c->para || !c->ism_ring) {
@@ -5357,6 +5422,7 @@ void rt_destroy(RtCore* c) {
     free(c->para);
     stream_set_destroy(c->streams);     /* stops the streaming thread, releases every open stream + ring */
     free(c->stream_scratch);
+    free(c->mix_scr);
     free(c->ambi_direct);
     free(c->path_accum);
     free(c->path_pub);

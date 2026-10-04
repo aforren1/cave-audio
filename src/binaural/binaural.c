@@ -6,6 +6,7 @@
  */
 #include "binaural/binaural.h"
 #include "core/frame.h"          /* BWA_ROOM_RIGHT + frame_qrot */
+#include "dsp/vec.h"             /* ramp_mac: the per-speaker pan ramps */
 
 #include <math.h>
 #include <stdlib.h>
@@ -95,20 +96,18 @@ void monitor_process(Monitor* m, const float* bus, const float* direct16,
     const float inv_n = 1.0f / (float)n;
     for (uint32_t k = 0; k < m->channels; ++k) {
         const float* src = bus + (size_t)k * n;
-        float gl = m->gL_cur[k], gr = m->gR_cur[k];              /* ramp per block toward the new pan gains: a head */
-        const float dgl = (m->gL[k] - gl) * inv_n;              /* turn moves the stereo image smoothly, no zipper */
-        const float dgr = (m->gR[k] - gr) * inv_n;
-        for (uint32_t i = 0; i < n; ++i) { L[i] += gl * src[i]; R[i] += gr * src[i]; gl += dgl; gr += dgr; }
+        const float gl = m->gL_cur[k], gr = m->gR_cur[k];        /* ramp per block toward the new pan gains: a head */
+        ramp_mac(L, src, n, 0, gl, (m->gL[k] - gl) * inv_n);    /* turn moves the stereo image smoothly, no zipper */
+        ramp_mac(R, src, n, 0, gr, (m->gR[k] - gr) * inv_n);
         m->gL_cur[k] = m->gL[k]; m->gR_cur[k] = m->gR[k];        /* land exactly */
     }
     if (direct16) {                                 /* direct-binaural field: per-ear cardioids on W/Y/Z/X,
                                                      * coefficients ramped like the pan (invariant 4) */
         for (int k = 0; k < 4; ++k) {
             const float* src = direct16 + (size_t)k * n;
-            float al = m->aL_cur[k], ar = m->aR_cur[k];
-            const float dal = (m->aL[k] - al) * inv_n;
-            const float dar = (m->aR[k] - ar) * inv_n;
-            for (uint32_t i = 0; i < n; ++i) { L[i] += al * src[i]; R[i] += ar * src[i]; al += dal; ar += dar; }
+            const float al = m->aL_cur[k], ar = m->aR_cur[k];
+            ramp_mac(L, src, n, 0, al, (m->aL[k] - al) * inv_n);
+            ramp_mac(R, src, n, 0, ar, (m->aR[k] - ar) * inv_n);
             m->aL_cur[k] = m->aL[k]; m->aR_cur[k] = m->aR[k];    /* land exactly */
         }
     }

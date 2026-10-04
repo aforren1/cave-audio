@@ -16,6 +16,8 @@
 #include "spatial/cap.h"
 #include "spatial/hole.h"
 #include "spatial/align.h"
+#include "spatial/dirstage.h"
+#include "dsp/vec.h"
 #include "spatial/ambisonics.h"
 #include "spatial/allrad.h"
 #include "spatial/epad.h"
@@ -585,6 +587,161 @@ int main(void) {
             CHECK(fabs(buf[1*n+0] - 1.0f) < 1e-6, "a channel with no correction passes through");
             align_destroy(a);
         }
+    }
+
+    /* 7a1. the FIR against a direct double-precision convolution: a long kernel over several blocks
+     * whose sizes cross the stage's chunk (600) and leave a ragged tail (37), so the carried history,
+     * the wide vector path and the scalar tail all have to agree with the reference. The 16-frame
+     * impulse above reaches none of them. */
+    {
+        static Layout EQ; layout_default(&EQ);
+        enum { KT = 300, TOTAL = 256 + 600 + 37 + 256 };
+        static const uint32_t blocks[] = { 256, 600, 37, 256 };
+        uint32_t rng = 12345u;
+        EQ.speakers[3].eq_len = KT;
+        for (int t = 0; t < KT; ++t) { rng = rng * 1664525u + 1013904223u; EQ.speakers[3].eq[t] = ((float)(rng >> 8) / 16777216.f - 0.5f) * 0.2f; }
+        static float in[TOTAL], got[TOTAL];
+        for (int i = 0; i < TOTAL; ++i) { rng = rng * 1664525u + 1013904223u; in[i] = (float)(rng >> 8) / 16777216.f - 0.5f; }
+        Aligner* a = align_create(CH, &EQ, RATE);
+        CHECK(a != NULL, "align_create (long eq)");
+        if (a) {
+            static float blk[CH * 600];
+            uint32_t at = 0;
+            for (int b = 0; b < 4; ++b) {
+                const uint32_t n = blocks[b];
+                memset(blk, 0, sizeof(float) * CH * n);
+                memcpy(&blk[3 * n], &in[at], sizeof(float) * n);
+                align_process(a, blk, n);
+                memcpy(&got[at], &blk[3 * n], sizeof(float) * n);
+                at += n;
+            }
+            double worst = 0.0;
+            for (int i = 0; i < TOTAL; ++i) {
+                double ref = 0.0;
+                for (int t = 0; t < KT && t <= i; ++t) ref += (double)EQ.speakers[3].eq[t] * (double)in[i - t];
+                const double e = fabs((double)got[i] - ref);
+                if (e > worst) worst = e;
+            }
+            CHECK(worst < 1e-5, "correction FIR matches a direct convolution across blocks and chunk edges");
+            align_destroy(a);
+        }
+    }
+
+    /* 7a4. dsp/vec.h kernels against plain double-precision references. Lengths are ragged and ramp
+     * offsets nonzero, so the vector body AND the scalar tail run, and a lane or offset slip in either
+     * shows. The stages that use these are tested end to end elsewhere; this pins the arithmetic
+     * where an end-to-end check can't see it (an image gain's ramp, a padded biquad lane). */
+    {
+        enum { VN = 37, VR = 6, VT = 23 };
+        static float a[VR * VN + VT + 8], b[VN + VT + 8], out[VN], ref[VN];
+        uint32_t rng = 777u;
+        #define VRND() (rng = rng * 1664525u + 1013904223u, (float)(rng >> 8) / 16777216.f - 0.5f)
+        for (size_t i = 0; i < sizeof a / sizeof a[0]; ++i) a[i] = VRND();
+        for (size_t i = 0; i < sizeof b / sizeof b[0]; ++i) b[i] = VRND();
+        double worst = 0.0;
+        #define VCMP(X, R) do { const double e_ = fabs((double)(X) - (R)); if (e_ > worst) worst = e_; } while (0)
+
+        const uint32_t k0 = 5; const float g0 = 0.3f, st = -0.01f;   /* ramp_mac */
+        for (int j = 0; j < VN; ++j) { out[j] = b[j]; ref[j] = b[j]; }
+        ramp_mac(out, a, VN, k0, g0, st);
+        for (int j = 0; j < VN; ++j) VCMP(out[j], (double)ref[j] + ((double)g0 + (double)st * (k0 + j)) * a[j]);
+
+        float rg0[VR], rst[VR];                                       /* ramp_mat_mac + mat_mac */
+        for (int r = 0; r < VR; ++r) { rg0[r] = VRND(); rst[r] = 0.01f * VRND(); }
+        for (int j = 0; j < VN; ++j) out[j] = b[j];
+        ramp_mat_mac(out, a, VN, VR, rg0, rst, k0, VN);
+        for (int j = 0; j < VN; ++j) {
+            double r_ = b[j];
+            for (int r = 0; r < VR; ++r) r_ += ((double)rg0[r] + (double)rst[r] * (k0 + j)) * a[r * VN + j];
+            VCMP(out[j], r_);
+        }
+        for (int j = 0; j < VN; ++j) out[j] = b[j];
+        mat_mac(out, a, VN, VR, rg0, VN);
+        for (int j = 0; j < VN; ++j) {
+            double r_ = b[j];
+            for (int r = 0; r < VR; ++r) r_ += (double)rg0[r] * a[r * VN + j];
+            VCMP(out[j], r_);
+        }
+
+        vec_fir(out, b, a, VT, VN);                                   /* vec_fir: out[j] = sum kr[v] h[j+v] */
+        for (int j = 0; j < VN; ++j) {
+            double r_ = 0; for (int v = 0; v < VT; ++v) r_ += (double)a[v] * b[j + v];
+            VCMP(out[j], r_);
+        }
+        { double r_ = 0; for (int v = 0; v < VT; ++v) r_ += (double)a[v] * b[v]; VCMP(vec_dot(a, b, VT), r_); }
+
+        for (int j = 0; j < VN; ++j) out[j] = b[j];                   /* vec_ramp_scale */
+        vec_ramp_scale(out, VN, 0.9f, -0.004f);
+        for (int j = 0; j < VN; ++j) VCMP(out[j], (double)b[j] * (0.9 - 0.004 * j));
+
+        {   /* vec_biquad8: eight lanes against eight scalar DF-I filters; lane 7 is identity padding */
+            float c[5][8], s8[4][8], v8[8 * VN];
+            double sd[8][4];
+            for (int l = 0; l < 8; ++l) {
+                const double w = 0.05 + 0.04 * l, al = sin(w) / 1.4, A = 1.0 + 0.1 * l, a0 = 1 + al / A;
+                double co[5] = { (1 + al * A) / a0, -2 * cos(w) / a0, (1 - al * A) / a0, -2 * cos(w) / a0, (1 - al / A) / a0 };
+                if (l == 7) { co[0] = 1; co[1] = co[2] = co[3] = co[4] = 0; }
+                for (int q = 0; q < 5; ++q) c[q][l] = (float)co[q];
+                for (int q = 0; q < 4; ++q) { s8[q][l] = l == 7 ? 0.f : 0.1f * VRND(); sd[l][q] = s8[q][l]; }
+            }
+            for (int i = 0; i < 8 * VN; ++i) v8[i] = a[i % (VR * VN)];
+            float in8[8 * VN]; memcpy(in8, v8, sizeof in8);
+            vec_biquad8(v8, VN, (const float (*)[8])c, s8);
+            for (int l = 0; l < 8; ++l)
+                for (int i = 0; i < VN; ++i) {
+                    const double x = in8[8 * i + l];
+                    const double y = c[0][l]*x + c[1][l]*sd[l][0] + c[2][l]*sd[l][1] - c[3][l]*sd[l][2] - c[4][l]*sd[l][3];
+                    sd[l][1] = sd[l][0]; sd[l][0] = x; sd[l][3] = sd[l][2]; sd[l][2] = y;
+                    VCMP(v8[8 * i + l], y);
+                }
+            CHECK(memcmp(&v8[7], &in8[7], sizeof(float)) == 0, "vec_biquad8: an identity lane passes its input exactly");
+        }
+
+        {   /* vec_absmax(_into) and vec_scale_clamp, with a NaN and an Inf planted */
+            float x[VN], g[VN], pk[VN];
+            for (int j = 0; j < VN; ++j) { x[j] = 2.f * a[j]; g[j] = 1.f + a[VN + j]; pk[j] = 0.05f; }
+            x[3] = NAN;                                               /* the abs-max kernels ignore NaN */
+            float m = 0.f; for (int j = 0; j < VN; ++j) if (x[j] == x[j] && fabsf(x[j]) > m) m = fabsf(x[j]);
+            CHECK(vec_absmax(x, VN) == m, "vec_absmax: max |x|, NaN ignored");
+            vec_absmax_into(pk, x, VN);
+            int ok = 1; for (int j = 0; j < VN; ++j) { const float e = (x[j] == x[j] && fabsf(x[j]) > 0.05f) ? fabsf(x[j]) : 0.05f; if (pk[j] != e) ok = 0; }
+            CHECK(ok, "vec_absmax_into: row-wise max, NaN ignored");
+            x[30] = INFINITY;                                         /* the clamp scrubs Inf as well */
+            float y[VN]; memcpy(y, x, sizeof y);
+            const float mc = vec_scale_clamp(y, g, VN, 0.4f);
+            float mr = 0.f; ok = 1;
+            for (int j = 0; j < VN; ++j) {
+                float s = x[j] * g[j];
+                if (!isfinite(s)) s = 0.f; else if (s > 0.4f) s = 0.4f; else if (s < -0.4f) s = -0.4f;
+                if (y[j] != s) ok = 0;
+                if (fabsf(s) > mr) mr = fabsf(s);
+            }
+            CHECK(ok && mc == mr, "vec_scale_clamp: clamp, scrub NaN/Inf to 0, meter the result");
+        }
+        printf("vec.h kernels: worst |error| vs double reference %.3g\n", worst);
+        CHECK(worst < 1e-5, "vec.h kernels match their double-precision references");   /* float rounding ~2e-6;
+                                                                                           * a lane or offset slip ~0.1 */
+        #undef VCMP
+        #undef VRND
+    }
+
+    /* 7a3. the directivity comp's broadband gain RAMPS across the block (invariant 4): a -6 dB
+     * target moves the gain by one block's slew, starting from exactly where the last block ended.
+     * Stepping straight to the block's end gain passed every align and rt check. */
+    {
+        static DirStage ds;
+        CHECK(dirstage_init(&ds, 2, 3000.f, RATE, 24.f), "dirstage_init");
+        const float tg[2] = { -6.f, 0.f };
+        dirstage_targets(&ds, tg, NULL, 6.f, 10.f);
+        enum { DN = 256 };
+        static float x[2 * DN];
+        for (int i = 0; i < 2 * DN; ++i) x[i] = 1.f;
+        dirstage_process(&ds, x, DN);
+        const float l1 = powf(10.f, -(24.f / (float)RATE * (float)DN) / 20.f);   /* one block of slew */
+        CHECK(x[0] == 1.f && fabsf(x[DN - 1] - (1.f + (l1 - 1.f) * (float)(DN - 1) / (float)DN)) < 1e-6f
+              && x[DN / 2] < 1.f && x[DN / 2] > l1,
+              "dirstage broadband gain ramps from the last block's gain (no step)");
+        CHECK(x[DN] == 1.f && x[2 * DN - 1] == 1.f, "dirstage leaves an identity channel untouched");
     }
 
     /* 7a2. room_eq modal cut: a -6 dB peaking section at 100 Hz attenuates a 100 Hz tone by ~6 dB

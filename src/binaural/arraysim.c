@@ -2,20 +2,13 @@
 #include "binaural/arraysim.h"
 #include "core/bits.h"           /* bwa_pow2_ge */
 #include "dsp/biquad.h"          /* bwa_biquad_rbj (the per-block coefficient rebuild) */
+#include "core/profile.h"         /* zones (no-ops unless BWA_TRACY / BWA_PROFILE_SELF) */
+#include "dsp/vec.h"             /* vec_biquad8 (the graphic EQ), vec_dot (the delay tap) */
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Four channels per vector for the graphic EQ (eq_section4). SSE on x86 (every x64 target has it),
- * NEON on ARM, and a plain four-lane loop elsewhere (wasm), which computes the same thing. */
-#if defined(_M_X64) || defined(_M_AMD64) || defined(__SSE__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
-#include <xmmintrin.h>
-#define ASIM_SSE 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#define ASIM_NEON 1
-#endif
 
 #define ASIM_SIZING_SOS   343.0f  /* ring sizing only; the live c scales the targets */
 #define ASIM_GAIN_MIN     0.0625f /* -24 dB: a listener far outside the array */
@@ -42,8 +35,12 @@ struct ArraySim {
                                                     * a tiny per-sample creep on a value near d_max */
     float    d_tgt[BWA_CHANNELS];
     double   d_rate;                               /* max delay change per frame (closing speed / c) */
-    float*   ring;                                 /* channels * len */
-    float*   sinc;                                 /* (ASIM_PHASES + 1) * ARRAYSIM_INTERP_TAPS kernels */
+    float*   ring;                                 /* channels * (len + TAPS): each ring's first TAPS slots
+                                                    * are mirrored past its end, so a kernel window is
+                                                    * always one contiguous run (no per-tap wrap mask) */
+    float*   sinc;                                 /* (ASIM_PHASES + 1) * ARRAYSIM_INTERP_TAPS kernels,
+                                                    * stored tap-REVERSED: element u weights the window's
+                                                    * u-th sample, oldest first */
     /* directivity graphic EQ (neq = 0: no model, stage 1 skipped) */
     uint32_t neq;
     uint8_t  eq_row[BWA_DIR_MAX_BANDS];            /* the model band each section fits */
@@ -63,7 +60,7 @@ struct ArraySim {
     float    last_p[3], last_sos;
     int      primed;
     float*   scratch;                              /* channels * max_block: what the decoders read */
-    float*   quad;                                 /* 4 * max_block: four channels interleaved for the EQ */
+    float*   quad;                                 /* 8 * max_block: eight channels interleaved for the EQ */
 };
 
 /* ---- design (control thread) ---- */
@@ -90,14 +87,15 @@ static double bessel_i0(double x) {
 }
 
 /* The delay tap's kernels: row p is the windowed sinc for fraction f = p / ASIM_PHASES, tap i
- * weighting the sample (i - (TAPS/2 - 1)) frames before the integer delay, normalized to unity DC.
- * Row 0 is an exact unit impulse, so an integer delay passes the samples through bit for bit. */
+ * weighting the sample (i - (TAPS/2 - 1)) frames before the integer delay, normalized to unity DC,
+ * then stored REVERSED (row[TAPS-1-i]) so the read walks the ring forward. Row 0 is an exact unit
+ * impulse, so an integer delay passes the samples through bit for bit. */
 static void sinc_design(float* tab) {
     const int N = ARRAYSIM_INTERP_TAPS, half = N / 2;
     const double i0b = bessel_i0(ASIM_SINC_BETA);
     for (int p = 0; p <= ASIM_PHASES; ++p) {
         float* row = tab + (size_t)p * N;
-        if (p == 0) { for (int i = 0; i < N; ++i) row[i] = (i == half - 1) ? 1.f : 0.f; continue; }
+        if (p == 0) { for (int i = 0; i < N; ++i) row[N - 1 - i] = (i == half - 1) ? 1.f : 0.f; continue; }
         const double f = (double)p / ASIM_PHASES;
         double h[ARRAYSIM_INTERP_TAPS], sum = 0.0;
         for (int i = 0; i < N; ++i) {
@@ -107,7 +105,7 @@ static void sinc_design(float* tab) {
             const double w = bessel_i0(ASIM_SINC_BETA * sqrt(r * r < 1.0 ? 1.0 - r * r : 0.0)) / i0b;
             h[i] = sn * w; sum += h[i];
         }
-        for (int i = 0; i < N; ++i) row[i] = (float)(h[i] / sum);
+        for (int i = 0; i < N; ++i) row[N - 1 - i] = (float)(h[i] / sum);
     }
 }
 
@@ -210,9 +208,9 @@ ArraySim* arraysim_create(const Layout* L, uint32_t sample_rate, uint32_t max_bl
     s->len   = bwa_pow2_ge(s->d_max + ARRAYSIM_INTERP_TAPS + 2);
     s->mask  = s->len - 1;
     s->d_rate = (double)(ARRAYSIM_CLOSING_MS / ASIM_SIZING_SOS);
-    s->ring    = (float*)calloc((size_t)s->channels * s->len, sizeof(float));
+    s->ring    = (float*)calloc((size_t)s->channels * (s->len + ARRAYSIM_INTERP_TAPS), sizeof(float));
     s->scratch = (float*)calloc((size_t)s->channels * max_block, sizeof(float));
-    s->quad    = (float*)calloc((size_t)4 * max_block, sizeof(float));
+    s->quad    = (float*)calloc((size_t)8 * max_block, sizeof(float));
     s->sinc    = (float*)malloc(sizeof(float) * (size_t)(ASIM_PHASES + 1) * ARRAYSIM_INTERP_TAPS);
     if (!s->ring || !s->scratch || !s->quad || !s->sinc) { arraysim_destroy(s); return NULL; }
     sinc_design(s->sinc);
@@ -232,7 +230,7 @@ void arraysim_destroy(ArraySim* s) {
 
 void arraysim_reset(ArraySim* s) {
     if (!s) return;
-    memset(s->ring, 0, sizeof(float) * (size_t)s->channels * s->len);
+    memset(s->ring, 0, sizeof(float) * (size_t)s->channels * (s->len + ARRAYSIM_INTERP_TAPS));
     memset(s->eq_st, 0, sizeof s->eq_st);
     for (uint32_t k = 0; k < s->channels; ++k) {
         s->g_cur[k] = s->g_tgt[k] = 1.f;
@@ -247,6 +245,7 @@ void arraysim_reset(ArraySim* s) {
 }
 
 /* ---- audio thread ---- */
+
 
 /* The fitted table rows at `ang` (linear in angle, clamped at the table's ends; NaN reads 0 deg):
  * exactly layout.c's directivity_loss_db_at at the band centers, with the log-frequency step
@@ -333,98 +332,53 @@ static void eq_prepare(ArraySim* s, uint32_t k, uint32_t n) {
     }
 }
 
-/* One section over channels k0..k0+3 at once, on s->quad (the four channels interleaved, frame by
- * frame). The cascade is latency-bound on one channel: each output sample waits on the previous one
- * through a multiply-add chain, so a channel-at-a-time loop leaves the arithmetic units idle. Four
- * channels per vector run four independent chains for the price of one: 26 channels x 27 sections
- * went from 459 to 152 us per 256-frame block (x64, monitor_test prints it). A FLAT lane holds identity coefficients, passes its samples through exactly, and has its
- * state re-zeroed after. */
-static void eq_section4(ArraySim* s, uint32_t k0, uint32_t j, uint32_t n) {
-    float c[5][4], st[4][4];
-    for (int l = 0; l < 4; ++l) {
-        const float* co = s->eq_co[k0 + l][j];
-        const float* sv = s->eq_st[k0 + l][j];
-        for (int q = 0; q < 5; ++q) c[q][l] = co[q];
-        for (int q = 0; q < 4; ++q) st[q][l] = sv[q];
-    }
-    float* v = s->quad;
-#if defined(ASIM_SSE)
-    const __m128 b0 = _mm_loadu_ps(c[0]), b1 = _mm_loadu_ps(c[1]), b2 = _mm_loadu_ps(c[2]);
-    const __m128 a1 = _mm_loadu_ps(c[3]), a2 = _mm_loadu_ps(c[4]);
-    __m128 x1 = _mm_loadu_ps(st[0]), x2 = _mm_loadu_ps(st[1]), y1 = _mm_loadu_ps(st[2]), y2 = _mm_loadu_ps(st[3]);
-    for (uint32_t i = 0; i < n; ++i) {
-        const __m128 in = _mm_loadu_ps(v + 4 * i);
-        const __m128 y = _mm_sub_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(b0, in), _mm_mul_ps(b1, x1)), _mm_mul_ps(b2, x2)),
-                                    _mm_add_ps(_mm_mul_ps(a1, y1), _mm_mul_ps(a2, y2)));
-        x2 = x1; x1 = in; y2 = y1; y1 = y;
-        _mm_storeu_ps(v + 4 * i, y);
-    }
-    _mm_storeu_ps(st[0], x1); _mm_storeu_ps(st[1], x2); _mm_storeu_ps(st[2], y1); _mm_storeu_ps(st[3], y2);
-#elif defined(ASIM_NEON)
-    const float32x4_t b0 = vld1q_f32(c[0]), b1 = vld1q_f32(c[1]), b2 = vld1q_f32(c[2]);
-    const float32x4_t a1 = vld1q_f32(c[3]), a2 = vld1q_f32(c[4]);
-    float32x4_t x1 = vld1q_f32(st[0]), x2 = vld1q_f32(st[1]), y1 = vld1q_f32(st[2]), y2 = vld1q_f32(st[3]);
-    for (uint32_t i = 0; i < n; ++i) {
-        const float32x4_t in = vld1q_f32(v + 4 * i);
-        const float32x4_t y = vsubq_f32(vaddq_f32(vaddq_f32(vmulq_f32(b0, in), vmulq_f32(b1, x1)), vmulq_f32(b2, x2)),
-                                        vaddq_f32(vmulq_f32(a1, y1), vmulq_f32(a2, y2)));
-        x2 = x1; x1 = in; y2 = y1; y1 = y;
-        vst1q_f32(v + 4 * i, y);
-    }
-    vst1q_f32(st[0], x1); vst1q_f32(st[1], x2); vst1q_f32(st[2], y1); vst1q_f32(st[3], y2);
-#else
-    for (uint32_t i = 0; i < n; ++i)
-        for (int l = 0; l < 4; ++l) {
-            const float in = v[4 * i + l];
-            const float y  = c[0][l]*in + c[1][l]*st[0][l] + c[2][l]*st[1][l] - c[3][l]*st[2][l] - c[4][l]*st[3][l];
-            st[1][l] = st[0][l]; st[0][l] = in; st[3][l] = st[2][l]; st[2][l] = y;
-            v[4 * i + l] = y;
+/* One section over channels k0..k0+nl-1 (nl <= 8) at once, on s->quad (eight lanes interleaved,
+ * frame by frame; lanes past nl are identity padding). The cascade is latency-bound on one channel,
+ * so vec_biquad8 runs eight channels as independent chains: one channel per pass measured 459 us
+ * per 256-frame block at 26 channels x 27 sections, four per vector 152 us. A FLAT lane holds
+ * identity coefficients, passes its samples through exactly, and has its state re-zeroed after. */
+static void eq_section8(ArraySim* s, uint32_t k0, uint32_t nl, uint32_t j, uint32_t n) {
+    float c[5][8], st[4][8];
+    for (uint32_t l = 0; l < 8; ++l) {
+        if (l < nl) {
+            const float* co = s->eq_co[k0 + l][j];
+            const float* sv = s->eq_st[k0 + l][j];
+            for (int q = 0; q < 5; ++q) c[q][l] = co[q];
+            for (int q = 0; q < 4; ++q) st[q][l] = sv[q];
+        } else {
+            c[0][l] = 1.f; c[1][l] = c[2][l] = c[3][l] = c[4][l] = 0.f;
+            st[0][l] = st[1][l] = st[2][l] = st[3][l] = 0.f;
         }
-#endif
-    for (int l = 0; l < 4; ++l) {
+    }
+    vec_biquad8(s->quad, n, (const float (*)[8])c, st);
+    for (uint32_t l = 0; l < nl; ++l) {
         float* sv = s->eq_st[k0 + l][j];
         if (s->eq_flat[k0 + l][j]) { sv[0] = sv[1] = sv[2] = sv[3] = 0.f; continue; }
         for (int q = 0; q < 4; ++q) sv[q] = st[q][l];
     }
 }
 
-/* The same section on one channel (the remainder after the groups of four). */
-static void eq_section1(ArraySim* s, uint32_t k, uint32_t j, float* x, uint32_t n) {
-    if (s->eq_flat[k][j]) return;
-    const float* co = s->eq_co[k][j];
-    float* st = s->eq_st[k][j];
-    float x1 = st[0], x2 = st[1], y1 = st[2], y2 = st[3];
-    const float b0 = co[0], b1 = co[1], b2 = co[2], a1 = co[3], a2 = co[4];
-    for (uint32_t i = 0; i < n; ++i) {
-        const float in = x[i];
-        const float y  = b0*in + b1*x1 + b2*x2 - a1*y1 - a2*y2;
-        x2 = x1; x1 = in; y2 = y1; y1 = y; x[i] = y;
-    }
-    st[0] = x1; st[1] = x2; st[2] = y1; st[3] = y2;
-}
-
-/* Stage 1 over the whole scratch, in place. */
+/* Stage 1 over the whole scratch, in place, eight channels at a time (the last group padded). */
 static void eq_run(ArraySim* s, uint32_t n) {
     for (uint32_t k = 0; k < s->channels; ++k) eq_prepare(s, k, n);
-    uint32_t k0 = 0;
-    for (; k0 + 4 <= s->channels; k0 += 4) {
+    for (uint32_t k0 = 0; k0 < s->channels; k0 += 8) {
+        const uint32_t nl = s->channels - k0 < 8 ? s->channels - k0 : 8;
         int any = 0;
         for (uint32_t j = 0; j < s->neq && !any; ++j)
-            any = !(s->eq_flat[k0][j] && s->eq_flat[k0 + 1][j] && s->eq_flat[k0 + 2][j] && s->eq_flat[k0 + 3][j]);
-        if (!any) continue;                                        /* all four channels flat: identity */
-        float* const x[4] = { s->scratch + (size_t)k0 * n,       s->scratch + (size_t)(k0 + 1) * n,
-                              s->scratch + (size_t)(k0 + 2) * n, s->scratch + (size_t)(k0 + 3) * n };
+            for (uint32_t l = 0; l < nl && !any; ++l) any = !s->eq_flat[k0 + l][j];
+        if (!any) continue;                                        /* every channel flat: identity */
         float* v = s->quad;
-        for (uint32_t i = 0; i < n; ++i) { v[4*i] = x[0][i]; v[4*i+1] = x[1][i]; v[4*i+2] = x[2][i]; v[4*i+3] = x[3][i]; }
-        for (uint32_t j = 0; j < s->neq; ++j) {
-            if (s->eq_flat[k0][j] && s->eq_flat[k0 + 1][j] && s->eq_flat[k0 + 2][j] && s->eq_flat[k0 + 3][j])
-                continue;
-            eq_section4(s, k0, j, n);
+        for (uint32_t l = 0; l < 8; ++l) {
+            if (l < nl) { const float* x = s->scratch + (size_t)(k0 + l) * n; for (uint32_t i = 0; i < n; ++i) v[8*i + l] = x[i]; }
+            else        { for (uint32_t i = 0; i < n; ++i) v[8*i + l] = 0.f; }
         }
-        for (uint32_t i = 0; i < n; ++i) { x[0][i] = v[4*i]; x[1][i] = v[4*i+1]; x[2][i] = v[4*i+2]; x[3][i] = v[4*i+3]; }
+        for (uint32_t j = 0; j < s->neq; ++j) {
+            int live = 0;
+            for (uint32_t l = 0; l < nl && !live; ++l) live = !s->eq_flat[k0 + l][j];
+            if (live) eq_section8(s, k0, nl, j, n);
+        }
+        for (uint32_t l = 0; l < nl; ++l) { float* x = s->scratch + (size_t)(k0 + l) * n; for (uint32_t i = 0; i < n; ++i) x[i] = v[8*i + l]; }
     }
-    for (; k0 < s->channels; ++k0)
-        for (uint32_t j = 0; j < s->neq; ++j) eq_section1(s, k0, j, s->scratch + (size_t)k0 * n, n);
 }
 
 const float* arraysim_apply(ArraySim* s, const float* bus, const float p[3], float sos, uint32_t n) {
@@ -444,19 +398,26 @@ const float* arraysim_apply(ArraySim* s, const float* bus, const float p[3], flo
     const uint32_t len = s->len, mask = s->mask, w = s->w;
     const double rate = s->d_rate;
     const float inv_n = 1.f / (float)n;
+    BWA_ZONE_BEGIN(zas, "array-sim room");
     memcpy(s->scratch, bus, sizeof(float) * (size_t)s->channels * n);
-    if (s->neq) eq_run(s, n);                                      /* 1. directivity */
+    if (s->neq) {                                                  /* 1. directivity */
+        BWA_ZONE_BEGIN(zeq, "array-sim eq");
+        eq_run(s, n);
+        BWA_ZONE_END(zeq);
+    }
     for (uint32_t k = 0; k < s->channels; ++k) {
         float* x = s->scratch + (size_t)k * n;
         float g = s->g_cur[k];                                     /* 2. distance gain, per-sample ramp */
         const float dg = (s->g_tgt[k] - g) * inv_n;
-        float* h = s->ring + (size_t)k * len;                      /* 3. propagation delay */
+        float* h = s->ring + (size_t)k * (len + ARRAYSIM_INTERP_TAPS);   /* 3. propagation delay */
         double dc = s->d_cur[k];
         const double dt = (double)s->d_tgt[k];
         const float* tab = s->sinc;
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t wi = (w + i) & mask;
-            h[wi] = x[i] * g;
+            const float in = x[i] * g;
+            h[wi] = in;
+            if (wi < ARRAYSIM_INTERP_TAPS) h[len + wi] = in;      /* the mirror a window near the end reads */
             g += dg;
             /* the windowed-sinc tap at dc + BASE: dc in [0, d_max], so the newest sample the kernel
              * reads is BASE - (TAPS/2 - 1) = 1 frame back, never the one just written */
@@ -465,10 +426,10 @@ const float* arraysim_apply(ArraySim* s, const float* bus, const float p[3], flo
             uint32_t       ph = (uint32_t)((dl - (double)di) * ASIM_PHASES + 0.5);
             if (ph >= ASIM_PHASES) { ph = 0; ++di; }               /* rounds to the next integer delay */
             const float*   kr = tab + (size_t)ph * ARRAYSIM_INTERP_TAPS;
-            const uint32_t r0 = wi - di + (ARRAYSIM_INTERP_TAPS / 2 - 1);   /* the sample tap 0 weights */
-            float acc = 0.f;
-            for (uint32_t t = 0; t < ARRAYSIM_INTERP_TAPS; ++t) acc += kr[t] * h[(r0 - t) & mask];
-            x[i] = acc;
+            /* the window's oldest sample: tap 0 weights (wi - di + TAPS/2 - 1), the last tap TAPS-1
+             * frames before it, and the mirrored tail keeps the whole window contiguous */
+            const uint32_t b = (wi - di + (ARRAYSIM_INTERP_TAPS / 2 - 1) - (ARRAYSIM_INTERP_TAPS - 1)) & mask;
+            x[i] = vec_dot(kr, h + b, ARRAYSIM_INTERP_TAPS);
             if      (dc < dt - rate) dc += rate;                  /* the creep IS the Doppler */
             else if (dc > dt + rate) dc -= rate;
             else                     dc  = dt;
@@ -477,6 +438,7 @@ const float* arraysim_apply(ArraySim* s, const float* bus, const float p[3], flo
         s->d_cur[k] = dc;
     }
     s->w = (w + n) & mask;
+    BWA_ZONE_END(zas);
     return s->scratch;
 }
 
@@ -503,6 +465,6 @@ uint32_t arraysim_max_delay_frames(const ArraySim* s) { return s ? s->d_max : 0;
 
 size_t arraysim_bytes(const ArraySim* s) {
     if (!s) return 0;
-    return sizeof *s + sizeof(float) * ((size_t)s->channels * (s->len + s->max_block) + (size_t)4 * s->max_block
+    return sizeof *s + sizeof(float) * ((size_t)s->channels * (s->len + ARRAYSIM_INTERP_TAPS + s->max_block) + (size_t)8 * s->max_block
                                         + (size_t)(ASIM_PHASES + 1) * ARRAYSIM_INTERP_TAPS);
 }

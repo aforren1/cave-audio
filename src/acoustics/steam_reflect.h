@@ -44,7 +44,8 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
 void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);
 
 /* Set the wet level applied to the reverb before it sums onto the bus (linear; 1 = unity). Control
- * thread, per-frame-safe (a single relaxed atomic the audio-thread tap reads). */
+ * thread, per-frame-safe: a single relaxed atomic the audio-thread tap reads once per block and
+ * ramps toward across that block, so a change never steps. */
 void steam_reflect_set_gain(SteamReflect* r, float linear);
 
 /* Stop the sim thread + release the owned phonon objects. Call AFTER the audio thread is joined and

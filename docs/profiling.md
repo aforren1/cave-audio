@@ -29,7 +29,8 @@ costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON
   render on a thread the server, the OS or the browser owns; their named threads
   (`bw-audio (JACK lost)` and so on) are the host-paced fallbacks after a device is lost.
 - **Zones** under the block: `rt_render` → `mix voices`, `decorrelate`, `reflect tap`,
-  `path tap`, `align`; plus `binaural decode` and `convert_out`. The sim threads show
+  `path tap`, `align`; plus `array-sim room` (with `array-sim eq` inside it), `binaural decode`
+  and `convert_out`. The sim threads show
   `occlusion ray-trace` / `reflection ray-trace` on `bw-sim (occlusion)` / `bw-sim (reflections)`;
   the pathing sim thread appears as `bw-sim (pathing)`.
 - **Plot**: `rt voices` (active voice count); load versus block time at a glance.
@@ -61,23 +62,44 @@ too. So does anything that runs the engine.
 ## The per-situation bench (headless numbers, no GUI)
 
 [`examples/bench_situations.c`](../examples/bench_situations.c) answers "**how much does each thing
-cost**" directly, without Tracy tooling. It renders a MATRIX of configurations (idle, DBAP scaling,
-binaural HRTF, occlusion EQ, spread/decorrelation, Doppler/air, FDN, the Steam reflection bed, pathing,
-everything-on) through the **manual sink** (`bwa_render_block`, synchronous; no device thread). It
-times the per-block cost of each and prints mean / median / p99 / max in microseconds and as a
-percentage of the block budget.
+cost**" directly, without Tracy tooling. It renders a MATRIX of configurations (idle, the limiter,
+DBAP / SPCAP / VBAP scaling with a moving listener, dual-band and CAP, binaural HRTF, `cave_sim`,
+occlusion EQ, spread/decorrelation, Doppler/air, ISM early reflections, 3rd-order beds, FDN, the
+Steam reflection bed, pathing, everything-on) through the **manual sink** (`bwa_render_block`,
+synchronous; no device thread). It times the per-block cost of each and prints mean / median / p99 /
+max in microseconds and as a percentage of the block budget.
 
 ```
-bwa_bench_situations [blocks=4000]
+bwa_bench_situations [blocks=4000] [zones] [layout=<path>] [only=<substring>]
 ```
+
+- `layout=` adds the `rig:` rows, rendered on that layout. The default grid carries no `directivity`
+  block, so without a rig-shaped layout the tracked directivity comp and the array-sim room's EQ
+  never run. Give it a 24-speaker layout with the 4410A model to see what the rig pays. Put `eq`
+  arrays in its speakers to measure the correction FIR.
+- `only=` runs the rows whose name contains the substring.
 
 It measures the **audio-thread budget**: the ray-tracing sim threads are background and not counted
 (only the audio-thread reflect/path decode they feed is). Because it drives blocks synchronously it's
 deterministic and needs no capture tooling; build it with or without `-DBWA_TRACY=ON` (the numbers
-match within a few us; the on-demand client is dormant). Caveat: the bench thread is normal priority,
-so `max` includes OS preemption the real (MMCSS-scheduled) ASIO thread wouldn't see. Read `mean` /
-`median` for the DSP cost, and `max` as a loose upper bound. The very first run right after a build can
-read high while the box settles; re-run for a stable number.
+match within a few us; the on-demand client is dormant). Caveat: the bench thread is not MMCSS, so
+`max` includes OS preemption the real ASIO thread wouldn't see. Read `mean` / `median` for the DSP
+cost, and `max` as a loose upper bound.
+
+### Comparing two builds
+
+On a hybrid CPU (performance plus efficiency cores, like most current laptops) a normal-priority
+thread migrates between core types, and the same block measured 2x apart run to run. The bench
+therefore pins its thread the way MMCSS places the real audio thread: on Windows it selects the CPU
+sets of the highest efficiency class, opts out of power throttling and raises its priority.
+
+Pinning is not enough on a laptop. Its clock state still drifted by up to 2x between two full runs
+of the matrix, which is larger than most changes you will want to measure. So never compare a run of
+build A against a later run of build B. Interleave them instead: run one row with `only=` on A, then
+on B, then on A again, four or more times, and keep each side's minimum median. The drift then hits
+both sides alike, and the ratio B/A is stable to a few percent where the absolute numbers are not. Any
+two build trees work, since the bench uses only the public ABI: copy the old DLL's tree aside, or
+build the old commit's source in a second tree.
 
 **Firewall.** The Tracy client opens a listening socket (TCP 8086) and a UDP discovery broadcast, so
 you must allow the profiled exe through the Windows Firewall the first time (you'll get the

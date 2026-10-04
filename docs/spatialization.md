@@ -767,8 +767,9 @@ walk past a speaker and its image moves. It re-solves the encode when you move m
 `ref`, because its bus holds only the synthesized-diffuse taps. The no-SDK pan already reads
 the live position.
 
-What it costs: 150 us per 256-frame block for 26 channels with all 27 sections of the 4410A
-model engaged (x64, SSE across four channels at a time), 3% of the block. In `cave_both` that
+What it costs: 80 to 120 us per 256-frame block for 26 channels with all 27 sections of the
+4410A model engaged (x64, SSE across eight channels at a time, measured on a laptop whose clock
+state drifts), about 2% of the block. In `cave_both` that
 runs on the array's audio thread, after the array's own output is written.
 
 What it cannot show: the room's own reflections and a real speaker's crossover lobes.

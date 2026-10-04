@@ -14,6 +14,7 @@
 #include "dsp/biquad.h"       /* shared RBJ cookbook (also used by rt.c's transmission/pathing EQ) */
 #include "spatial/dirstage.h" /* the directivity comp's gain + shelf (shared with the monitor) */
 #include "core/bits.h"         /* bwa_pow2_ge */
+#include "dsp/vec.h"           /* vec_fir: the correction FIR */
 
 #include <math.h>
 #include <stdlib.h>
@@ -30,9 +31,10 @@ struct Aligner {
     /* per-speaker correction FIR (optional). Applied to each channel BEFORE the gain+delay. */
     int      any_eq;               /* any channel has a correction filter */
     uint16_t eq_len[BWA_CHANNELS];  /* taps per channel (0 = bypass) */
-    float*   eq;                   /* channels * BWA_EQ_TAPS, the kernels */
-    uint32_t eqlen, eqmask, eqw;   /* per-channel input-history ring (power of two >= BWA_EQ_TAPS) */
-    float*   eqhist;               /* channels * eqlen */
+    float*   eq;                   /* channels * BWA_EQ_TAPS, the kernels stored REVERSED (vec_fir) */
+    float*   eqlin;                /* channels * EQ_HIST: per channel the last BWA_EQ_TAPS-1 inputs,
+                                    * then room for one chunk, so the FIR reads a LINEAR history (a
+                                    * masked ring read per tap cost ~30% of the block at 24 x 512) */
     /* LF room_eq modal cuts (optional): per-channel RBJ peaking biquads, coefficients derived from
      * the layout's fc/gain/Q at the engine rate. Static state — fixed arrays, no allocation. */
     int      any_rq;
@@ -81,6 +83,9 @@ struct Aligner {
  * for any other caller. */
 #define DIR_GAIN_MAX_DB  BWA_DIR_GAIN_MAX_DB
 #define DIR_SHELF_MAX_DB BWA_DIR_SHELF_MAX_DB
+
+#define EQ_CHUNK 256u                               /* FIR frames per vec_fir pass */
+#define EQ_HIST  (BWA_EQ_TAPS - 1 + EQ_CHUNK)       /* per-channel linear history length */
 
 #define RQ_SLEW_DB_S 24.0f   /* tracked-room-EQ gain slew: a full 12 dB cut lands in ~0.5 s — fast
                               * enough to track a walking listener, far too slow to zipper (the cuts
@@ -167,20 +172,20 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
     if (a->any_eq) {                               /* only pay the memory + DSP if a filter exists */
-        a->eqlen  = bwa_pow2_ge(BWA_EQ_TAPS);
-        a->eqmask = a->eqlen - 1;
-        a->eq     = (float*)calloc((size_t)channels * BWA_EQ_TAPS, sizeof(float));
-        a->eqhist = (float*)calloc((size_t)channels * a->eqlen, sizeof(float));
-        if (!a->eq || !a->eqhist) { free(a->buf); free(a->eq); free(a->eqhist); free(a); return NULL; }
-        for (uint32_t k = 0; k < channels; ++k)
-            for (uint32_t t = 0; t < a->eq_len[k]; ++t)
-                a->eq[(size_t)k * BWA_EQ_TAPS + t] = L->speakers[k].eq[t];
+        a->eq    = (float*)calloc((size_t)channels * BWA_EQ_TAPS, sizeof(float));
+        a->eqlin = (float*)calloc((size_t)channels * EQ_HIST, sizeof(float));
+        if (!a->eq || !a->eqlin) { free(a->buf); free(a->eq); free(a->eqlin); free(a); return NULL; }
+        for (uint32_t k = 0; k < channels; ++k) {
+            const uint32_t T = a->eq_len[k];
+            for (uint32_t t = 0; t < T; ++t)
+                a->eq[(size_t)k * BWA_EQ_TAPS + (T - 1 - t)] = L->speakers[k].eq[t];
+        }
     }
     return a;
 }
 
 void align_destroy(Aligner* a) {
-    if (a) { free(a->buf); free(a->eq); free(a->eqhist); free(a); }
+    if (a) { free(a->buf); free(a->eq); free(a->eqlin); free(a); }
 }
 
 void align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]) {
@@ -248,21 +253,23 @@ void align_tracked_state(const Aligner* a, float* delay_frames, float* gain_lin)
 
 void align_process(Aligner* a, float* bus, uint32_t n) {
     if (a->any_eq) {                               /* per-speaker correction FIR, in place on the bus */
-        const uint32_t elen = a->eqlen, emask = a->eqmask, C = a->channels, ew = a->eqw;
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t wi = (ew + i) & emask;
-            for (uint32_t k = 0; k < C; ++k) a->eqhist[(size_t)k * elen + wi] = bus[(size_t)k * n + i];
-            for (uint32_t k = 0; k < C; ++k) {
-                const uint16_t T = a->eq_len[k];
-                if (!T) continue;
-                const float* kn = &a->eq[(size_t)k * BWA_EQ_TAPS];
-                const float* hh = &a->eqhist[(size_t)k * elen];
-                float y = 0.f;
-                for (uint16_t t = 0; t < T; ++t) y += kn[t] * hh[(wi - t) & emask];
-                bus[(size_t)k * n + i] = y;
+        /* y[i] = sum_t k[t] x[i-t] over a linear history H: H[0 .. L-2] are the L-1 inputs before
+         * the chunk (L = BWA_EQ_TAPS), the chunk follows, and a T-tap kernel starts its window at
+         * H + (L - T). After the chunk the last L-1 inputs slide to the front. */
+        const uint32_t L = BWA_EQ_TAPS;
+        for (uint32_t k = 0; k < a->channels; ++k) {
+            const uint32_t T = a->eq_len[k];
+            if (!T) continue;                      /* static per layout: an unfiltered channel needs no history */
+            const float* kr = &a->eq[(size_t)k * BWA_EQ_TAPS];
+            float* H = &a->eqlin[(size_t)k * EQ_HIST];
+            float* x = &bus[(size_t)k * n];
+            for (uint32_t c0 = 0; c0 < n; c0 += EQ_CHUNK) {
+                const uint32_t cn = (n - c0 < EQ_CHUNK) ? n - c0 : EQ_CHUNK;
+                memcpy(H + (L - 1), x + c0, sizeof(float) * cn);
+                vec_fir(x + c0, H + (L - T), kr, T, cn);
+                memmove(H, H + cn, sizeof(float) * (L - 1));
             }
         }
-        a->eqw = (ew + n) & emask;
     }
     if (a->rq_dyn) {                               /* tracked room EQ: slew each section's gain toward its
                                                     * target, rebuilding its coefficients when it moved. The
@@ -304,14 +311,20 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
     dirstage_process(&a->dir, bus, n);             /* tracked directivity comp (no-op at identity) */
     const uint32_t len = a->len, mask = a->mask, C = a->channels;
     const uint32_t w = a->w;
+    /* Both paths run CHANNEL-outer. Each channel touches only its own ring, so the order across
+     * channels never mattered, and per channel the write-then-read of each sample is unchanged: the
+     * output is bit-identical to the frame-outer loop, which strode a whole ring (len floats) and a
+     * whole bus row per channel per sample. */
     if (!a->lc_live) {                                 /* the default path: integer taps, untouched */
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t wi = (w + i) & mask;
-            for (uint32_t k = 0; k < C; ++k)           /* write the trimmed current sample */
-                a->buf[(size_t)k * len + wi] = bus[(size_t)k * n + i] * a->gain[k];
-            for (uint32_t k = 0; k < C; ++k) {         /* read it back delayed (delay < len) */
-                const uint32_t ri = (wi - a->delay[k]) & mask;
-                bus[(size_t)k * n + i] = a->buf[(size_t)k * len + ri];
+        for (uint32_t k = 0; k < C; ++k) {
+            float* h = &a->buf[(size_t)k * len];
+            float* x = &bus[(size_t)k * n];
+            const float g = a->gain[k];
+            const uint32_t d = a->delay[k];
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t wi = (w + i) & mask;
+                h[wi] = x[i] * g;                      /* write the trimmed current sample ... */
+                x[i]  = h[(wi - d) & mask];            /* ... read it back delayed (delay < len) */
             }
         }
     } else {
@@ -320,31 +333,32 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
          * creep IS the resampling ratio (the same mechanism as the per-voice Doppler line in rt.c), so
          * lc_rate is what bounds the pitch shift; the extra gain rides a per-sample ramp beside it.
          * lc_dcur >= 0 and delay[k] + lc_max + 2 <= len, so both taps stay in the ring. */
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t wi = (w + i) & mask;
-            for (uint32_t k = 0; k < C; ++k)
-                a->buf[(size_t)k * len + wi] = bus[(size_t)k * n + i] * a->gain[k];
-            for (uint32_t k = 0; k < C; ++k) {
-                const double   dl = (double)a->delay[k] + a->lc_dcur[k];
+        for (uint32_t k = 0; k < C; ++k) {
+            float* h = &a->buf[(size_t)k * len];
+            float* x = &bus[(size_t)k * n];
+            const float gk = a->gain[k];
+            const double dk = (double)a->delay[k], dt = (double)a->lc_dtgt[k], rate = a->lc_rate;
+            const float gt = a->lc_gtgt[k], grate = a->lc_grate;
+            double d = a->lc_dcur[k];
+            float  g = a->lc_gcur[k];
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t wi = (w + i) & mask;
+                h[wi] = x[i] * gk;
+                const double   dl = dk + d;
                 const uint32_t di = (uint32_t)dl;                       /* integer part (dl >= 0) */
                 const float    df = (float)(dl - (double)di);           /* fraction in [0, 1) */
-                const float* h = &a->buf[(size_t)k * len];
                 const float s0 = h[(wi - di)     & mask];               /* di frames ago */
                 const float s1 = h[(wi - di - 1) & mask];               /* di+1 frames ago */
-                bus[(size_t)k * n + i] = (s0 + (s1 - s0) * df) * a->lc_gcur[k];
-                double d = a->lc_dcur[k];                               /* rate-limited glide, per sample */
-                const double dt = (double)a->lc_dtgt[k];
-                if      (d < dt - a->lc_rate) d += a->lc_rate;
-                else if (d > dt + a->lc_rate) d -= a->lc_rate;
-                else                          d  = dt;                  /* land exactly */
-                a->lc_dcur[k] = d;
-                float g = a->lc_gcur[k];
-                const float gt = a->lc_gtgt[k];
-                if      (g < gt - a->lc_grate) g += a->lc_grate;
-                else if (g > gt + a->lc_grate) g -= a->lc_grate;
-                else                           g  = gt;
-                a->lc_gcur[k] = g;
+                x[i] = (s0 + (s1 - s0) * df) * g;
+                if      (d < dt - rate) d += rate;                      /* rate-limited glide, per sample */
+                else if (d > dt + rate) d -= rate;
+                else                    d  = dt;                        /* land exactly */
+                if      (g < gt - grate) g += grate;
+                else if (g > gt + grate) g -= grate;
+                else                     g  = gt;
             }
+            a->lc_dcur[k] = d;
+            a->lc_gcur[k] = g;
         }
         int settled = 1;                               /* landed back on identity: resume the fast path */
         for (uint32_t k = 0; k < C; ++k)

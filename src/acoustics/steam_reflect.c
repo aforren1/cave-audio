@@ -15,6 +15,7 @@
 #include "acoustics/steam_reflect.h"
 #include "spatial/ambisonics.h"   /* BWA_AMBI_CH (max ambisonic channel count for scratch sizing) */
 #include "core/profile.h"
+#include "dsp/vec.h"              /* ramp_mac: the wet gain ramps across the block */
 
 #include <phonon.h>
 
@@ -59,6 +60,7 @@ struct SteamReflect {
     IPLint32 ir_size;
     float    duration; uint32_t rays, bounces;
     _Atomic float wet_gain;     /* control thread sets, audio-thread tap reads (linear; 1 = unity) */
+    float    wet_cur;           /* gain the last block LANDED on, the next block's ramp start (audio-thread-only) */
     float*   ambi;              /* ambi_ch * n */
     float*   out26;             /* BWA_CHANNELS * n */
 
@@ -66,6 +68,8 @@ struct SteamReflect {
     _Atomic uint32_t seq;
     uint32_t         seq_w;     /* writer's private copy of seq */
     IPLReflectionEffectParams pub;
+    IPLReflectionEffectParams last;     /* the audio thread's last consistent read (audio-thread-only) */
+    int                       have_last;
 
     os_thread     thread;
     _Atomic int   stop;
@@ -93,7 +97,8 @@ static void refl_publish(SteamReflect* r, const IPLReflectionEffectParams* p) {
 }
 
 /* seqlock read (audio thread, sole reader). 1 + *out filled on a consistent read; 0 if never
- * published or (rarely) contended this block. */
+ * published or (rarely) contended this block. The tap covers the contended case with its last
+ * good read, so only "never published" is silence. */
 static int refl_read(SteamReflect* r, IPLReflectionEffectParams* out) {
     for (int attempt = 0; attempt < 4; ++attempt) {
         uint32_t s1 = atomic_load_explicit(&r->seq, memory_order_acquire);
@@ -157,9 +162,18 @@ static void sim_thread(void* arg) {
 void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux) {
     SteamReflect* r = (SteamReflect*)ud;
     (void)lp; (void)lq;
-    if (n != r->n) return;                              /* off-spec device block: run dry */
+    /* A block that returns early adds nothing, so the gain it APPLIED was 0: record that, and the
+     * next rendered block ramps in from silence rather than restarting the field at full level.
+     * Keeping the old wet_cur instead would ramp from a level that never sounded. */
+    if (n != r->n) { r->wet_cur = 0.f; return; }        /* off-spec device block: run dry */
+    /* A read that loses to a publish in progress reuses the last good one: the sim ticks at 12 Hz,
+     * so those params are at most one tick stale, where dropping the block was a hard gap in the bed
+     * (invariant 4). The copy is safe to reuse because publish copies by value and `ir` names the
+     * same source's IR buffer every tick. */
     IPLReflectionEffectParams rp;
-    if (!refl_read(r, &rp)) return;                     /* silent until the first sim publish */
+    if (refl_read(r, &rp))  { r->last = rp; r->have_last = 1; }
+    else if (r->have_last)  rp = r->last;
+    else { r->wet_cur = 0.f; return; }                  /* silent until the first sim publish */
     rp.type = REFL_TYPE;                                /* authoritative: must match the effect's create type */
     if (rp.numChannels > (IPLint32)r->ambi_ch) rp.numChannels = (IPLint32)r->ambi_ch;   /* clamp to the baked order */
     if (rp.irSize > r->ir_size)                rp.irSize       = r->ir_size;
@@ -181,9 +195,13 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
     cs_at(&dp.orientation, (float[3]){ 0.f, 0.f, 0.f });
     iplAmbisonicsDecodeEffectApply(r->dec, &dp, &amb, &o26);
 
-    const float g = atomic_load_explicit(&r->wet_gain, memory_order_relaxed);   /* live wet level */
+    /* read the live target ONCE: the ramp must aim at and land on the same value (invariant 4: a
+     * second read racing a control-thread store would step the next block's first sample) */
+    const float g_tgt = atomic_load_explicit(&r->wet_gain, memory_order_relaxed);
+    const float g0 = r->wet_cur, st = (g_tgt - g0) / (float)n;
     for (uint32_t s = 0; s < r->channels; ++s)          /* sum the wet reverb onto the bus (composes with the dry voices) */
-        for (uint32_t i = 0; i < n; ++i) bus[(size_t)s * n + i] += g * r->out26[(size_t)s * n + i];
+        ramp_mac(bus + (size_t)s * n, r->out26 + (size_t)s * n, n, 0, g0, st);
+    r->wet_cur = g_tgt;                                 /* land exactly (same local) */
 }
 
 void steam_reflect_set_gain(SteamReflect* r, float linear) {
@@ -260,6 +278,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     SteamReflect* r = (SteamReflect*)calloc(1, sizeof *r);
     if (!r) return NULL;
     atomic_store_explicit(&r->wet_gain, wet_gain, memory_order_relaxed);
+    r->wet_cur = wet_gain;                       /* a gain set before start is not a change: no ramp from 0 */
     r->ctx       = (IPLContext)steam_scene_ipl_context(scene);
     r->scene_ipl = (IPLScene)steam_scene_ipl_scene(scene);
     r->scene     = scene;                        /* for the shared scene lock on the sim thread */

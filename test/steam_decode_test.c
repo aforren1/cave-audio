@@ -287,14 +287,31 @@ int main(void) {
             CHECK(!memcmp(o_par, o_fix, sizeof o_par), "parallax: at ref the parallax encode IS the fixed one, bit for bit");
             double l0 = 0, r0 = 0;
             for (uint32_t i = 0; i < N; ++i) { l0 += fabs(o_par[i]); r0 += fabs(o_par[N + i]); }
+            double qa = 0, qb = 0;                            /* the ramp block's first / last quarter L/R */
             for (int b = 0; b < 3; ++b) {                     /* one block ramps the encode, phonon settles */
                 steam_monitor_process(mp, bus, NULL, NULL, 0, moved, q, o_par, N);
                 steam_monitor_process(mf, bus, NULL, NULL, 0, moved, q, o_fix, N);
                 steam_monitor_process(mr, bus, NULL, NULL, 0, at_ref, q, o_ref, N);
+                if (b == 0) {
+                    double la = 0, ra = 0, lb = 0, rb = 0;
+                    for (uint32_t i = 0; i < N / 4; ++i)         { la += fabs(o_par[i]); ra += fabs(o_par[N + i]); }
+                    for (uint32_t i = 3 * N / 4; i < N; ++i)     { lb += fabs(o_par[i]); rb += fabs(o_par[N + i]); }
+                    qa = ra > 0 ? la / ra : 0; qb = rb > 0 ? lb / rb : 0;
+                }
             }
             double l1 = 0, r1 = 0;
             for (uint32_t i = 0; i < N; ++i) { l1 += fabs(o_par[i]); r1 += fabs(o_par[N + i]); }
             printf("parallax front speaker: at ref L=%.4g R=%.4g; stepped 1 m right L=%.4g R=%.4g\n", l0, r0, l1, r1);
+            printf("parallax ramp block: L/R first quarter %.4f, last quarter %.4f (ref %.4f, settled %.4f)\n",
+                   qa, qb, l0 / r0, l1 / r1);
+            /* invariant 4 on the re-encode: the move RAMPS across its block. The decode's latency hides
+             * the first quarter either way, but the last quarter sat 67% of the way from the at-ref
+             * ratio to the settled one with the ramp and 104% with the coefficients stepped to the
+             * target, which every check above also passed. */
+            {
+                const double f = (qb - l0 / r0) / (l1 / r1 - l0 / r0);
+                CHECK(f > 0.3 && f < 0.85, "parallax: the re-encode ramps across the block (no coefficient step)");
+            }
             CHECK(fabs(l0 - r0) < 0.1 * (l0 + r0), "parallax: at ref the front speaker is centered");
             /* 34 deg left at 660 Hz is about a 2 dB ILD on the default HRTF: demand the image MOVED
              * (the L/R ratio grew by 1.15 over its value at ref), not just that it leans */

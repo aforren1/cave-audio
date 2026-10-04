@@ -907,7 +907,7 @@ typedef struct {
 BWA_API void     bwa_reflections_config(bwa_engine* e, const bwa_reflections_desc* cfg);
 /* The reverb wet level (linear; 1 = unity, the default) - the ONE control, live, for whichever
  * reverb bed owns the tap (the Steam bed or the FDN below). Valid from bwa_create on: a value set
- * before bwa_start seeds the bed it creates. Per-frame-safe. */
+ * before bwa_start seeds the bed it creates. Per-frame-safe; a change ramps across one block. */
 BWA_API void     bwa_set_reverb_gain(bwa_engine* e, float linear);
 
 /* ---- directional FDN reverb bed (load-time; no SDK needed) ----

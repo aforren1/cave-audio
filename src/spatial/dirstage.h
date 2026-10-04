@@ -20,6 +20,8 @@
 
 #include <stdint.h>
 
+#define DIRSTAGE_CHUNK 256u   /* frames per pass of the eight-channel shelf (the lanes[] buffer) */
+
 typedef struct {
     uint32_t channels;
     int      have;                                    /* init succeeded: the calls below do something */
@@ -31,6 +33,7 @@ typedef struct {
     float    sco[BWA_CHANNELS];                       /* the shelf gain co[] was built for */
     float    co[BWA_CHANNELS][5];
     float    x1[BWA_CHANNELS], x2[BWA_CHANNELS], y1[BWA_CHANNELS], y2[BWA_CHANNELS];
+    float    lanes[8 * DIRSTAGE_CHUNK];               /* eight shelves interleaved (vec_biquad8) */
 } DirStage;
 
 /* Zero the state and precompute the shelf prototype at `split_hz` (pulled under 0.45 x the rate, so
@@ -51,7 +54,8 @@ void dirstage_state(const DirStage* s, float* gain_db, float* shelf_db);
 
 /* Apply one block in place: `bus` is planar, channel stride n. Per channel, a linear gain ramp from
  * the block's start gain to its end gain, then the shelf (coefficients rebuilt only when its gain
- * moved). Clears `live` once every channel has landed exactly on identity. Audio thread. */
+ * moved; the live shelves run eight channels per pass). Clears `live` once every channel has landed
+ * exactly on identity. Audio thread. */
 void dirstage_process(DirStage* s, float* bus, uint32_t n);
 
 #endif /* BWA_DIRSTAGE_H */
