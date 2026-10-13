@@ -370,6 +370,10 @@ so:
   `windows` job. So a wheel out of release `v0.3.0` is `bw_audio-0.3.0`, and a client that checks
   `bwa_get_version()` against the header sees the release number. Do not edit the defines by
   hand: a patch release moves them too.
+- **`Bwa.BoundVersion` in `bindings/unity/Runtime/Bwa.cs`** is the Unity binding's copy of the
+  same number, because C# cannot read the header. `Engine` refuses to start on a DLL whose
+  major.minor differs from it. `tools/release.ps1` sets it with the header, and CI fails any push
+  where the two disagree.
 
 The tags jump from v0.7.0 to v0.16.0 because the header's version sequence became the tag's.
 
@@ -384,13 +388,13 @@ everything else reads the three defines out of it.
    `bindings/unity/CHANGELOG.md` as features merge.
 2. **Cut it:** `powershell -File tools/release.ps1 0.3.0`. The helper validates the version and
    refuses if the tag already exists, the tree is dirty, or `[Unreleased]` is empty. It then sets
-   `BWA_VERSION_*` in the header to `0.3.0`, rolls `## [Unreleased]` to `## [0.3.0]` (leaving a
-   fresh empty `[Unreleased]`), commits both, and creates an annotated `v0.3.0` tag. `-DryRun`
-   previews both edits and changes nothing; `-Push` also pushes.
+   `BWA_VERSION_*` in the header and `Bwa.BoundVersion` to `0.3.0`, rolls `## [Unreleased]` to
+   `## [0.3.0]` (leaving a fresh empty `[Unreleased]`), commits all three files, and creates an
+   annotated `v0.3.0` tag. `-DryRun` previews the edits and changes nothing; `-Push` also pushes.
 3. **Push:** `git push --follow-tags`. The tag triggers the CI release job.
 
-Prefer to tag by hand? `git tag v0.3.0` works if you set the header first; CI refuses the tag
-otherwise.
+Prefer to tag by hand? `git tag v0.3.0` works if you set the header and `Bwa.BoundVersion`
+first; CI refuses the tag otherwise.
 
 That job builds, tests, stamps the version, and cuts a **GitHub Release**. The Release IS the
 distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding source that

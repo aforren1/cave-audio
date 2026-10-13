@@ -55,7 +55,7 @@ extern "C" {
  * CMake package and bwa_get_version() all answer the same number a GitHub release carries. Do not
  * edit them by hand; a release moves them, and a patch release moves them too. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 17
+#define BWA_VERSION_MINOR 18
 #define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
@@ -1575,7 +1575,7 @@ typedef struct {
     float            align_dead_zone_m;      /* 0 = the 5 cm default. */
     float            align_slew_frames_per_s;/* 0 = the ~63 at 48 kHz default. */
     bool             tracked_directivity;    /* on both; a no-op without a directivity model in the layout.
-                                              * Took one reserved slot (0.17), so struct_size is unchanged;
+                                              * Took one reserved slot (0.18), so struct_size is unchanged;
                                               * a client built against an older header that zeroes
                                               * reserved[] after bwa_tuning_preset turns this OFF. */
     uint32_t         reserved[3];    /* zero; reserved so the struct can grow without an ABI break */

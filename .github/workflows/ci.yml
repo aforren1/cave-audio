@@ -138,6 +138,22 @@ jobs:
             exit 1
           fi
 
+      # The Unity binding cannot read the header, so it carries its own copy (Bwa.BoundVersion), and
+      # Engine.Awake refuses any DLL whose major.minor differs. Left at 0.13.0 it shipped three
+      # packages that never started, and nothing ran the Unity tests to notice. Checked on EVERY
+      # push, not just tags: a hand bump between releases has to move both, and finding out at
+      # tag time is too late.
+      - name: Check the Unity binding's BoundVersion against the header
+        shell: bash
+        run: |
+          h=$(sed -nE 's/^#define BWA_VERSION_MAJOR ([0-9]+).*/\1/p' include/bw_audio.h).$(sed -nE 's/^#define BWA_VERSION_MINOR ([0-9]+).*/\1/p' include/bw_audio.h).$(sed -nE 's/^#define BWA_VERSION_PATCH ([0-9]+).*/\1/p' include/bw_audio.h)
+          b=$(sed -nE 's/.*public const uint BoundVersion = \(([0-9]+)u << 16\) \| \(([0-9]+)u << 8\) \| ([0-9]+)u;.*/\1.\2.\3/p' bindings/unity/Runtime/Bwa.cs)
+          echo "header BWA_VERSION $h, Bwa.BoundVersion $b"
+          if [ "$h" != "$b" ]; then
+            echo "::error::bindings/unity/Runtime/Bwa.cs BoundVersion is '$b' but include/bw_audio.h says $h. tools/release.ps1 sets both; a hand bump must move both."
+            exit 1
+          fi
+
       - name: Version
         id: ver
         shell: bash

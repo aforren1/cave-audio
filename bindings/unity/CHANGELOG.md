@@ -4,6 +4,85 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Fixed: `Engine` refused to start against its own DLL
+
+`Bwa.BoundVersion` was still 0.13.0 while the engine moved to 0.14.0 and later. `Engine.Awake`
+compares the two on major.minor, so the 0.7.0, 0.16.0 and 0.17.0 packages logged "ABI version
+mismatch" and never started. `BoundVersion` is now 0.18.0, the same as the DLL in this package.
+
+### Changed: `BWA_VERSION` -> 0.18.0
+
+This release adds a call (`bwa_set_tracked_directivity`) and gives meaning to a field that used to
+be reserved (`bwa_tuning.tracked_directivity`). An older DLL does not export the new call, so a
+package built against 0.18.0 must not run on a 0.17.0 DLL. The version bump lets the ABI check
+catch that mismatch.
+
+### Added: tracked directivity compensation (`Engine.trackedDirectivity`, `SetTrackedDirectivity`)
+
+A speaker loses level off its acoustic axis, and more so at high frequencies. The trims and the
+gain solve both assume the listening point's view of each speaker, and a tracked listener walks
+across every speaker's beam. With this on, each block the engine looks up each speaker's angle to
+the live head and to the listening point in the layout's directivity model, and applies the
+difference as a per-speaker gain plus a high shelf. The gain is clamped to +/-6 dB and the shelf to
++/-10 dB, and both glide at 24 dB/s. It is pure gain, with no resampling, so it is ON by default.
+
+It does nothing unless the layout carries a `directivity` model. Generate one with
+`tools/directivity/clf_to_json.py` from the speaker vendor's CLF file
+(`examples/genelec_4410a_directivity.json` is the rig's). Each speaker can also carry an `aim`;
+omit it and the speaker points at the listening point. It is identity at the listening point, so a
+calibrated layout sounds the same there. Off glides back to identity, so the toggle is a click-free
+A/B.
+
+The engine call is `bwa_set_tracked_directivity`. In the tuning struct, `tracked_directivity` takes
+reserved slot 0, so `struct_size` is unchanged. In `Bwa.Tuning` the field `r0` is now
+`trackedDirectivity`.
+
+### Added: new optional layout fields
+
+- `directivity` (top level): the off-axis loss table above.
+- `aim` (per speaker): the speaker's acoustic axis.
+- `plan_position` and `plan_aim` (per speaker): where the installer planned the speaker. The
+  calibration tools write these once, before they overwrite `position` and `aim` with what they
+  measured. The engine ignores both.
+
+A speaker's `position` is now defined as its acoustic center, not its front baffle or its mount.
+
+### Changed: the `cave_sim` monitor plays the room
+
+`BWA_PROFILE_CAVE_SIM` and the `cave_both` headphone tap now apply what the physical room does to
+each speaker, on a copy of the bus before the HRTF decode:
+
+- a distance gain from each speaker to the live listener;
+- the propagation delay, so a walking listener hears the real Doppler;
+- the speaker's off-axis loss toward the listener, at the directivity model's full resolution
+  (only when the layout has a model).
+
+The Steam Audio decode also encodes each virtual speaker from the live listener position instead of
+the listening point, so the virtual speakers have parallax. Walk toward a speaker in the audition
+and it gets louder and earlier, as it would in the CAVE. `BWA_PROFILE_BINAURAL` and the array output
+are unchanged.
+
+### Changed: the render is faster
+
+The voice mix, the limiter and the per-speaker correction FIR now walk the bus one channel at a
+time with SIMD kernels. The correction FIR went from 1.9 ms to 156 us per 5.33 ms block at 24
+speakers with 512 taps. The output does not change.
+
+### Fixed: ASIO clock pairs were not on the host clock
+
+The ASIO sink passed the driver's `systemTime` through as the host time. The ASIO SDK documents
+that value as `timeGetTime`: 1 ms resolution, and 27 ms off QPC on the development machine. So
+`GetClock`'s `hostTimeNs` on ASIO was tens of ms off `Engine.HostTimeNs`, and a 1 ms sawtooth went
+into the drift fit behind `DspTimeFramesAt` and `RealtimeAt`. The sink now uses the driver's stamp
+only when the stamps themselves show it is on QPC, and reads QPC at callback entry otherwise.
+
+### Fixed: the reflection bed's wet level stepped, and the bed could drop a block
+
+Setting `Engine.ReverbGain` with the Steam reflection bed active changed the level on a block boundary instead of
+ramping, which is audible as a click. It now ramps across one block, like every other gain. A block
+that lost a race with the 12 Hz reflection simulation also played no bed at all. It now reuses the
+last good parameters, which are at most one tick old.
+
 ## [0.17.0]
 
 ### Changed: the speaker-array capacity is 64, and it is no longer the default grid
