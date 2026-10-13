@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.18.0]
+
 ### Fixed: `Engine` refused to start against its own DLL
 
 `Bwa.BoundVersion` was still 0.13.0 while the engine moved to 0.14.0 and later. `Engine.Awake`
