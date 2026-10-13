@@ -3,7 +3,7 @@
 // The bw_audio engine OWNS the audio device (ASIO/Dante + the binaural monitor). Unity's built-in
 // audio pipeline must therefore be OFF — left enabled it opens its own output device (wasted CPU,
 // possible contention for the monitor's headphones) and any stray AudioSource plays the WRONG path
-// instead of the 26-speaker array. The switch is Project Settings > Audio > "Disable Unity Audio"
+// instead of the speaker array. The switch is Project Settings > Audio > "Disable Unity Audio"
 // (the AudioManager's m_DisableAudio), which Unity reads at startup — so it cannot be flipped from a
 // runtime script. This warns when it's on and offers one-click disable. It does NOT change the
 // setting automatically (silently editing project settings on import is surprising).

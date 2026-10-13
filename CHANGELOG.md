@@ -4,6 +4,87 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.18.0]
+
+### Fixed: `Engine` refused to start against its own DLL
+
+`Bwa.BoundVersion` was still 0.13.0 while the engine moved to 0.14.0 and later. `Engine.Awake`
+compares the two on major.minor, so the 0.7.0, 0.16.0 and 0.17.0 packages logged "ABI version
+mismatch" and never started. `BoundVersion` is now 0.18.0, the same as the DLL in this package.
+
+### Changed: `BWA_VERSION` -> 0.18.0
+
+This release adds a call (`bwa_set_tracked_directivity`) and gives meaning to a field that used to
+be reserved (`bwa_tuning.tracked_directivity`). An older DLL does not export the new call, so a
+package built against 0.18.0 must not run on a 0.17.0 DLL. The version bump lets the ABI check
+catch that mismatch.
+
+### Added: tracked directivity compensation (`Engine.trackedDirectivity`, `SetTrackedDirectivity`)
+
+A speaker loses level off its acoustic axis, and more so at high frequencies. The trims and the
+gain solve both assume the listening point's view of each speaker, and a tracked listener walks
+across every speaker's beam. With this on, each block the engine looks up each speaker's angle to
+the live head and to the listening point in the layout's directivity model, and applies the
+difference as a per-speaker gain plus a high shelf. The gain is clamped to +/-6 dB and the shelf to
++/-10 dB, and both glide at 24 dB/s. It is pure gain, with no resampling, so it is ON by default.
+
+It does nothing unless the layout carries a `directivity` model. Generate one with
+`tools/directivity/clf_to_json.py` from the speaker vendor's CLF file
+(`examples/genelec_4410a_directivity.json` is the rig's). Each speaker can also carry an `aim`;
+omit it and the speaker points at the listening point. It is identity at the listening point, so a
+calibrated layout sounds the same there. Off glides back to identity, so the toggle is a click-free
+A/B.
+
+The engine call is `bwa_set_tracked_directivity`. In the tuning struct, `tracked_directivity` takes
+reserved slot 0, so `struct_size` is unchanged. In `Bwa.Tuning` the field `r0` is now
+`trackedDirectivity`.
+
+### Added: new optional layout fields
+
+- `directivity` (top level): the off-axis loss table above.
+- `aim` (per speaker): the speaker's acoustic axis.
+- `plan_position` and `plan_aim` (per speaker): where the installer planned the speaker. The
+  calibration tools write these once, before they overwrite `position` and `aim` with what they
+  measured. The engine ignores both.
+
+A speaker's `position` is now defined as its acoustic center, not its front baffle or its mount.
+
+### Changed: the `cave_sim` monitor plays the room
+
+`BWA_PROFILE_CAVE_SIM` and the `cave_both` headphone tap now apply what the physical room does to
+each speaker, on a copy of the bus before the HRTF decode:
+
+- a distance gain from each speaker to the live listener;
+- the propagation delay, so a walking listener hears the real Doppler;
+- the speaker's off-axis loss toward the listener, at the directivity model's full resolution
+  (only when the layout has a model).
+
+The Steam Audio decode also encodes each virtual speaker from the live listener position instead of
+the listening point, so the virtual speakers have parallax. Walk toward a speaker in the audition
+and it gets louder and earlier, as it would in the CAVE. `BWA_PROFILE_BINAURAL` and the array output
+are unchanged.
+
+### Changed: the render is faster
+
+The voice mix, the limiter and the per-speaker correction FIR now walk the bus one channel at a
+time with SIMD kernels. The correction FIR went from 1.9 ms to 156 us per 5.33 ms block at 24
+speakers with 512 taps. The output does not change.
+
+### Fixed: ASIO clock pairs were not on the host clock
+
+The ASIO sink passed the driver's `systemTime` through as the host time. The ASIO SDK documents
+that value as `timeGetTime`: 1 ms resolution, and 27 ms off QPC on the development machine. So
+`GetClock`'s `hostTimeNs` on ASIO was tens of ms off `Engine.HostTimeNs`, and a 1 ms sawtooth went
+into the drift fit behind `DspTimeFramesAt` and `RealtimeAt`. The sink now uses the driver's stamp
+only when the stamps themselves show it is on QPC, and reads QPC at callback entry otherwise.
+
+### Fixed: the reflection bed's wet level stepped, and the bed could drop a block
+
+Setting `Engine.ReverbGain` with the Steam reflection bed active changed the level on a block boundary instead of
+ramping, which is audible as a click. It now ramps across one block, like every other gain. A block
+that lost a race with the 12 Hz reflection simulation also played no bed at all. It now reuses the
+last good parameters, which are at most one tick old.
+
 ## [0.17.0]
 
 ### Changed: the speaker-array capacity is 64, and it is no longer the default grid
@@ -189,7 +270,7 @@ binding's runtime behavior, and behavioral confidence was inference from the God
 the same C ABI through equivalent machinery. `bindings/unity/test~/` closes that: 20 PlayMode tests
 that drive the real components against the real `bw_audio.dll` on the offline sink, registered as the
 `unity_playmode` ctest behind `-DBWA_UNITY_EXE=<editor>`. Details and the feasibility notes are in
-`https://github.com/aforren1/cave-audio/blob/80401223065e/docs/integration.md` -> "Tests".
+`https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/integration.md` -> "Tests".
 
 What it pins, in the order the risk sits: a sub-frame clip fires `onFinished` exactly once (the case
 the drain replaced the `IsPlaying` edge for); a natural end fires once and not twice with both feeds
@@ -226,7 +307,7 @@ code, refusing a run that discovered fewer tests than expected or skipped any.
 
 Four additions in the same spirit, all of them control-thread sugar over calls that already existed.
 The C ABI sat one tier below what a client actually writes, so every client rebuilt the same three
-things by hand. `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md` gains an "API tiers" section that states the split and the guarantee
+things by hand. `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md` gains an "API tiers" section that states the split and the guarantee
 that goes with it: a convenience call writes the same command ring and lands in the same mixer, so
 nothing new reaches the audio thread and there is no second render path.
 
@@ -241,7 +322,7 @@ nothing new reaches the audio thread and there is no second render path.
   immediately and decodes on a lazily started loader thread, for content that arrives mid-session.
   A play issued against a not-yet-ready handle is held on the control thread and re-issued as an
   ordinary `CMD_PLAY` once the data lands, so playback starts from frame 0 with nothing skipped. The
-  audio thread never sees a reserved slot and gained no new branch. See `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/concurrency.md`,
+  audio thread never sees a reserved slot and gained no new branch. See `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/concurrency.md`,
   "Async asset staging".
 - **Source configuration: `bwa_source_desc` with `bwa_source_preset`, `bwa_source_create_desc`,
   `bwa_source_apply`, `bwa_source_get_desc`.** There were 24 per-source setters and readback for two
@@ -750,7 +831,7 @@ where matching a 3-vector is not, so the ITD comes out exact and stays exact as 
 - Not implemented: the published method's near-field ILD arm (one first-order filter per image). It
   needs per-speaker frequency-dependent gain, which would make this a render mode rather than a
   gain-vector modifier. The near-field proximity shelf and near-listener widening cover adjacent
-  ground. See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
+  ground. See https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
   and permits negative gains where this minimizes change from the seed and does not.
 
 ### Added: situation tuning (`bwa_tuning_preset` / `bwa_apply_tuning`)
@@ -774,7 +855,7 @@ sits or roams. `bwa_setup` names that, `bwa_tuning_preset` fills a complete `bwa
 - **Seated and roaming differ in exactly three fields** today (`panner`, `dual_band`,
   `dual_band_cap`), and `smoke` asserts that count. That is not an oversight, it is what the evidence
   supports: most knobs are still rig-day questions and are left at the engine default rather than
-  guessed. https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md carries a per-field evidence table marking each value as measured, design
+  guessed. https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md carries a per-field evidence table marking each value as measured, design
   intent, or unmeasured, so a preset cannot quietly become folklore.
 
 ### Fixed: a finite but un-normalized listener quaternion poisoned the render
@@ -847,7 +928,7 @@ tell, so all four are fixed at the C level and the workarounds can go.
 - **`bwa_source_is_playing` no longer lies about a RE-play.** The published word carries a play
   SEQUENCE now, because it alone cannot tell "not playing, before your play" from "after it": same
   generation, same 0 bit. A re-play on a handle whose voice already ended used to read false until
-  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md` claimed the opposite in as many words. Prefer
+  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md` claimed the opposite in as many words. Prefer
   `bwa_poll_ended` for completion regardless; is_playing still cannot see a clip shorter than your
   poll interval, and no sequence fixes that.
 - **Scene composition no longer needs a lie or a re-derivation.** `bwa_scene_set_mesh_mat` **clears**
@@ -947,7 +1028,7 @@ sidelobes bend rE even at center, and the taper suppresses them.
 - This is the **diffuse layer only**. Point-source panning is untouched, and so is `BWA_PROFILE_BINAURAL`,
   where the taper is gated off anyway. What changes is ambisonic beds, the reflection bed and the FDN
   reverb's line render.
-- The rig trial in `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
+- The rig trial in `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
   disagrees, revert the default. Turn it off with `bwa_set_max_re(e, false)`.
 - `bwa_set_max_re_split` stays OFF. Nothing in the evidence speaks to the band split, so the broadband
   taper remains the incumbent.
@@ -1069,7 +1150,7 @@ routes, **was tried and made point-source localization worse**: rE direction err
 intended bearing rose from 14 degrees to 26 (routed to the rim) or 30 (share discarded) at 60 degrees
 below the horizon, and only the exact pole improved. An imaginary speaker is a triangulation vertex,
 so it claims a share of every direction in the hole and drags it poleward. No code change; the
-measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/80401223065e/docs/spatialization.md so nobody repeats it.
+measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/spatialization.md so nobody repeats it.
 
 ### Added: SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
 
@@ -1154,7 +1235,7 @@ previous result and reporting before/after scores plus ear-plane occupancy.
   content wants (spherical uniformity), not only for the point-source panners.
   `epad` / `allrad` / `maxre` tokens (GUI: bed decode combo + max-rE checkbox)
   grade the decode the install actually ships.
-- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/80401223065e/docs/layout-schema.md (pin-count trend, the
+- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/layout-schema.md (pin-count trend, the
   visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
   conditions express requirements, they are not accuracy shortcuts; DBAP gained
   nothing in the wedge from wedge-only optimization, VBAP's fixed solve did.
@@ -1203,7 +1284,7 @@ one in this ABI - frames and seconds are both real - so every time-valued name n
 Distances (meters), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
 stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
 A decibel value must say `_db`, since linear is the unmarked default. Stated in
-https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md → "Coordinates and units".
+https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md → "Coordinates and units".
 
 - **Three C symbols renamed** (the only frames-valued names that did not say so):
   `bwa_get_output_latency` → `bwa_get_output_latency_frames`, `bwa_source_get_playhead` →
@@ -1257,8 +1338,8 @@ interpreted. Both stayed invisible off-hardware, because the null sink returns t
   `Engine.AsioDrivers`. The count/name pair remains, but it was undocumented and had to be found by
   grepping the DLL's strings.
 - **The release artifacts no longer ship dangling doc pointers.** The 0.4.0 zip contained
-  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
-  `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
+  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
+  `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
   which rewrites every repo-doc reference in the staged tree to a permalink at the packed commit
   and then FAILS the pack if any relative `.md` reference is left that the stage cannot satisfy.
   The Unity tarball had the same bug and is fixed the same way.
@@ -1433,7 +1514,7 @@ with the ones a scene actually authors surfaced on the components:
   handle) - unified in `SourceBase.TryInit`.
 - **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
   reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
-- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/80401223065e/docs/integration.md` "1:1" claims now name the two deliberately-unbound
+- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/integration.md` "1:1" claims now name the two deliberately-unbound
   calls instead of overclaiming. The README's live-A/B list gains SPECTRAL spread and max-rE, and
   its load-time list names the bed decoder as AllRAD / EPAD (sampling is no longer selectable).
 

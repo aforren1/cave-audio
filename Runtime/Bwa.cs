@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md + https://github.com/aforren1/cave-audio/blob/80401223065e/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md + https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -40,7 +40,7 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
     /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
-    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md, "What each preset rests on".</summary>
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md, "What each preset rests on".</summary>
     public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -80,7 +80,7 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
-    /// https://github.com/aforren1/cave-audio/blob/80401223065e/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    /// https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
     public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 
@@ -532,9 +532,9 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
         // The BWA_VERSION these bindings were written against (bw_audio.h). The header guarantees enum
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
-        // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
-        // any re-sync with a header whose BWA_VERSION moved.
-        public const uint BoundVersion = (0u << 16) | (13u << 8) | 0u;   // 0.13.0
+        // marshal every struct in this file wrong — silent corruption, not a crash. tools/release.ps1
+        // rewrites this line with the header's defines, and CI fails a push where the two disagree.
+        public const uint BoundVersion = (0u << 16) | (18u << 8) | 0u;   // 0.18.0
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
@@ -609,6 +609,12 @@ namespace BwAudio
         // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Tracked directivity compensation (layouts carrying a `directivity` model from the speaker vendor's
+        // CLF balloon, plus each speaker's `aim`): each speaker's off-axis loss is re-referenced from the
+        // listening point onto the TRACKED listener each block, as a slewed broadband gain plus an HF shelf
+        // (clamped +/-6 and +/-10 dB). Identity at the listening point. ON by default; this is the live kill
+        // switch. No-op without a model.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_directivity(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Tracked listener alignment (OFF by default). The layout's per-speaker delay/gain trims align the
         // array at ONE point (the array centroid); this re-references them onto the TRACKED listener, adding
         // each speaker's extra propagation delay and 1/r level for |speaker - listener| vs |speaker - centroid|.
@@ -642,7 +648,8 @@ namespace BwAudio
             [MarshalAs(UnmanagedType.I1)] public bool trackedRoomEq;
             [MarshalAs(UnmanagedType.I1)] public bool trackedAlign;
             public float alignDeadZoneM, alignSlewFramesPerSecond;
-            public uint r0, r1, r2, r3;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedDirectivity;   // took reserved slot 0 (0.18); same size
+            public uint r1, r2, r3;
         }
 
         // Source configuration. Same fill-then-apply shape as the engine tuning above, for a SOURCE:
