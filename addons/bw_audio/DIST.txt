@@ -1,5 +1,5 @@
-bw_audio for Godot 0.17.0
-commit 80401223065ecefd0b1e5d303ec07055087cbb6a
+bw_audio for Godot 0.18.0
+commit 39bd7fb161d97d80a5eb948d047b8d4dd6439061
 
 Install: copy addons/bw_audio/ into your Godot project, then enable nothing - a GDExtension
 loads on project open. Restart the editor after copying. To hear it work, open
