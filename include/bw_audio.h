@@ -56,7 +56,7 @@ extern "C" {
  * edit them by hand; a release moves them, and a patch release moves them too. */
 #define BWA_VERSION_MAJOR 0
 #define BWA_VERSION_MINOR 18
-#define BWA_VERSION_PATCH 0
+#define BWA_VERSION_PATCH 1
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
 #ifdef _WIN32

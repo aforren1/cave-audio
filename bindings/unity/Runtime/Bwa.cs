@@ -534,7 +534,7 @@ namespace BwAudio
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. tools/release.ps1
         // rewrites this line with the header's defines, and CI fails a push where the two disagree.
-        public const uint BoundVersion = (0u << 16) | (18u << 8) | 0u;   // 0.18.0
+        public const uint BoundVersion = (0u << 16) | (18u << 8) | 1u;   // 0.18.1
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);

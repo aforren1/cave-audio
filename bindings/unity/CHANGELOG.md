@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.18.1]
+
 ### Added: imported bed decoders (`BwaBedDecoder.Layout`, `bwa_bed_gains_layout`)
 
 `BwaBedDecoder.Layout = 3` decodes ambisonic beds through a matrix designed elsewhere and carried in
