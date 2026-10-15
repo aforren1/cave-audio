@@ -397,6 +397,49 @@ int calib_trilaterate_refine(const double* range, const float (*anchor)[3], int 
  * quoting. Returns -1 when the geometry is degenerate. */
 double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3]);
 
+/* Every speaker from K mic rows in ONE least-squares solve, the unknowns n positions plus the system
+ * latency (as a range, c*tau), either one per mic ROW (per_row = 1) or one for the run (per_row = 0).
+ * Why per row: the ZM-1 reaches the Digiface through Dante Via, which bridges the ZM-1's own USB clock
+ * onto the Dante clock. The latency through that bridge is bounded but not known to stay put: it can
+ * wander, or step when Via re-syncs. A latency that moves between rows is a range error at every later
+ * row for a solve that assumes one; per row, each row only has to hold still while its speakers are
+ * swept. Every row sees every speaker, so its latency is pinned the way a GPS receiver's clock bias is
+ * pinned by the satellites around it, at the cost of K - 1 extra unknowns against n*K equations.
+ * Gauss-Newton on the exact ranges, each step reduced onto the latencies by a Schur complement (the
+ * positions decouple once the latencies are fixed), so a step costs a K x K solve.
+ *
+ * `range[s*K + k]` is speaker s from mic row k (meters, latency INCLUDED). `use[s]` nonzero includes
+ * speaker s (NULL = all); the others are left untouched and their residuals 0. `cap_use[s*K + k]`
+ * nonzero includes that one CAPTURE (n*K, speaker-major like range; NULL = all): an excluded capture
+ * adds no equation, to its speaker's position or to its row's latency, but still gets its residual,
+ * measured minus the model of a solve that never saw it, which is how far off it really was. `pos_io`
+ * is the START (calib_trilaterate's per-speaker answers, or the plan) and the result. `lat_out` gets
+ * K latencies (per_row) or 1, started internally from the mean residual. `resid_out` (n*K, may be
+ * NULL) gets measured minus modeled range, meters. Needs 5 <= K <= CALIB_LOC_MAX_ROWS, at least one
+ * equation to spare, at least 4 used captures per used speaker, and per row at least 4 used captures.
+ * Returns 1, or 0 on a degenerate or non-converging solve (nothing written). */
+#define CALIB_LOC_MAX_ROWS 64
+int calib_localize_joint(const double* range, const float (*mic)[3], int K, int n, const unsigned char* use,
+                         const unsigned char* cap_use, int per_row, float (*pos_io)[3], double* lat_out,
+                         double* resid_out);
+
+/* The per-row latencies of a calib_localize_joint run count as HELD when their spread (max - min) is
+ * under this. 10 us is 3.4 mm of range, about the RMS position error the solve itself lands at in
+ * simulation (calibrate_zylia_localize). Over it the positions still hold (each row has its own
+ * latency); what does not is a latency carried from this run into another one. Provisional: nobody has
+ * measured how Via's latency behaves yet (docs/hardware-validation.md, Stage 0). */
+#define CALIB_ROW_LAT_STEADY_S 10e-6
+
+/* A localize capture whose range residual (calib_localize_joint's resid_out) is past this is flagged:
+ * the same 10 mm the capsule survey's range check uses (CSURVEY_RANGE_FLAG_MM). Most often a
+ * reflection taken for the direct sound, or the mic bumped between its tracked reading and the sweep.
+ * The residual shows only PART of a bad capture's error: the fit spends the rest moving that speaker
+ * and that row's latency, which every speaker in the row shares (in calib_test a capture 40 mm late
+ * leaves 17.6 mm). So the flag catches gross errors, not every one, and bwa_calibrate drops the worst
+ * flagged capture and solves again once, where its residual against the solve without it reads the
+ * whole error. */
+#define CALIB_LOC_RESID_FLAG_M 0.010
+
 /* Write recovered speaker positions back into the layout JSON (sets each speaker's "position" [x,y,z],
  * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`.
  * A measuring writer: a record with no plan yet first keeps its old position (and aim) as

@@ -114,10 +114,39 @@ static float g_dir_hz[DIR_MAX_B], g_dir_ang[DIR_MAX_A], g_dir_loss[DIR_MAX_B][DI
 static char  g_dir_model[64];
 static char* g_dir_json = NULL;            /* cJSON_PrintUnformatted of the block; re-emitted by save_json */
 
+/* Every OTHER top-level block of the loaded file (bed_decode, room_eq_grid, anything a later tool
+ * adds): save_json rewrites the file from scratch and owns only the keys it writes, so without this a
+ * save silently dropped an imported bed decoder. Kept as one unformatted JSON object and re-emitted
+ * key by key. Two of them are written PER SPEAKER INDEX (one row per speaker), so a speaker-count
+ * change would make the saved file fail to load: those are dropped on such a save, with a notice. */
+static char* g_extra_json = NULL;          /* cJSON_PrintUnformatted of {unknown key: value, ...} */
+static int   g_extra_n = 0;                /* the speaker count those blocks were written for */
+static char  g_bed_path[512] = "";         /* the loaded file, when it carries bed_decode (the `layout` grading reads it) */
+static const char* const k_owned_keys[] = { "schema_version", "units", "coordinate_space", "reference", "dbap",
+                                            "pin_slab_m", "listening_point_m", "directivity", "speakers" };
+static int key_owned(const char* k) {
+    for (const char* o : k_owned_keys) if (!strcmp(k, o)) return 1;
+    return 0;
+}
+static int key_per_speaker(const char* k) { return !strcmp(k, "bed_decode") || !strcmp(k, "room_eq_grid"); }
+
 static void dir_reset(void) {
     g_dir_nb = g_dir_na = 0; g_dir_model[0] = 0;
     free(g_dir_json); g_dir_json = NULL;
+    free(g_extra_json); g_extra_json = NULL; g_extra_n = 0; g_bed_path[0] = 0;
     for (int i = 0; i < NSPK; ++i) spk[i].has_aim = 0;
+}
+
+/* keep the blocks save_json does not own (see g_extra_json) */
+static void extra_load(cJSON* root, int nspk, const char* path) {
+    cJSON* keep = cJSON_CreateObject();
+    cJSON* it;
+    cJSON_ArrayForEach(it, root)
+        if (it->string && !key_owned(it->string))
+            cJSON_AddItemToObject(keep, it->string, cJSON_Duplicate(it, 1));
+    if (cJSON_GetArraySize(keep) > 0) { g_extra_json = cJSON_PrintUnformatted(keep); g_extra_n = nspk; }
+    if (cJSON_GetObjectItemCaseSensitive(root, "bed_decode")) snprintf(g_bed_path, sizeof g_bed_path, "%s", path);
+    cJSON_Delete(keep);
 }
 
 /* the off-axis angle where band `b` first drops to `level_db` (linear between the table's angles);
@@ -348,6 +377,7 @@ static int load_json(const char* path) {
     }
     if (lp_y_pending > 0.0f) obs_height = lp_y_pending;   /* the declared point wins over ears_m */
     dir_load(root);                                  /* the directivity model, for the cone + the save */
+    extra_load(root, g_nspk, path);                  /* bed_decode and every other block save_json does not own */
     cJSON_Delete(root);
     return loaded;
 }
@@ -421,6 +451,20 @@ static int save_json(const char* path) {
     if (npin) fprintf(f, "  \"pin_slab_m\": %g,\n", pin_slab_m);   /* authoring-only, like \"pin\"; the engine ignores it */
     if (g_lp_set) fprintf(f, "  \"listening_point_m\": [%.4f, %.4f, %.4f],\n", g_lp_x, obs_height, g_lp_z);
     if (g_dir_json) fprintf(f, "  \"directivity\": %s,\n", g_dir_json);   /* verbatim: the tool never edits it */
+    if (g_extra_json) {                              /* every other block, verbatim (see g_extra_json) */
+        cJSON* ex = cJSON_Parse(g_extra_json);
+        cJSON* it;
+        cJSON_ArrayForEach(it, ex) {
+            if (key_per_speaker(it->string) && g_nspk != g_extra_n) {
+                fprintf(stderr, "save: dropped `%s` - it holds one row per speaker for %d speakers and this layout "
+                                "now has %d. Regenerate it for the new array.\n", it->string, g_extra_n, g_nspk);
+                continue;
+            }
+            char* v = cJSON_PrintUnformatted(it);
+            if (v) { fprintf(f, "  \"%s\": %s,\n", it->string, v); free(v); }
+        }
+        cJSON_Delete(ex);
+    }
     fprintf(f, "  \"speakers\": [\n");
     for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
@@ -657,9 +701,26 @@ static float score_spread[3];                    /* mean perceived spread (deg):
 static float score_bed_mean, score_bed_worst, score_bed_spread;   /* the AMBI-bed row */
 /* The bed row evaluates the decode the INSTALL ships: bwa_desc.bed_decoder (AllRAD default, EPAD
  * opt-in) and bwa_set_max_re. Scoring a different decoder than the rig runs would grade the wrong
- * render - same trap class as scoring only at the sweet spot. CLI: `epad` / `maxre` tokens. */
-static int bed_decoder = 0;    /* UI index: 0 = AllRAD, 1 = EPAD. NOT the bwa_bed_decoder value -
-                                * that enum reserves 0 for default-init, so map before passing. */
+ * render - same trap class as scoring only at the sweet spot. CLI: `epad` / `layout` / `maxre`
+ * tokens. `layout` grades the loaded file's IMPORTED bed_decode through bwa_bed_gains_layout (the
+ * engine's own path); max-rE does not touch an imported matrix, in the engine or here. */
+static int bed_decoder = 0;    /* UI index: 0 = AllRAD, 1 = EPAD, 2 = the file's imported decoder.
+                                * NOT the bwa_bed_decoder value - that enum reserves 0 for
+                                * default-init, so map before passing (bed_dec_enum). */
+static bwa_bed_decoder bed_dec_enum(void) {
+    return bed_decoder == 2 ? BWA_DECODE_LAYOUT : bed_decoder == 1 ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD;
+}
+static const char* bed_dec_name(void) { return bed_decoder == 2 ? "layout" : bed_decoder == 1 ? "EPAD" : "AllRAD"; }
+/* What score_bed adds beside the rE numbers (the optimizer never reads these, so its cost is the
+ * same as before). rV is Gerzon's VELOCITY vector, sum(g u)/sum(g) with AMPLITUDE gains: the
+ * low-frequency (ITD) cue, so it is read from the LF matrix of a two-band imported decoder and from
+ * the one matrix otherwise. Criterion 5 of the mixed-order paper (Heller/Benjamin/Lopez-Lezcano,
+ * AES 150) is that rV and rE point the same way: the angle between them. Flatness is the energy
+ * over direction, sum(g^2) of the HF gains, as a coefficient of variation (0 = every direction
+ * equally loud). */
+struct BedExtra { float rv_mean, rv_min, ang_mean, ang_worst, flat_cv; int ok; char err[200];
+                  char graded[160]; };   /* which speaker positions the rE/rV numbers were graded against */
+static BedExtra g_bedx;
 static int bed_max_re  = 1;    /* tracks the ENGINE default, which flipped ON after the offline
                                 * bake-off (rt.c). A scorer whose default disagrees with the engine
                                 * grades a render nobody ships - the trap this comment block names. */
@@ -765,6 +826,39 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
     if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 197.1f;
 }
 
+/* The speaker positions an IMPORTED matrix belongs to: the file's own `position` values (by index),
+ * the same file bwa_bed_gains_layout reads and the same field the engine renders from. The tool's
+ * in-memory positions can be something else (an as-built file is edited as its PLAN, and any edit
+ * moves them), and grading a fixed matrix against moved speakers grades a render nobody ships.
+ * Returns how many speakers it read (every index 0..n-1, or 0). */
+static int bed_file_positions(const char* path, Vector3* out, int n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char* buf = (len > 0) ? (char*)malloc((size_t)len + 1) : NULL;
+    if (!buf) { fclose(f); return 0; }
+    size_t rd = fread(buf, 1, (size_t)len, f); buf[rd] = 0; fclose(f);
+    cJSON* root = cJSON_Parse(buf); free(buf);
+    if (!root) return 0;
+    int got = 0;
+    unsigned char seen[NSPK] = { 0 };
+    cJSON* spks = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    cJSON* sp;
+    if (cJSON_IsArray(spks) && cJSON_GetArraySize(spks) == n)
+        cJSON_ArrayForEach(sp, spks) {
+            cJSON* ij = cJSON_GetObjectItemCaseSensitive(sp, "index");
+            cJSON* pj = cJSON_GetObjectItemCaseSensitive(sp, "position");
+            if (!cJSON_IsNumber(ij) || !cJSON_IsArray(pj) || cJSON_GetArraySize(pj) != 3) continue;
+            const int i = ij->valueint;
+            cJSON* x = cJSON_GetArrayItem(pj, 0); cJSON* y = cJSON_GetArrayItem(pj, 1); cJSON* z = cJSON_GetArrayItem(pj, 2);
+            if (i < 0 || i >= n || seen[i] || !cJSON_IsNumber(x) || !cJSON_IsNumber(y) || !cJSON_IsNumber(z)) continue;
+            out[i] = Vector3{ (float)x->valuedouble, (float)y->valuedouble, (float)z->valuedouble };
+            seen[i] = 1; ++got;
+        }
+    cJSON_Delete(root);
+    return got == n ? n : 0;
+}
+
 /* ---- bed (ambisonic) scoring: what DIFFUSE/bed content wants from the layout ----
  * A bed decodes SH->speakers through a layout-FIXED matrix (AllRAD, the engine default; via
  * bwa_bed_gains_batch = the engine's actual build), so it is fixed-solve by construction and there
@@ -773,7 +867,7 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
  * quadrature of the sphere - a property the point-source panners cannot see (they want coverage/
  * triangulation; a bed wants uniformity). Shares the condition shell (band/azi) and observer model. */
 static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spread_deg) {
-    static float gains[NCOV * NSPK], dirs[NCOV * 3];
+    static float gains[NCOV * NSPK], gains_lf[NCOV * NSPK], dirs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
     if (stride < 1) stride = 1;
@@ -786,19 +880,59 @@ static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spre
         dirs[nd*3] = cov_dir[i].x; dirs[nd*3+1] = cov_dir[i].y; dirs[nd*3+2] = cov_dir[i].z;
         ++nd;
     }
-    bwa_bed_gains_batch(bed_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD, bed_max_re != 0,
-                        pos, (uint32_t)g_nspk, dirs, (uint32_t)nd, gains);
+    g_bedx = BedExtra{};
+    const float* glf = gains;                       /* the matrix rV reads: LF of a two-band import, else the one */
+    /* the positions the grade is measured from: the edited ones for a built-in decoder (it is BUILT
+     * from them), the file's own for an import (the matrix was designed for those; see
+     * bed_file_positions) */
+    static Vector3 gpos[NSPK];
+    for (int s = 0; s < g_nspk; ++s) gpos[s] = spk[s].pos;
+    snprintf(g_bedx.graded, sizeof g_bedx.graded, "graded against the edited positions");
+    if (bed_decoder == 2) {
+        /* the IMPORTED decoder: the engine's own grading call, against the file it came from. Its
+         * matrix is keyed by speaker index, so the count must still match the file's. */
+        const uint32_t cap = (uint32_t)(NCOV * NSPK);
+        uint32_t n0 = 0, n1 = 0;
+        if (!g_bed_path[0]) snprintf(g_bedx.err, sizeof g_bedx.err, "no bed_decode in the loaded layout");
+        else {
+            n0 = bwa_bed_gains_layout(g_bed_path, BWA_DECODE_LAYOUT, NULL, false, 0, dirs, (uint32_t)nd,
+                                      gains, cap, g_bedx.err, sizeof g_bedx.err);
+            if (n0) n1 = bwa_bed_gains_layout(g_bed_path, BWA_DECODE_LAYOUT, NULL, false, 1, dirs, (uint32_t)nd,
+                                              gains_lf, cap, g_bedx.err, sizeof g_bedx.err);
+            if (n0 && (int)n0 != g_nspk)
+                snprintf(g_bedx.err, sizeof g_bedx.err, "bed_decode is for %u speakers, the layout has %d", n0, g_nspk);
+        }
+        if (n0 && n1 && (int)n0 == g_nspk && bed_file_positions(g_bed_path, gpos, g_nspk) != g_nspk) {
+            snprintf(g_bedx.err, sizeof g_bedx.err, "cannot read the speaker positions of %s", g_bed_path);
+            n0 = 0;
+        }
+        if (!n0 || !n1 || (int)n0 != g_nspk) {      /* nothing to grade: pessimal, like an empty shell */
+            *mean_deg = 90.f; *worst_deg = 180.f;
+            if (spread_deg) *spread_deg = 197.1f;
+            return;
+        }
+        glf = gains_lf;
+        snprintf(g_bedx.graded, sizeof g_bedx.graded, "graded against the file's `position` values (%s)", g_bed_path);
+    } else {
+        bwa_bed_gains_batch(bed_dec_enum(), bed_max_re != 0, pos, (uint32_t)g_nspk, dirs, (uint32_t)nd, gains);
+    }
     double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
+    double rv_sum = 0, ang_sum = 0; float rv_min = 1e9f, ang_worst = 0; int rv_cnt = 0;
     for (int l = 0; l < (score_fixed_obs ? 1 : 27); ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;
+        Vector3 sdir[NSPK];
+        for (int s = 0; s < g_nspk; ++s) sdir[s] = Vector3Normalize(Vector3Subtract(gpos[s], Lp));
         for (int j = 0; j < nd; ++j) {
             float* g = &gains[j * g_nspk];
-            float rE[3] = { 0, 0, 0 }, esum = 0;
+            const float* gl = &glf[j * g_nspk];
+            float rE[3] = { 0, 0, 0 }, esum = 0, rV[3] = { 0, 0, 0 }, psum = 0;
             for (int s = 0; s < g_nspk; ++s) {
                 float w2 = g[s] * g[s];
-                Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
+                const Vector3 sd = sdir[s];
                 rE[0] += w2 * sd.x; rE[1] += w2 * sd.y; rE[2] += w2 * sd.z;
                 esum  += w2;
+                rV[0] += gl[s] * sd.x; rV[1] += gl[s] * sd.y; rV[2] += gl[s] * sd.z;   /* amplitude, signed */
+                psum  += gl[s];
             }
             float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
             if (rl < 1e-9f || esum < 1e-12f) continue;
@@ -809,11 +943,39 @@ static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spre
             if (re_mag > 1.f) re_mag = 1.f;
             sumspread += 186.4 * (1.0 - re_mag) + 10.7;
             sumerr += err; if (err > worst) worst = err; ++cnt;
+            if (fabsf(psum) > 1e-9f) {                  /* rV needs a pressure to normalize by */
+                const float v[3] = { rV[0] / psum, rV[1] / psum, rV[2] / psum };
+                const float vm = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+                rv_sum += vm; if (vm < rv_min) rv_min = vm;
+                if (vm > 1e-9f) {
+                    float c = (v[0]*ev.x + v[1]*ev.y + v[2]*ev.z) / vm;
+                    c = c > 1.f ? 1.f : (c < -1.f ? -1.f : c);
+                    const float a = acosf(c) * (180.0f / PI);
+                    ang_sum += a; if (a > ang_worst) ang_worst = a;
+                }
+                ++rv_cnt;
+            }
         }
     }
     *mean_deg  = cnt ? (float)(sumerr / cnt) : 90.f;   /* empty shell = pessimal, same as score_panner */
     *worst_deg = cnt ? worst : 180.f;
     if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 197.1f;
+    /* energy flatness over the evaluated directions (listener-free: sum g^2 is the decode's own) */
+    double e1 = 0, e2 = 0;
+    for (int j = 0; j < nd; ++j) {
+        double e = 0;
+        for (int s = 0; s < g_nspk; ++s) e += (double)gains[j * g_nspk + s] * gains[j * g_nspk + s];
+        e1 += e; e2 += e * e;
+    }
+    if (nd > 0 && e1 > 1e-12 && rv_cnt > 0) {
+        const double m = e1 / nd, var = e2 / nd - m * m;
+        g_bedx.flat_cv  = (float)(sqrt(var > 0 ? var : 0) / m);
+        g_bedx.rv_mean  = (float)(rv_sum / rv_cnt);
+        g_bedx.rv_min   = rv_min;
+        g_bedx.ang_mean = (float)(ang_sum / rv_cnt);
+        g_bedx.ang_worst = ang_worst;
+        g_bedx.ok = 1;
+    }
 }
 
 /* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
@@ -995,7 +1157,10 @@ static float opt_cost_of(bwa_panner p) {   /* coarse; + a penalty per speaker in
     float m, w, sp; score_panner(p, 4, panner_tracked(p), &m, &w, &sp);
     int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
     float c = 2.0f * ((1.0f - opt_worst_wt) * m + opt_worst_wt * w) + opt_focus_wt * sp + 25.0f * (float)occ;
-    if (opt_bed_wt > 0.0f) {               /* what the ambisonic beds want, same mean/worst blend */
+    /* what the ambisonic beds want, same mean/worst blend. Never against an IMPORTED decoder: its
+     * matrix was designed for the file's positions and does not follow a moved speaker, so climbing
+     * positions under it would optimize against a decode the moved array would never get. */
+    if (opt_bed_wt > 0.0f && bed_decoder != 2) {
         float bm, bw, bs; score_bed(4, &bm, &bw, &bs);
         c += opt_bed_wt * 2.0f * ((1.0f - opt_worst_wt) * bm + opt_worst_wt * bw);
     }
@@ -1628,9 +1793,18 @@ static void draw_hud(float cov_worst, float cov_mean) {
                            score_spread[0], score_spread[1], score_spread[2]);
         ImGui::TextColored(ImVec4(0.73f, 0.66f, 0.92f, 1),
                            "AMBI bed (%s%s):   rE err %.0f/%.0f deg   spread %.0f deg%s",
-                           bed_decoder ? "EPAD" : "AllRAD", bed_max_re ? ", max-rE" : "",
+                           bed_dec_name(), (bed_max_re && bed_decoder != 2) ? ", max-rE" : "",
                            score_bed_mean, score_bed_worst, score_bed_spread,
-                           opt_bed_wt > 0 ? "   (in the cost)" : "");
+                           (opt_bed_wt > 0 && bed_decoder != 2) ? "   (in the cost)" : "");
+        if (g_bedx.ok) {
+            ImGui::TextColored(ImVec4(0.73f, 0.66f, 0.92f, 1),
+                               "AMBI rV:   |rV| %.2f mean / %.2f min   rV-rE %.0f/%.0f deg   energy CV %.0f%%",
+                               g_bedx.rv_mean, g_bedx.rv_min, g_bedx.ang_mean, g_bedx.ang_worst,
+                               100.0f * g_bedx.flat_cv);
+            ImGui::TextColored(ImVec4(0.73f, 0.66f, 0.92f, 1), "AMBI %s", g_bedx.graded);
+        }
+        else if (g_bedx.err[0])
+            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.40f, 1), "AMBI bed: %s", g_bedx.err);
     }
     if (coverage_on && !preview) {
         const char* obs = coverage_moving ? "moving" : "fixed";
@@ -1890,12 +2064,13 @@ static void draw_panel(void) {
           "point-source score cannot see; 0 = point sources only, 1 = the bed's mean/worst blend "
           "counts as much as the panner's. The scoreboard's AMBI row shows it either way");
     { int bd = bed_decoder;
-      if (ImGui::Combo("bed decode", &bd, "AllRAD\0EPAD\0")) {
+      if (ImGui::Combo("bed decode", &bd, "AllRAD\0EPAD\0layout (imported)\0")) {
           bed_decoder = bd; mark_score();
           if (opt_running && opt_bed_wt > 0.0f) opt_cost = opt_cost_of((bwa_panner)pv_panner);
       } }
     bwTip("which SH->speaker decode the AMBI row (and bed wt) evaluates - match your install's "
-          "bwa_desc.bed_decoder, or you grade a render the rig never runs");
+          "bwa_desc.bed_decoder, or you grade a render the rig never runs. `layout` grades the loaded "
+          "file's imported bed_decode (max-rE never applies to it, and the optimizer leaves it out)");
     ImGui::SameLine();
     { bool mr = bed_max_re != 0;
       if (ImGui::Checkbox("max-rE", &mr)) {
@@ -2282,6 +2457,96 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_GT(es, 10.0f);
         IM_CHECK_LT(es, 197.2f);
         bed_decoder = 0; bed_max_re = 0;
+        score_bed(2, &em, &ew, &es);                             /* a built-in decoder reports rV too */
+        IM_CHECK(g_bedx.ok);
+        IM_CHECK(g_bedx.rv_mean > 0.0f && g_bedx.flat_cv >= 0.0f);
+
+        /* rV on a case with a closed form: an OCTAHEDRON around the ears (a 3-design) with an
+         * imported two-band first-order decoder. LF = the first-order sampling decode,
+         * g = (1 + 3 u.d)/6, whose rV at the center is exactly d (|rV| = 1); HF halves the
+         * first-order columns, |rV| = 0.5. So |rV| reads 1.00 only if it comes from the LF matrix. */
+        const char* BJ = "layout_tool_bed_test.json";
+        {
+            const float u[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+            FILE* f = fopen(BJ, "wb");
+            IM_CHECK(f != NULL);
+            if (f) {
+                fprintf(f, "{ \"listening_point_m\": [0, %g, 0],\n  \"speakers\": [\n", obs_height);
+                for (int s = 0; s < 6; ++s)
+                    fprintf(f, "    {\"index\": %d, \"position\": [%g, %g, %g]}%s\n", s, 2 * u[s][0],
+                            obs_height + 2 * u[s][1], 2 * u[s][2], s < 5 ? "," : "");
+                fprintf(f, "  ],\n  \"bed_decode\": { \"source\": \"layout_tool self-test\", \"decoders\": [ {\n"
+                           "    \"channels\": \"full1\", \"xover_hz\": 400,\n");
+                for (int band = 0; band < 2; ++band) {                /* 0 = hf, 1 = lf */
+                    const float c1 = band ? 3.0f : 1.5f;
+                    fprintf(f, "    \"%s\": [\n", band ? "lf" : "hf");
+                    for (int s = 0; s < 6; ++s) {                     /* ACN 1/2/3 = room x/y/z (ambi left/up/front) */
+                        fprintf(f, "      {\"index\": %d, \"gains\": [%.9g, %.9g, %.9g, %.9g", s, 1.0 / 6.0,
+                                c1 * u[s][0] / 6.0, c1 * u[s][1] / 6.0, c1 * u[s][2] / 6.0);
+                        for (int k = 4; k < 16; ++k) fprintf(f, ", 0");
+                        fprintf(f, "]}%s\n", s < 5 ? "," : "");
+                    }
+                    fprintf(f, "    ]%s\n", band ? "" : ",");
+                }
+                fprintf(f, "  } ] }\n}\n");
+                fclose(f);
+            }
+        }
+        const int keepN = g_nspk, keepFix = score_fixed_obs, keepLp = g_lp_set;
+        const float keepH = obs_height, keepLx = g_lp_x, keepLz = g_lp_z;
+        IM_CHECK_EQ(load_json(BJ), 6);
+        IM_CHECK(g_bed_path[0] != 0);
+        bed_decoder = 2; score_fixed_obs = 1;                    /* the sweet spot: where the closed form holds */
+        score_bed(1, &em, &ew, &es);
+        IM_CHECK(g_bedx.ok);
+        IM_CHECK_LT(fabsf(g_bedx.rv_mean - 1.0f), 0.01f);        /* LF: |rV| = 1, not HF's 0.5 */
+        IM_CHECK_LT(fabsf(g_bedx.rv_min  - 1.0f), 0.01f);
+        IM_CHECK_LT(g_bedx.ang_worst, 90.0f);
+        bed_max_re = 1;                                          /* max-rE never touches an imported matrix */
+        { float rm = g_bedx.rv_mean, m1 = em; score_bed(1, &em, &ew, &es);
+          IM_CHECK_EQ(em, m1); IM_CHECK_EQ(g_bedx.rv_mean, rm); }
+        bed_max_re = 0;
+        IM_CHECK(strstr(g_bedx.graded, "file's `position`") != NULL);
+        /* the import is graded against the positions its matrix was designed for (the FILE's), never
+         * the edited ones: move every speaker in memory and the grade must not change. Graded against
+         * the moved speakers, |rV| and the rV-rE angle would both move. */
+        {
+            const float rm = g_bedx.rv_mean, am = g_bedx.ang_mean, m1 = em, w1 = ew;
+            Vector3 keep[NSPK];
+            for (int s = 0; s < g_nspk; ++s) { keep[s] = spk[s].pos; spk[s].pos.x += 0.9f; spk[s].pos.z -= 0.6f; }
+            score_bed(1, &em, &ew, &es);
+            const int ok2 = g_bedx.ok;
+            const float em2 = em, ew2 = ew, rm2 = g_bedx.rv_mean, am2 = g_bedx.ang_mean;
+            bed_decoder = 0;                                     /* ...while a built-in decoder follows the edit */
+            score_bed(1, &em, &ew, &es);
+            const int edited = strstr(g_bedx.graded, "edited") != NULL;
+            bed_decoder = 2;                                     /* restore BEFORE checking: a failed check
+                                                                  * returns, and later tests need the layout */
+            for (int s = 0; s < g_nspk; ++s) spk[s].pos = keep[s];
+            score_bed(1, &em, &ew, &es);
+            IM_CHECK(ok2);
+            IM_CHECK_EQ(em2, m1); IM_CHECK_EQ(ew2, w1);
+            IM_CHECK_EQ(rm2, rm); IM_CHECK_EQ(am2, am);
+            IM_CHECK(edited);
+        }
+        /* the save keeps the block (it used to drop every block it did not write) ... */
+        IM_CHECK(save_json(TEST_OUT));
+        IM_CHECK_EQ(load_json(TEST_OUT), 6);
+        IM_CHECK(g_bed_path[0] != 0);
+        { char e[200] = { 0 };
+          IM_CHECK_EQ(bwa_bed_gains_layout(TEST_OUT, BWA_DECODE_LAYOUT, NULL, false, 0, NULL, 0, NULL, 0, e, sizeof e), 6u); }
+        /* ... and drops it, rather than write a file the engine refuses, when the count changes */
+        g_nspk = 5;
+        IM_CHECK(save_json(TEST_OUT));
+        IM_CHECK_EQ(load_json(TEST_OUT), 5);
+        IM_CHECK(g_bed_path[0] == 0);
+        score_bed(1, &em, &ew, &es);                             /* `layout` with no block: pessimal + a reason */
+        IM_CHECK(!g_bedx.ok && g_bedx.err[0] != 0);
+        IM_CHECK_EQ(em, 90.0f);
+        bed_decoder = 0; score_fixed_obs = keepFix;
+        g_lp_set = keepLp; g_lp_x = keepLx; g_lp_z = keepLz; obs_height = keepH;
+        dir_reset(); g_nspk = keepN; seed_default(); layout_dirty = 1;
+        remove(BJ);
     };
 
     t = IM_REGISTER_TEST(te, "logic", "score");                  /* the real engine solve scores the default dome sanely */
@@ -2777,14 +3042,15 @@ int main(int argc, char** argv) {
                    "  --export   [file] [ears=<m>] [listen] write the layout headless; ears= sets the ear\n"
                    "             height, listen declares listening_point_m there\n"
                    "  --score    [file] [condition] [fixed|moving] [ears=<m>] [focus=<n>]\n"
-                   "             [density=<n>] [epad|allrad] [maxre]\n"
+                   "             [density=<n>] [epad|allrad|layout] [maxre]\n"
                    "             print each panner's rE-localization error, under a named condition\n"
                    "             if given (3d, horizontal, visual); 'fixed' scores the sweet spot only\n"
                    "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
                    "             sets the listener ear height (the plane; default 1.4); focus=<n>\n"
                    "             and density=<n> score the SPCAP row at that tuning (0 = the value\n"
-                   "             the geometry derives), so the knob can be swept offline; epad/maxre\n"
-                   "             grade the AMBI row with the decode the install ships\n"
+                   "             the geometry derives), so the knob can be swept offline; epad/layout/\n"
+                   "             maxre grade the AMBI row with the decode the install ships\n"
+                   "             (layout = the file's imported bed_decode), plus its rV and energy CV\n"
                    "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>] [radial]\n"
                    "             [guard=<panner>[:tol]] [anneal] [restarts=<n>] [leash=<m>] [bed=<wt>]\n"
                    "             hill-climb within constraints, save in place; stages = a comma-\n"
@@ -2802,7 +3068,8 @@ int main(int argc, char** argv) {
                    "             overriding the condition's own leash; bed=<wt> weighs the ambisonic\n"
                    "             BED's decode error into the cost (what diffuse content wants;\n"
                    "             --score prints its row either way); epad/allrad + maxre pick the\n"
-                   "             bed decode graded, matching the install\n"
+                   "             bed decode graded, matching the install (an imported `layout`\n"
+                   "             decode stays out of the cost: it does not follow a moved speaker)\n"
                    "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
             return 0;
         }
@@ -2879,6 +3146,7 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
             else if (!strcmp(argv[a], "epad"))   bed_decoder = 1;       /* grade the decode the install ships */
             else if (!strcmp(argv[a], "allrad")) bed_decoder = 0;
+            else if (!strcmp(argv[a], "layout")) bed_decoder = 2;       /* the file's imported bed_decode */
             else if (!strcmp(argv[a], "maxre"))  bed_max_re = 1;
             /* SPCAP's knobs: sweep the lobe headless. 0 is a LEGAL value here (the revert sentinel),
              * so a garbage token cannot be caught by the range alone - check that it parsed at all. */
@@ -2906,7 +3174,7 @@ int main(int argc, char** argv) {
                 if (ci < 0) {
                     printf("score: unknown condition '%s' (have:", argv[a]);
                     for (int i = 0; i < NCONDITIONS; ++i) printf(" %s", opt_conditions[i].name);
-                    printf(" fixed moving ears=<m> focus=<n> density=<n> epad allrad maxre)\n");
+                    printf(" fixed moving ears=<m> focus=<n> density=<n> epad allrad layout maxre)\n");
                     return 1;
                 }
             }
@@ -2931,9 +3199,17 @@ int main(int argc, char** argv) {
                    panner_names[p], m, w, sp);
         }
         { float bm, bw, bs; score_bed(1, &bm, &bw, &bs);       /* what bed content gets from this array */
-          char lbl[24]; snprintf(lbl, sizeof lbl, "AMBI (%s)", bed_decoder ? "EPAD" : "AllRAD");
-          printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg%s\n",
-                 lbl, bm, bw, bs, bed_max_re ? "   [max-rE]" : ""); }
+          char lbl[24]; snprintf(lbl, sizeof lbl, "AMBI (%s)", bed_dec_name());
+          if (bed_decoder == 2 && !g_bedx.ok)
+              printf("  %-14s cannot grade: %s\n", lbl, g_bedx.err[0] ? g_bedx.err : "no bed_decode");
+          else {
+              printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg%s\n",
+                     lbl, bm, bw, bs, (bed_max_re && bed_decoder != 2) ? "   [max-rE]" : "");
+              /* rV from the LF matrix (or the one matrix); the angle to rE is Gerzon's criterion 5 */
+              printf("  %-14s rV: |rV| mean %.2f  min %.2f   rV-rE angle mean %4.1f deg  worst %4.1f deg   energy CV %.1f%%\n",
+                     "", g_bedx.rv_mean, g_bedx.rv_min, g_bedx.ang_mean, g_bedx.ang_worst, 100.0f * g_bedx.flat_cv);
+              printf("  %-14s %s\n", "", g_bedx.graded);
+          } }
         return 0;
     }
     if (optimize_only) {                           /* headless: optimize in place for one panner + save.
@@ -2982,6 +3258,7 @@ int main(int argc, char** argv) {
             }
             else if (!strcmp(argv[a], "epad"))   bed_decoder = 1;       /* grade the decode the install ships */
             else if (!strcmp(argv[a], "allrad")) bed_decoder = 0;
+            else if (!strcmp(argv[a], "layout")) bed_decoder = 2;       /* the file's imported bed_decode */
             else if (!strcmp(argv[a], "maxre"))  bed_max_re = 1;
             else {
                 char buf[128]; snprintf(buf, sizeof buf, "%s", argv[a]);
@@ -3002,9 +3279,12 @@ int main(int argc, char** argv) {
         if (ears_set) printf("  ears: %.2f m (the plane, scoring, and delay-alignment height)\n", obs_height);
         if (opt_sa || opt_restarts > 1)
             printf("  search: %s, %d restart(s), best-so-far kept\n", opt_sa ? "annealed" : "greedy", opt_restarts);
-        if (opt_bed_wt > 0.0f || bed_decoder || bed_max_re)
+        if (bed_decoder == 2 && opt_bed_wt > 0.0f)
+            printf("  bed: the imported (layout) decode is fixed to the file's positions, so it stays OUT of the\n"
+                   "       objective (bed= ignored); score it with --score after the climb\n");
+        else if (opt_bed_wt > 0.0f || bed_decoder || bed_max_re)
             printf("  bed: %s%s decode, weight %.2f in the objective\n",
-                   bed_decoder ? "EPAD" : "AllRAD", bed_max_re ? " + max-rE" : "", opt_bed_wt);
+                   bed_dec_name(), bed_max_re ? " + max-rE" : "", opt_bed_wt);
         { int np = 0; for (int i = 0; i < g_nspk; ++i) np += spk[i].pin;
           if (np) printf("  pins: %d speaker(s) held to the ear plane (slab +-%.2f m)\n", np, pin_slab_m); }
         apply_condition(last, p);                  /* before/after report under the objective the result ships against */
@@ -3068,7 +3348,7 @@ int main(int argc, char** argv) {
                 printf("    guard %-5s (tol %.2f):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg\n",
                        panner_names[opt_guard_panner], opt_guard_tol, gm0, gm1, gw0, gw1);
             }
-            if (opt_bed_wt > 0.0f) {
+            if (opt_bed_wt > 0.0f && bed_decoder != 2) {
                 float bm1, bw1;
                 score_bed(1, &bm1, &bw1, NULL);
                 printf("    bed (wt %.2f):  mean %.1f deg   worst %.1f deg  (after this stage)\n",

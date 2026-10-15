@@ -126,6 +126,27 @@ def test_pure_solves_need_no_engine():
     assert bwa.spcap_focus_default(positions) > 0.0
 
 
+def test_bed_gains_layout_reads_the_file():
+    """bed_gains_layout grades a LAYOUT FILE's decode; an imported decoder it does not carry raises."""
+    dome = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "examples", "dome_24.json")
+    if not os.path.exists(dome):
+        pytest.skip("examples/dome_24.json is not beside this test (running outside a repo checkout)")
+    dirs = np.array([[0, 1, 0], [0, 0, 1]], dtype=np.float32)
+    g = bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, max_re=True)
+    assert g.shape == (2, 24)
+    assert np.all(np.isfinite(g))
+    m = bwa.bed_gains_layout(dome, bwa.BedDecoder.EPAD, dirs, channels="3H1V")
+    assert m.shape == (2, 24)
+    f1 = bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, channels="full1")
+    assert f1.shape == (2, 24)
+    with pytest.raises(RuntimeError, match="channels"):
+        bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, channels="full")   # a full set names its order
+    with pytest.raises(RuntimeError, match="bed_decode"):
+        bwa.bed_gains_layout(dome, bwa.BedDecoder.LAYOUT, dirs)
+    with pytest.raises(RuntimeError, match="channels"):
+        bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, channels="4H")
+
+
 def test_box_mesh_is_pure_and_bounded():
     mesh = bwa.box_mesh(4.0, 3.0, 5.0, [0, 0, 0, 0, 0, 0])
     assert mesh is not None

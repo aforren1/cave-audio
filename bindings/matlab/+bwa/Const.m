@@ -23,6 +23,7 @@ classdef Const
         DECODE_DEFAULT = 0
         DECODE_ALLRAD  = 1
         DECODE_EPAD    = 2
+        DECODE_LAYOUT  = 3   % the layout file's imported bed_decode
 
         % Output-device policy (bwa_sink_type). MANUAL creates no device and no thread: you pump
         % blocks yourself with Engine.render_block. NULL is the silent offline sink.

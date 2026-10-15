@@ -22,10 +22,12 @@
 #include "spatial/ambisonics.h"   /* SH->26 decode for ambisonic beds (+ room_to_ambi, ambi_sad_decode) */
 #include "spatial/allrad.h"       /* robust SH->26 decode for irregular arrays */
 #include "spatial/epad.h"         /* energy-preserving SH->26 decode (bed_decoder = 2) */
+#include "spatial/ambiset.h"       /* bed channel sets (the imported decoder picks by set) */
 #include "core/bits.h"         /* bwa_pow2_ge */
 #include "core/sane.h"         /* bwa_quat_unit, bwa_finite3_bounded, bwa_finite_clamp */
 #include "core/profile.h"      /* Tracy zones/plots (no-ops unless BWA_TRACY=ON) */
 
+#include <float.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -49,6 +51,9 @@
  * block size. The rows are packed at the CHUNK stride on purpose: at BWA_RT_MAX_BLOCK stride
  * (32 KB) every row would map to the same L1 sets. */
 #define BWA_MIX_CHUNK 256u
+/* layout.h sizes the imported bed matrices without seeing ambisonics.h; mix_bed reads them as decode
+ * rows, so the two widths must agree */
+typedef char bwa_bed_sh_matches_ambi_ch[(BWA_BED_SH == BWA_AMBI_CH) ? 1 : -1];
 #define MIX_R_SIG  0                                   /* coherent signal (dual: s - the LF re-weight) */
 #define MIX_R_DL   1                                   /* dual-band: dmix-scaled low band */
 #define MIX_R_SD   2                                   /* decorrelated share */
@@ -57,7 +62,9 @@
 #define MIX_R_ISM  (MIX_R_FS + BWA_FS_BANDS)           /* ISM: one damped read per image */
 #define MIX_ROWS_VOICE (MIX_R_ISM + ISM_IMAGES)
 /* mix_bed uses the same scratch for its (rotated, tapered, gained) SH rows, one per bed channel */
-#define MIX_ROWS   (MIX_ROWS_VOICE > BWA_AMBI_CH ? MIX_ROWS_VOICE : BWA_AMBI_CH)
+/* ...and, for a TWO-BAND imported decoder, a second set of BWA_AMBI_CH rows holding the low-passed
+ * field the (LF - HF) matrix reads */
+#define MIX_ROWS   (MIX_ROWS_VOICE > 2 * BWA_AMBI_CH ? MIX_ROWS_VOICE : 2 * BWA_AMBI_CH)
 
 /* clock-drift fit (RtCore.fit_*): the exponential window and the point at which the slope is worth
  * reporting. TAU trades convergence against precision — 120 s is ~22k stamps at 256/48k, enough to
@@ -271,6 +278,11 @@ typedef struct {
      * split's per-SH-channel one-pole LP state (xover_a). Both wiped while the taper is disengaged. */
     float    re_sm;
     float    re_lp[BWA_AMBI_CH];
+    /* IMPORTED two-band decoder (bed_decoder 3, a decoder with `lf`): the AmbDec / OpenAL Soft band
+     * splitter per SH channel (OpenAL Soft core/filters/splitter.cpp, BandSplitter): imp_lz1/imp_lz2
+     * the two cascaded one-pole low-pass stages, imp_ap the first-order allpass. Separate from re_lp
+     * so the taper split and the import never share a filter. Reset on every play. */
+    float    imp_lz1[BWA_AMBI_CH], imp_lz2[BWA_AMBI_CH], imp_ap[BWA_AMBI_CH];
     /* image-source early reflections (CMD_SET_ISM). Per image: a gliding fractional read into this
      * voice's ism_ring slice, a one-pole HF damping state (walls absorb HF harder), and a ramped
      * per-speaker gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
@@ -582,11 +594,26 @@ struct RtCore {
     _Atomic float sos;       /* engine-wide speed of sound (m/s; default BWA_SPEED_OF_SOUND) — live
                               * (rt_set_speed_of_sound); Doppler + ISM delays derive from it per block */
     int        bed_decoder;  /* 1 = AllRAD (robust on irregular arrays); 2 = EPAD (energy-preserving,
-                              * epad.c); 0 = the sampling decode (SAD) — internal-only: the engine
+                              * epad.c); 3 = IMPORTED (the layout's bed_decode block, layout.h
+                              * BedImport: final matrices, no max-rE taper, optionally two-band);
+                              * 0 = the sampling decode (SAD) — internal-only: the engine
                               * never selects it, it is the fallback when a build fails (and what a
                               * bare rt core without rt_set_bed_decoder uses, which the rt tests do) */
+    /* imported decoder (bed_decoder 3 with a layout that carries the block; imp_on 0 otherwise).
+     * imp_ac / imp_lc: per decoder, the band splitter's allpass coefficient at the file's own
+     * crossover and its low-pass stage coefficient (two-band only; OpenAL Soft BandSplitter::init).
+     * imp_pick[set][order]: layout_bed_decoder_for tabulated at load (index into layout.bed.dec, -1
+     * none), imp_exact the same table's exact flag, so the audio thread does a lookup and the
+     * control thread's notice (rt_bed_decoder_pick) reads the very same answer. */
+    int        imp_on;
+    float      imp_ac[BWA_BED_DEC_MAX], imp_lc[BWA_BED_DEC_MAX];
+    int8_t     imp_pick[AMBI_SET_COUNT][4];
+    uint8_t    imp_exact[AMBI_SET_COUNT][4];
     /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
-     * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
+     * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this.
+     * With an imported decoder it holds a COPY of the HF matrix of the full decoder a 3rd-order bed
+     * gets (layout_bed_decoder_for), so bed_pref follows the import unchanged; mix_bed reads each
+     * bed's own decoder instead (docs/spatialization.md has what that leaves approximate). */
     float    bed_decode[BWA_CHANNELS][BWA_AMBI_CH];
     /* parametric bed renderer (bwa_set_bed_renderer): per-band FOA direction+diffuseness analysis;
      * the non-diffuse stream re-pans through the LISTENER-RELATIVE panner (a walkable bed), the
@@ -598,7 +625,9 @@ struct RtCore {
      * (gamma * P_l(r), diffuse-energy-normalized — ambisonics.h), applied wherever bed_decode
      * matrix-decodes a bed's signal (decode(w*sh) == the max-rE decode). The parametric ANALYSIS and
      * its re-panned direct stream see the raw field (max-rE is a decode-side taper, not a field
-     * property). The FDN carries its own weighted render pair (fdn.c); phonon's decodes are its own. */
+     * property). The FDN carries its own weighted render pair (fdn.c); phonon's decodes are its own.
+     * Never on an IMPORTED decoder (bed_decoder 3): its matrices are final, and a second taper would
+     * double-weight the high orders, so mix_bed keeps use_re off for any bed it decodes. */
     _Atomic int max_re;
     _Atomic int max_re_split;/* band-split max-rE (rt_set_max_re_split): taper only above ~700 Hz (the
                               * dual-band crossover), the rV-optimal unweighted decode below — the
@@ -1262,6 +1291,12 @@ static void drain_commands(RtCore* c) {
                           memset(v->gcur_lo, 0, sizeof v->gcur_lo);
                           v->fs_on = 0;
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
+                          /* ...and fresh bed band-split state: a replayed slot must not ring the
+                           * previous sound's low band (or allpass memory) into the new one */
+                          memset(v->re_lp,   0, sizeof v->re_lp);
+                          memset(v->imp_lz1, 0, sizeof v->imp_lz1);
+                          memset(v->imp_lz2, 0, sizeof v->imp_lz2);
+                          memset(v->imp_ap,  0, sizeof v->imp_ap);
                           v->dual_mix = (!c->direct_on &&                                                       /* start in the current mode; direct
                                                                                                                  * has no dual-band (SH gains, and
                                                                                                                  * gtarget_lo is never solved there) */
@@ -1476,7 +1511,45 @@ static void drain_commands(RtCore* c) {
  * directions as direction samples). */
 static void build_bed_decode(RtCore* c) {
     int built = 0;
-    if      (c->bed_decoder == 1) built = allrad_build_decode(&c->layout, c->bed_decode);
+    c->imp_on = 0;
+    if (c->bed_decoder == 3) {
+        /* IMPORTED: the layout's own matrices, used as they are (final: their per-order gains are in
+         * them, so mix_bed skips the max-rE taper). No block = the engine refuses to start
+         * (engine.c), and this keeps AllRAD underneath so a bare core still renders sanely. */
+        const BedImport* bi = &c->layout.bed;
+        const BedDecoder* full = layout_bed_decoder_for(bi, AMBI_SET_FULL, 3, NULL);
+        if (full) {
+            memcpy(c->bed_decode, full->hf, sizeof c->bed_decode);
+            for (int d = 0; d < bi->ndec; ++d) {
+                /* OpenAL Soft BandSplitter::init, in float: w = 2 pi f0/fs (f0/fs capped at 0.49),
+                 * ap = (sin w - 1)/cos w (or -cos w / 2 near Nyquist), lp stage = (ap + 1)/2. The
+                 * file's xover_hz is validated to [100, 4000] at load; the range guard keeps a
+                 * future caller's absurd rate from reaching the audio thread as NaN. */
+                float ac = 0.f;
+                if (bi->dec[d].two_band) {
+                    float f0 = bi->dec[d].xover_hz / (float)c->sample_rate;
+                    if (f0 > 0.49f) f0 = 0.49f;
+                    const float w = 6.2831853f * f0, cw = cosf(w);
+                    ac = (cw > FLT_EPSILON) ? (sinf(w) - 1.f) / cw : cw * -0.5f;
+                    if (!(ac >= -1.f && ac <= 1.f)) ac = 0.f;
+                }
+                c->imp_ac[d] = ac;
+                c->imp_lc[d] = ac * 0.5f + 0.5f;
+            }
+            for (int set = 0; set < AMBI_SET_COUNT; ++set)
+                for (int o = 0; o < 4; ++o) {
+                    int ex = 0;
+                    const BedDecoder* pd = layout_bed_decoder_for(bi, set, o, &ex);
+                    c->imp_pick[set][o]  = pd ? (int8_t)(pd - bi->dec) : (int8_t)-1;
+                    c->imp_exact[set][o] = (uint8_t)ex;
+                }
+            c->imp_on = 1;
+            built = 1;
+        } else {
+            built = allrad_build_decode(&c->layout, c->bed_decode);
+        }
+    }
+    else if (c->bed_decoder == 1) built = allrad_build_decode(&c->layout, c->bed_decode);
     else if (c->bed_decoder == 2) built = epad_build_decode(&c->layout, c->bed_decode);
     if (!built)
         ambi_sad_decode(&c->layout, c->channels, c->bed_decode);
@@ -2708,6 +2781,28 @@ static float rot_glide(float cur, float tgt, float dmax) {
     return cur + d;
 }
 
+/* The imported two-band decoder's band splitter, one sample of every SH channel: OpenAL Soft's
+ * BandSplitter::process (core/filters/splitter.cpp), which AmbDec's dual-band decode also uses. lp is
+ * two cascaded one-pole low-pass stages from one coefficient (lc = (ac + 1)/2), ap a first-order
+ * allpass (ac), and the high band is ap - lp, so lp + hp = ap: phase-matched bands that sum to an
+ * allpass, 12 dB/oct each side, -6 dB each at the crossover. The caller forms HF*ap + (LF - HF)*lp.
+ * Sample-major on purpose: the channels are independent, so the k loop is the vector axis. */
+static inline void imp_split(Voice* v, const float* sh, int nch, float ac, float lc, float* ap, float* lp) {
+    for (int k = 0; k < nch; ++k) {
+        const float x  = sh[k];
+        const float d0 = (x - v->imp_lz1[k]) * lc;
+        const float y0 = v->imp_lz1[k] + d0;
+        v->imp_lz1[k]  = y0 + d0;
+        const float d1 = (y0 - v->imp_lz2[k]) * lc;
+        const float y1 = v->imp_lz2[k] + d1;
+        v->imp_lz2[k]  = y1 + d1;
+        lp[k] = y1;
+        const float a  = x * ac + v->imp_ap[k];
+        v->imp_ap[k]   = x - a * ac;
+        ap[k] = a;
+    }
+}
+
 /* Mix an ambisonic BED voice: decode its SH channels straight onto the 26-ch bus through the static
  * decode matrix (world-locked — no DBAP, occlusion, or directivity), with a master-gain ramp on
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice.
@@ -2734,6 +2829,22 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
      * (rotation still applies: it turns the field before either destination). */
     const int direct  = c->direct_blk;
     const int want_p  = nch >= 4 && !direct && c->bed_param_blk;  /* the block's single load (rt_render) */
+    /* IMPORTED decoder (bed_decoder 3): the decoder layout_bed_decoder_for picks for this bed's
+     * channel set and order (tabulated at load). Its matrices are FINAL (per-order gains folded in by
+     * the designer), so the max-rE taper below stays off for it. Two-band: each (rotated) SH channel
+     * goes through the AmbDec / OpenAL Soft phase-matched splitter (imp_split), and
+     * out = HF*hp + LF*lp = HF*ap + (LF - HF)*lp, which keeps one precomputed LF - HF matrix and two
+     * mat_mac passes. */
+    const BedDecoder* idec = NULL;
+    float iac = 0.f, ilc = 0.f;
+    if (c->imp_on && !direct) {
+        const int set = snd->chset < AMBI_SET_COUNT ? snd->chset : 0;
+        const int ord = (snd->order >= 1 && snd->order <= 3) ? snd->order : 3;
+        const int pi  = c->imp_pick[set][ord];
+        if (pi >= 0) { idec = &c->layout.bed.dec[pi]; iac = c->imp_ac[pi]; ilc = c->imp_lc[pi]; }
+    }
+    const int imp2 = idec && idec->two_band;
+    const float (*const Dh)[BWA_AMBI_CH] = idec ? idec->hf : (const float (*)[BWA_AMBI_CH])c->bed_decode;
     const int use_p   = want_p || pb->mix > 0.f;
     /* bed orientation (rt_bed_set_orientation): angles glide at BWA_BED_YAW_RATE, and rotation
      * happens BEFORE either renderer, so the matrix decode and the parametric analysis see the same
@@ -2777,9 +2888,9 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
      * decode (decode(w*sh) == the max-rE decode); re_mix ramps 0<->1 per sample so the A/B
      * crossfades. The parametric analysis, its re-panned direct stream, and the decorrelated
      * diffuse stream see the raw field (see RtCore.max_re). */
-    const int   re_on    = direct ? 0 : atomic_load_explicit(&c->max_re, memory_order_acquire);
+    const int   re_on    = (direct || idec) ? 0 : atomic_load_explicit(&c->max_re, memory_order_acquire);
     const float re_tgt   = re_on ? 1.f : 0.f;
-    const int   use_re   = re_on || v->re_mix > 0.f;
+    const int   use_re   = !idec && (re_on || v->re_mix > 0.f);   /* never on an imported matrix */
     float       rem      = v->re_mix;
     const float rem_step = (re_tgt - rem) / (float)nr;
     /* band-split share (rt_set_max_re_split): 1 = taper only the band ABOVE the 700 Hz crossover
@@ -2809,6 +2920,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
          * writes one row per SH channel, then each output row takes one matrix-row MAC over them.
          * Evaluating the decode per sample wrote every speaker at a row stride per sample. */
         float* const scr = c->mix_scr;              /* nch rows at the BWA_MIX_CHUNK stride */
+        float* const scl = scr + (size_t)BWA_AMBI_CH * BWA_MIX_CHUNK;   /* imported two-band: low-passed rows */
         for (uint32_t c0 = start; c0 < n; c0 += BWA_MIX_CHUNK) {
             const uint32_t cn = (n - c0 < BWA_MIX_CHUNK) ? n - c0 : BWA_MIX_CHUNK;
             for (uint32_t j = 0; j < cn; ++j) {
@@ -2836,10 +2948,20 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                         sh = shw;
                     }
                     const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
-                    for (int k = 0; k < nch; ++k) scr[(size_t)k * BWA_MIX_CHUNK + j] = g * sh[k];
+                    if (imp2) {                        /* HF reads the allpass, (LF - HF) the low band */
+                        float ap[BWA_AMBI_CH], lp[BWA_AMBI_CH];
+                        imp_split(v, sh, nch, iac, ilc, ap, lp);
+                        for (int k = 0; k < nch; ++k) {
+                            scr[(size_t)k * BWA_MIX_CHUNK + j] = g * ap[k];
+                            scl[(size_t)k * BWA_MIX_CHUNK + j] = g * lp[k];
+                        }
+                    } else {
+                        for (int k = 0; k < nch; ++k) scr[(size_t)k * BWA_MIX_CHUNK + j] = g * sh[k];
+                    }
                     ++cur;
                 } else {
                     for (int k = 0; k < nch; ++k) scr[(size_t)k * BWA_MIX_CHUNK + j] = 0.f;
+                    if (imp2) for (int k = 0; k < nch; ++k) scl[(size_t)k * BWA_MIX_CHUNK + j] = 0.f;
                 }
                 pg += pg_step;
                 v->gcur[0] += g_step;
@@ -2851,8 +2973,10 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                     ramp_mac(c->ambi_direct + (size_t)k * n + c0, scr + (size_t)k * BWA_MIX_CHUNK, cn, 0,
                              ambi_canon_to_phonon[k], 0.f);
             } else {
-                for (uint32_t s = 0; s < c->channels; ++s)
-                    mat_mac(bus + (size_t)s * n + c0, scr, BWA_MIX_CHUNK, (uint32_t)nch, c->bed_decode[s], cn);
+                for (uint32_t s = 0; s < c->channels; ++s) {
+                    mat_mac(bus + (size_t)s * n + c0, scr, BWA_MIX_CHUNK, (uint32_t)nch, Dh[s], cn);
+                    if (imp2) mat_mac(bus + (size_t)s * n + c0, scl, BWA_MIX_CHUNK, (uint32_t)nch, idec->dlf[s], cn);
+                }
             }
         }
     } else {
@@ -2915,10 +3039,13 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                     for (int j = 0; j < rot_n; ++j) v->rot_m[j] += rot_step[j];
                 }
                 const float g = v->gcur[0] * pg;
+                float ap2[BWA_AMBI_CH], lo2[BWA_AMBI_CH];   /* imported two-band: the split, run every
+                                                             * sample so a crossfade back is clean */
+                if (imp2) imp_split(v, sh, nch, iac, ilc, ap2, lo2);
                 if (run_matrix) {                      /* matrix share of the crossfade */
                     const float gm = g * (1.f - pmix);
                     float shw[BWA_AMBI_CH];
-                    const float* shd = sh;
+                    const float* shd = imp2 ? ap2 : sh;   /* HF reads the allpass (imp_split) */
                     if (use_re) {                      /* max-rE taper on the MATRIX share only */
                         for (int k = 0; k < nch; ++k) {
                             const float lo = (v->re_lp[k] += re_xa * (sh[k] - v->re_lp[k]));
@@ -2927,9 +3054,10 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                         shd = shw;
                     }
                     for (uint32_t s = 0; s < c->channels; ++s) {
-                        const float* D = c->bed_decode[s];
+                        const float* D = Dh[s];
                         float acc = 0.f;
                         for (int k = 0; k < nch; ++k) acc += shd[k] * D[k];
+                        if (imp2) { const float* L = idec->dlf[s]; for (int k = 0; k < nch; ++k) acc += lo2[k] * L[k]; }
                         bus[(size_t)s * n + i] += gm * acc;
                     }
                 }
@@ -2954,7 +3082,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                 const float gp2 = g * pmix;
                 for (uint32_t s = 0; s < c->channels; ++s) {
                     float dacc = 0.f, macc = 0.f;
-                    const float* D = c->bed_decode[s];
+                    const float* D = Dh[s];            /* first-order columns: the diffuse FOA decode */
                     for (int b = 0; b < BWA_PARA_BANDS; ++b) {
                         dacc += sd[b] * pb->g_cur[b][s];                  /* re-panned direct */
                         pb->g_cur[b][s] += g_stp[b][s];
@@ -5295,12 +5423,31 @@ void rt_set_limiter_ceiling(RtCore* c, float ceiling_linear) {
     atomic_store_explicit(&c->lim_ceiling, ceiling_linear, memory_order_release);
 }
 
-/* Select the diffuse-bed decoder: 0 = sampling (SAD, default), 1 = AllRAD. Rebuilds the decode matrix
- * the audio thread reads, so call BEFORE bwa_start (or while stopped), like rt_set_layout. */
+/* Select the diffuse-bed decoder: 0 = sampling (SAD, a bare core's default), 1 = AllRAD, 2 = EPAD,
+ * 3 = the layout's imported bed_decode (AllRAD when the layout has none). Rebuilds the decode
+ * matrix the audio thread reads, so call BEFORE bwa_start (or while stopped), like rt_set_layout. */
 void rt_set_bed_decoder(RtCore* c, int decoder) {
     if (!c) return;
-    c->bed_decoder = (decoder == 1 || decoder == 2) ? decoder : 0;
+    c->bed_decoder = (decoder >= 1 && decoder <= 3) ? decoder : 0;
     build_bed_decode(c);
+}
+
+int rt_bed_imported(const RtCore* c) { return c ? c->imp_on : 0; }
+
+/* Which imported decoder a bed of channel set `set` and highest order `order` decodes through: its
+ * index into layout.bed.dec, or -1 when no import is in use (a built-in decoder: every full bed gets
+ * a matrix built for its order, a mixed one the full matrix). *exact = 1 when that decoder was
+ * designed for exactly this set at this order. The same table mix_bed reads. Control thread. */
+int rt_bed_decoder_pick(const RtCore* c, int set, int order, int* exact) {
+    if (exact) *exact = 0;
+    if (!c || !c->imp_on || set < 0 || set >= AMBI_SET_COUNT || order < 1 || order > 3) return -1;
+    if (exact) *exact = c->imp_exact[set][order];
+    return c->imp_pick[set][order];
+}
+
+uint8_t rt_sound_chset(RtCore* c, uint32_t sound) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    return s ? s->data.chset : 0;
 }
 
 void rt_set_tracker(RtCore* c, const PoseSlot* slot) {

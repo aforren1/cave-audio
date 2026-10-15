@@ -322,7 +322,7 @@ To set a whole configuration at once instead of knob by knob, `Bwa.bwa_tuning_pr
 `Bwa.bwa_apply_tuning` are bound. They are not inspector fields, so call them directly.
 
 Load-time settings (a scene restart to change): the profile, the reverb bed (Steam **or** FDN - they
-share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD), the room box, and all
+share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD / Layout, the layout file's imported `bed_decode`), the room box, and all
 acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's

@@ -98,6 +98,11 @@ void   calib_sim_set_speaker_latency(int ch, double seconds);
  * through calib_sim_capture_ex (the --zylia position survey's exact wavefronts). */
 double calib_sim_speaker_latency(int ch);
 
+/* Simulate only: from now on EVERY speaker plays `seconds` later, on top of CAL_SIM_LATENCY_SAMPLES and
+ * each speaker's own extra: a Dante Via re-sync mid-run (bwa_calibrate --sim-latency-step). The arrival
+ * window is not told, the way a rig's is not. 0 restores it. Non-finite values are ignored. */
+void calib_sim_set_latency_step(double seconds);
+
 /* Simulate only: a ROOM around the array (bwa_calibrate --sim-room), so the direct-sound gate and
  * the reverberant dilution it exists for have something to act on. `absorption` is every wall's
  * energy absorption coefficient in (0, 1]; 0 = off, the anechoic capture (the default).

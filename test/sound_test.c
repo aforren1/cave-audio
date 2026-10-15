@@ -211,11 +211,78 @@ int main(void) {
                   "fuma load rejects a mono file");
         }
         remove(WAV_FUMA);
+
+        /* 6b. the .amb MIXED-order sets, by channel count (Dobson 2001: channels are WXYZ,RSTUV,
+         * KLMNOPQ with the unused ones omitted). Restated here as letter strings, independently of the
+         * loader's table: each file channel carries its letter's SN3D value / the SN3D->FuMa factor,
+         * and the load must put it in its ACN slot of the highest order with every other slot zero. */
+        static const char* const LETTERS = "WXYZRSTUVKLMNOPQ";    /* FuMa channel index = position here */
+        static const struct { int nch; const char* set; int chset; int order; } MIX[] = {
+            {  3, "WXY",         1, 1 }, {  5, "WXYUV",    2, 2 }, {  6, "WXYZUV",      3, 2 },
+            {  7, "WXYUVPQ",     4, 3 }, {  8, "WXYZUVPQ", 5, 3 }, { 11, "WXYZRSTUVPQ", 6, 3 },
+        };
+        for (size_t m = 0; m < sizeof MIX / sizeof MIX[0]; ++m) {
+            float fr[16];
+            int in_set[16] = { 0 };
+            for (int c = 0; c < MIX[m].nch; ++c) {
+                const int fi = (int)(strchr(LETTERS, MIX[m].set[c]) - LETTERS);
+                fr[c] = sn3d[acn[fi]] * s2f[fi];
+                in_set[acn[fi]] = 1;
+            }
+            const char* WM = "bwa_snd_fuma_mixed.wav";
+            drwav_data_format fm = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, (drwav_uint32)MIX[m].nch, RATE, 32 };
+            int ok_w = 0;
+            if (drwav_init_file_write(&wav, WM, &fm, NULL)) {
+                float buf[16 * 4];
+                for (int i = 0; i < 4; ++i) memcpy(buf + i * MIX[m].nch, fr, sizeof(float) * MIX[m].nch);
+                ok_w = drwav_write_pcm_frames(&wav, 4, buf) == 4;
+                drwav_uninit(&wav);
+            }
+            CHECK(ok_w, "write a mixed-order FuMa wav");
+            SoundData sm;
+            char msg[160];
+            const bool ok = ok_w && sound_load_fuma(WM, RATE, &sm, err, sizeof err);
+            snprintf(msg, sizeof msg, "fuma %d-ch (%s) loads", MIX[m].nch, MIX[m].set);
+            CHECK(ok, ok ? msg : err);
+            if (ok) {
+                const int slots = (MIX[m].order + 1) * (MIX[m].order + 1);
+                snprintf(msg, sizeof msg, "fuma %d-ch: %d ACN slots, order %d, set %d", MIX[m].nch, slots,
+                         MIX[m].order, MIX[m].chset);
+                CHECK(sm.channels == slots && sm.order == MIX[m].order && sm.chset == MIX[m].chset, msg);
+                int good = 1;
+                for (int k = 0; k < slots; ++k) {
+                    const float want = in_set[k] ? sn3d[k] : 0.f;
+                    if (fabsf(sm.pcm[slots + k] - want) > 1e-4f) good = 0;     /* frame 1 */
+                }
+                snprintf(msg, sizeof msg, "fuma %d-ch (%s): each letter lands in its ACN slot at SN3D, zeros elsewhere",
+                         MIX[m].nch, MIX[m].set);
+                CHECK(good, msg);
+                sound_unload(&sm);
+            }
+            /* AmbiX has no mixed-order convention: the same count is refused there, and says why */
+            SoundData sx;
+            const bool ax = ok_w && sound_load_ambix(WM, RATE, &sx, err, sizeof err);
+            CHECK(ok_w && !ax && strstr(err, "FuMa") != NULL, "ambix refuses a mixed-order channel count, naming FuMa");
+            if (ax) sound_unload(&sx);
+            remove(WM);
+        }
+        {   /* 2 channels (W, Y: M/S stereo) is not a bed */
+            const char* W2 = "bwa_snd_fuma2.wav";
+            drwav_data_format f2 = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 2, RATE, 32 };
+            if (drwav_init_file_write(&wav, W2, &f2, NULL)) {
+                float b2[8] = { 0.1f, 0.2f, 0.1f, 0.2f, 0.1f, 0.2f, 0.1f, 0.2f };
+                drwav_write_pcm_frames(&wav, 4, b2);
+                drwav_uninit(&wav);
+                SoundData s2;
+                CHECK(!sound_load_fuma(W2, RATE, &s2, err, sizeof err), "fuma refuses 2 channels");
+            }
+            remove(W2);
+        }
     }
 
     remove(WAV_LONG);
     remove(WAV_SHORT);
     if (fails) { printf("sound_test: %d FAILURES\n", fails); return 1; }
-    printf("sound_test OK (wav/flac/mp3 decode, resample, FuMa->AmbiX, oneshot recycle, unload-safety verified)\n");
+    printf("sound_test OK (wav/flac/mp3 decode, resample, FuMa->AmbiX + mixed-order sets, oneshot recycle, unload-safety verified)\n");
     return 0;
 }

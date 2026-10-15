@@ -145,6 +145,64 @@ static int write_layout_grid(const char* path, int mode) {
  * explicitly (non-unit, along +z). mode 0 = valid; 1 = a zero aim on speaker 1; 2 = a loss row of
  * the wrong length; 3 = bands not ascending; 4 = a loss entry past +12 dB; 5 = valid plus an
  * on_axis_db; 6 = an on_axis_db of the wrong length; 7 = an on_axis_db entry past 200 dB. */
+/* a 6-speaker octahedron carrying a `bed_decode` block: a two-band "full3" decoder and a single-band
+ * 3H1V one, rows written in REVERSE index order (a reader that keyed them by position would land
+ * every row on the wrong speaker). hf gain [k] of speaker i = (i+1) + k/100, lf = minus that.
+ * mode 0 = valid; 1 = a speaker's row missing; 2 = a duplicated index; 3 = a non-numeric gain;
+ * 4 = an absurd gain (1e5); 5 = xover_hz 50; 6 = ten decoders; 7 = no full-order decoder; 8 = a
+ * nonzero gain outside the 3H1V set (ACN 5); 9 = xover_hz on a single-band decoder; 10 = an unknown
+ * set name; 11 = two decoders for one set; 12 = lf with no xover_hz; 13 = a bare "full" (no order);
+ * 14 = a "full1" decoder carrying a 2nd-order gain; 15 = valid with a third decoder, "full1". */
+static int write_layout_bed(const char* path, int mode) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const int u[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+    fprintf(f, "{ \"listening_point_m\": [0, 1.5, 0], \"speakers\": [\n");
+    for (int s = 0; s < 6; ++s)
+        fprintf(f, "  {\"index\":%d,\"position\":[%d,%g,%d]}%s\n", s, 2 * u[s][0], 1.5 + 2 * u[s][1], 2 * u[s][2],
+                s < 5 ? "," : "");
+    fprintf(f, "], \"bed_decode\": { \"source\": \"dsp_test\", \"decoders\": [\n");
+    const int ndec = (mode == 6) ? 10 : (mode == 14 || mode == 15) ? 3 : 2;
+    static const char* const names[10] = { "full3", "3H1V", "full1", "1H", "3H", "full2", "2H", "2H1V", "3H2V", "full" };
+    for (int d = 0; d < ndec; ++d) {
+        const char* name = names[d];
+        if (mode == 7 && d == 0) name = "3H2V";
+        if (mode == 10 && d == 1) name = "4H";
+        if (mode == 11 && d == 1) name = "full3";
+        if (mode == 13 && d == 0) name = "full";
+        const int two = (d == 0);
+        fprintf(f, " { \"channels\": \"%s\"", name);
+        if (two && mode != 12) fprintf(f, ", \"xover_hz\": %g", mode == 5 ? 50.0 : 400.0);
+        if (!two && mode == 9) fprintf(f, ", \"xover_hz\": 400");
+        const uint16_t mask = (d == 0) ? (mode == 7 ? 0x83FFu : 0xFFFFu)   /* full3 (or mode 7's 3H2V) */
+                            : (d == 2) ? (mode == 14 ? 0x001Fu : 0x000Fu)  /* full1 (14: plus ACN 4) */
+                                       : 0x831Fu;                         /* 3H1V: ACN 0 1 2 3 4 8 9 15 */
+        for (int band = 0; band < (two ? 2 : 1); ++band) {
+            fprintf(f, ",\n  \"%s\": [", band ? "lf" : "hf");
+            int first = 1;
+            for (int s = 5; s >= 0; --s) {
+                if (mode == 1 && s == 2) continue;
+                const int idx = (mode == 2 && s == 1) ? 0 : s;
+                fprintf(f, "%s\n   {\"index\":%d,\"gains\":[", first ? "" : ",", idx);
+                first = 0;
+                for (int k = 0; k < 16; ++k) {
+                    double g = (mask & (1u << k)) ? ((s + 1) + k / 100.0) * (band ? -1.0 : 1.0) : 0.0;
+                    if (mode == 8 && d == 1 && k == 5) g = 0.5;
+                    if (mode == 3 && s == 4 && k == 3) { fprintf(f, "%s\"x\"", k ? "," : ""); continue; }
+                    if (mode == 4 && s == 4 && k == 3) g = 1e5;
+                    fprintf(f, "%s%.9g", k ? "," : "", g);
+                }
+                fprintf(f, "]}");
+            }
+            fprintf(f, "]");
+        }
+        fprintf(f, " }%s\n", d < ndec - 1 ? "," : "");
+    }
+    fprintf(f, "] } }\n");
+    fclose(f);
+    return 1;
+}
+
 static int write_layout_dir(const char* path, int mode) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
@@ -1051,6 +1109,81 @@ int main(void) {
         write_layout_with(BJ, 0.7, 1000.0, 0.0);  CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "gain_db=1000 is rejected");
         write_layout_with(BJ, 0.7, 0.0, 1.0e7);   CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "huge delay_ms is rejected");
         write_layout_with(BJ, 0.7, 0.0, 0.0);     CHECK( layout_load(BJ, RATE, &B, err, sizeof err), "valid layout still loads");
+        remove(BJ);
+    }
+
+    /* 7b1a. bed_decode schema (the imported ambisonic decoder): rows land by INDEX, LF arrives as
+     * dlf = LF - HF, the set and crossover parse, and every malformed variant is refused with a
+     * message that names the block. */
+    {
+        const char* BJ = "bwa_layout_bed.json";
+        static Layout B;
+        write_layout_bed(BJ, 0);
+        err[0] = 0;
+        CHECK(layout_load(BJ, RATE, &B, err, sizeof err), err[0] ? err : "bed_decode layout loads");
+        CHECK(B.bed.ndec == 2, "bed_decode: two decoders");
+        const BedDecoder* F = &B.bed.dec[0], *M = &B.bed.dec[1];
+        CHECK(F->set == 0 && F->order == 3 && F->two_band == 1 && F->xover_hz == 400.f,
+              "bed_decode: full3 is a 3rd-order full decoder, two-band at 400 Hz");
+        CHECK(M->set == 5 && M->order == 3 && M->two_band == 0 && M->xover_hz == 0.f, "bed_decode: 3H1V is single-band");
+        int rows_ok = 1;
+        for (int s = 0; s < 6; ++s)
+            for (int k = 0; k < 16; ++k) {
+                const float hf = (s + 1) + k / 100.f;
+                if (fabsf(F->hf[s][k] - hf) > 1e-5f || fabsf(F->dlf[s][k] - (-2.f * hf)) > 1e-4f) rows_ok = 0;
+                const float mh = (0x831Fu & (1u << k)) ? hf : 0.f;
+                if (fabsf(M->hf[s][k] - mh) > 1e-5f || M->dlf[s][k] != 0.f) rows_ok = 0;
+            }
+        CHECK(rows_ok, "bed_decode: rows keyed by index (written in reverse), dlf = lf - hf");
+        int ex = -1;
+        CHECK(layout_bed_decoder_for(&B.bed, 5, 3, &ex) == M && ex == 1, "bed_decode: a 3H1V bed takes its own decoder, exactly");
+        CHECK(layout_bed_decoder_for(&B.bed, 2, 2, &ex) == F && ex == 0, "bed_decode: a 2H bed with no 2H decoder takes full3, not exact");
+        CHECK(layout_bed_decoder_for(&B.bed, 0, 3, &ex) == F && ex == 1, "bed_decode: a 3rd-order bed takes full3, exactly");
+        CHECK(layout_bed_decoder_for(&B.bed, 0, 1, &ex) == F && ex == 0, "bed_decode: a 1st-order bed takes full3 (above), not exact");
+        write_layout_bed(BJ, 15);                         /* full3 + 3H1V + full1 */
+        err[0] = 0;
+        CHECK(layout_load(BJ, RATE, &B, err, sizeof err), err[0] ? err : "bed_decode with full1 + full3 loads");
+        {
+            const BedDecoder* F3 = &B.bed.dec[0], *F1 = &B.bed.dec[2];
+            CHECK(B.bed.ndec == 3 && F1->set == 0 && F1->order == 1, "bed_decode: full1 parses as a 1st-order full decoder");
+            CHECK(layout_bed_decoder_for(&B.bed, 0, 1, &ex) == F1 && ex == 1, "full1 + full3: a 1st-order bed takes full1, exactly");
+            CHECK(layout_bed_decoder_for(&B.bed, 0, 2, &ex) == F3 && ex == 0, "full1 + full3: a 2nd-order bed takes full3 (lowest above)");
+            CHECK(layout_bed_decoder_for(&B.bed, 0, 3, &ex) == F3 && ex == 1, "full1 + full3: a 3rd-order bed takes full3");
+            CHECK(layout_bed_decoder_for(&B.bed, 1, 1, &ex) == F1 && ex == 0, "full1 + full3: a 1H bed takes full1 by its order");
+            CHECK(layout_bed_decoder_for(&B.bed, 4, 3, &ex) == F3 && ex == 0, "full1 + full3: a 3H bed takes full3 by its order");
+        }
+        {   /* the rule's last branch, in memory: only lower full orders -> the HIGHEST below */
+            static BedImport bi;
+            memset(&bi, 0, sizeof bi);
+            bi.ndec = 2;
+            bi.dec[0].set = 0; bi.dec[0].order = 1;
+            bi.dec[1].set = 0; bi.dec[1].order = 2;
+            CHECK(layout_bed_decoder_for(&bi, 0, 3, &ex) == &bi.dec[1] && ex == 0,
+                  "full1 + full2: a 3rd-order bed takes full2 (highest below), not exact");
+            CHECK(layout_bed_decoder_for(&bi, 6, 3, &ex) == &bi.dec[1] && ex == 0,
+                  "full1 + full2: a 3H2V bed takes full2 by its order");
+            bi.ndec = 1;
+            CHECK(layout_bed_decoder_for(&bi, 0, 3, &ex) == &bi.dec[0] && ex == 0, "full1 alone serves a 3rd-order bed");
+            /* two orders ABOVE the bed: the LOWEST of them (its order gains are the nearest fit) */
+            bi.ndec = 2;
+            bi.dec[0].order = 3; bi.dec[1].order = 2;
+            CHECK(layout_bed_decoder_for(&bi, 0, 1, &ex) == &bi.dec[1] && ex == 0,
+                  "full3 + full2: a 1st-order bed takes full2 (lowest above), not exact");
+            bi.ndec = 0;
+            CHECK(layout_bed_decoder_for(&bi, 0, 3, &ex) == NULL && ex == 0, "no block: no decoder");
+        }
+        static const char* const why[15] = { NULL, "one row per speaker", "duplicated", "non-numeric",
+            "outside +/-1e4", "xover_hz in [100, 4000]", "1..9 entries", "needs a full-order", "outside its channel set",
+            "xover_hz without an lf", "channels must be", "two decoders for one", "xover_hz in [100, 4000]",
+            "must name its order", "outside its channel set" };
+        for (int mode = 1; mode <= 14; ++mode) {
+            write_layout_bed(BJ, mode);
+            err[0] = 0;
+            char msg[160];
+            const bool ok = layout_load(BJ, RATE, &B, err, sizeof err);
+            snprintf(msg, sizeof msg, "bed_decode mode %d is refused naming '%s' (got: %s)", mode, why[mode], err);
+            CHECK(!ok && strstr(err, "bed_decode") && strstr(err, why[mode]), msg);
+        }
         remove(BJ);
     }
 

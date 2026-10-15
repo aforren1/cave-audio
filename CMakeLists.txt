@@ -1160,6 +1160,20 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_xval PRIVATE bwa_core)
   add_test(NAME xval COMMAND test_xval)
 
+  # The AmbDec -> bed_decode converter (tools/decoder/ambdec_to_json.py, stdlib only) against its
+  # fixture: scaling, column expansion, speaker mapping, merge, refusals. A host tool, so it is not
+  # registered when cross-compiling, nor when no Python 3 interpreter is found (ctest cannot run a
+  # Python test with no Python); the script itself exits 77 (SKIPPED) if the converter is missing.
+  if(NOT CMAKE_CROSSCOMPILING)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME ambdec_convert COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/test/ambdec/convert_test.py")
+      set_tests_properties(ambdec_convert PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+      message(STATUS "bw_audio: no Python 3 interpreter - the ambdec_convert test is not registered")
+    endif()
+  endif()
+
   # Directional FDN reverb bed: drives fdn_tap directly (like the reflect test does the Steam bed) —
   # decay lands on target, anisotropy is real, output is directional, long runs stay finite.
   add_executable(test_fdn test/fdn_test.c)

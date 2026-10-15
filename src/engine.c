@@ -18,6 +18,7 @@
 #include "spatial/ambisonics.h"    /* offline bed evaluation (bwa_bed_gains_batch) */
 #include "spatial/allrad.h"
 #include "spatial/epad.h"
+#include "spatial/ambiset.h"       /* bed channel sets (mixed-order FuMa, bwa_bed_gains_layout) */
 #include "binaural/binaural.h"
 #include "binaural/arraysim.h"      /* the array sim's room: distance, delay, directivity */
 #include "tracking/natnet.h"
@@ -105,6 +106,10 @@ struct bwa_engine {
     int         layout_failed;    /* an EXPLICIT layout_path failed to load at create — engine is on
                                    * the 26-grid fallback and bwa_start refuses with BWA_ERR_LAYOUT */
     char        layout_errbuf[256]; /* the load failure reason, preserved across start's error clear */
+    int         bed_import_missing; /* bed_decoder = BWA_DECODE_LAYOUT but the layout has no bed_decode:
+                                     * create stays usable, bwa_start refuses with BWA_ERR_LAYOUT */
+    uint32_t    bed_warned;       /* the bed/decoder mismatch notices already given, one bit per
+                                   * (bed set, bed order): set * 4 + order (warn_bed_decoder) */
     uint32_t    cap;              /* scratch capacity in frames (== cfg.block_size) */
 
     bwa_sink*     sink;             /* primary: cave/cave_both array Nch / binaural+cave_sim 2ch */
@@ -390,7 +395,50 @@ static void render_both_monitor(void* user, float* dev2, uint32_t n, const bwa_t
  * docs/spatialization.md. */
 static int resolve_bed_decoder(bwa_bed_decoder d) {
     if (d == BWA_DECODE_DEFAULT) d = BWA_DECODE_ALLRAD;
+    if (d == BWA_DECODE_LAYOUT) return 3;     /* the layout's imported bed_decode (rt-internal 3) */
     return (d == BWA_DECODE_EPAD) ? 2 : 1;
+}
+
+/* Bed/decoder mismatch notice (bwa_bed_play*): the bed plays through a matrix that was not designed
+ * for its channel set at its order. It works, but it is not the decode the content was made for, so
+ * say so once per (set, order). A success-path notice, like the ISM one. Three shapes:
+ *   built-in decoder, mixed bed: the FULL-order matrix (the absent channels contribute nothing);
+ *   imported, a higher-order decoder: the bed's missing orders meet zero columns, but the decoder's
+ *     per-order gains were designed for its own order (a 1st-order bed plays quieter and wider);
+ *   imported, a lower-order decoder: the bed's orders above the decoder's are DROPPED. */
+static void warn_bed_decoder(bwa_engine* e, bwa_sound snd) {
+    if (e->profile == BWA_PROFILE_BINAURAL) return;   /* binaural: SH->SH, no speaker decode */
+    const uint16_t nch = rt_sound_channels(e->rt, snd);
+    const int order = (nch == 4) ? 1 : (nch == 9) ? 2 : (nch == 16) ? 3 : 0;
+    if (!order) return;
+    int set = rt_sound_chset(e->rt, snd);
+    if (set < 0 || set >= AMBI_SET_COUNT) set = AMBI_SET_FULL;
+    const uint32_t bit = 1u << (set * 4 + order);
+    if (e->bed_warned & bit) return;
+    int exact = 0;
+    const int pick = rt_bed_decoder_pick(e->rt, set, order, &exact);
+    char msg[320];
+    if (pick < 0) {                                   /* a built-in decoder: only a mixed set is off */
+        if (set == AMBI_SET_FULL) return;
+        snprintf(msg, sizeof msg, "note: this %s mixed-order bed decodes through the FULL-order matrix, which "
+                 "is not optimal for it. Import a decoder designed for the set (bed_decode in the layout, "
+                 "bwa_desc.bed_decoder = BWA_DECODE_LAYOUT) for the best image.", ambi_set_names[set]);
+    } else {
+        if (exact) return;
+        const BedDecoder* d = &e->layout.bed.dec[pick];
+        const char* bed = ambi_chan_name(set, order);
+        const char* dn  = ambi_chan_name(d->set, d->order);
+        if (d->order < order)
+            snprintf(msg, sizeof msg, "note: this %s bed decodes through the imported %s decoder: its orders above "
+                     "%d are DROPPED. Import a %s (or higher) decoder into bed_decode for the full image.",
+                     bed, dn, (int)d->order, ambi_chan_name(AMBI_SET_FULL, order));
+        else
+            snprintf(msg, sizeof msg, "note: this %s bed decodes through the imported %s decoder, whose per-order "
+                     "gains were designed for order %d, not %d (the level and the order weighting differ from a matched decode). "
+                     "Import a decoder for %s into bed_decode.", bed, dn, (int)d->order, order, bed);
+    }
+    e->bed_warned |= bit;
+    set_error(e, msg);
 }
 
 /* ---- lifecycle ---- */
@@ -447,6 +495,16 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * decode, which is NOT selectable from the API any more — it survives only as the automatic
      * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
     rt_set_bed_decoder(e->rt, resolve_bed_decoder(e->cfg.bed_decoder));
+    /* an imported decoder the layout does not carry: create stays usable (the core runs AllRAD
+     * underneath), the reason is readable now, and bwa_start refuses - the same shape as a failed
+     * explicit layout load, because a session that asked for a decoder must not silently get another */
+    if (resolve_bed_decoder(e->cfg.bed_decoder) == 3 && !rt_bed_imported(e->rt) && !e->layout_failed) {
+        e->bed_import_missing = 1;
+        snprintf(e->layout_errbuf, sizeof e->layout_errbuf, "%s",
+                 "bwa_create: bed_decoder = BWA_DECODE_LAYOUT, but the layout carries no bed_decode block "
+                 "(import one with tools/decoder/ambdec_to_json.py, or pick ALLRAD/EPAD)");
+        set_error(e, e->layout_errbuf);
+    }
     e->refl_wet = 1.0f;                             /* reverb wet default; bwa_set_reverb_gain */
     for (int i = 0; i < BWA_VOICE_SLOTS; ++i) {     /* directivity cache: forward = room ahead, off */
         e->src_fwd[i][2] = 1.f;
@@ -532,6 +590,10 @@ bwa_result bwa_start(bwa_engine* e) {
      * was preserved from create (start's error clear above would have eaten it). */
     if (e->layout_failed) {
         set_error(e, e->layout_errbuf[0] ? e->layout_errbuf : "bwa_start: layout_path failed to load at bwa_create");
+        return BWA_ERR_LAYOUT;
+    }
+    if (e->bed_import_missing) {
+        set_error(e, e->layout_errbuf);
         return BWA_ERR_LAYOUT;
     }
     /* The rt core's channel count and the engine's layout must agree: every sink, capture and
@@ -1008,6 +1070,7 @@ void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
     rt_bed_play(e->rt, b, snd, loop);               /* direct: bypass bwa_source_play's mono-only guard.
                                                      * The bed-kind entry point, so a HELD play carries
                                                      * the kind into rt_sound_publish's re-check. */
+    warn_bed_decoder(e, snd);
 }
 /* The two scheduled/region play forms. They repeat bwa_bed_play's kind guards rather than call it,
  * because the guard is what makes the prefix mean anything: routing them through bwa_source_play_at
@@ -1024,7 +1087,7 @@ void  bwa_bed_play_at(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop, uint64
     }
     if (refuse_push_play(e, b, "bwa_bed_play_at: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
-    rt_bed_play_at(e->rt, b, snd, loop, start_sample);
+    rt_bed_play_at(e->rt, b, snd, loop, start_sample); warn_bed_decoder(e, snd);
 }
 void  bwa_bed_play_loop(bwa_engine* e, bwa_bed b, bwa_sound snd, uint64_t loop_beg, uint64_t loop_end) {
     if (!e) return;
@@ -1037,7 +1100,7 @@ void  bwa_bed_play_loop(bwa_engine* e, bwa_bed b, bwa_sound snd, uint64_t loop_b
     }
     if (refuse_push_play(e, b, "bwa_bed_play_loop: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
-    rt_bed_play_loop(e->rt, b, snd, loop_beg, loop_end);
+    rt_bed_play_loop(e->rt, b, snd, loop_beg, loop_end); warn_bed_decoder(e, snd);
 }
 void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear)       { bwa_source_set_gain(e, b, linear); }
 void  bwa_bed_stop(bwa_engine* e, bwa_bed b)                         { bwa_source_stop(e, b); }
@@ -1614,6 +1677,7 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
                              const float* positions, uint32_t n,
                              const float* dirs, uint32_t ndir, float* out) {
     if (!positions || !dirs || !out || n == 0 || n > BWA_CHANNELS || ndir == 0) return 0;
+    if (decoder == BWA_DECODE_LAYOUT) return 0;          /* no file, no imported matrix: bwa_bed_gains_layout */
     Layout* L = (Layout*)malloc(sizeof *L);              /* never a stack local (layout.h) */
     if (!L) return 0;
     layout_default(L);
@@ -1646,6 +1710,83 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
     }
     free(L);
     return ndir;
+}
+
+static void gl_err(char* err, uint32_t cap, const char* msg) {
+    if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
+}
+
+/* Offline: the bed decode a LAYOUT FILE gets, including its imported matrices. Follows the engine
+ * step for step: layout_load as bwa_create runs it, the decoder build_bed_decode installs (imported
+ * by channel set and order through layout_bed_decoder_for, AllRAD/EPAD from the file's geometry and
+ * listening point, SAD on a degenerate array), and mix_bed's taper rule (re_w by the bed's highest
+ * order, never on an imported matrix). The SIZE QUERY (out = NULL) validates everything the full
+ * call can know without directions: path, band, channels, the file, and an imported decoder for the
+ * bed. See the header contract. */
+uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
+                              const char* channels, bool max_re, uint32_t band,
+                              const float* dirs, uint32_t ndir,
+                              float* out, uint32_t out_cap, char* err, uint32_t err_cap) {
+    if (err && err_cap) err[0] = 0;
+    if (!layout_path) { gl_err(err, err_cap, "bwa_bed_gains_layout: NULL layout_path"); return 0; }
+    if (band > 1)     { gl_err(err, err_cap, "bwa_bed_gains_layout: band must be 0 (HF/broadband) or 1 (LF)"); return 0; }
+    int set = AMBI_SET_FULL, order = BWA_AMBI_ORDER;
+    if (channels && channels[0] && !ambi_chan_parse(channels, &set, &order)) {
+        gl_err(err, err_cap, "bwa_bed_gains_layout: channels must be NULL (full3), full1, full2, full3, 1H, 2H, "
+                             "2H1V, 3H, 3H1V or 3H2V");
+        return 0;
+    }
+    if (out && (!dirs || ndir == 0)) { gl_err(err, err_cap, "bwa_bed_gains_layout: NULL dirs or ndir 0"); return 0; }
+    Layout* L = (Layout*)malloc(sizeof *L);              /* never a stack local (layout.h) */
+    if (!L) { gl_err(err, err_cap, "bwa_bed_gains_layout: out of memory"); return 0; }
+    char lerr[256] = { 0 };
+    if (!layout_load(layout_path, 48000, L, lerr, sizeof lerr)) {   /* the rate only converts delay_ms */
+        gl_err(err, err_cap, lerr[0] ? lerr : "bwa_bed_gains_layout: layout load failed");
+        free(L); return 0;
+    }
+    const uint32_t n = L->count;
+    const int id = resolve_bed_decoder(decoder);
+    const BedDecoder* imp = (id == 3) ? layout_bed_decoder_for(&L->bed, set, order, NULL) : NULL;
+    if (id == 3 && !imp) {
+        gl_err(err, err_cap, "bwa_bed_gains_layout: BWA_DECODE_LAYOUT, but the layout carries no bed_decode block");
+        free(L); return 0;
+    }
+    if (!out) { free(L); return n; }                     /* size query: everything above held */
+    if ((uint64_t)ndir * n > out_cap) {
+        char m[160];
+        snprintf(m, sizeof m, "bwa_bed_gains_layout: out_cap %u floats is too small (need ndir*N = %u*%u)",
+                 (unsigned)out_cap, (unsigned)ndir, (unsigned)n);
+        gl_err(err, err_cap, m); free(L); return 0;
+    }
+    float (*dec)[BWA_AMBI_CH] = (float (*)[BWA_AMBI_CH])malloc(sizeof(float) * BWA_CHANNELS * BWA_AMBI_CH);
+    if (!dec) { gl_err(err, err_cap, "bwa_bed_gains_layout: out of memory"); free(L); return 0; }
+    float w[BWA_AMBI_CH];
+    for (int k = 0; k < BWA_AMBI_CH; ++k) w[k] = 1.f;
+    if (imp) {
+        for (uint32_t s = 0; s < n; ++s)
+            for (int k = 0; k < BWA_AMBI_CH; ++k)
+                dec[s][k] = imp->hf[s][k] + (band == 1 ? imp->dlf[s][k] : 0.f);   /* LF = HF + (LF - HF) */
+    } else {
+        int ok = (id == 2) ? epad_build_decode(L, dec) : allrad_build_decode(L, dec);
+        if (!ok) ambi_sad_decode(L, n, dec);             /* the engine's own degenerate fallback */
+        if (max_re) ambi_max_re_weights(order, w);
+    }
+    const uint16_t mask = ambi_set_mask_for(set, order);
+    for (uint32_t i = 0; i < ndir; ++i) {
+        float a[3], y[BWA_AMBI_CH];
+        room_to_ambi(&dirs[(size_t)i * 3], a);
+        ambi_encode_sn3d(a, y);
+        for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] = (mask & (1u << k)) ? y[k] * w[k] : 0.f;
+        float* o = &out[(size_t)i * n];
+        for (uint32_t s = 0; s < n; ++s) {
+            float acc = 0.f;
+            for (int k = 0; k < BWA_AMBI_CH; ++k) acc += dec[s][k] * y[k];
+            o[s] = acc;
+        }
+    }
+    free(dec);
+    free(L);
+    return n;
 }
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap) {
     if (!e) return 0;

@@ -16,6 +16,17 @@
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
 
+/* the worst distance between two position lists, mm */
+static double worst_mm(const float (*a)[3], const float (*b)[3], int n) {
+    double w = 0.0;
+    for (int s = 0; s < n; ++s) {
+        const double ex = a[s][0] - b[s][0], ey = a[s][1] - b[s][1], ez = a[s][2] - b[s][2];
+        const double e = sqrt(ex*ex + ey*ey + ez*ez) * 1e3;
+        if (e > w) w = e;
+    }
+    return w;
+}
+
 int main(void) {
     const double fs = 48000.0, c = 343.0;
 
@@ -720,6 +731,130 @@ int main(void) {
         CHECK(fabs(pos[0]-1.2) < 0.01 && fabs(pos[1]-0.5) < 0.01 && fabs(pos[2]-0.8) < 0.01, "recovers the speaker position");
         CHECK(fabs(lat - 3.66) < 0.01, "recovers the system latency jointly");
         CHECK(!calib_trilaterate(range, micp, 4, pos, &lat), "rejects fewer than 5 mic positions");
+    }
+
+    /* the joint localize: 12 speakers around a CAVE-sized listening area, 6 mic rows, ranges with
+     * 0.3 mm of noise and the ZM-1 chain's 60 ms of latency. Then the latency STEPS by 0.2 ms (69 mm,
+     * a Dante Via re-sync) after the third row. One latency per row must absorb the step; one for the
+     * run, and the old per-speaker solve, must not, or the per-row unknowns are buying nothing. */
+    {
+        enum { NS = 12, NK = 6 };
+        float spk[NS][3], micp[NK][3] = { { 0.4f, 1.0f, 0.3f }, { -0.5f, 1.6f, 0.4f }, { 0.3f, 1.9f, -0.5f },
+                                          { -0.4f, 1.1f, -0.4f }, { 0.0f, 1.45f, 0.0f }, { 0.6f, 1.3f, -0.1f } };
+        for (int s = 0; s < NS; ++s) {                       /* two rings and a crown, 2 m out */
+            const double az = s * 2.0 * M_PI / 6.0 + (s >= 6 ? M_PI / 6.0 : 0.0);
+            const double el = s < 6 ? -0.25 : 0.45;
+            spk[s][0] = (float)(2.0 * cos(el) * sin(az));
+            spk[s][1] = (float)(1.45 + 2.0 * sin(el));
+            spk[s][2] = (float)(2.0 * cos(el) * cos(az));
+        }
+        const double LAT = 20.58, STEP = 0.2e-3 * 343.0;
+        double rsteady[NS * NK], rstep[NS * NK];
+        uint32_t lcg = 12345u;
+        for (int s = 0; s < NS; ++s)
+            for (int k = 0; k < NK; ++k) {
+                const double dx = spk[s][0]-micp[k][0], dy = spk[s][1]-micp[k][1], dz = spk[s][2]-micp[k][2];
+                lcg = lcg * 1664525u + 1013904223u;
+                const double noise = ((double)(lcg >> 8) / (double)(1u << 24) - 0.5) * 0.6e-3;
+                const double r = sqrt(dx*dx + dy*dy + dz*dz) + LAT + noise;
+                rsteady[s * NK + k] = r;
+                rstep[s * NK + k]   = r + (k >= 3 ? STEP : 0.0);
+            }
+        /* the start is the plan: the truth with up to 15 cm of placement error per axis. The old per-speaker
+         * linear solve is no start once the latency moves: it trades the step into the radius */
+        float start[NS][3], lin[NS][3], p[NS][3];
+        double lat[NK], res[NS * NK], worst;
+        for (int s = 0; s < NS; ++s)
+            for (int a = 0; a < 3; ++a) start[s][a] = spk[s][a] + 0.15f * (float)sin(1.7 * s + 2.3 * a);
+        int lin_ok = 1;
+        for (int s = 0; s < NS; ++s) {                       /* the old --localize */
+            double l;
+            lin_ok &= calib_trilaterate(&rstep[s * NK], (const float (*)[3])micp, NK, lin[s], &l);
+        }
+        const double lin_worst = worst_mm((const float (*)[3])lin, (const float (*)[3])spk, NS);
+
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, NULL, 1, p, lat, res), "joint localize, per row: solves");
+        worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+        /* each row's latency error splits into a part every row shares (the latency trading against the
+         * radius, which mic rows bunched near the center pin poorly: the dome trap) and the row-to-row
+         * part, which is what carries the step */
+        double emin = 1e9, emax = -1e9, rmax = 0;
+        for (int k = 0; k < NK; ++k) {
+            const double e = lat[k] - (LAT + (k >= 3 ? STEP : 0.0));
+            if (e < emin) emin = e;
+            if (e > emax) emax = e;
+        }
+        for (int i = 0; i < NS * NK; ++i) if (fabs(res[i]) > rmax) rmax = fabs(res[i]);
+        printf("joint localize: latency step %.1f mm: per row worst %.2f mm, latency errors %+.2f..%+.2f mm, residual max %.2f mm;"
+               " old per-speaker worst %.1f mm\n", STEP * 1e3, worst, emin * 1e3, emax * 1e3, rmax * 1e3, lin_worst);
+        CHECK(worst < 2.0, "joint localize, per row: the step leaves every speaker within 2 mm");
+        CHECK(emax - emin < 0.5e-3, "joint localize, per row: the rows' latencies carry the step, within 0.5 mm of each other");
+        CHECK(fabs(emin) < 2.0e-3 && fabs(emax) < 2.0e-3, "joint localize, per row: every latency within 2 mm");
+        CHECK(rmax < 1.0e-3, "joint localize, per row: no capture residual past 1 mm");
+        CHECK(!lin_ok || lin_worst > 20.0, "the old per-speaker solve is thrown 20 mm or more by the step (what the per-row latency buys)");
+
+        double lat1;
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, NULL, 0, p, &lat1, res), "joint localize, one latency: solves");
+        worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+        rmax = 0;
+        for (int i = 0; i < NS * NK; ++i) if (fabs(res[i]) > rmax) rmax = fabs(res[i]);
+        printf("joint localize: one latency for the run: worst %.1f mm, residual max %.1f mm\n", worst, rmax * 1e3);
+        CHECK(worst > 10.0 && rmax > 10.0e-3, "joint localize, one latency: the step throws it 10 mm and its residuals show it");
+
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rsteady, (const float (*)[3])micp, NK, NS, NULL, NULL, 0, p, &lat1, NULL), "joint localize, steady: solves");
+        worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+        printf("joint localize: steady latency, one for the run: worst %.2f mm, latency %.2f mm off\n", worst, (lat1 - LAT) * 1e3);
+        CHECK(worst < 2.0 && fabs(lat1 - LAT) < 0.5e-3, "joint localize, steady: one latency for the run lands within 2 mm");
+
+        /* one capture takes a reflection 40 mm late: its residual is the run's largest and flagged */
+        rstep[5 * NK + 2] += 0.040;
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, NULL, 1, p, lat, res), "joint localize, a bad capture: solves");
+        int imax = 0;
+        for (int i = 1; i < NS * NK; ++i) if (fabs(res[i]) > fabs(res[imax])) imax = i;
+        printf("joint localize: a 40 mm late capture: largest residual %.1f mm at speaker %d row %d\n", res[imax] * 1e3, imax / NK, imax % NK);
+        CHECK(imax == 5 * NK + 2 && fabs(res[imax]) > CALIB_LOC_RESID_FLAG_M, "joint localize: the bad capture is the flagged residual");
+        const double bad_worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+
+        /* the same capture DROPPED (cap_use): every speaker back within 2 mm, and its residual against a
+         * solve that never saw it reads the whole 40 mm, where the fit above showed only part of it */
+        unsigned char cu[NS * NK];
+        memset(cu, 1, sizeof cu); cu[5 * NK + 2] = 0;
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, res), "joint localize, the bad capture dropped: solves");
+        worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+        rmax = 0;
+        for (int i = 0; i < NS * NK; ++i) if (i != 5 * NK + 2 && fabs(res[i]) > rmax) rmax = fabs(res[i]);
+        printf("joint localize: the 40 mm capture dropped: worst %.2f mm (%.1f mm with it), its residual %+.1f mm, the rest's max %.2f mm\n",
+               worst, bad_worst, res[5 * NK + 2] * 1e3, rmax * 1e3);
+        CHECK(worst < 2.0 && bad_worst > 2.0, "joint localize: dropping the bad capture brings every speaker back within 2 mm");
+        CHECK(fabs(res[5 * NK + 2] - 0.040) < 2.0e-3 && rmax < 1.0e-3, "joint localize: the dropped capture's residual reads its whole 40 mm");
+        /* speaker 5 keeps 4 of its 6 captures; a third one gone leaves it 3 for 3 unknowns */
+        cu[5 * NK + 4] = 0;
+        memcpy(p, start, sizeof p);
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize: a speaker keeps 4 captures");
+        cu[5 * NK + 0] = 0;
+        CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize: refuses a speaker left 3 captures");
+        /* a row left with 3 used captures has no latency to solve */
+        memset(cu, 1, sizeof cu);
+        for (int s = 3; s < NS; ++s) cu[s * NK + 1] = 0;
+        CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize: per row refuses a row left 3 captures");
+        rstep[5 * NK + 2] -= 0.040;
+
+        /* a speaker left out keeps its position; the refusals */
+        unsigned char use[NS];
+        memset(use, 1, sizeof use); use[4] = 0;
+        memcpy(p, start, sizeof p);
+        p[4][0] = 9.f;
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, use, NULL, 1, p, lat, res) && p[4][0] == 9.f && res[4 * NK] == 0.0,
+              "joint localize: a speaker left out is left alone");
+        memset(use, 0, sizeof use); use[0] = use[1] = use[2] = 1;
+        CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, use, NULL, 1, p, lat, NULL), "joint localize: per row refuses 3 speakers");
+        CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, use, NULL, 0, p, &lat1, NULL), "joint localize: one latency takes 3");
+        CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, 4, NS, NULL, NULL, 1, p, lat, NULL), "joint localize: refuses 4 mic rows");
     }
 
     /* position writeback round-trip */

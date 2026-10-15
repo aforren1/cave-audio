@@ -5513,6 +5513,27 @@ static void register_tests(ImGuiTestEngine* e) {
             if (want[i]) IM_CHECK(S.step[SES_LOCALIZE].summary.find(want[i]) != std::string::npos);
             else IM_CHECK(S.step[SES_LOCALIZE].summary.find('(') == std::string::npos);
         }
+        /* the latency is carried to the later steps only when the run says it HELD: one that MOVED between
+         * rows, or one never checked (one latency for the run, or the per-speaker fallback), hands nothing */
+        const char* const lat_runs[3] = {
+            "localize: system latency 3.6597 m (10.670 ms), the median over the mic rows\n"
+            "localize: the latency held: 0.5 us spread across the 5 rows (under 10 us)\n",
+            "localize: system latency 3.6597 m (10.670 ms), the median over the mic rows\n"
+            "localize: WARNING: the latency MOVED 200.3 us across the run (max - min over the rows; 10 us counts as\n",
+            "localize: system latency 3.6597 m (10.670 ms), the median over the run (one latency)\n"
+            "localize: the latency was not checked for movement (fewer than 4 speakers solved, so one latency for the run): a\n" };
+        const bool lat_carried[3] = { true, false, false };
+        const char* const lat_why[3] = { NULL, "(MOVED", "(not checked" };
+        for (int i = 0; i < 3; ++i) {
+            ses_begin(&S, SES_LOCALIZE, "test", std::vector<SesFile>());
+            ses_finish(&S, SES_LOCALIZE, 0, lat_runs[i], false);
+            const SesStep& Z = S.step[SES_LOCALIZE];
+            printf("session test: localize latency run %d: carried %d, summary: %s\n", i, (int)Z.have_latency, Z.summary.c_str());
+            IM_CHECK_EQ(Z.have_latency, lat_carried[i]);
+            if (lat_carried[i]) IM_CHECK(fabs(Z.latency_m - 3.6597) < 1e-9);
+            if (lat_why[i]) IM_CHECK(Z.summary.find(lat_why[i]) != std::string::npos);
+            else IM_CHECK(Z.summary.find('(') == std::string::npos);
+        }
         ses_clear_dir("calibview_session_rules");
     };
 

@@ -61,7 +61,9 @@ To author or optimize a layout with `bwa_layout_tool`, see
       "min_gain_db":         -40.0
     }
   },
-  "speakers": [ /* 4..64 entries - the count IS the engine's channel count; see below */ ]
+  "speakers": [ /* 4..64 entries - the count IS the engine's channel count; see below */ ],
+  "directivity": { /* optional: the speaker model's off-axis loss; see below */ },
+  "bed_decode":  { /* optional: an imported ambisonic bed decoder; see below */ }
 }
 ```
 
@@ -206,6 +208,65 @@ tab read its high-to-mid tilt as the tilt a speaker shows when it points straigh
 (see [calibration.md](./calibration.md) -> "Live aiming"). Leave it out and everything else
 works; the live angle estimate then needs a reference speaker. The engine never reads it.
 
+### Bed decoder: top-level `bed_decode` (optional)
+
+An ambisonic bed decoder designed elsewhere, for example in the Ambisonic Decoder Toolbox,
+converted from its AmbDec preset by `tools/decoder/ambdec_to_json.py`. The engine uses it
+only when `bwa_desc.bed_decoder = BWA_DECODE_LAYOUT`; every other decoder ignores the block.
+Why and how it renders: [spatialization.md](./spatialization.md#imported-decoders-bwa_decode_layout).
+
+```jsonc
+"bed_decode": {
+  "source": "cave24_o3.ambdec; cave24_o1.ambdec; cave24_3h1v.ambdec",   // provenance, engine-ignored
+  "decoders": [                                          // 1..9, one per channel set
+    {
+      "channels": "full3",                               // full1, full2, full3, or a mixed set:
+                                                         //   1H 2H 2H1V 3H 3H1V 3H2V
+      "xover_hz": 400,                                   // two-band only (with "lf"), in [100, 4000]
+      "nfeff_comp": "input",                             // optional, engine-ignored (see below)
+      "hf": [ { "index": 0, "gains": [ /* 16 floats, ACN/SN3D */ ] }, /* one row per speaker */ ],
+      "lf": [ /* same shape; optional: absent = single-band */ ]
+    },
+    { "channels": "full1", "hf": [ /* ... */ ] },
+    { "channels": "3H1V", "hf": [ /* ... */ ] }
+  ]
+}
+```
+
+Each matrix maps a bed's 16 ACN/SN3D channels (3rd order; x front, y left, z up, the
+engine's own basis) to the speakers. It is **final**: the per-order gains are already in the
+rows, so the engine applies no max-rE taper to it. A row is keyed by the speaker's `index`
+(never by its place in the array), and every speaker has exactly one row in each matrix. A
+decoder carries zeros in every column its set lacks: above its order for `full1` and
+`full2`, and the missing channels of a mixed set.
+
+A full-order decoder names its ORDER (`full1`, `full2`, `full3`) because its per-order gains
+are designed for that order: a max-rE `full3` decoder weights its first order for a
+3rd-order field, and a 1st-order bed played through it comes out about 2.5 dB quiet on a
+regular array (computed from typical order gains, not measured), with
+order weights nobody designed for it. There is no bare `"full"`; the loader refuses it. The engine picks a decoder per bed:
+
+| Bed | Decoder |
+| --- | --- |
+| full, order N | `fullN`; else the lowest full order above N; else the highest full order below N |
+| mixed set | its own decoder; else the full decoder the row above picks for the set's highest order |
+
+Only the exact match is the decode the designer intended. A higher order than the bed works
+(the bed's missing orders meet zero columns) with the wrong order gains; a lower order drops
+the bed's higher orders. The engine says so once per bed shape, through `bwa_last_error`.
+At least one full-order decoder is required, of any order.
+
+`nfeff_comp` is informational. The converter copies AmbDec's `/opt/nfeff_comp` there when the
+file asks for near-field compensation, and prints a note: the engine decodes plane waves and
+applies no near-field compensation
+([spatialization.md](./spatialization.md#near-field-compensation-deliberately-omitted)). The
+loader ignores the field.
+
+A writer that changes the speaker COUNT has to drop or regenerate the block, because its
+rows no longer cover the array. `bwa_layout_tool` keeps it verbatim on a save and drops it
+(with a notice) when you change the count. A moved speaker does not invalidate the block
+mechanically, but the matrix was designed for the old position: redesign and reconvert.
+
 ## Validation (loader contract)
 
 `layout_load` rejects a malformed file (the reason surfaces through `bwa_last_error`)
@@ -238,7 +299,18 @@ if any of:
   1e6, `angles_deg` outside 2..37 entries, not starting at 0, not ascending, or
   past 180, a `loss_db` row count or length that does not match, an entry outside
   `[-80, 12]`, a `split_hz` outside `[20, 20000]`, or an `on_axis_db` that is present
-  without one number per band or with an entry outside `[-200, 200]`.
+  without one number per band or with an entry outside `[-200, 200]`;
+- a `bed_decode` block is malformed: not an object, a `source` that is not a string, no
+  `decoders` array or one outside 1..9 entries, a decoder that is not an object, a `channels`
+  that is not full1, full2, full3 or one of 1H, 2H, 2H1V, 3H, 3H1V, 3H2V (a bare "full" is
+  refused with its own message), two decoders for one set, no full-order decoder, an `hf` (or
+  `lf`) that does not have exactly one row per speaker, a row without a numeric `index` and 16
+  `gains`, an index out of range or repeated, a gain that is non-numeric, non-finite or beyond
+  ±1e4, a nonzero gain in a column outside the decoder's set (above its order for a full
+  decoder), an `lf` without an `xover_hz` in `[100, 4000]`, or an `xover_hz` without an `lf`.
+
+The `bed_decode` block is checked whatever decoder the engine is asked for, so a broken
+block fails a load even when the session would not use it.
 
 `schema_version` is not checked: the loader never reads it.
 

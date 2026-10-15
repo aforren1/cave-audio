@@ -257,7 +257,8 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   Start from the preset: this struct's zero is not its default, and the engine refuses a
   zero-filled one. See docs/api.md for what each field rests on.
 - **Offline evaluation (pure, no engine handle)**: `bwa_panner_gains_batch`,
-  `bwa_bed_gains_batch`, and `bwa_spcap_focus_default`, for layout scoring from
+  `bwa_bed_gains_batch`, `bwa_bed_gains_layout` (a layout FILE's bed decode, imported
+  `bed_decode` included), and `bwa_spcap_focus_default`, for layout scoring from
   C# tooling. They never touch a running engine.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`, `bwa_set_dual_band_cap`,
   `bwa_set_spcap_focus`, `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
@@ -522,7 +523,7 @@ re-pushes in Play mode.
 | max-rE and its band split | `maxRe`, `maxReSplit` | live |
 | Air absorption | `Emitter.airAbsorption` | live |
 | Spread mode, decorrelation | `spreadMode`, `decorrelation` | live |
-| Bed decoder, AllRAD vs EPAD | `bedDecoder` | restart |
+| Bed decoder, AllRAD vs EPAD (vs an imported `Layout` one) | `bedDecoder` | restart |
 | HRTF monitor quality | profile `Binaural` | restart |
 
 - **Load twice, not four times**: `bedDecoder` is the only load-time half of the decoder and taper

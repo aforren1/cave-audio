@@ -315,6 +315,32 @@ install that ships EPAD passes `epad` (GUI: the bed decode combo and max-rE
 checkbox) so the score matches the render, not a sibling of it. Pass `maxre` to
 force the taper on when you have turned it off some other way.
 
+An install that ships an **imported decoder** (`BWA_DECODE_LAYOUT`, the layout's
+`bed_decode` block) passes `layout` (GUI: "layout (imported)" in the bed decode combo).
+The row then grades the file's own matrix through `bwa_bed_gains_layout`, the engine's
+path, against the file's own `position` values: the speakers that matrix was designed for
+and the engine renders from, not the positions you are editing (an as-built file opens as
+its plan). The score output says which positions it graded against. max-rE does not apply
+to it, in the engine or here. The imported matrix does not follow a moved speaker, so it
+stays out of the optimizer's cost: `bed=<wt>` is ignored under `layout`. Optimize with a built-in
+decoder, redesign the import for the result, then score it. If you change the speaker
+count, a save drops the block (it no longer has one row per speaker) and the row reports
+why it cannot grade.
+
+The AMBI row has a second line with three more numbers. None of them enters the
+optimizer's cost.
+
+- **|rV|**, mean and minimum: the velocity vector `sum(g u) / sum(g)` from amplitude
+  gains, the low-frequency (ITD) cue. It reads the LF matrix of a two-band import and
+  the one matrix otherwise. 1 is ideal at the center.
+- **rV-rE angle**, mean and worst: how far the low-frequency cue points from the
+  high-frequency one. A good two-band decoder keeps them together (criterion 5 of
+  Heller, Benjamin and Lopez-Lezcano, AES 150).
+- **energy CV**: the coefficient of variation of the decoded energy `sum g^2` over the
+  scored directions. 0 means every direction plays equally loud.
+
+`--score` prints the same line under the AMBI row.
+
 Point-source optimization already does most of the bed's work for free. A naive
 `bed=1` co-optimization trades badly: a little bed accuracy for a lot of DBAP worst
 case. The recipe that works is the guard again: from the DBAP optimum,
@@ -348,7 +374,7 @@ use case picks its renderer on top (tracked DBAP for a roaming session, SPCAP or
 VBAP fixed-solve for a seated one, the bed renderer for ambisonic content).
 The shared layout costs a seated user little against a dedicated seated-only
 array, while a seated-only array is unusable for everyone else. Verify any use case's slice of the same file with
-`--score L.json [condition] [fixed|moving] [epad] [maxre]`.
+`--score L.json [condition] [fixed|moving] [epad|layout] [maxre]`.
 
 ### Leash and ear height
 

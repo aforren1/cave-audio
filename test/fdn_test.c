@@ -11,6 +11,7 @@
  */
 #include "acoustics/fdn.h"
 #include "core/layout.h"
+#include "spatial/allrad.h"   /* the imported-decoder section imports the AllRAD matrix */
 
 #include <math.h>
 #include <stdio.h>
@@ -238,7 +239,38 @@ int main(void) {
         }
     }
 
+    /* 7. IMPORTED decoder (decoder 3, the layout's bed_decode): the lines render through the
+     * imported "full" HF matrix and that matrix is FINAL, so max-rE must not taper it a second time.
+     * Import the very AllRAD matrix the house render uses: decoder 3 with max-rE ON must then equal
+     * AllRAD with max-rE OFF block for block, and differ from AllRAD with max-rE ON (or the check
+     * could not tell a taper from none). */
+    {
+        static Layout LI;
+        LI = L;
+        memset(&LI.bed, 0, sizeof LI.bed);
+        CHECK(allrad_build_decode(&LI, LI.bed.dec[0].hf) == 1, "imported: AllRAD dump");
+        LI.bed.ndec = 1; LI.bed.dec[0].order = 3;          /* a full3 decoder */
+        Fdn* fi = fdn_create(&LI, RATE, CH, 3);
+        Fdn* fa = fdn_create(&LI, RATE, CH, 1);
+        Fdn* fr = fdn_create(&LI, RATE, CH, 1);
+        if (fi && fa && fr) {
+            static double ei[BLOCKS], ea[BLOCKS], er[BLOCKS];
+            fdn_set_max_re(fi, 1);                   /* the taper is ON for the import ... */
+            fdn_set_max_re(fa, 0);                   /* ... and OFF for the house AllRAD */
+            fdn_set_max_re(fr, 1);
+            run_fdn(fi, &LI, NULL, 60, ei);
+            run_fdn(fa, &LI, NULL, 60, ea);
+            run_fdn(fr, &LI, NULL, 60, er);
+            int same = 1, differs = 0;
+            for (int b = 0; b < 60; ++b) { if (ei[b] != ea[b]) same = 0; if (er[b] != ea[b]) differs = 1; }
+            CHECK(ei[10] > 0.0 && same, "imported decoder: no second max-rE taper on the FDN render");
+            CHECK(differs, "imported decoder: (the max-rE taper does change a built-in render)");
+        } else CHECK(0, "fdn_create (imported)");
+        fdn_destroy(fi); fdn_destroy(fa); fdn_destroy(fr);
+    }
+
     if (fails) { printf("fdn_test: %d FAILURES\n", fails); return 1; }
-    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, max-rE pair, stability, live retune)\n");
+    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, max-rE pair, stability, live retune, "
+           "imported decoder)\n");
     return 0;
 }

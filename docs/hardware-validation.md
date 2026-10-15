@@ -157,6 +157,31 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-devices for every 
 - [ ] `bwa_zylia_probe --driver "<driver name>"`: 19 channels live. Tap each capsule and watch
       its channel jump. A channel at digital silence is dead or unpatched; a channel far louder
       than the rest is hot. Fix the routing before Stage 2.
+- [ ] **Dante Via's latency holds still.** The ZM-1 samples on its own crystal and Via bridges that
+      clock onto Dante's, so nothing promises a constant latency through it
+      ([calibration.md: the latency per row](./calibration.md#modes)). Every mode that carries a
+      latency from one run to another depends on it. Set the ZM-1 down anywhere, leave it, pick one
+      speaker, and log its range for 20 minutes:
+
+      ```
+      bwa_calibrate --layout plan.json --driver "<driver name>" --live <N> --input <first ZM-1 channel> > via_latency.log
+      ```
+
+      Redirected to a file, the run writes one reading per line, prefixed with the seconds since it
+      started: `  612.48 s  range 24.1532 m`. The range is one capsule's arrival in meters at c,
+      latency included, to 0.1 mm (0.3 µs). A rejected sweep writes `reading skipped:` and the reason
+      on its own line. Nothing moves, so any change is the latency. The run needs no `--mic` here: the
+      arrival window opens at the driver's reported loop, and the part of the ZM-1 chain the driver
+      does not report (about 60 ms, 20 m) puts the arrival well inside it wherever the ZM-1 stands.
+      Press a key in the console to stop. Then restart
+      Dante Via, unplug and replug the ZM-1, and log 5 more minutes.
+      - Flat within 1 mm, and the same after the restart: a latency carries between runs.
+      - A slow wander of a few mm: `--localize` absorbs it (one latency per mic row). Measure the
+        latency in each later run with `--ref-speakers` instead of carrying it.
+      - A step at the restart: never carry a latency across a Via restart or a ZM-1 replug. Re-run
+        localize, or measure with `--ref-speakers`, after one.
+      - Readings that jump by a sample (7 mm) and back: Via slips samples instead of resampling. A
+        slip inside a sweep smears its impulse response, so expect re-sweeps in Stage 2.
 
 `bwa_minimal` opens 2 channels. Stage 1 proves the full-width open.
 
@@ -349,7 +374,7 @@ survey and to live aiming, so in a session you do nothing here. By hand, take it
 
 | Source | How | Use it for |
 | --- | --- | --- |
-| localize (step 2) | it solves the latency: the `solved system latency <m> m` line, the median of the per-speaker `[system latency <m> m]` | everything after it; the best one |
+| localize (step 2) | it solves one latency per mic row: the `localize: system latency <m> m` line is their median | everything after it, the best one, but only when the run printed `the latency held`. Not after `the latency MOVED` or `the latency was not checked for movement` |
 | the capsule survey (step 3) | its `--latency <m> for live aiming` line | live aiming, the `--zylia` survey |
 | `--ref-speakers <list>` | 3 or more speakers with MEASURED positions (`optical.json`, or a surveyed layout) | live aiming and the `--zylia` survey, before or without localize |
 | `--ref <spk> <m>` | one tape-measured distance from the array center to a speaker | the same, when nothing is measured |
@@ -391,6 +416,20 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
       60 ms for the whole chain on the rig), and the next line says so. A WARNING fires only past
       150 ms, the most the arrival window allows past the driver's loop. On a WARNING, check the
       Via latency setting and any extra buffer. Record the value.
+- [ ] **The latency held**: `localize: the latency held: X us spread across the N rows`. The run
+      solves one latency per mic row, so a latency that moved does not spoil the positions. It
+      spoils a latency carried into a later run. On `WARNING: the latency MOVED`, or on `the latency
+      was not checked for movement`, the Session tab does not hand it over, and by hand you measure
+      each later run's own (`--ref-speakers`). Record the spread, and compare it with Stage 0's log.
+- [ ] **No FLAGGED capture**: each speaker line ends `[residual rms X mm, worst Y mm at row N]`.
+      A capture more than 10 mm off the fit is FLAGGED: a reflection taken for the direct sound, or
+      the stand moved during that row. The flag reads the fit residual, which shows only part of a
+      bad capture's error: the fit absorbs the rest into that speaker's position and that row's
+      latency (in `calib_test`, a capture 40 mm late leaves 17.6 mm). So it catches gross errors,
+      not every error. The run drops the worst flagged capture once and solves again: a
+      `dropped speaker S's capture at row R` line with no FLAGGED line after it is a pass, and the
+      dropped capture's second residual tells you how far off it was. A FLAGGED line after a drop
+      means a second bad capture: re-take the run with those rows moved or repeated.
 - [ ] Optional, by hand: add `--check-aim` to fit each box's acoustic axis from these captures.
       A box more than 15 degrees off its aim is flagged
       ([calibration.md: Modes](./calibration.md#modes)).
@@ -762,6 +801,8 @@ the day.
 | Range residuals | the capsule survey's per-speaker `from the median` (mm) | flag 10 mm | `CSURVEY_RANGE_FLAG_MM`, `examples/calibrate.cpp` |
 | Rigid-sphere effect | the capsule survey's `residual` and `radius`, against a clap survey of the same mounting | WARNING over 5 µs, radius outside 40 to 60 mm | `CSURVEY_RESID_WARN_US`, `examples/calibrate.cpp`; [calibration.md: The speaker-sweep capsule survey](./calibration.md#the-speaker-sweep-capsule-survey---capsule-survey) |
 | Live-aiming reading rate | `live: N reading(s) in X s, Y per second` | 1 to 1.2 per second, untimed | [calibration.md: Update rate](./calibration.md#update-rate) |
+| Dante Via latency over a session | Stage 0's `via_latency.log` (max - min of the range); localize's `each row's latency against the median` | held under 10 µs spread across the rows | `CALIB_ROW_LAT_STEADY_S`, `src/calib/calib.h`; [calibration.md: Modes](./calibration.md#modes) (`--localize`) |
+| Localize capture residual | localize's per-speaker `worst ... at row N` | flag 10 mm; the worst flagged capture dropped once, then solved again | `CALIB_LOC_RESID_FLAG_M`, `src/calib/calib.h` |
 | Latency residual with the ZM-1 | localize's `-> residual` | WARNING over 150 ms | `CALIB_WIN_LAT_DRIVER_S`, `src/calib/calib.h`; [calibration.md: Modes](./calibration.md#modes) (`--localize`) |
 | Physical floor | `bwa_validate`'s `physical floor` | 1 to 3 deg expected, stop above 5 | [validation.md: The physical reference arm](./validation.md#the-physical-reference-arm) |
 

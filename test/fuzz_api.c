@@ -75,7 +75,7 @@ static uint32_t rng_u32(Rng* r) {
 #define FZ_GRAVE     32     /* stale-handle graveyard depth (a ring; old entries overwritten) */
 #define FZ_MAX_DYN   8
 
-#define FZ_NUM_SEEDS     16
+#define FZ_NUM_SEEDS     18
 #define FZ_DEFAULT_ITERS 1500   /* 16 x 1500 = 24k ops in a few seconds WITH the Steam SDK (whose
                                  * sim threads and BVH rebuilds are the cost); soak with --iters */
 
@@ -277,7 +277,24 @@ static int write_layout8(const char* path) {
                         k, 1.5 * x, y ? 2.4 : 0.4, 1.5 * zz, k == 7 ? "" : ",");
                 ++k;
             }
-    fprintf(f, "] }\n");
+    /* an imported bed decoder, so a seed that takes BWA_DECODE_LAYOUT has one to start with: a
+     * two-band full1 decoder (first order, LF a touch hotter) and a single-band 3H1V one (W only) */
+    fprintf(f, "], \"bed_decode\": { \"decoders\": [\n");
+    for (int d = 0; d < 2; ++d) {
+        fprintf(f, " { \"channels\": \"%s\"%s", d ? "3H1V" : "full1", d ? "" : ", \"xover_hz\": 400");
+        for (int band = 0; band < (d ? 1 : 2); ++band) {
+            fprintf(f, ", \"%s\": [", band ? "lf" : "hf");
+            for (int s = 0; s < 8; ++s) {
+                const float sc = band ? 1.1f : 1.f;
+                fprintf(f, "%s{\"index\":%d,\"gains\":[%g", s ? "," : "", s, sc * 0.125f);
+                for (int c = 1; c < 16; ++c) fprintf(f, ",%g", (!d && c < 4) ? sc * 0.2f * (float)((s + c) % 3 - 1) : 0.f);
+                fprintf(f, "]}");
+            }
+            fprintf(f, "]");
+        }
+        fprintf(f, " }%s\n", d ? "" : ",");
+    }
+    fprintf(f, "] } }\n");
     fclose(f);
     return k == 8;
 }
@@ -1325,6 +1342,26 @@ static int do_op(Fz* z) {
                     FAIL("bed_gains_batch did not return ndir");
                 for (int i = 0; i < 8; ++i)
                     if (!isfinite(out[i])) FAIL("bed_gains_batch produced a non-finite gain");
+                if (bwa_bed_gains_batch(BWA_DECODE_LAYOUT, mre, pos, 8, dirs, 1, out) != 0u)   /* no file, no import */
+                    FAIL("bed_gains_batch accepted BWA_DECODE_LAYOUT with no file");
+                {   /* the file-based grading, over the fixture layout (which carries a bed_decode).
+                     * EVERY choice here derives from the draws above and adds none: a new draw would
+                     * shift the stream and re-map every pinned seed (see run_seed's overlay). */
+                    if (((uint32_t)pn + (uint32_t)mre) % 3 == 0) dec = BWA_DECODE_LAYOUT;
+                    static const char* const chs[5] = { NULL, "full1", "3H1V", "full3", "5H" };
+                    const char* ch = chs[((uint32_t)pn + (uint32_t)dec) % 5];
+                    const uint32_t band = mre ? 1u : ((uint32_t)pn == 2u ? 2u : 0u);
+                    char gerr[128];
+                    const uint32_t n = bwa_bed_gains_layout(FZ_LAYOUT8, dec, ch, mre, band, dirs, 1, out, 8, gerr, sizeof gerr);
+                    const int bad = (ch && !strcmp(ch, "5H")) || band > 1;
+                    if (!bad && bwa_bed_gains_layout(FZ_LAYOUT8, dec, ch, mre, band, NULL, 0, NULL, 0, gerr, sizeof gerr) != 8u)
+                        FAIL("bed_gains_layout size query disagrees with the full call: %s", gerr);
+                    if (bad ? n != 0 : n != 8u)
+                        FAIL("bed_gains_layout returned %u (channels %s, band %u, decoder %d): %s",
+                             n, ch ? ch : "NULL", band, (int)dec, gerr);
+                    if (n) for (int i = 0; i < 8; ++i)
+                        if (!isfinite(out[i])) FAIL("bed_gains_layout produced a non-finite gain");
+                }
                 break;
             }
             default: {  /* driver enumeration bounds + preset determinism */
@@ -1399,6 +1436,18 @@ static int do_op(Fz* z) {
 
 /* ---------------------------------------------------------------- one seed ---------------- */
 
+/* The BWA_DECODE_LAYOUT overlay: a SEPARATE stream, seeded from the seed xor a salt, decides it (one
+ * draw in four), so adding the option shifted no draw on the main stream. The salt was searched so
+ * that no PINNED seed fires (FZ_PINNED below: the frozen ctest set as it stood before the option,
+ * plus the regression seeds CLAUDE.md names), which keeps every one of them bit-for-bit the
+ * configuration it was found or frozen with; main() re-checks that before running anything. */
+#define FZ_LAYOUT_SALT 0x1A70D3C0DE000179ULL
+static int fz_layout_overlay(unsigned long long seed) {
+    Rng r;
+    rng_seed(&r, (uint64_t)(seed ^ FZ_LAYOUT_SALT));
+    return rng_u32(&r) % 4u == 0u;
+}
+
 static int run_seed(unsigned long long seed, uint32_t iters) {
     Fz zz;
     Fz* z = &zz;
@@ -1421,6 +1470,18 @@ static int run_seed(unsigned long long seed, uint32_t iters) {
         if (bwa_get_channel_count(pe) != BWA_DEFAULT_GRID) { bwa_destroy(pe); FAIL("layout fallback is not the 26-grid"); }
         for (int i = 0; i < 2; ++i)
             if (bwa_start(pe) != BWA_ERR_LAYOUT) { bwa_destroy(pe); FAIL("start #%d did not fail BWA_ERR_LAYOUT", i + 1); }
+        bwa_destroy(pe);
+        z->e = NULL;
+        /* the same shape for an imported bed decoder the layout does not carry (no draws: the
+         * default grid has no bed_decode) */
+        d.layout_path = NULL;
+        d.bed_decoder = BWA_DECODE_LAYOUT;
+        pe = bwa_create(&d);
+        z->e = pe;
+        if (!pe) FAIL("create must survive BWA_DECODE_LAYOUT with no bed_decode");
+        if (!bwa_last_error(pe)) { bwa_destroy(pe); FAIL("BWA_DECODE_LAYOUT with no bed_decode left no error at create"); }
+        for (int i = 0; i < 2; ++i)
+            if (bwa_start(pe) != BWA_ERR_LAYOUT) { bwa_destroy(pe); FAIL("LAYOUT start #%d did not fail BWA_ERR_LAYOUT", i + 1); }
         bwa_destroy(pe);
         z->e = NULL;
     }
@@ -1449,6 +1510,11 @@ static int run_seed(unsigned long long seed, uint32_t iters) {
     d.embree         = chance(z, 1, 8);
     if (chance(z, 1, 16)) d.hrtf_path = FZ_GARBAGE;           /* HRTF failure is non-fatal */
     int use_layout8 = chance(z, 3, 10);
+    /* BWA_DECODE_LAYOUT is an OVERLAY from a side stream (fz_layout_overlay), never a draw from z->rng:
+     * every draw above and after is the one the seed always made, and the overlay only fires where
+     * the main stream already chose the 8-speaker fixture (the one layout here carrying bed_decode),
+     * so it changes the decoder and nothing else. The pinned seeds never take it (main checks). */
+    if (use_layout8 && fz_layout_overlay(seed)) d.bed_decoder = BWA_DECODE_LAYOUT;
     if (use_layout8) d.layout_path = FZ_LAYOUT8;
 
     z->e = bwa_create(&d);
@@ -1541,10 +1607,20 @@ static int run_seed(unsigned long long seed, uint32_t iters) {
 
 /* ---------------------------------------------------------------- main -------------------- */
 
-/* The fixed ctest set. Arbitrary but FROZEN: reproducibility is the point. */
+/* The fixed ctest set. Arbitrary but FROZEN: reproducibility is the point. The last two were
+ * appended for BWA_DECODE_LAYOUT coverage: they are seeds whose main stream picks the 8-speaker
+ * fixture and whose side stream takes the overlay (94: CAVE, 44: CAVE_SIM). */
 static const unsigned long long FZ_SEEDS[FZ_NUM_SEEDS] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-    42, 0xC0FFEEULL, 0xDEADBEEFULL, 0x123456789ABCDEFULL
+    42, 0xC0FFEEULL, 0xDEADBEEFULL, 0x123456789ABCDEFULL,
+    94, 44
+};
+/* Seeds whose configuration is PINNED: the first 16 of FZ_SEEDS, and the regression seeds that found
+ * real defects (CLAUDE.md, Traps: 12648430 = 0xC0FFEE, 126, 142, 185). None may take the overlay. */
+static const unsigned long long FZ_PINNED[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    42, 0xC0FFEEULL, 0xDEADBEEFULL, 0x123456789ABCDEFULL,
+    126, 142, 185
 };
 
 int main(int argc, char** argv) {
@@ -1577,6 +1653,19 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    for (size_t i = 0; i < sizeof FZ_PINNED / sizeof FZ_PINNED[0]; ++i)
+        if (fz_layout_overlay(FZ_PINNED[i])) {
+            fprintf(stderr, "fuzz_api: pinned seed %llu takes the BWA_DECODE_LAYOUT overlay; FZ_LAYOUT_SALT "
+                            "must keep every pinned seed's configuration\n", FZ_PINNED[i]);
+            remove_fixtures();
+            return 1;
+        }
+    if (!fz_layout_overlay(94) || !fz_layout_overlay(44)) {
+        fprintf(stderr, "fuzz_api: the LAYOUT coverage seeds (94, 44) no longer take the overlay\n");
+        remove_fixtures();
+        return 1;
+    }
+
     build_pick_table();
     clock_t t0 = clock();
     int rc = 0;
@@ -1594,7 +1683,7 @@ int main(int argc, char** argv) {
 
     double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
     printf("fuzz_api OK (%s%llu ops across %s, %llu rendered blocks, %.1f s)\n",
-           have_seed ? "" : "16 seeds, ",
+           have_seed ? "" : "18 seeds, ",
            (unsigned long long)g_total_ops,
            have_seed ? "1 seed" : "the fixed set",
            (unsigned long long)g_total_renders, secs);

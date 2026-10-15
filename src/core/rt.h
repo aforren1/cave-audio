@@ -228,8 +228,12 @@ typedef struct {
 void    rt_set_direct_ambi(RtCore* c, int mode);
 const float* rt_direct_ambi(RtCore* c);
 uint32_t rt_direct_voices(RtCore* c, const RtDirectVoice** out);
-void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 1 = AllRAD, 2 = EPAD (0 = the SAD fallback — internal only,
-                                                      * no longer reachable from the public enum); before bwa_start */
+void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 1 = AllRAD, 2 = EPAD, 3 = the layout's imported bed_decode
+                                                      * (AllRAD when it has none) (0 = the SAD fallback — internal
+                                                      * only, no longer reachable from the public enum); before bwa_start */
+int     rt_bed_imported(const RtCore* c);            /* 1 = the imported decoder is in use (decoder 3 + a block) */
+int     rt_bed_decoder_pick(const RtCore* c, int set, int order, int* exact); /* imported decoder index a bed of this
+                                                      * set + order gets (-1 = no import); *exact = designed for it */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 void    rt_set_cap(RtCore* c, int on);               /* CAP on the dual-band low band (ITD-exact); live A/B */
 void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe, 1 = MDAP ring, 2 = spectral; live A/B */
@@ -339,6 +343,7 @@ uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t 
 uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
 uint32_t rt_load_fuma   (RtCore* c, const char* path, char* err, size_t errcap); /* FuMa bed, converted to AmbiX at load */
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
+uint8_t  rt_sound_chset(RtCore* c, uint32_t sound);      /* a bed's channel set (ambiset.h), 0 = full or invalid */
 uint64_t rt_sound_frames  (RtCore* c, uint32_t sound);   /* length in frames at the engine rate;
                                                           * 0 = invalid, or unknown (push streams) */
 bool     rt_sound_is_stream(RtCore* c, uint32_t sound);  /* streamed/push (reports 1 channel like mono) */

@@ -284,6 +284,16 @@ static void null_engine_sweep(void) {
               "bed batch: NULL directions returns 0");
         CHECK(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, NS, srcs, 0, out) == 0,
               "bed batch: ndir = 0 returns 0");
+        CHECK(bwa_bed_gains_batch(BWA_DECODE_LAYOUT, false, pos, NS, srcs, 1, out) == 0,
+              "bed batch: BWA_DECODE_LAYOUT (no file to import from) returns 0");
+        CHECK(bwa_bed_gains_layout(NULL, BWA_DECODE_ALLRAD, NULL, false, 0, srcs, 1, out, NS, NULL, 0) == 0,
+              "bed layout: NULL path returns 0 (and a NULL err buffer is fine)");
+        CHECK(bwa_bed_gains_layout("", BWA_DECODE_ALLRAD, NULL, false, 0, srcs, 1, out, NS, NULL, 0) == 0,
+              "bed layout: an empty path returns 0");
+        CHECK(bwa_bed_gains_layout(NULL, BWA_DECODE_ALLRAD, NULL, false, 0, NULL, 0, NULL, 0, NULL, 0) == 0,
+              "bed layout: a size query with a NULL path returns 0");
+        CHECK(bwa_bed_gains_layout(NULL, (bwa_bed_decoder)99, "", true, 7, NULL, 0, NULL, 0, (char*)out, 0) == 0,
+              "bed layout: garbage everywhere returns 0 (and a zero-cap err is not written)");
     }
     {
         float v[24]; int tr[36]; bwa_material m[12];

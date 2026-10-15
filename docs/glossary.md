@@ -47,7 +47,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 
 **A** [Absorption](#absorption), [ACN](#acn), [Active-intensity DOA](#active-intensity-doa),
 [Aim check](#aim-check), [Aiming sheet](#aiming-sheet), [Air absorption](#air-absorption), [Air temperature](#air-temperature), [AllRAD](#allrad),
-[AmbiX and FuMa](#ambix-and-fuma), [Ambisonic order](#ambisonic-order),
+[AmbDec](#ambdec), [AmbiX and FuMa](#ambix-and-fuma), [Ambisonic order](#ambisonic-order),
 [Angular miss](#angular-miss), [Anisotropic decay](#anisotropic-decay),
 [Array-sim monitor](#array-sim-monitor), [Array-sim room](#array-sim-room),
 [Azimuth reference](#azimuth-reference)
@@ -69,7 +69,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Distance attenuation](#distance-attenuation), [Doppler](#doppler), [Drift check](#drift-check),
 [Dual-band panning](#dual-band-panning)
 
-**E** [Early reflections](#early-reflections), [EPAD](#epad),
+**E** [Early reflections](#early-reflections), [Energy flatness](#energy-flatness), [EPAD](#epad),
 [Expected-arrival window](#expected-arrival-window), [Exponential sweep](#exponential-sweep),
 [Extent](#extent), [Extra listeners](#extra-listeners)
 
@@ -83,7 +83,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [HRTF](#hrtf), [Hybrid reverb](#hybrid-reverb)
 
 **I** [ILD](#ild), [Image-source method](#image-source-method),
-[Imaginary loudspeaker](#imaginary-loudspeaker)
+[Imaginary loudspeaker](#imaginary-loudspeaker), [Imported bed decoder](#imported-bed-decoder)
 
 **L** [Laterality check](#laterality-check), [Leash](#leash),
 [Listener-centric versus listener-relative](#listener-centric-versus-listener-relative),
@@ -91,6 +91,7 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Lobe mode](#lobe-mode), [Loudness compensation](#loudness-compensation)
 
 **M** [Matched-cell contrast](#matched-cell-contrast), [max-rE](#max-re), [MDAP](#mdap),
+[Mixed order](#mixed-order),
 [Mode strength](#mode-strength), [Mount offset](#mount-offset),
 [Move in room words](#move-in-room-words)
 
@@ -286,7 +287,9 @@ around the sweet spot. See [layout-schema.md](./layout-authoring.md#authoring-wi
 ### Bed metric
 
 The `AMBI (AllRAD)` row on the layout tool's scoreboard: plane waves at infinity through the
-engine's real bed decode build (`bwa_bed_gains_batch`), scored over the same shell as the panners.
+engine's real bed decode build (`bwa_bed_gains_batch`, or `bwa_bed_gains_layout` for an
+[imported decoder](#imported-bed-decoder)), scored over the same shell as the panners, with
+[rV](#rv) and [energy flatness](#energy-flatness) on a second row.
 A bed wants a good **quadrature** of the sphere, which the point-source scores cannot see. Grade it
 with the decoder and the max-rE setting your install actually ships, or you are scoring a sibling of
 your render. See [layout-schema.md](./layout-authoring.md#authoring-with-bwa_layout_tool).
@@ -393,11 +396,15 @@ input to [Frank spread](#frank-spread).
 
 ### rV
 
-The **velocity vector**, the amplitude-weighted (not energy-weighted) direction sum. It models
-low-frequency localization, where the ear reads summed pressure. The engine never computes `rV`
-explicitly. It appears as the reason [dual-band panning](#dual-band-panning) normalizes the sub-700
-Hz band for amplitude, and as the reason [max-rE](#max-re)'s band-split variant leaves the low band
-untapered (`src/core/rt.c:2785`).
+The **velocity vector**, the amplitude-weighted (not energy-weighted) direction sum,
+`rV = sum(g_i u_i) / sum(g_i)`. It models low-frequency localization, where the ear reads summed
+pressure. The render path never computes it: it appears as the reason
+[dual-band panning](#dual-band-panning) normalizes the sub-700 Hz band for amplitude, as the reason
+[max-rE](#max-re)'s band-split variant leaves the low band untapered (`src/core/rt.c:2785`), and as
+what a two-band [imported bed decoder](#imported-bed-decoder)'s LF matrix is designed to match. The
+layout tool's `score_bed` does compute it, from the LF matrix of a two-band import and the one matrix
+otherwise, and reports `|rV|` (1 is ideal at the center) and the angle between rV and rE (Gerzon's
+criterion that the two cues agree) beside the [bed metric](#bed-metric).
 
 ## Ambisonics, beds and decoders
 
@@ -420,11 +427,21 @@ keeps the decode well-conditioned; VBAP absorbs the real array's irregularity. C
 load-time build only. Measured results:
 [spatialization.md](./spatialization.md#diffuse-bed-decode-allrad-versus-epad).
 
+### AmbDec
+
+Fons Adriaensen's ambisonic decoder program, and its plain-text preset format (`.ambdec`,
+version 3): a channel mask, one or two bands, the speakers by azimuth and elevation, and the
+matrices with per-order gains. The Ambisonic Decoder Toolbox writes it, which makes it the
+interchange format for an [imported bed decoder](#imported-bed-decoder).
+`tools/decoder/ambdec_to_json.py` converts one into the layout's `bed_decode` block. No official
+specification exists; the converter follows OpenAL Soft's reader.
+
 ### AmbiX and FuMa
 
-The two ambisonic file conventions `bwa_load_ambix` accepts. AmbiX is [ACN](#acn) ordering with
-[SN3D](#sn3d-and-n3d) normalization and is the engine's internal convention. FuMa is the older
-ordering and normalization. The engine converts it on load. See
+The two ambisonic file conventions the engine loads (`bwa_load_ambix`, `bwa_load_fuma`). AmbiX is
+[ACN](#acn) ordering with [SN3D](#sn3d-and-n3d) normalization and is the engine's internal
+convention. FuMa is the older ordering and normalization. The engine converts it on load. FuMa's
+`.amb` files also carry the [mixed-order](#mixed-order) sets; AmbiX has no such convention. See
 [api.md](./api.md#ambisonic-beds-control-thread).
 
 ### Ambisonic order
@@ -462,6 +479,12 @@ Directional audio coding (Pulkki). The analysis model behind the
 first-order in 4 coarse time-domain bands with one-pole crossovers at 200, 800 and 3200 Hz
 (`src/core/rt.c:92`) rather than through an STFT, which keeps it block-rate and latency-free.
 
+### Energy flatness
+
+How evenly a bed decode spreads loudness over direction: the coefficient of variation of the decoded
+energy `sum g^2` over the scored directions (0 = every direction equally loud). The layout tool
+prints it as `energy CV` beside the [bed metric](#bed-metric). [EPAD](#epad) is flat by construction.
+
 ### EPAD
 
 Energy-Preserving Ambisonic Decoding (Zotter, Pomberger and Noisternig 2012), the opt-in bed
@@ -481,14 +504,36 @@ spans the nadir with triangles of bottom-ring speakers, and downward diffuse ene
 them. A pole with a real speaker within 60 degrees is untouched; the default cube grid has a speaker
 at each pole.
 
+### Imported bed decoder
+
+A bed decode matrix designed outside the engine, typically in the Ambisonic Decoder Toolbox, carried
+in the layout file's `bed_decode` block and selected with `BWA_DECODE_LAYOUT`. One matrix per
+channel set (full order per order, `full1` to `full3`, plus optional [mixed-order](#mixed-order)
+sets), single- or two-band. It is **final**: the engine adds no [max-rE](#max-re) taper. A two-band
+one splits each SH channel with AmbDec's phase-matched crossover (two one-pole low-pass stages and a
+first-order allpass, the high band = allpass - low) and renders `HF*high + LF*low` at its own
+crossover. Produced from an [AmbDec](#ambdec) preset.
+See [spatialization.md](./spatialization.md#imported-decoders-bwa_decode_layout).
+
 ### max-rE
 
 A per-degree taper applied to the SH signal before the bed decode matrix, `w_l = P_l(r)` with `r`
 the largest zero of `P_{order+1}`, renormalized so diffuse energy matches the untapered decode
 (`src/spatial/ambisonics.c:61-72`). Trades a little directional sharpness for a smoother, more robust
-image away from the center. **Band-split max-rE** (`bwa_set_max_re_split`) tapers only above the
+image away from the center. Never applied to an [imported bed decoder](#imported-bed-decoder),
+whose designer already chose the per-order gains. **Band-split max-rE** (`bwa_set_max_re_split`) tapers only above the
 700 Hz crossover, leaving the [rV](#rv)-optimal plain decode below (`src/core/rt.c:2785`), the Gerzon
 split. Score a layout's [bed metric](#bed-metric) with the same setting the install ships.
+
+### Mixed order
+
+Ambisonic content whose horizontal resolution exceeds its vertical: the horizontal harmonics to
+order H plus the full set to order V, written `#H#V` (3H1V: third order horizontally, first order
+in height). The `.amb` (FuMa) format identifies six such sets by channel count (3, 5, 6, 7, 8, 11).
+The engine stores one in the slots of its highest order with zeros in the absent channels, and an
+[imported bed decoder](#imported-bed-decoder) can carry a matrix designed for it; a mixed-order
+decoder suits an array with sparse vertical coverage. See
+[api.md](./api.md#ambisonic-beds-control-thread).
 
 ### NFC-HOA
 

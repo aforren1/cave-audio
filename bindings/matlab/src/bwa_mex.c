@@ -1505,6 +1505,45 @@ CMD(bed_gains_batch)
     }
 }
 
+/* bwa_mex('bed_gains_layout', layout_path, decoder, channels, max_re, band, dirs) -> (N, ndir):
+ * the same grading against a LAYOUT FILE, so it sees an imported bed_decode (DECODE_LAYOUT).
+ * channels is [] for a 3rd-order full bed, 'full1'/'full2'/'full3' for a full bed of that order, else
+ * a mixed set name ('3H1V', ...). The C call
+ * has no engine, so its reason comes back through its own err buffer and becomes the error here. */
+CMD(bed_gains_layout)
+{
+    const char* cmd = "bed_gains_layout";
+    uint32_t ndir = 0, n;
+    char err[256] = { 0 };
+    char *path, *chans;
+    float* dp;
+    bwa_bed_decoder dec;
+    bool max_re;
+    uint32_t band;
+    (void)nlhs; need(nrhs, 6, cmd);
+    path   = get_str(prhs[0], cmd);
+    dec    = (bwa_bed_decoder)(int)get_u32(prhs[1], cmd);
+    chans  = get_str_or_null(prhs[2], cmd);
+    max_re = get_bool(prhs[3], cmd);
+    band   = get_u32(prhs[4], cmd);
+    dp     = get_xyz_rows(prhs[5], &ndir, cmd);
+    if (!dp) {
+        mxFree(path); if (chans) mxFree(chans);
+        mexErrMsgIdAndTxt("bwa:usage", "bwa_mex('bed_gains_layout'): dirs must be a non-empty (n,3) array.");
+    }
+    n = bwa_bed_gains_layout(path, dec, chans, max_re, band, NULL, 0, NULL, 0, err, sizeof err);
+    if (n) {
+        /* out[i*N + s]: direction i's N gains contiguously = an (N, ndir) column-major matrix */
+        mxArray* out = mxCreateNumericMatrix((mwSize)n, (mwSize)ndir, mxSINGLE_CLASS, mxREAL);
+        if (bwa_bed_gains_layout(path, dec, chans, max_re, band, dp, ndir, (float*)mxGetData(out),
+                                 n * ndir, err, sizeof err) == 0) {
+            mxDestroyArray(out); n = 0;
+        } else plhs[0] = out;
+    }
+    mxFree(path); if (chans) mxFree(chans); mxFree(dp);
+    if (!n) mexErrMsgIdAndTxt("bwa:bed_gains_layout", "%s", err[0] ? err : "bwa_bed_gains_layout failed");
+}
+
 /* ------------------------------------------------------------------ listener and tracking */
 
 CMD(set_listener_pose)
@@ -1603,7 +1642,7 @@ CMD(constants)
         "SINK_FLAG_EXCLUSIVE", "SINK_FLAG_EXACT_RATE", "SINK_FLAG_TIGHT_BUFFER",
         "ROOM_AHEAD", "ROOM_UP", "ROOM_RIGHT",
         "PROFILE_CAVE", "PROFILE_BINAURAL", "PROFILE_CAVE_SIM", "PROFILE_CAVE_BOTH",
-        "DECODE_DEFAULT", "DECODE_ALLRAD", "DECODE_EPAD",
+        "DECODE_DEFAULT", "DECODE_ALLRAD", "DECODE_EPAD", "DECODE_LAYOUT",
         "SINK_AUTO", "SINK_ASIO", "SINK_NULL", "SINK_MANUAL", "SINK_WASAPI", "SINK_COREAUDIO",
         "SINK_ALSA", "SINK_AAUDIO", "SINK_JACK",
         "OK", "ERR_CONFIG", "ERR_DEVICE", "ERR_LAYOUT", "ERR_HRTF", "ERR_STATE", "ERR_INTERNAL",
@@ -1647,6 +1686,7 @@ CMD(constants)
     sf_dbl(s, "DECODE_DEFAULT", BWA_DECODE_DEFAULT);
     sf_dbl(s, "DECODE_ALLRAD", BWA_DECODE_ALLRAD);
     sf_dbl(s, "DECODE_EPAD", BWA_DECODE_EPAD);
+    sf_dbl(s, "DECODE_LAYOUT", BWA_DECODE_LAYOUT);
     sf_dbl(s, "SINK_AUTO", BWA_SINK_AUTO);
     sf_dbl(s, "SINK_ASIO", BWA_SINK_ASIO);
     sf_dbl(s, "SINK_NULL", BWA_SINK_NULL);
@@ -1776,7 +1816,7 @@ static const bwa_cmd_entry g_cmds[] = {
     ENT(set_limiter), ENT(set_limiter_ceiling), ENT(load_headphone_eq), ENT(set_headphone_eq),
     ENT(set_bed_renderer), ENT(set_tracked_room_eq), ENT(set_tracked_directivity), ENT(set_tracked_align),
     ENT(set_tracked_align_guards), ENT(tuning_preset), ENT(apply_tuning), ENT(get_tuning),
-    ENT(panner_gains_batch), ENT(bed_gains_batch),
+    ENT(panner_gains_batch), ENT(bed_gains_batch), ENT(bed_gains_layout),
     /* listener and tracking */
     ENT(set_listener_pose), ENT(get_listener_pose), ENT(tracker_connect),
     ENT(tracker_disconnect), ENT(tracker_status), ENT(set_pose_prediction),

@@ -4,6 +4,19 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: imported bed decoders (`BwaBedDecoder.Layout`, `bwa_bed_gains_layout`)
+
+`BwaBedDecoder.Layout = 3` decodes ambisonic beds through a matrix designed elsewhere and carried in
+the layout file's `bed_decode` block: the Ambisonic Decoder Toolbox writes an AmbDec preset, and
+`tools/decoder/ambdec_to_json.py` converts it into the layout. Two-band (with AmbDec's phase-matched
+crossover), per-order full (`full1` to `full3`) and mixed-order decoders are supported. The matrix
+is final, so `maxRe` and `maxReSplit` have no effect on a bed it decodes. A layout without the
+block makes `Engine` fail to start (the reason is in the log). Mixed-order FuMa beds (3, 5, 6, 7, 8
+and 11 channels) now load. `Bwa.bwa_bed_gains_layout` is bound: it grades a layout file's own
+decode, imported matrix included. `bwa_bed_gains_batch` takes speaker positions, not a file, so it
+returns 0 for `BwaBedDecoder.Layout`. It is a new export, so this package needs a DLL that carries
+it.
+
 ## [0.18.0]
 
 ### Fixed: `Engine` refused to start against its own DLL

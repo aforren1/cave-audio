@@ -52,6 +52,13 @@ extern "C" {
 #include <windows.h>       /* Sleep */
 #include <conio.h>         /* _kbhit/_getch for --live */
 #endif
+#ifdef _WIN32
+#include <io.h>            /* _isatty: the omni --live writes a log when stdout is not a console */
+#define cal_stdout_tty() _isatty(_fileno(stdout))
+#else
+#include <unistd.h>
+#define cal_stdout_tty() isatty(fileno(stdout))
+#endif
 
 /* local aliases for the shared sweep geometry (the rest of this file predates the extraction) */
 static const double FS         = CAL_FS;
@@ -1365,6 +1372,7 @@ int main(int argc, char** argv) {
     int    ref_spk = -1; double ref_dist = 0.0;               /* --ref: one tape-measured distance -> latency */
     const char* ref_spk_list = NULL;                          /* --ref-speakers 2,6,18: measured positions -> latency */
     int    sim_lat_spk[8]; double sim_lat_s[8]; int nsim_lat = 0;   /* --sim-speaker-latency spk,ms (repeatable) */
+    int    sim_step_row = 0; double sim_step_s = 0.0;               /* --sim-latency-step row,ms */
     const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
@@ -1423,6 +1431,18 @@ int main(int argc, char** argv) {
             for (int k = 0; k < nsim_lat; ++k)
                 if (sim_lat_spk[k] == (int)sp) { fprintf(stderr, "calibrate: --sim-speaker-latency names speaker %ld twice\n", sp); return 2; }
             sim_lat_spk[nsim_lat] = (int)sp; sim_lat_s[nsim_lat] = ms * 1e-3; ++nsim_lat;
+        }
+        else if (!strcmp(argv[i],"--sim-latency-step") && i+1<argc) {   /* "3,0.2": from mic row 3 on, 0.2 ms later */
+            const char* q = argv[++i];
+            char* end = NULL;
+            const long row = strtol(q, &end, 10);
+            double ms = 0.0;
+            int ok = end != q && *end == ',' && row >= 2 && row <= CALIB_LOC_MAX_ROWS;
+            if (ok) { q = end + 1; ms = strtod(q, &end); ok = end != q && *end == 0 && ms >= -20.0 && ms <= 20.0 && ms != 0.0; }
+            if (!ok) {
+                fprintf(stderr, "calibrate: --sim-latency-step wants row,ms with row 2 or later (rows count from 1) and ms in\n"
+                                "           [-20, 20] and not 0 (got %s)\n", argv[i]); return 2; }
+            sim_step_row = (int)row; sim_step_s = ms * 1e-3;
         }
         else if (!strcmp(argv[i],"--survey") && i+1<argc)  survey_path = argv[++i]; /* --zylia: capsule self-survey (room axes) */
         else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
@@ -1561,7 +1581,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
                                "  --zylia: the mic is a ZM-1; --input is the FIRST of its 19 consecutive capture channels,\n"
                                "  --mic is the array center. Alone it is the single-placement position survey: distances\n"
                                "  need --latency (loopback, m at c) or --ref <spk> <m> (one tape-measured center->speaker\n"
@@ -1576,6 +1596,8 @@ int main(int argc, char** argv) {
                                "  with no unflagged majority nothing is used (exit 6). A layout speaker with no plan_position,\n"
                                "  or one equal to its position, is warned about: nothing ever measured it.\n"
                                "  --sim-speaker-latency spk,ms (simulate, repeatable): that speaker plays ms later than the rest.\n"
+                               "  --sim-latency-step row,ms (simulate, --localize): from mic row `row` on (counted from 1), every\n"
+                               "  speaker plays ms later: a Dante Via re-sync mid-run, which the per-row latency must absorb.\n"
                                "  --zylia --trims measures the trims with it, --zylia --verify the second pass,\n"
                                "  both through a pressure proxy (the power mean over the capsules, the center arrival).\n"
                                "  --verify: sweep every speaker THROUGH the layout's output stage (gain, delay, eq, room_eq)\n"
@@ -1688,6 +1710,9 @@ int main(int argc, char** argv) {
     if (nsim_lat && !simulate) {
         fprintf(stderr, "calibrate: --sim-speaker-latency is a --simulate knob: a real box's Dante latency is set in Dante\n"
                         "           Controller\n"); return 2; }
+    if (sim_step_row && (!simulate || !localize_file)) {
+        fprintf(stderr, "calibrate: --sim-latency-step is a --simulate knob for --localize: it steps the latency between\n"
+                        "           its mic rows\n"); return 2; }
     if (drop_outliers && !csurvey_out) {
         fprintf(stderr, "calibrate: --drop-outliers drops the speakers the --capsule-survey's leave-one-out flags\n"); return 2; }
     if (track_sim_off_set && !track_sim) {
@@ -2088,6 +2113,14 @@ int main(int argc, char** argv) {
 #endif
             return 1;
         }
+        if (sim_step_row > K) {   /* a step past the last row never happens, and the run would read as held */
+            fprintf(stderr, "calibrate: --sim-latency-step row %d: %s has %d mic rows (rows count from 1)\n",
+                    sim_step_row, localize_file, K);
+#ifdef BWA_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            return 2;
+        }
         printf("localize: %d mic positions, %d speakers each\n", K, n);
         double* range = (double*)malloc((size_t)n * K * sizeof(double));
         float*  tilt  = (float*)calloc((size_t)n * K, sizeof(float));   /* --check-aim: high/mid tilt per capture */
@@ -2133,6 +2166,11 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             } else if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
+            if (sim_step_row && k + 1 == sim_step_row) {
+                calib_sim_set_latency_step(sim_step_s);
+                printf("localize: simulate: from row %d on, every speaker plays %+.3f ms later (--sim-latency-step)\n",
+                       k + 1, sim_step_s * 1e3);
+            }
             for (int s = 0; s < n; ++s) {
                 MeasureResult r;
                 if (zylia && simulate) {   /* the physical array as it is turned right now, at the stand's TRUE center */
@@ -2174,21 +2212,173 @@ int main(int argc, char** argv) {
                 printf("  pos %2d: (%+.4f %+.4f %+.4f)  [%+.3f %+.3f %+.3f]\n", k + 1, micpos[k][0], micpos[k][1], micpos[k][2],
                        planned[k][0], planned[k][1], planned[k][2]);
         }
+        /* The positions. First each speaker alone (calib_trilaterate, linear, its own latency): it needs no
+         * start, and it is the fallback. Then every speaker in one solve with ONE LATENCY PER MIC ROW
+         * (calib_localize_joint): the ZM-1 reaches the Digiface through Dante Via, which bridges the ZM-1's
+         * own clock onto Dante's, and nothing promises the latency through that bridge holds still for a
+         * whole run. Per row, each row only has to hold still while its speakers are swept. The joint solve
+         * runs from TWO starts, the per-speaker answers and the layout's positions, and keeps the converged
+         * one with the smaller residual: a latency that moved between rows throws the per-speaker solve
+         * meters off (it trades the step into the radius; calib_test), and the plan is the better start
+         * then. */
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
-        double* latv = (double*)malloc((size_t)n * sizeof(double));
-        int failed = 0;
+        float (*lin)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        float (*trial)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        unsigned char* solved = (unsigned char*)calloc((size_t)n, 1);
+        unsigned char* cuse = (unsigned char*)malloc((size_t)n * K);      /* the captures the joint solve uses */
+        memset(cuse, 1, (size_t)n * K);
+        double* linlat = (double*)calloc((size_t)n, sizeof(double));
+        double* resid  = (double*)calloc((size_t)n * K, sizeof(double));
+        double* tres   = (double*)calloc((size_t)n * K, sizeof(double));
+        double rowlat[CALIB_LOC_MAX_ROWS], tlat[CALIB_LOC_MAX_ROWS];
+        int nsolved = 0;
         for (int s = 0; s < n; ++s) {
-            double lat = 0;
-            latv[s] = -1.0;
-            if (!calib_trilaterate(&range[(size_t)s * K], micpos, K, pos[s], &lat)) {
-                /* keep what the file already says rather than write the floor origin over it: (0,0,0)
-                 * is a confident-looking position the engine would then render from */
+            /* an unsolved speaker keeps what the file already says rather than get the floor origin: (0,0,0)
+             * is a confident-looking position the engine would then render from */
+            memcpy(pos[s], L.speakers[s].pos, sizeof pos[s]);
+            solved[s] = (unsigned char)calib_trilaterate(&range[(size_t)s * K], micpos, K, lin[s], &linlat[s]);
+            nsolved += solved[s];
+            if (!solved[s])
                 fprintf(stderr, "  spk %2d: trilateration failed (degenerate mic positions?); its position is left as it was\n", s);
-                memcpy(pos[s], L.speakers[s].pos, sizeof pos[s]); ++failed;
-            } else {
-                printf("  spk %2d: pos=(%+.3f %+.3f %+.3f)  [system latency %.3f m]\n", s, pos[s][0], pos[s][1], pos[s][2], lat);
-                latv[s] = lat;
+        }
+        const int failed = n - nsolved;
+        /* the joint solve over the captures in cuse, from both starts; the converged one with the smaller
+         * residual (over those captures: a dropped one's residual is large on purpose) lands in pos, rowlat
+         * and resid. Returns the latencies solved, 0 when neither start converged (nothing touched). */
+        auto joint = [&](int pr) -> int {
+            int nl = 0;
+            double best = INFINITY;
+            for (int st = 0; st < 2; ++st) {
+                for (int s = 0; s < n; ++s) memcpy(trial[s], st == 0 ? lin[s] : L.speakers[s].pos, sizeof trial[s]);
+                if (!calib_localize_joint(range, micpos, K, n, solved, cuse, pr, trial, tlat, tres)) continue;
+                double ss = 0.0;
+                for (size_t i = 0; i < (size_t)n * K; ++i) if (cuse[i]) ss += tres[i] * tres[i];
+                if (ss < best) {
+                    best = ss;
+                    for (int s = 0; s < n; ++s) if (solved[s]) memcpy(pos[s], trial[s], sizeof pos[s]);
+                    nl = pr ? K : 1;
+                    memcpy(rowlat, tlat, (size_t)nl * sizeof(double));
+                    memcpy(resid, tres, (size_t)n * K * sizeof(double));
+                }
             }
+            return nl;
+        };
+        /* per row needs 4 speakers; under that, or when it does not converge, ONE latency for the run is
+         * still a joint fit and still beats the per-speaker answers. Neither one checks the latency held. */
+        const char* unchecked = NULL;
+        int nlat = nsolved >= 4 ? joint(1) : 0;             /* latencies in rowlat: K per row, 1, or 0 */
+        if (nlat == 0 && nsolved > 0) {
+            unchecked = nsolved < 4 ? "fewer than 4 speakers solved, so one latency for the run"
+                                    : "the per-row solve did not converge, so one latency for the run";
+            nlat = joint(0);
+        }
+        if (nlat == 0 && nsolved > 0) {
+            /* the joint solve did not converge at all: the per-speaker answers, flagged */
+            unchecked = "the joint solve did not converge, so each speaker's own solve";
+            printf("localize: WARNING: the joint solve did not converge; writing each speaker's own solve, which assumes the\n"
+                   "          latency held for the whole run\n");
+            for (int s = 0; s < n; ++s) if (solved[s]) memcpy(pos[s], lin[s], sizeof pos[s]);
+        }
+        /* One bad capture shows only PART of its error in its own residual: the fit spends the rest on that
+         * speaker's position and that row's latency, which every speaker in the row shares (calib_test: 40 mm
+         * late leaves 17.6 mm). So the worst capture past the flag is dropped and the solve runs again
+         * without it, where its residual reads the whole error. ONE drop, the capsule survey's rule: a second
+         * capture past the flag after it says more than one is bad, so the rest is no longer known to be
+         * consistent, and the run reports it rather than pick among captures it cannot tell apart. */
+        int drop_i = -1;
+        if (nlat > 0) {
+            int wi = -1;
+            for (int s = 0; s < n; ++s)
+                if (solved[s])
+                    for (int k = 0; k < K; ++k) {
+                        const int i = s * K + k;
+                        if (wi < 0 || fabs(resid[i]) > fabs(resid[wi])) wi = i;
+                    }
+            if (wi >= 0 && fabs(resid[wi]) > CALIB_LOC_RESID_FLAG_M) {
+                const double first = resid[wi];
+                cuse[wi] = 0;
+                if (joint(nlat > 1 ? 1 : 0)) {
+                    drop_i = wi;
+                    printf("localize: dropped speaker %d's capture at row %d: %+.1f mm off the solve, past the %.0f mm flag.\n"
+                           "          Solved again without it; against that solve it is %+.1f mm off\n",
+                           wi / K, wi % K + 1, first * 1e3, CALIB_LOC_RESID_FLAG_M * 1e3, resid[wi] * 1e3);
+                } else {
+                    cuse[wi] = 1;
+                    printf("localize: speaker %d's capture at row %d is %+.1f mm off the solve, past the %.0f mm flag, but the\n"
+                           "          solve without it did not converge (that speaker or that row is left under 4 captures): kept\n",
+                           wi / K, wi % K + 1, first * 1e3, CALIB_LOC_RESID_FLAG_M * 1e3);
+                }
+            }
+        }
+        int nflag = 0;
+        for (int s = 0; s < n; ++s) {
+            if (!solved[s]) continue;
+            if (nlat == 0) {
+                printf("  spk %2d: pos=(%+.3f %+.3f %+.3f)  [its own latency %.3f m]\n", s, pos[s][0], pos[s][1], pos[s][2], linlat[s]);
+                continue;
+            }
+            double ss = 0.0; int wk = -1, nu = 0;
+            for (int k = 0; k < K; ++k) {
+                if (!cuse[(size_t)s * K + k]) continue;
+                const double e = resid[(size_t)s * K + k];
+                ss += e * e; ++nu;
+                if (wk < 0 || fabs(e) > fabs(resid[(size_t)s * K + wk])) wk = k;
+            }
+            const double worst = resid[(size_t)s * K + wk];
+            const int flag = fabs(worst) > CALIB_LOC_RESID_FLAG_M;
+            nflag += flag;
+            char dn[64] = "";
+            if (drop_i >= 0 && drop_i / K == s)
+                snprintf(dn, sizeof dn, " [row %d dropped, %+.1f mm off]", drop_i % K + 1, resid[drop_i] * 1e3);
+            printf("  spk %2d: pos=(%+.3f %+.3f %+.3f)  [residual rms %.1f mm, worst %+.1f mm at row %d]%s%s\n", s,
+                   pos[s][0], pos[s][1], pos[s][2], sqrt(ss / nu) * 1e3, worst * 1e3, wk + 1, dn,
+                   flag ? "   <- FLAGGED: a reflection taken for the direct sound, or the mic moved during that row" : "");
+        }
+        if (nflag && drop_i >= 0)
+            printf("localize: WARNING: after the drop, %d speaker(s) still carry a capture more than %.0f mm off the solve.\n"
+                   "          The run drops one capture: a second outlier means more than one is bad, so the rest is no\n"
+                   "          longer known to be consistent. Re-take those rows, or check those boxes\n",
+                   nflag, CALIB_LOC_RESID_FLAG_M * 1e3);
+        else if (nflag)
+            printf("localize: %d speaker(s) carry a capture more than %.0f mm off the solve: re-take that row, or check the box\n",
+                   nflag, CALIB_LOC_RESID_FLAG_M * 1e3);
+        /* the run's latency: the median over the rows (or over the per-speaker solves, on the fallback) */
+        double med_m = 0.0;
+        {
+            std::vector<double> v;
+            if (nlat > 0) v.assign(rowlat, rowlat + nlat);
+            else for (int s = 0; s < n; ++s) if (solved[s]) v.push_back(linlat[s]);
+            if (!v.empty()) {
+                std::sort(v.begin(), v.end());
+                const size_t h = v.size() / 2;
+                med_m = (v.size() & 1) ? v[h] : 0.5 * (v[h - 1] + v[h]);
+                printf("localize: system latency %.4f m (%.3f ms), the median over %s\n", med_m, med_m / sos * 1e3,
+                       nlat > 1 ? "the mic rows" : nlat == 1 ? "the run (one latency)" : "the speakers' own solves");
+            }
+        }
+        if (nlat > 1) {
+            double lo = rowlat[0], hi = rowlat[0];
+            printf("localize: each row's latency against the median, us:");
+            for (int k = 0; k < nlat; ++k) {
+                printf(" %+.1f", (rowlat[k] - med_m) / sos * 1e6);
+                if (rowlat[k] < lo) lo = rowlat[k];
+                if (rowlat[k] > hi) hi = rowlat[k];
+            }
+            const double spread_s = (hi - lo) / sos;
+            printf("\n");
+            if (spread_s < CALIB_ROW_LAT_STEADY_S)
+                printf("localize: the latency held: %.1f us spread across the %d rows (under %.0f us)\n",
+                       spread_s * 1e6, nlat, CALIB_ROW_LAT_STEADY_S * 1e6);
+            else
+                printf("localize: WARNING: the latency MOVED %.1f us across the run (max - min over the rows; %.0f us counts as\n"
+                       "          held). Each row solved its own latency, so the positions hold. A latency carried from this run\n"
+                       "          into another does not: measure it in that run (--ref-speakers), and check the Dante Via leg\n"
+                       "          (docs/hardware-validation.md, Stage 0)\n", spread_s * 1e6, CALIB_ROW_LAT_STEADY_S * 1e6);
+        } else if (unchecked) {
+            /* the Session tab carries a latency only past "the latency held", so this one stays in this run */
+            printf("localize: the latency was not checked for movement (%s): a latency that moved\n"
+                   "          between rows is not seen, lands in the positions, and is no value to carry into another run\n",
+                   unchecked);
         }
 #ifdef BWA_HAVE_ASIO
         /* Cross-check the solved latency against the driver's own numbers: the solve recovers the
@@ -2196,16 +2386,10 @@ int main(int argc, char** argv) {
          * solved-minus-driver must be positive. Negative is physically impossible (device mix-up,
          * clocking). How large it may be depends on the mic (calib_latency_check): a few ms for an
          * omni, where tens of ms point at an unexpected buffer, and with the ZM-1 the Dante Via leg the
-         * driver never reports, tens of ms on a CORRECT run, up to the arrival window's own allowance.
-         * Median over speakers — per-speaker latency should agree, it is one system. */
+         * driver never reports, tens of ms on a CORRECT run, up to the arrival window's own allowance. */
         { long il = 0, ol = 0;
-          if (!simulate && calib_asio_latencies(&il, &ol)) {
-              double lats[BWA_MAX_CHANNELS]; int nl = 0;
-              for (int s = 0; s < n; ++s) if (latv[s] >= 0.0) lats[nl++] = latv[s];
-              if (nl > 0) {
-                  for (int a = 1; a < nl; ++a) { double v = lats[a]; int b = a;   /* tiny insertion sort */
-                      while (b > 0 && lats[b-1] > v) { lats[b] = lats[b-1]; --b; } lats[b] = v; }
-                  double med_m = (nl & 1) ? lats[nl/2] : 0.5 * (lats[nl/2 - 1] + lats[nl/2]);
+          if (!simulate && nsolved > 0 && calib_asio_latencies(&il, &ol)) {
+              {
                   double drv_m = sos * (double)(il + ol) / FS;
                   double resid_s = 0.0;
                   const int lc = calib_latency_check(zylia, med_m / sos, drv_m / sos, &resid_s);
@@ -2236,7 +2420,7 @@ int main(int argc, char** argv) {
              * or a model that does not fit these boxes, and it is not an aim error. */
             static Layout LA;                                /* never a stack local (layout.h) */
             LA = L;
-            for (int s = 0; s < n; ++s) if (latv[s] >= 0.0) memcpy(LA.speakers[s].pos, pos[s], sizeof pos[s]);
+            for (int s = 0; s < n; ++s) if (solved[s]) memcpy(LA.speakers[s].pos, pos[s], sizeof pos[s]);
             printf("check-aim: fitted acoustic axis per speaker (tilt = direct-sound high/mid level, %.0f-%.0f Hz\n"
                    "           against %.0f Hz up, dB; %d positions)\n", AIM_BAND_HZ[0], AIM_BAND_HZ[1], AIM_BAND_HZ[1], K);
             printf("           spk  spread  rms@layout  rms@fit   aim error  fitted aim                whole-resp\n");
@@ -2298,7 +2482,7 @@ int main(int argc, char** argv) {
         }
         free(tilt);
         free(tiltw);
-        free(latv);
+        free(lin); free(trial); free(solved); free(cuse); free(linlat); free(resid); free(tres);
         int nplan = 0;
         if (!calib_write_positions(layout_path, out_path, pos, n, &nplan, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         record_sos(out_path, sos);
@@ -2600,6 +2784,12 @@ int main(int argc, char** argv) {
                      sos * (double)(il + ol) / FS); }
 #endif
         int iters = sweeps > 0 ? sweeps : (simulate ? 4 : (1 << 30));
+        /* Redirected (the Stage 0 Via-latency log), a reading per line with its time: one \r-overwritten
+         * line in a file is unreadable, and a drift is only a drift against a clock. 0.1 mm, because the
+         * log is read for sub-millimeter movement where the console is read for centimeters. */
+        const bool as_log = !cal_stdout_tty();
+        const auto t0 = std::chrono::steady_clock::now();
+        auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
         for (int t = 0; t < iters; ++t) {
             if (simulate) calib_sim_capture(live_speaker, &L, mic, sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
@@ -2619,17 +2809,24 @@ int main(int argc, char** argv) {
             if (qc != CALIB_SWEEP_OK) {
                 char why[240];
                 calib_sweep_why(&r, qc, FS, why, sizeof why);
-                printf("\r  reading skipped: %s\n", why);
+                if (as_log) printf("%9.2f s  reading skipped: %s\n", elapsed(), why);
+                else     printf("\r  reading skipped: %s\n", why);
+                fflush(stdout);
                 continue;
             }
             double range = ((double)r.delay_samples + r.delay_frac) * sos / FS;
-            if (known_latency >= 0.0)
+            if (as_log && known_latency >= 0.0)
+                printf("%9.2f s  distance %.4f m  target %.4f m  delta %+.1f mm\n", elapsed(), range - known_latency, target,
+                       (range - known_latency - target) * 1e3);
+            else if (as_log)
+                printf("%9.2f s  range %.4f m\n", elapsed(), range);
+            else if (known_latency >= 0.0)
                 printf("\r  distance %.3f m   target %.3f   delta %+.1f cm        ", range - known_latency, target, (range - known_latency - target) * 100.0);
             else
                 printf("\r  range %.3f m (distance + latency; pass --latency m for absolute)        ", range);
             fflush(stdout);
         }
-        printf("\n");
+        if (!as_log) printf("\n");
 #ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif

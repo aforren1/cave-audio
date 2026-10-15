@@ -6,6 +6,7 @@
 #include "core/sound.h"
 #include "core/rt.h"          /* BWA_MAX_SAMPLE: the file-sample cap (see scrub_samples) */
 #include "os/os.h"        /* os_strcasecmp: the extension sniff */
+#include "spatial/ambiset.h" /* mixed-order FuMa channel sets */
 
 #include <math.h>
 #include <stdlib.h>
@@ -222,6 +223,26 @@ static float fuma_sn3d(int i) {
     return 0.79056942f;                                    /* P Q: sqrt(5/8) */
 }
 
+/* The .amb MIXED-order sets, by channel count (Dobson 2001, "The AMB Ambisonic File Format",
+ * people.bath.ac.uk/masrwd/bformat.html: channels are always interleaved WXYZ,RSTUV,KLMNOPQ with
+ * the unused ones omitted, so the count alone identifies the set). `fuma` lists the FuMa letter
+ * (index into fuma_acn / fuma_sn3d: W=0 X=1 Y=2 Z=3 R=4 S=5 T=6 U=7 V=8 K=9 .. P=14 Q=15) each file
+ * channel carries, in file order. 1, 2 (W, WY) are not beds and stay refused. */
+typedef struct { unsigned int nch; int set; int order; int fuma[11]; } FumaMixed;
+static const FumaMixed fuma_mixed[] = {
+    {  3, AMBI_SET_1H,   1, { 0, 1, 2 } },                            /* W X Y */
+    {  5, AMBI_SET_2H,   2, { 0, 1, 2, 7, 8 } },                      /* W X Y U V */
+    {  6, AMBI_SET_2H1V, 2, { 0, 1, 2, 3, 7, 8 } },                   /* W X Y Z U V */
+    {  7, AMBI_SET_3H,   3, { 0, 1, 2, 7, 8, 14, 15 } },              /* W X Y U V P Q */
+    {  8, AMBI_SET_3H1V, 3, { 0, 1, 2, 3, 7, 8, 14, 15 } },           /* W X Y Z U V P Q */
+    { 11, AMBI_SET_3H2V, 3, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15 } },  /* W X Y Z R S T U V P Q */
+};
+static const FumaMixed* fuma_mixed_for(unsigned int nch) {
+    for (size_t i = 0; i < sizeof fuma_mixed / sizeof fuma_mixed[0]; ++i)
+        if (fuma_mixed[i].nch == nch) return &fuma_mixed[i];
+    return NULL;
+}
+
 static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap, int fuma) {
     memset(out, 0, sizeof *out);
     if (!path) { set_err(err, errcap, "ambix: null path"); return false; }
@@ -233,15 +254,37 @@ static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char*
     if (frames == 0)          { free(inter); set_err(err, errcap, "ambix: empty file"); return false; }
     if (rate == 0)            { free(inter); set_err(err, errcap, "ambix: invalid sample rate (0)"); return false; }
     if (rate < 1000 || rate > 1000000) { free(inter); set_err(err, errcap, "ambix: implausible sample rate (must be 1 kHz .. 1 MHz)"); return false; }
-    if (channels != 4 && channels != 9 && channels != 16) {
-        free(inter); set_err(err, errcap, fuma ? "fuma: channel count must be 4, 9, or 16 (full 3D 1st/2nd/3rd order)"
-                                               : "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)");
+    const int full = (channels == 4 || channels == 9 || channels == 16);
+    const FumaMixed* mixed = (fuma && !full) ? fuma_mixed_for(channels) : NULL;
+    if (!full && !mixed) {
+        free(inter);
+        set_err(err, errcap, fuma ? "fuma: channel count must be 4, 9 or 16 (full 3D), or a mixed-order .amb set: "
+                                    "3 (1H), 5 (2H), 6 (2H1V), 7 (3H), 8 (3H1V), 11 (3H2V)"
+                                  : "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order). AmbiX has no "
+                                    "mixed-order convention: load mixed-order content as FuMa, or pad it to a full set");
         return false;
     }
-    uint16_t order = (channels == 4) ? 1 : (channels == 9) ? 2 : 3;
     scrub_samples(inter, frames * channels);               /* NaN/Inf/absurd out before the SH math */
 
-    if (fuma) {                                            /* reorder + rescale each frame in place */
+    uint8_t chset = AMBI_SET_FULL;
+    if (mixed) {                                           /* scatter into the full (order+1)^2 ACN slots */
+        const unsigned int slots = (unsigned int)((mixed->order + 1) * (mixed->order + 1));
+        float* wide = (float*)malloc((size_t)frames * slots * sizeof(float));
+        if (!wide) { free(inter); set_err(err, errcap, "fuma: out of memory (mixed-order expand)"); return false; }
+        for (uint64_t i = 0; i < frames; ++i) {
+            const float* f = inter + i * channels;
+            float* w = wide + i * slots;
+            memset(w, 0, slots * sizeof(float));
+            for (unsigned int k = 0; k < channels; ++k) {
+                const int fi = mixed->fuma[k];             /* the FuMa letter this file channel carries */
+                w[fuma_acn[fi]] = f[k] * fuma_sn3d(fi);
+            }
+        }
+        free(inter);
+        inter = wide;
+        channels = slots;
+        chset = (uint8_t)mixed->set;
+    } else if (fuma) {                                     /* reorder + rescale each frame in place */
         float tmp[16];
         for (uint64_t i = 0; i < frames; ++i) {
             float* f = inter + i * channels;
@@ -249,6 +292,7 @@ static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char*
             memcpy(f, tmp, channels * sizeof(float));
         }
     }
+    uint16_t order = (channels == 4) ? 1 : (channels == 9) ? 2 : 3;
 
     if (rate != want_rate) {                          /* resample each SH channel to the engine rate */
         uint64_t nout = 0;
@@ -264,6 +308,7 @@ static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char*
     out->sample_rate = want_rate;
     out->channels = (uint16_t)channels;
     out->order = order;
+    out->chset = chset;
     return true;
 }
 
@@ -283,4 +328,5 @@ void sound_unload(SoundData* s) {
     s->sample_rate = 0;
     s->channels = 0;
     s->order = 0;
+    s->chset = 0;
 }

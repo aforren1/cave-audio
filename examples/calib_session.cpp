@@ -717,18 +717,20 @@ void ses_finish(Session* S, int k, int exit_code, const std::string& out, bool c
         P.summary = last_line_with(out, "summary: ");
         break;
     case SES_LOCALIZE: {
-        /* the per-speaker solves each carry the system latency; their median is the run's */
-        std::vector<double> lat;
-        for (size_t from = 0, p; (p = out.find("[system latency ", from)) != std::string::npos; from = p + 1) {
-            double m;
-            if (sscanf(out.c_str() + p + 16, "%lf", &m) == 1) lat.push_back(m);
-        }
-        if (!lat.empty()) {
-            std::sort(lat.begin(), lat.end());
-            const size_t h = lat.size() / 2;
-            P.latency_m = (lat.size() & 1) ? lat[h] : 0.5 * (lat[h - 1] + lat[h]);
-            P.have_latency = true;
-            snprintf(b, sizeof b, "system latency %.3f m (median of %d speakers)", P.latency_m, (int)lat.size());
+        /* the run's latency is the median over its mic rows, carried only when the run says it HELD. One
+         * that moved between rows was absorbed row by row, but a later step would inherit whichever value
+         * it got; one never checked (one latency for the run, or the per-speaker fallback) may have moved
+         * unseen. Keyed on the positive line, so a run that prints neither carries nothing. */
+        P.have_latency = false;                             /* a re-run never inherits the last run's */
+        if (last_nums(out, "localize: system latency ", "%lf", v, 1)) {
+            const bool held = out.find("localize: the latency held") != std::string::npos;
+            const bool moved = out.find("the latency MOVED") != std::string::npos;
+            P.latency_m = v[0];
+            P.have_latency = held && !moved;
+            snprintf(b, sizeof b, "system latency %.3f m%s", v[0],
+                     P.have_latency ? ""
+                     : moved ? " (MOVED across the rows: not carried to the later steps)"
+                             : " (not checked for movement: not carried to the later steps)");
             P.summary = b;
         }
         /* the rig: the solved latency against the driver's own loop (the runbook's "residual sane"). The

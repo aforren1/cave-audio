@@ -53,8 +53,10 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   live engine-wide parameter (underwater, slow motion).
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
   files, push sources that take your own PCM into the engine (`bwa_source_push`, a source
-  feed, never a render path), and AmbiX or FuMa ambisonic beds decoded world-locked to the
-  array: a matrix decode (AllRAD or EPAD) or a parametric renderer whose direct stream re-pans
+  feed, never a render path), and AmbiX or FuMa ambisonic beds (FuMa's mixed-order sets too)
+  decoded world-locked to the array: a matrix decode (AllRAD, EPAD, or a two-band or
+  mixed-order decoder imported from the Ambisonic Decoder Toolbox through the layout's
+  `bed_decode`) or a parametric renderer whose direct stream re-pans
   listener-relative (`bwa_set_bed_renderer`), with an orientation to line a capture up with
   the scene (`bwa_bed_set_orientation`). Two ownership tiers:
   explicit load/unload, and a refcounted by-path cache (`bwa_sound_acquire`,
@@ -91,7 +93,8 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   listener-pose readbacks,
   offline panner and bed-decode evaluation for layout tools
   (`bwa_panner_gains_batch`, which also takes SPCAP's focus and density knobs so a
-  layout can be graded at the tuning it ships with, and `bwa_bed_gains_batch`).
+  layout can be graded at the tuning it ships with, `bwa_bed_gains_batch`, and
+  `bwa_bed_gains_layout`, which grades a layout file's own decode, imported matrix included).
 
 ## Quickstart
 
@@ -746,7 +749,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). Three backends read it differently: JACK takes a port regular expression, AAudio a decimal Android device id, and the worklet sink a decimal AudioContext handle (see [Sink policy](#sink-policy)). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
-| `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
+| `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1), EPAD (2), or LAYOUT (3, the layout file's imported `bed_decode`) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
 | `sink_flags`     | `BWA_SINK_FLAG_*` backend options for the PRIMARY device (they do not reach the `cave_both` monitor); 0 is the default, every bit opt-in. The flags and what each backend does: [Latency classes](#latency-classes) |
 | `reserved[3]`    | zero; room to grow without an ABI break                             |
 
@@ -1595,15 +1598,22 @@ world-fixed too, so the real acoustics handle a listener walking through the fie
 and the headphone renders' head-tracking applies downstream.
 
 Load with `bwa_load_ambix` (full 3D sets only: 4/9/16 channels; mono and other counts are
-rejected), then drive with the `bwa_bed_*` family: no position, only a master gain. Legacy
-**FuMa** B-format (`.amb` and friends: WXYZ order, MaxN normalization, the W −3 dB) loads with
-`bwa_load_fuma`; the conversion happens at load, so past that call the asset is indistinguishable
-from an AmbiX load of the same field. Internally a bed is a voice playing a multichannel asset,
+rejected, because AmbiX has no mixed-order convention), then drive with the `bwa_bed_*` family:
+no position, only a master gain. Legacy **FuMa** B-format (`.amb` and friends: WXYZ order, MaxN
+normalization, the W −3 dB) loads with `bwa_load_fuma`; the conversion happens at load, so past
+that call the asset is indistinguishable from an AmbiX load of the same field. `bwa_load_fuma`
+also takes the `.amb` **mixed-order** sets, which the format identifies by channel count:
+3 (1H: WXY), 5 (2H: WXYUV), 6 (2H1V: WXYZUV), 7 (3H: WXYUVPQ), 8 (3H1V: WXYZUVPQ) and 11
+(3H2V: WXYZRSTUVPQ). Such a bed is stored in the ACN slots of its highest order with zeros in
+the channels it lacks, so `bwa_sound_get_channels` reports 4, 9 or 16, and it remembers its set.
+With an imported decoder (`BWA_DECODE_LAYOUT`) it decodes through the decoder designed for that
+set, if the layout has one. Otherwise it decodes through the full-order matrix, and the first
+such `bwa_bed_play*` sets a one-time notice in `bwa_last_error` (the play itself succeeds). Internally a bed is a voice playing a multichannel asset,
 so handles and lifetime match `bwa_source_*`: fades, pause/seek, priority, and groups are the
 same per-voice machinery re-exported under the bed prefix. The priority default (128) means a bed
 **can be stolen** by a full-pool `bwa_source_create`; set 255 on a bed that must survive an SFX
-overload. The decode is a static SN3D SH→speaker matrix (AllRAD or EPAD per
-`bwa_desc.bed_decoder`; see below), rebuilt from the layout.
+overload. The decode is a static SN3D SH→speaker matrix (AllRAD, EPAD, or the layout's imported
+decoder, per `bwa_desc.bed_decoder`; see below), rebuilt from the layout.
 
 ```c
 void bwa_set_max_re(bwa_engine* e, bool on);         // ON by default; live A/B (crossfaded)
@@ -1619,7 +1629,9 @@ of the engine's own decode: bed matrix rendering (the sampling fallback / AllRAD
 line render. It doesn't reach the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) or
 phonon's own decodes (reflection bed, pathing, the HRTF monitor). **ON by default**: in the offline
 bed sweep the taper won every axis under both decoders and both observer models. The rig trial
-has not run yet.
+has not run yet. It has **no effect on an imported decoder** (`BWA_DECODE_LAYOUT`): that matrix is
+final, its designer already chose the per-order gains, and a second taper would double-weight the
+high orders. The same holds for the FDN's render under an imported decoder.
 
 `bwa_set_max_re_split` is the **band-split** refinement (the literature-standard Gerzon
 basic-LF/max-rE-HF decode): with it on, the taper acts only **above a ~700 Hz crossover**; below,
@@ -1627,7 +1639,9 @@ the unweighted decode stays, because the ear localizes LF by summed pressure (th
 which the plain decode maximizes) and HF by energy. Same 700 Hz boundary as dual-band panning; a
 per-bed one-pole splitter, crossfaded like the taper itself, so both toggles are click-free live
 A/Bs. Bed matrix decodes only: the FDN's line render stays broadband either way (a diffuse tail
-has no LF image to sharpen). Broadband versus split is a by-ear call for the rig.
+has no LF image to sharpen). Broadband versus split is a by-ear call for the rig. An imported
+TWO-BAND decoder brings its own split instead (its LF and HF matrices at its own `xover_hz`), and
+this toggle does not touch it either.
 
 ```c
 typedef enum { BWA_BED_MATRIX = 0, BWA_BED_PARAMETRIC = 1 } bwa_bed_renderer;
@@ -2436,7 +2450,8 @@ callback on a manual sink, but reading `bwa_render_block`'s return value directl
 typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
 typedef enum { BWA_DECODE_DEFAULT = 0,   // reserved for default-init; NOT a named algorithm
                BWA_DECODE_ALLRAD  = 1,
-               BWA_DECODE_EPAD    = 2 } bwa_bed_decoder;   // bwa_desc.bed_decoder
+               BWA_DECODE_EPAD    = 2,
+               BWA_DECODE_LAYOUT  = 3 } bwa_bed_decoder;   // bwa_desc.bed_decoder; 3 = the layout's bed_decode
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
 void     bwa_set_dual_band_cap(bwa_engine* e, bool on);                      // live A/B; ITD-corrects dual_band's low band
@@ -2522,6 +2537,18 @@ and reflection beds only, never the point-source panner:
   flattest loudness-versus-direction of the two. AllRAD versus EPAD on the real array is a
   by-ear call. The **FDN's line render follows EPAD too** (with AllRAD selected the FDN keeps
   its house AllRAD render).
+- **LAYOUT** (`BWA_DECODE_LAYOUT`): a decoder designed elsewhere, carried in the layout file's
+  `bed_decode` block. The Ambisonic Decoder Toolbox designs it (two-band rV/rE-matched decoders,
+  mixed-order decoders for sparse vertical coverage), writes an AmbDec preset, and
+  `tools/decoder/ambdec_to_json.py` converts that into the layout. The engine applies the matrix
+  as it is: no max-rE taper, AmbDec's phase-matched crossover when it is two-band, and the decoder
+  for the bed's own set and order when the block has one (a full decoder per order, `full1` to
+  `full3`; with no exact match, the nearest full order, higher first, and a one-time note in
+  `bwa_last_error`). The FDN renders through the HF matrix of the full decoder a 3rd-order bed gets. With a layout
+  that carries no block, `bwa_create` still succeeds (reason in `bwa_last_error`) and `bwa_start`
+  refuses with `BWA_ERR_LAYOUT`. The block is
+  [layout-schema.md](./layout-schema.md#bed-decoder-top-level-bed_decode-optional); the rendering is
+  [spatialization.md](./spatialization.md#imported-decoders-bwa_decode_layout).
 
 The plain sampling (projection) decode is **not selectable**: on an irregular array it
 over-energizes dense speaker regions (dominated by both options above), so it survives only as
@@ -2583,9 +2610,13 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
 uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
                              const float* positions, uint32_t n,
                              const float* dirs, uint32_t ndir, float* out);
+uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
+                              const char* channels, bool max_re, uint32_t band,
+                              const float* dirs, uint32_t ndir,
+                              float* out, uint32_t out_cap, char* err, uint32_t err_cap);
 ```
 
-Both take no engine handle. They run the engine's own solves over a **candidate** layout you pass
+The first two take no engine handle. They run the engine's own solves over a **candidate** layout you pass
 in, so a layout tool scores what will ship instead of a re-implementation. Both are pure and
 reentrant: the per-listener cache is per-call state with no globals, so any thread can call them,
 including while an engine renders. Both **allocate** one scratch layout per call and free it
@@ -2608,9 +2639,33 @@ than positions, because a bed is content at infinity. It builds the same AllRAD 
 engine builds for this layout, applies max-rE weighting when you ask for it, and writes `ndir*n`
 gains. Those gains can be negative (SH sidelobes). A layout that scores well here is a good
 quadrature for the sphere, which is what ambisonic content wants from an array and what the
-point-source panners cannot see.
+point-source panners cannot see. It returns 0 for `BWA_DECODE_LAYOUT`: a list of positions
+carries no imported matrix.
 
-`bwa_layout_tool` drives both: the Score board, the rE coverage overlay, the badness map, and the
+`bwa_bed_gains_layout` grades a **layout file** instead, so it sees what the positions batch
+cannot: the file's imported `bed_decode`, its listening point, and its speaker count. It loads the
+file the way `bwa_create` does and builds the decode `bwa_start` would install, then encodes each
+direction and multiplies through, like the batch.
+
+- `channels` names the bed: NULL for a 3rd-order full bed, `"full1"`, `"full2"` or `"full3"` for
+  a full bed of that order, or a mixed-order set name (`"1H"`, `"2H"`, `"2H1V"`, `"3H"`, `"3H1V"`,
+  `"3H2V"`). The encode zeroes the channels outside the bed, the way the loader stores such a bed,
+  and the decode is the one that bed would get, by the engine's own pick.
+- `max_re` applies the taper by the bed's highest order. It has no effect on an imported matrix,
+  as in the engine.
+- `band` 0 reads the HF matrix (the only one of a single-band decoder), 1 reads the LF matrix of a
+  two-band imported decoder. Built-in decoders read the same matrix for both.
+- `out = NULL` is a size query: it returns the file's speaker count N and writes nothing. It makes
+  every check the full call makes except the three about `dirs`, `ndir` and `out_cap`, so it
+  returns 0, with the same reason, for a file the full call would refuse (for example
+  `BWA_DECODE_LAYOUT` on a file with no `bed_decode`). Otherwise `out` needs `ndir*N` floats and
+  `out_cap` says how many it holds.
+
+It returns N on success and 0 on any failure. There is no engine to carry the reason, so it goes
+to the optional `err` buffer (always NUL-terminated, truncated to `err_cap - 1`). It reads the file
+and allocates: pure and reentrant, but never on an audio callback.
+
+`bwa_layout_tool` drives all three: the Score board, the rE coverage overlay, the badness map, and the
 optimizer cost all go through them. See [`layout-authoring.md`](./layout-authoring.md#scoring-and-the-observer-model).
 
 ## Tracked room EQ (control thread; live)

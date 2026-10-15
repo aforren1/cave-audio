@@ -843,8 +843,9 @@ A fixed SH→speaker **decode matrix** renders the diffuse layer (ambisonic beds
 FDN reverb) per block (`build_bed_decode` / `mix_bed` in `rt.c`). The Steam reflection bed
 is the exception: it decodes through phonon's own decode effect
 ([materials.md](./materials.md)). The engine
-builds that matrix from the speaker geometry at load time. Two decoders are selectable
-with **`bwa_desc.bed_decoder`** (create-time). The plain **sampling (projection) decode**
+builds that matrix from the speaker geometry at load time. Two built-in decoders are selectable
+with **`bwa_desc.bed_decoder`** (create-time), and a third choice takes a matrix designed
+elsewhere (see [Imported decoders](#imported-decoders-bwa_decode_layout)). The plain **sampling (projection) decode**
 `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`ambi_sad_decode`) is **not** one of
 them. It is exact on a perfectly uniform array, but it over-energizes dense regions on
 an irregular one, since every speaker radiates a fixed diffuse energy regardless of
@@ -891,6 +892,104 @@ AllRAD doesn't touch the point-source panner (DBAP/SPCAP/VBAP). It is the
 diffuse-layer counterpart to the speaker-placement correction SPCAP makes for
 localized sources. Its convex-hull + VBAP solve is factored into `hull.c`, shared with the
 `BWA_PAN_VBAP` point panner.
+
+### Imported decoders (`BWA_DECODE_LAYOUT`)
+
+AllRAD and EPAD are one design each. Decoder design is a field of its own, and a tool
+built for it can do things the engine does not try. The Ambisonic Decoder Toolbox (ADT,
+Heller, Benjamin and Lopez-Lezcano) is the reference: it optimizes **two-band** decoders
+whose low-frequency matrix matches the velocity vector rV to the energy vector rE, and
+**mixed-order** decoders for arrays with sparse vertical coverage ("Optimized Decoders for
+Mixed-Order Ambisonics", AES 150th Convention, paper 10507, 2021; arXiv 2210.00378). The
+engine does not port that optimizer. It imports the result.
+
+`BWA_DECODE_LAYOUT` decodes beds through the layout file's own **`bed_decode`** block
+([layout-schema.md](./layout-schema.md#bed-decoder-top-level-bed_decode-optional)). The pipeline:
+
+1. Design the decoder in ADT for the speaker positions in your layout, and write it as an
+   AmbDec preset (`.ambdec`). One preset per channel set: a full-order one for each order
+   your content uses (`full1`, `full2`, `full3`), plus one per mixed-order set.
+2. Convert each preset into the layout:
+   `uv run tools/decoder/ambdec_to_json.py dec.ambdec --into cave_layout.json`.
+   The converter matches AmbDec speakers to layout indices by direction from the listening
+   point (within 5° and unambiguous, or pinned with `--map`), converts N3D or FuMa input
+   scaling to SN3D, expands the channel mask to 16 ACN columns, and folds AmbDec's per-order
+   gains and crossover ratio into the rows. It refuses what it cannot represent: a 4th-order
+   mask, a mask that is no known set, a speaker it cannot place. `--into` adds or replaces
+   one decoder by its set name, so run it once per preset. A preset that asks for near-field
+   compensation (`/opt/nfeff_comp`) gets a printed note: the engine does not apply it (see
+   [below](#near-field-compensation-deliberately-omitted)).
+3. Set `bwa_desc.bed_decoder = BWA_DECODE_LAYOUT`. A layout without the block leaves
+   `bwa_create` usable with the reason in `bwa_last_error`, and `bwa_start` refuses with
+   `BWA_ERR_LAYOUT`.
+4. Grade it before the rig day: `bwa_layout_tool --score cave_layout.json layout` prints the
+   rE error, rV, the rV-rE angle and the energy flatness of the imported decode
+   ([layout-authoring.md](./layout-authoring.md)). `bwa_bed_gains_layout` is the same
+   numbers from code.
+
+**The matrix is final.** The designer already chose the per-order gains (ADT's max-rE and
+rV-matching weights live inside the rows), so the engine applies no taper of its own:
+`bwa_set_max_re` and `bwa_set_max_re_split` keep working for AllRAD and EPAD and have no
+effect on a bed the imported decoder renders. A second taper would double-weight the high
+orders. The FDN follows the same rule: under `BWA_DECODE_LAYOUT` its lines render through
+the imported full decoder's HF matrix, untapered.
+
+**Per order.** A full-order decoder is designed for one order, so the layout names it
+`full1`, `full2` or `full3`, and each full bed takes the decoder of its own order. With no
+exact match, a bed takes the lowest full order above its own (its missing orders meet zero
+columns, but the order gains were chosen for the decoder's order: a 1st-order bed through a
+3rd-order max-rE decoder gets a first-order gain of 0.86 where its own design would use
+0.577, and on a regular array it plays about 2.5 dB quiet: computed from the order gains, the
+1st-order share of the energy is 3.2 of 5.7, not measured), else the highest order below (the bed's higher orders
+are dropped). A mixed-order bed takes its own set's decoder, else the full decoder that rule
+picks for the set's highest order. Every pick that is not an exact match sets a one-time
+notice per bed shape in `bwa_last_error`.
+
+**Two-band.** A decoder with an `lf` matrix splits each (rotated) SH signal per bed voice with
+the phase-matched band splitter AmbDec uses, as OpenAL Soft implements it
+(`core/filters/splitter.cpp`, `BandSplitter`; its dual-band `BFormatDec` mixes the two bands
+through the HF and LF matrices). From one coefficient `c = (sin w − 1) / cos w`,
+`w = 2π·xover_hz/fs`: the low band is two cascaded one-pole low-pass stages (coefficient
+`(c + 1)/2` each), the allpass is first order (`c`), and the high band is `allpass − low`. So
+the two bands are 12 dB/octave each side, both −6 dB at the crossover, and they sum to the
+allpass: flat in magnitude, a phase shift only. The render is
+`out = HF·high + LF·low = HF·allpass + (LF − HF)·low`; `LF − HF` is precomputed at load, so the
+audio thread pays one extra matrix pass per two-band bed through the same `mat_mac` kernel. A
+decoder whose two matrices agree renders the allpassed field, the same magnitude as a
+single-band one. The `rt_feature` test pins each band against the analytic response from a
+quarter to 8 times the crossover (the low band is about −14 dB at twice the crossover, where
+the one-pole split this replaced leaked −7 dB). The splitter state is reset on every play.
+The built-in max-rE split (`bwa_set_max_re_split`) keeps its own one-pole at 700 Hz.
+
+**Mixed order.** A FuMa `.amb` file identifies its mixed-order set by channel count (3 = 1H,
+5 = 2H, 6 = 2H1V, 7 = 3H, 8 = 3H1V, 11 = 3H2V). The loader stores such a bed in the ACN
+slots of its highest order with zeros in the absent channels and tags the set. Under
+`BWA_DECODE_LAYOUT` the bed decodes through the decoder for its set, else through the full
+decoder picked by its highest order. Under AllRAD or EPAD it always decodes through the full matrix, which works (the absent
+channels contribute nothing) but is not the decode the content was mixed for, so the first
+such `bwa_bed_play*` sets a one-time notice in `bwa_last_error`. The max-rE taper on a
+built-in decoder applies by the bed's highest order. Rotation turns the stored field as
+usual; a pitch or roll moves energy into channels the set lacks, which a mixed-order decoder
+then drops. AmbiX has no mixed-order convention, so `bwa_load_ambix` still takes 4, 9 or 16
+channels only.
+
+What uses the imported matrix, and what does not:
+
+- `mix_bed`'s matrix decode and the parametric renderer's matrix share: the decoder picked
+  for the bed's set and order, two-band when it has `lf`.
+- The parametric renderer's DIFFUSE stream decodes its first-order (FOA) signal through that
+  decoder's HF first-order columns only. It ignores the LF matrix and the crossover: the
+  stream is already band-split by the renderer's own analysis bands and goes to the
+  decorrelators, so a two-band import's low-frequency rV design does not reach it. Its
+  re-panned direct stream never used a matrix.
+- `bed_pref` and `bed_radius` (the parametric loudness match) derive from the HF matrix of
+  the full decoder a 3rd-order bed would get, exactly as they derive from AllRAD's. That holds
+  for EVERY bed, including one that decodes through a mixed-set or lower-order decoder, so
+  the parametric direct stream of such a bed is loudness-matched to a different matrix than
+  the one its matrix share uses. Expect a level step on the matrix/parametric A/B for those
+  beds when the decoders differ much in gain.
+- `BWA_PROFILE_BINAURAL` skips the speaker decode entirely (beds pass SH to SH), so the block
+  is inert there.
 
 ### Near-field compensation: deliberately omitted
 

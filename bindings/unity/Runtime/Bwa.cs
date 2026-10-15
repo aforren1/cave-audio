@@ -26,7 +26,7 @@ namespace BwAudio
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
     // Value 0 is RESERVED for default-init and mirrors the C enum: it means "the engine's current
     // default", not a named algorithm, so the default can move without an ABI break.
-    public enum BwaBedDecoder : int { Default = 0, Allrad = 1, Epad = 2 }
+    public enum BwaBedDecoder : int { Default = 0, Allrad = 1, Epad = 2, Layout = 3 }   // Layout = the layout file's imported bed_decode
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
@@ -709,6 +709,12 @@ namespace BwAudio
         // vectors — a bed is content at infinity) over a layout of n speaker positions. outGains =
         // ndir*n floats (gains may be negative — SH sidelobes); returns ndir. Pure and reentrant.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_batch(BwaBedDecoder decoder, [MarshalAs(UnmanagedType.I1)] bool maxRe, float[] positions, uint n, float[] dirs, uint ndir, [Out] float[] outGains);
+        // The same grading against a LAYOUT FILE, so it sees the file's imported bed_decode
+        // (BwaBedDecoder.Layout), listening point and speaker count. channels: null (a 3rd-order full
+        // bed), "full1"/"full2"/"full3", or a mixed-order set ("3H1V", ...); band 0 = HF, 1 = LF of a two-band import. outGains = null
+        // is a size query (returns the speaker count N); else it needs ndir*N floats (outCap). Returns
+        // N, or 0 with the reason in err (UTF-8, NUL-terminated). Pure and reentrant; reads the file.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_layout([MarshalAs(UnmanagedType.LPUTF8Str)] string layoutPath, BwaBedDecoder decoder, [MarshalAs(UnmanagedType.LPUTF8Str)] string channels, [MarshalAs(UnmanagedType.I1)] bool maxRe, uint band, float[] dirs, uint ndir, [Out] float[] outGains, uint outCap, [Out] byte[] err, uint errCap);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

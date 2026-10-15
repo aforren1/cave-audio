@@ -567,6 +567,188 @@ static int run_bed_batch(void) {
 }
 
 
+/* bwa_bed_gains_layout + BWA_DECODE_LAYOUT (the imported bed_decode): the file-based grading
+ * reads the imported matrix (band 0 = HF, 1 = LF) and refuses each bad argument with a reason; an
+ * engine asked for LAYOUT on a layout without the block creates but will not start, and starts with
+ * it. The imported decoder carries only W (ACN 0) and Z (ACN 2), so a wave from straight up (ambi z:
+ * SN3D Y = 1 at ACN 0, 2, 6, 12) has closed-form gains: HF W + Z, LF W. */
+static int write_cube_layout(const char* path, int with_bed) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    fprintf(f, "{ \"speakers\": [\n");
+    int k = 0;
+    for (int ix = -1; ix <= 1; ix += 2)
+        for (int iy = -1; iy <= 1; iy += 2)
+            for (int iz = -1; iz <= 1; iz += 2, ++k)
+                fprintf(f, "  {\"index\":%d,\"position\":[%d,%g,%d]}%s\n", k, ix, 1.4 + iy, iz, k < 7 ? "," : "");
+    fprintf(f, "]");
+    if (with_bed) {
+        fprintf(f, ", \"bed_decode\": { \"source\": \"smoke\", \"decoders\": [ { \"channels\": \"full1\", \"xover_hz\": 400");
+        for (int band = 0; band < 2; ++band) {
+            fprintf(f, ", \"%s\": [", band ? "lf" : "hf");
+            k = 0;
+            for (int ix = -1; ix <= 1; ix += 2)
+                for (int iy = -1; iy <= 1; iy += 2)
+                    for (int iz = -1; iz <= 1; iz += 2, ++k) {
+                        fprintf(f, "%s{\"index\":%d,\"gains\":[%g,0,%g", k ? "," : "", k,
+                                band ? 0.3 : 0.1, band ? 0.0 : 0.2 * iy);
+                        for (int c = 3; c < 16; ++c) fprintf(f, ",0");
+                        fprintf(f, "]}");
+                    }
+            fprintf(f, "]");
+        }
+        fprintf(f, " } ] }");
+    }
+    fprintf(f, " }\n");
+    fclose(f);
+    return 1;
+}
+/* A 16-bit PCM wav of `nch` channels, W (channel 0) a 440 Hz tone and the rest silent: enough for a
+ * bed whose ORDER is what the test is about. */
+static int write_bed_wav(const char* path, uint32_t nch, uint32_t frames) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const uint32_t rate = 48000u, data = frames * 2u * nch;
+    uint32_t u; uint16_t w;
+    fwrite("RIFF", 1, 4, f); u = 36u + data; fwrite(&u, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    u = 16;              fwrite(&u, 4, 1, f);
+    w = 1;               fwrite(&w, 2, 1, f);      /* PCM */
+    w = (uint16_t)nch;   fwrite(&w, 2, 1, f);
+    u = rate;            fwrite(&u, 4, 1, f);
+    u = rate * 2u * nch; fwrite(&u, 4, 1, f);
+    w = (uint16_t)(2u * nch); fwrite(&w, 2, 1, f);
+    w = 16;              fwrite(&w, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
+    for (uint32_t i = 0; i < frames; ++i)
+        for (uint32_t c = 0; c < nch; ++c) {
+            int16_t v = c ? 0 : (int16_t)(6000.0 * sin(6.2831853 * 440.0 * (double)i / (double)rate));
+            fwrite(&v, 2, 1, f);
+        }
+    fclose(f);
+    return 1;
+}
+static int run_bed_layout(void) {
+    const char* LB = "smoke_bed_layout.json", *LN = "smoke_nobed_layout.json";
+    if (!write_cube_layout(LB, 1) || !write_cube_layout(LN, 0)) { fprintf(stderr, "FAIL[bedL]: write layouts\n"); return 1; }
+    int rc = 1;
+    char err[256];
+    float g[8];
+    const float up[3] = { 0.f, 1.f, 0.f };
+    do {
+        if (bwa_bed_gains_layout(LB, BWA_DECODE_LAYOUT, NULL, false, 0, NULL, 0, NULL, 0, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedL]: size query did not return the speaker count: %s\n", err); break; }
+        if (bwa_bed_gains_layout(LB, BWA_DECODE_LAYOUT, "full1", true, 0, up, 1, g, 8, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedL]: HF grading failed: %s\n", err); break; }
+        int okh = 1;
+        for (int s = 0; s < 8; ++s) {                 /* index s: iy = -1 for s&2 == 0 (the loop order) */
+            const float want = 0.1f + 0.2f * ((s & 2) ? 1.f : -1.f);   /* max_re true: NO effect on an import */
+            if (fabsf(g[s] - want) > 1e-5f) okh = 0;
+        }
+        if (!okh) { fprintf(stderr, "FAIL[bedL]: HF gains are not W + Z of the imported rows\n"); break; }
+        if (bwa_bed_gains_layout(LB, BWA_DECODE_LAYOUT, NULL, false, 1, up, 1, g, 8, err, sizeof err) != 8u ||
+            fabsf(g[0] - 0.3f) > 1e-5f || fabsf(g[7] - 0.3f) > 1e-5f) {
+            fprintf(stderr, "FAIL[bedL]: band 1 did not read the LF matrix\n"); break; }
+        if (bwa_bed_gains_layout(LB, BWA_DECODE_ALLRAD, "3H1V", true, 0, up, 1, g, 8, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedL]: the built-in grading of a mixed set failed: %s\n", err); break; }
+        /* refusals, each with a reason */
+        struct { const char* path; bwa_bed_decoder d; const char* ch; uint32_t band; const float* dirs;
+                 uint32_t ndir; uint32_t cap; const char* why; } bad[] = {
+            { NULL, BWA_DECODE_ALLRAD, NULL, 0, up, 1, 8, "NULL layout_path" },
+            { LB, BWA_DECODE_ALLRAD, NULL, 2, up, 1, 8, "band" },
+            { LB, BWA_DECODE_ALLRAD, "4H", 0, up, 1, 8, "channels" },
+            { LB, BWA_DECODE_ALLRAD, "full", 0, up, 1, 8, "channels" },      /* a full set names its order */
+            { LB, BWA_DECODE_ALLRAD, NULL, 0, NULL, 1, 8, "dirs" },
+            { LB, BWA_DECODE_ALLRAD, NULL, 0, up, 0, 8, "dirs" },
+            { LB, BWA_DECODE_ALLRAD, NULL, 0, up, 1, 7, "too small" },
+            { LN, BWA_DECODE_LAYOUT, NULL, 0, up, 1, 8, "no bed_decode" },
+            { "smoke_no_such_layout.json", BWA_DECODE_ALLRAD, NULL, 0, up, 1, 8, "layout" },
+        };
+        int okb = 1;
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+            err[0] = 0;
+            if (bwa_bed_gains_layout(bad[i].path, bad[i].d, bad[i].ch, false, bad[i].band, bad[i].dirs, bad[i].ndir,
+                                     g, bad[i].cap, err, sizeof err) != 0 || !strstr(err, bad[i].why)) {
+                fprintf(stderr, "FAIL[bedL]: bad case %u not refused with '%s' (err: %s)\n", (unsigned)i, bad[i].why, err);
+                okb = 0;
+            }
+        }
+        if (!okb) break;
+        /* the SIZE QUERY (out = NULL) refuses what the full call refuses, with the same reason: it
+         * used to return N for LAYOUT on a file with no bed_decode, where the header promises 0 */
+        struct { const char* path; bwa_bed_decoder d; const char* ch; uint32_t band; const char* why; } badq[] = {
+            { LN, BWA_DECODE_LAYOUT, NULL, 0, "no bed_decode" },
+            { LB, BWA_DECODE_ALLRAD, "4H", 0, "channels" },
+            { LB, BWA_DECODE_ALLRAD, NULL, 2, "band" },
+            { "smoke_no_such_layout.json", BWA_DECODE_ALLRAD, NULL, 0, "layout" },
+        };
+        for (size_t i = 0; i < sizeof badq / sizeof badq[0]; ++i) {
+            err[0] = 0;
+            if (bwa_bed_gains_layout(badq[i].path, badq[i].d, badq[i].ch, false, badq[i].band, NULL, 0, NULL, 0,
+                                     err, sizeof err) != 0 || !strstr(err, badq[i].why)) {
+                fprintf(stderr, "FAIL[bedL]: size query %u not refused with '%s' (err: %s)\n", (unsigned)i, badq[i].why, err);
+                okb = 0;
+            }
+        }
+        if (!okb) break;
+        if (bwa_bed_gains_layout(LN, BWA_DECODE_ALLRAD, NULL, false, 0, NULL, 0, NULL, 0, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedL]: a built-in decoder's size query on a file with no bed_decode must return N: %s\n", err);
+            break; }
+        if (bwa_bed_gains_layout(NULL, BWA_DECODE_ALLRAD, NULL, false, 0, up, 1, g, 8, NULL, 0) != 0) {
+            fprintf(stderr, "FAIL[bedL]: a NULL err buffer must still refuse\n"); break; }
+        if (bwa_bed_gains_batch(BWA_DECODE_LAYOUT, false, (const float*)g, 1, up, 1, g) != 0) {
+            fprintf(stderr, "FAIL[bedL]: the positions batch must refuse BWA_DECODE_LAYOUT\n"); break; }
+
+        /* the engine: LAYOUT without the block creates (reason readable) but refuses to start */
+        bwa_desc d; memset(&d, 0, sizeof d);
+        d.profile = BWA_PROFILE_CAVE; d.sink = BWA_SINK_MANUAL; d.block_size = 256;
+        d.bed_decoder = BWA_DECODE_LAYOUT; d.layout_path = LN;
+        bwa_engine* e = bwa_create(&d);
+        if (!e) { fprintf(stderr, "FAIL[bedL]: create with LAYOUT and no block returned NULL\n"); break; }
+        const char* le = bwa_last_error(e);
+        const int has_reason = le && strstr(le, "bed_decode") != NULL;
+        const bwa_result r = bwa_start(e);
+        bwa_destroy(e);
+        if (!has_reason || r != BWA_ERR_LAYOUT) {
+            fprintf(stderr, "FAIL[bedL]: LAYOUT without bed_decode: reason %d, start %d (want BWA_ERR_LAYOUT)\n", has_reason, (int)r);
+            break; }
+        d.layout_path = LB;
+        e = bwa_create(&d);
+        if (!e || bwa_start(e) != BWA_OK) {
+            fprintf(stderr, "FAIL[bedL]: LAYOUT with a bed_decode must start: %s\n", e && bwa_last_error(e) ? bwa_last_error(e) : "");
+            if (e) bwa_destroy(e);
+            break; }
+        /* the order notice: the file carries only full1, so a 1st-order bed is an exact match (no
+         * note) and a 3rd-order one plays through it with its orders above 1 dropped (one note) */
+        {
+            const char* W4 = "smoke_bed4.wav", *W16 = "smoke_bed16.wav";
+            int okn = write_bed_wav(W4, 4, 4800) && write_bed_wav(W16, 16, 4800);
+            bwa_sound s4 = okn ? bwa_load_ambix(e, W4) : 0, s16 = okn ? bwa_load_ambix(e, W16) : 0;
+            bwa_bed b4 = bwa_bed_create(e), b16 = bwa_bed_create(e);
+            if (!s4 || !s16 || !b4 || !b16) okn = 0;
+            if (okn) {
+                bwa_bed_play(e, b4, s4, true);
+                const char* m1 = bwa_last_error(e);
+                if (m1 && strstr(m1, "decodes through")) { fprintf(stderr, "FAIL[bedL]: an exact bed drew a notice: %s\n", m1); okn = 0; }
+                bwa_bed_play(e, b16, s16, true);
+                const char* m2 = bwa_last_error(e);
+                if (!m2 || !strstr(m2, "full3 bed decodes through the imported full1") || !strstr(m2, "DROPPED")) {
+                    fprintf(stderr, "FAIL[bedL]: a 3rd-order bed through full1 drew no notice (got: %s)\n", m2 ? m2 : "(null)");
+                    okn = 0;
+                }
+                for (int i = 0; i < 3; ++i) { uint32_t ch_ = 0, nf_ = 0; bwa_render_block(e, &ch_, &nf_); }
+            } else fprintf(stderr, "FAIL[bedL]: the order-notice beds did not load\n");
+            remove(W4); remove(W16);
+            if (!okn) { bwa_destroy(e); break; }
+        }
+        bwa_destroy(e);
+        rc = 0;
+    } while (0);
+    remove(LB); remove(LN);
+    if (!rc) printf("smoke[bedL] bed_gains_layout (HF/LF, refusals, size-query refusals) + LAYOUT start guard + order notice OK\n");
+    return rc;
+}
+
 /* ---- situation tuning (bwa_tuning_preset / bwa_apply_tuning) -------------------------------------
  * Three things worth pinning: the preset is PURE and deterministic, apply REFUSES a zero-initialized
  * struct (this struct's zero is not its default - the whole reason struct_size exists), and SEATED
@@ -905,8 +1087,9 @@ int main(int argc, char** argv) {
     if (run_headphone_eq())                           return 1;
     if (run_material_release())                       return 1;
     if (run_bed_batch())                              return 1;
+    if (run_bed_layout())                             return 1;
     if (run_tuning())                                 return 1;
     if (run_ergonomics())                             return 1;
-    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; dome layout; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning; completion events + tuning readback + box mesh)\n");
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; dome layout; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; bed gains layout + LAYOUT guard; situation tuning; completion events + tuning readback + box mesh)\n");
     return 0;
 }

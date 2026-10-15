@@ -87,8 +87,64 @@ typedef struct {
     float   on_axis_db[BWA_DIR_MAX_BANDS];
 } Directivity;
 
-/* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~176 KB, almost all
- * of it the 512-tap FIR each Speaker embeds, and a binding may call in from a 512 KB thread. Keep it
+/* Imported ambisonic bed decoder (docs/layout-schema.md `bed_decode`, written by
+ * tools/decoder/ambdec_to_json.py from an AmbDec file, which the Ambisonic Decoder Toolbox emits).
+ * Each decoder is a FINAL SH->speaker matrix in the engine's own basis (ACN/SN3D, 16 columns, the
+ * columns outside its channel set zero), per-order gains already folded in, so the engine applies
+ * no max-rE taper to it. A decoder is designed for ONE channel set at ONE order: "full1".."full3"
+ * (every channel to that order) or a mixed set (ambiset.h), and its per-order gains are only right
+ * for that order, which is why a full decoder is per order. Two-band decoders carry an LF matrix
+ * and a crossover; the render splits each SH channel with the AmbDec / OpenAL Soft phase-matched
+ * splitter (rt.c: lp = two one-pole stages, ap = a first-order allpass, hp = ap - lp) and computes
+ * HF*hp + LF*lp = HF*ap + (LF - HF)*lp, so `dlf` = LF - HF is derived at load and is zero for a
+ * single-band decoder. One decoder per channel set, at least one full one when ndec > 0. Selected
+ * with BWA_DECODE_LAYOUT; every other decoder ignores the block. ~8 KB per decoder at 64 speakers
+ * (two 64 x 16 matrices); the cap is one per distinct set (3 full orders + 6 mixed), so it can
+ * never refuse a file the duplicate-set rule accepts. */
+#define BWA_BED_DEC_MAX 9
+#define BWA_BED_SH      16   /* == BWA_AMBI_CH (3rd order); layout.h cannot include ambisonics.h */
+typedef struct {
+    uint8_t set;                              /* AMBI_SET_* (ambiset.h) */
+    uint8_t order;                            /* the order it was designed for: full1..3, or the mixed set's own */
+    uint8_t two_band;                         /* 1 = the file carries `lf` */
+    float   xover_hz;                         /* two-band crossover (Hz), 0 single-band */
+    float   hf[BWA_CHANNELS][BWA_BED_SH];     /* [speaker index][ACN]: the HF (or only) matrix */
+    float   dlf[BWA_CHANNELS][BWA_BED_SH];    /* derived: LF - HF (zero when single-band) */
+} BedDecoder;
+typedef struct {
+    uint8_t    ndec;                          /* 0 = the layout carries no bed_decode */
+    BedDecoder dec[BWA_BED_DEC_MAX];
+} BedImport;
+
+/* The decoder that serves a bed of channel set `set` (ambiset.h) whose highest order is `order`
+ * (a full bed's own order; a mixed set's ambi_set_orders). NULL when the layout has no block.
+ *   mixed set: its own decoder; else the full decoder the rule below picks for `order`.
+ *   full set, order N: the full decoder of order N; else the LOWEST full order above N (its columns
+ *     above N meet zeros in the bed and contribute nothing, but its per-order gains were designed
+ *     for its own order); else the HIGHEST full order below N (the bed's orders above it drop).
+ * *exact (optional) = 1 only when the decoder was designed for exactly this set at this order: any
+ * other pick is a working but compromised decode, and engine.c says so once. Pure; rt.c tabulates
+ * it per (set, order) at load so the audio thread does a lookup. */
+static inline const BedDecoder* layout_bed_decoder_for(const BedImport* b, int set, int order, int* exact) {
+    if (exact) *exact = 0;
+    if (!b || !b->ndec) return 0;
+    if (set != 0 /* AMBI_SET_FULL */)
+        for (int i = 0; i < b->ndec; ++i)
+            if (b->dec[i].set == set) { if (exact) *exact = 1; return &b->dec[i]; }
+    const BedDecoder *eq = 0, *above = 0, *below = 0;
+    for (int i = 0; i < b->ndec; ++i) {
+        const BedDecoder* d = &b->dec[i];
+        if (d->set != 0) continue;
+        if (d->order == order) eq = d;
+        else if (d->order > order) { if (!above || d->order < above->order) above = d; }
+        else                       { if (!below || d->order > below->order) below = d; }
+    }
+    if (eq) { if (exact) *exact = (set == 0); return eq; }
+    return above ? above : below;
+}
+
+/* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~252 KB, most
+ * of it the 512-tap FIR each Speaker embeds (and 72 KB the imported bed decoders), and a binding may call in from a 512 KB thread. Keep it
  * a plain value type, but give it heap or static residency: a member of a heap struct (RtCore,
  * bwa_engine), a calloc, or a static in non-reentrant code. That is also why layout_default fills
  * in place rather than returning by value: a by-value return is a hidden stack temporary. */
@@ -117,6 +173,7 @@ typedef struct {
     uint32_t max_delay_samples;     /* max over speakers; sizes the alignment delay lines */
     RoomEqGrid rq_grid;             /* tracked room EQ grid (npos = 0 when the layout has none) */
     Directivity dir;                /* speaker directivity model (nband = 0 when the layout has none) */
+    BedImport bed;                  /* imported bed decoders (ndec = 0 when the layout has none) */
 } Layout;
 
 /* A sane default: a 3 m-cube 3x3x3 boundary grid (minus center), FLOOR-origin — x/z at

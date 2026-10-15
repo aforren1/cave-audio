@@ -332,6 +332,11 @@ double calib_sim_speaker_latency(int ch) {
     return (ch >= 0 && ch < BWA_MAX_CHANNELS) ? g_sim_spk_lat_s[ch] : 0.0;
 }
 
+static double g_sim_lat_step_s;
+void calib_sim_set_latency_step(double seconds) {
+    if (seconds == seconds) g_sim_lat_step_s = seconds;
+}
+
 /* the rotated (simulated-error) acoustic axis of speaker ch */
 static void sim_aim(const Layout* L, int ch, float aim[3]) {
     calib_sim_rotate(sim_speaker(L, ch)->aim, g_sim_aim_err_deg, aim);
@@ -407,8 +412,9 @@ static void sim_capture_core(int ch, const Layout* L, const float mic[3], double
      * 343.0 while the analyzer follows the layout's recorded temperature splits the matched pair and
      * inflates every solved position by their ratio — silently, and --localize writes it back. */
     if (!(sos >= BWA_SOS_MIN_MPS && sos <= BWA_SOS_MAX_MPS)) sos = BWA_SOS_REF_MPS;
-    /* system latency (plus this box's own extra, --sim-speaker-latency) + time of flight (fractional) */
-    const double lat_f = (double)CAL_SIM_LATENCY_SAMPLES + calib_sim_speaker_latency(ch) * CAL_FS;
+    /* system latency (plus this box's own extra, --sim-speaker-latency, and a mid-run step,
+     * --sim-latency-step) + time of flight (fractional) */
+    const double lat_f = (double)CAL_SIM_LATENCY_SAMPLES + (calib_sim_speaker_latency(ch) + g_sim_lat_step_s) * CAL_FS;
     double delay_f = lat_f + dist / sos * CAL_FS;
     int    di = (int)delay_f; float frac = (float)(delay_f - di);
     double sens = calib_sim_sensitivity(ch);                      /* deterministic +/- ~1.4 dB wobble */

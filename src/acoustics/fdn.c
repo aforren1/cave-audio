@@ -101,16 +101,26 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
 
     /* line -> speaker render: each line is a plane wave from its direction, decoded through the
      * layout's bed decode. `bed_decoder` is the rt-internal id engine.c maps from the public enum:
-     * 2 = EPAD renders the lines through the same energy-preserving decode the beds use; anything
-     * else keeps the FDN's house AllRAD (the sampling form below is only the non-triangulable
-     * fallback, mirroring rt.c's build_bed_decode fallback — not selectable). */
+     * 2 = EPAD renders the lines through the same energy-preserving decode the beds use; 3 = the
+     * layout's IMPORTED full decoder a 3rd-order bed would get (the lines encode at 3rd order; its HF
+     * matrix: a diffuse tail has no low-band image to
+     * velocity-match), and since that matrix is FINAL its max-rE "render" is the same matrix, so
+     * fdn_set_max_re cannot taper it a second time; anything else keeps the FDN's house AllRAD
+     * (the sampling form below is only the non-triangulable fallback, mirroring rt.c's
+     * build_bed_decode fallback — not selectable). */
     float dec[BWA_CHANNELS][BWA_AMBI_CH];
-    int built = 0;
-    if (bed_decoder == 2) built = epad_build_decode(L, dec);
-    if (!built)           built = allrad_build_decode(L, dec);
-    if (!built) ambi_sad_decode(L, L->count, dec);              /* shared sampling decode (degenerate-array fallback) */
     float rw[BWA_AMBI_CH];
     ambi_max_re_weights(BWA_AMBI_ORDER, rw);                    /* the lines encode at full order */
+    int built = 0;
+    const BedDecoder* imp = (bed_decoder == 3) ? layout_bed_decoder_for(&L->bed, 0 /* full */, BWA_AMBI_ORDER, NULL) : NULL;
+    if (imp) {
+        memcpy(dec, imp->hf, sizeof dec);
+        for (int k = 0; k < BWA_AMBI_CH; ++k) rw[k] = 1.f;      /* final matrix: no second taper */
+        built = 1;
+    }
+    if (!built && bed_decoder == 2) built = epad_build_decode(L, dec);
+    if (!built)           built = allrad_build_decode(L, dec);
+    if (!built) ambi_sad_decode(L, L->count, dec);              /* shared sampling decode (degenerate-array fallback) */
     for (int l = 0; l < FDN_N; ++l) {
         fib_sphere_dir(l, FDN_N, f->dir[l]);
         float ad[3]; room_to_ambi(f->dir[l], ad);                     /* room -> ambi (z,x,y) */

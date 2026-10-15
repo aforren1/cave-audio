@@ -255,6 +255,12 @@ src/
                          resampling event. Off = the exact integer tap, bit-identical. [spatialization]
     ambisonics.h/.c      3rd-order ACN/SN3D encode (+ ambi_encode_phonon, the monitor-basis encode
                          shared by steam_decode and rt's direct mode). [M5]
+    ambiset.h            the ambisonic CHANNEL SETS (full + the six .amb mixed-order #H#V sets: names,
+                         ACN masks, highest order). Header-only and include-free so layout.h, sound.c,
+                         rt.c and the tools share it (layout.h cannot include ambisonics.h, which
+                         includes it). A mixed FuMa bed is stored in its highest order's (order+1)^2 slots
+                         with zeros elsewhere, tagged SoundData.chset; mix_bed picks an imported
+                         decoder by that tag. [imported decoder]
   acoustics/
     fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
     ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
@@ -514,6 +520,19 @@ tools/directivity/     clf_to_json.py: the speaker vendor's CLF simulation file 
 tools/layout/          gen_dome.py: the playgrounds' default array, a 24-speaker dome evenly spread over
                        the sphere ABOVE the floor. Writes examples/dome_24.json and the Godot addon's
                        copy (playground/dome_24.json) - regenerate, never hand-edit either. Stdlib only.
+tools/decoder/         ambdec_to_json.py: an AmbDec preset (.ambdec, version 3; what the Ambisonic Decoder
+                       Toolbox writes) -> the layout's `bed_decode` block, the IMPORTED bed decoder
+                       (BWA_DECODE_LAYOUT). Expands the channel mask to 16 ACN columns, converts N3D/FuMa
+                       input scaling to SN3D, folds order_gain and xover_ratio into the rows, matches AmbDec
+                       speakers to layout INDICES by direction from the listening point (5 deg, unambiguous,
+                       --map to pin), names the set from the mask (full1/full2/full3 by ORDER, since a
+                       decoder's order gains fit one order, or one of the six .amb mixed sets), refuses the
+                       rest. `--into` adds or replaces one decoder per set, so ADT's per-order presets go in
+                       one file at a time. /opt/nfeff_comp is NOT applied by the engine: a printed note and
+                       an engine-ignored `nfeff_comp` field. Stdlib only.
+                       test/ambdec/convert_test.py (+ fixture.ambdec, layout.json) is the `ambdec_convert`
+                       ctest. Format facts: OpenAL Soft's core/ambdec.cpp reader + docs/ambdec.txt (no
+                       official spec), and the ADT-written presets OpenAL Soft ships. [imported decoder]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -689,12 +708,15 @@ engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manyl
 release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
 phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
 everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
-tree registers 81 on Windows at full options and 51 off it, and each job's bindings tree registers
+tree registers 82 on Windows at full options and 52 off it, and each job's bindings tree registers
 the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 81 tests with the Steam Audio SDK, 76 without (the 5 SDK-gated ones are `reflect`,
-`bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the four GUI-tool suites
+suite — 82 tests with the Steam Audio SDK, 77 without (the 5 SDK-gated ones are `reflect`,
+`bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES `ambdec_convert` (the AmbDec
+converter's Python test, registered wherever CMake finds a Python 3 interpreter and never when
+cross-compiling, so Android and wasm keep their counts and a host with no Python 3 reads one
+lower in every desktop count below; added 2026-10-15, the CI counts with it are UNVERIFIED), the four GUI-tool suites
 (`calib_view`, `calib_view_session`, `layout_tool`, `playground`), the nine `validate_*` runs (four plus `validate_track_settle`/`_bump`/`_twist`/`_ref_capture`/`_background`), the ten calibrate CLI runs
 (`calibrate_sim_room_aim`/`_trim`, `calibrate_verify_omni`/`_zylia`, `calibrate_zylia_trims`,
 `calibrate_aim_sheet`, `calibrate_live_zylia`, `calibrate_zylia_localize`, `calibrate_capsule_survey`,
@@ -702,20 +724,20 @@ suite — 81 tests with the Steam Audio SDK, 76 without (the 5 SDK-gated ones ar
 `_ring`/`_bump`/`_refuse`/`_survey`/`_twist`) plus `calibrate_grid_rows`, the twelve optical-survey tests (`survey` plus eleven `speaker_survey_*`),
 and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux or macOS at the DEFAULT options it is 46: `calib_view`
+under their build flags. On Linux or macOS at the DEFAULT options it is 47: `calib_view`
 and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
 `validate_*` and seventeen calibrate runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
 `BWA_BUILD_PLAYGROUND`, which defaults OFF. Android is 35 at the defaults: the eleven
 `speaker_survey_*` runs need a host CMake to drive them (`if(NOT CMAKE_CROSSCOMPILING)`), so only
 `survey` comes along. Those two GUI tools are NOT Windows-bound (raylib + rlImGui +
 imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
-back, for 53 with phonon and 48 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
+back, for 54 with phonon and 49 without (MEASURED as 40 / 35 on Ubuntu 22.04 / gcc 11.4 before the
 survey's eight). They need a DISPLAY:
 a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs its 35
 through `tools/android/run-tests.ps1` rather
 than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
 too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
-`lib/android-arm64` + `lib/android-x64`), so the count there is **51** on Linux and macOS and
+`lib/android-arm64` + `lib/android-x64`), so the count there is **52** on Linux and macOS and
 **40** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
 the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
@@ -724,8 +746,8 @@ sleep-lateness bound, which a no-SDK library of the same commit misses identical
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
-`python_example_live_onset`), so the full-options Windows tree is 85 and the default Windows tree
-55; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
+`python_example_live_onset`), so the full-options Windows tree is 86 and the default Windows tree
+56; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
 developer should not need it. The `minimal` example is the SAME demo in every binding since
 2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
 example"), so a change to the stimulus is a change to five files plus the web page.
@@ -741,8 +763,8 @@ after, so run them alone before believing a red.
 `-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_minimal` / `_example_offline_render` / `_example_live_onset` /
 `_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
-91 (81 + 10) and 95 at full options (95 registered, 2026-10-02); a Linux or macOS box with Octave
-alone reaches 56 (51 + 5) and with both 61 (51 + 10). Each suite exits 77
+92 (82 + 10) and 96 at full options (96 registered, 2026-10-15); a Linux or macOS box with Octave
+alone reaches 57 (52 + 5) and with both 62 (52 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
@@ -751,7 +773,7 @@ into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's
 engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
-that is the 55 the linux and macos jobs report, and on Windows 85 registered with 81 run (the four
+that is the 56 the linux and macos jobs report, and on Windows 86 registered with 82 run (the four
 GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is
@@ -1056,7 +1078,8 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `-lwasi-emulated-process-clocks`) each have a comment in `tools/wasm/wasi-sdk.toolchain.cmake`.
   Also: `os` under wasmtime is the same sleep-lateness flake the Android emulator shows (32/33 then
   33/33 on back-to-back runs); it passes in isolation.
-- **A `Layout` is never a stack local.** Raising the capacity to 64 grew it from 72 KB to 176 KB,
+- **A `Layout` is never a stack local.** (It is about 258 KB since the imported bed decoders, 2026-10-15:
+  nine decoders of two 64 x 16 bands each.) Raising the capacity to 64 grew it from 72 KB to 176 KB,
   almost all of it the 512-tap FIR each `Speaker` embeds. Four tests (`rt_feature`, `dsp`, `xval`,
   `valid`) then overflowed the 1 MB main-thread stack with exit `0xC00000FD` BEFORE PRINTING
   ANYTHING, so the log shows a bare SegFault and no failing check. The fix is residency, not a
@@ -1151,7 +1174,18 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   geometry itself pins it to dilution x the range error (2.75 there). The capsule survey refines with
   `calib_trilaterate_refine` and prints `calib_latency_dilution`, and with `--latency` (the Session tab
   passes localize's, whose moving mic rows pin it) it solves only the center
-  (`calib_locate_known_latency`). `--localize` itself still uses the linear solve alone.
+  (`calib_locate_known_latency`). `--localize` solves every speaker at once with one latency per mic
+  row (`calib_localize_joint`, below).
+- **The ZM-1 is NOT sample-locked to the Digiface.** It samples on its own crystal and Dante Via bridges
+  that clock onto Dante's, so the latency through Via is bounded but not known to be constant: it can
+  wander, or step on a Via re-sync. Capsule-to-capsule timing is unaffected (one clock, one bridge);
+  every RANGE is exposed. The docs said "sample-locked" until 2026-10-15. So `--localize` solves a latency
+  per mic row (`calib_localize_joint`, Gauss-Newton with a Schur complement onto the K latencies) and
+  warns when they spread past `CALIB_ROW_LAT_STEADY_S`; the Session tab then stops carrying that
+  latency forward. A 0.2 ms step put the old per-speaker linear solve 8.9 m off in calib_test (bunched
+  mic rows trade the latency against the radius), so the linear answers are no start once the latency
+  moves: the joint solve also starts from the layout and keeps the smaller residual.
+  `--sim-latency-step row,ms` is the simulated step. Unmeasured on hardware (runbook Stage 0).
 - **A test that depends on an earlier test's in-memory state passes vacuously when run alone**
   (`session/resume` returned early under `--tests resume`), and an exit code shared by two failures
   hides one of them (`speaker_survey_mirror`'s exit 3 came from the write refusal, so

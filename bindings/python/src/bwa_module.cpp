@@ -151,7 +151,8 @@ NB_MODULE(_bwa, m) {
     nb::enum_<bwa_bed_decoder>(m, "bed_decoder", nb::is_arithmetic())
         .value("DEFAULT", BWA_DECODE_DEFAULT)
         .value("ALLRAD",  BWA_DECODE_ALLRAD)
-        .value("EPAD",    BWA_DECODE_EPAD);
+        .value("EPAD",    BWA_DECODE_EPAD)
+        .value("LAYOUT",  BWA_DECODE_LAYOUT);
 
     nb::enum_<bwa_sink_type>(m, "sink_type", nb::is_arithmetic())
         .value("AUTO",      BWA_SINK_AUTO)
@@ -897,6 +898,32 @@ NB_MODULE(_bwa, m) {
     }, "decoder"_a, "max_re"_a, "positions"_a, "dirs"_a,
        "Pure and reentrant: the (ndir, n) per-speaker gains the diffuse-bed decode produces. "
        "Gains may be negative (SH sidelobes).");
+    m.def("bed_gains_layout", [](const std::string& path, bwa_bed_decoder dec, ArrF dirs,
+                                 std::optional<std::string> channels, bool max_re, uint32_t band) {
+        if (dirs.size() % 3 || dirs.size() == 0)
+            throw std::invalid_argument("bed_gains_layout: dirs must be ndir*3, ndir > 0");
+        const uint32_t ndir = (uint32_t)(dirs.size() / 3);
+        const char* ch = channels ? channels->c_str() : nullptr;
+        char err[256] = { 0 };
+        uint32_t n;
+        {
+            nb::gil_scoped_release rel;
+            n = bwa_bed_gains_layout(path.c_str(), dec, ch, max_re, band, nullptr, 0, nullptr, 0, err, sizeof err);
+        }
+        if (n == 0) throw std::runtime_error(err[0] ? err : "bed_gains_layout: failed");
+        std::vector<float> out((size_t)ndir * n);
+        const float* dp = dirs.data(); float* op = out.data();
+        uint32_t got;
+        {
+            nb::gil_scoped_release rel;
+            got = bwa_bed_gains_layout(path.c_str(), dec, ch, max_re, band, dp, ndir, op,
+                                       (uint32_t)out.size(), err, sizeof err);
+        }
+        if (got == 0) throw std::runtime_error(err[0] ? err : "bed_gains_layout: failed");
+        return adopt<float, OutF32>(std::move(out), {ndir, n});
+    }, "layout_path"_a, "decoder"_a, "dirs"_a, "channels"_a = nb::none(), "max_re"_a = false, "band"_a = 0u,
+       "Pure and reentrant: the (ndir, n) per-speaker gains a LAYOUT FILE's bed decode produces, "
+       "including its imported bed_decode (decoder LAYOUT). Raises RuntimeError with the reason.");
 
     /* ---- listener and tracking ---- */
     m.def("set_listener_pose", [](Engine& e, float px, float py, float pz,

@@ -92,6 +92,11 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 - **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalized LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
+- **bed band splits**: `re_lp[16]` (the built-in max-rE split's one-pole per SH channel) and,
+  for an imported two-band decoder, `imp_lz1[16]` / `imp_lz2[16]` / `imp_ap[16]` (the AmbDec /
+  OpenAL Soft splitter: two low-pass stages and a first-order allpass per SH channel). Kept
+  apart so the two splits never share a filter, and all four reset on every play, so a replayed
+  slot does not ring the previous bed into the new one.
 - **occlusion / directivity**: `occ_cur`, `dir_cur` ramp state plus the
   3-band transmission-EQ biquad state `eq`, a `VoiceEq` (`g_cur`, `co`, DF-I
   histories, `engaged`). The published *targets* live in `RtCore`'s atomic arrays,
@@ -134,7 +139,9 @@ typedef struct {
     uint32_t frames;
     uint32_t sample_rate;
     uint16_t channels;       /* 1 = mono point source; 4/9/16 = ambisonic bed */
-    uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed) */
+    uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed: a mixed set's HIGHEST) */
+    uint8_t  chset;          /* channel set (spatial/ambiset.h AMBI_SET_*): 0 = full; a mixed-order
+                              * FuMa bed sits in the (order+1)^2 slots, zeros where its set has none */
     struct Stream* stream;   /* non-NULL = streamed from disk (mono; see stream.h) */
 } SoundData;
 
@@ -166,7 +173,14 @@ channel count. The loader accepts 4..`BWA_CHANNELS` speakers whose indices form 
 complete `0..count-1` permutation. A layout with fewer than `BWA_CHANNELS` speakers
 leaves the tail `speakers[]` entries unused (harmless: `count` gates every consumer).
 Abridged from [`src/core/layout.h`](../src/core/layout.h) (the SPCAP defaults, the tracked
-room-EQ grid and the directivity model are left out):
+room-EQ grid, the directivity model and the imported bed decoders are left out). The last of
+those, `BedImport bed`, holds up to `BWA_BED_DEC_MAX` (9, one per channel set: three full
+orders and six mixed sets) `BedDecoder`s, each a channel set, the order it was designed for, an
+`hf[speaker][16]` matrix and a derived `dlf = LF - HF` (zero for a single-band one). Pick one
+through `layout_bed_decoder_for(&L->bed, set, order, &exact)`: a bed's own set and order, else
+the lowest full order above, else the highest below, with `exact` saying whether the pick was a
+match. At 64 speakers a `Layout` is about 252 KB, 72 KB of it the decoders (8.2 KB each): it is
+never a stack local.
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */
@@ -243,8 +257,14 @@ reference):
 - **channel count**: `channels` (the layout's speaker count; set at `rt_create`),
   the width every bus loop, decode matrix, and meter array actually runs to.
 - **bed decode**: the `bed_decode[BWA_CHANNELS][BWA_AMBI_CH]` matrix (built for the
-  first `channels` rows) + `bed_decoder` selector (rt-internal numbering: 1 = AllRAD, 2 = EPAD;
-  0 is the sampling fallback a bare rt core uses and is not selectable through the public ABI).
+  first `channels` rows) + `bed_decoder` selector (rt-internal numbering: 1 = AllRAD, 2 = EPAD,
+  3 = the layout's imported `bed_decode`; 0 is the sampling fallback a bare rt core uses and is
+  not selectable through the public ABI). Under 3, `bed_decode` holds a copy of the HF matrix
+  of the full decoder a 3rd-order bed gets, `imp_on` says the import is live, `imp_ac[]` /
+  `imp_lc[]` hold each imported decoder's splitter coefficients at its own crossover, and
+  `imp_pick[set][order]` / `imp_exact[set][order]` tabulate `layout_bed_decoder_for` at load,
+  so `mix_bed` does a lookup and `rt_bed_decoder_pick` (the engine's mismatch notice) reads the
+  same table. `mix_bed` reads the imported matrices straight out of `layout.bed`.
 - **limiter**: `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
   rate-derived attack/release coefficients.
 - **pathing publish**: the `PathPub` double buffer + `path_idx` flip atomics,

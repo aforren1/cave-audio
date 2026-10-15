@@ -353,8 +353,9 @@ it. Do not expect it to be audible.
 ## Modes
 
 - **`--localize positions.txt`**: acoustic self-survey. Capture every speaker at K ≥ 5 known mic
-  positions. `calib_trilaterate` solves each speaker's 3D position *and* the unknown constant system
-  latency jointly (linear least squares). This **sees speakers optical trackers can't**: the sweep
+  positions. `calib_localize_joint` solves every speaker's 3D position in one least-squares fit,
+  with the unknown system latency solved **once per mic row** (see "The latency per row" below).
+  This **sees speakers optical trackers can't**: the sweep
   passes through the screens. Pair it with the OptiTrack you already have for head tracking: put
   the mic on a tracked stand and add `--track <body>`, so the tool records each MEASURED mic
   position (see "Placing the ZM-1 with the tracker" below), and let acoustics locate the
@@ -372,9 +373,57 @@ it. Do not expect it to be audible.
   turns, so this needs no capsule survey and no orientation: the rows are the array center, tracked or
   typed. The channel order still matters a little, up to 15 µs (5 mm of range), so run `bwa_zylia_probe`
   first. `--check-aim` works here too and reads the pooled direct-sound tilt. In simulation, with the
-  stand turned 30° and the array turned 40° inside its mount, 5 tracked rows put 24 of the 26 example
-  speakers within 3 mm and the worst 7 mm off; ranging with one capsule instead put every speaker about
-  5 cm off. The `calibrate_zylia_localize` ctest pins 12 mm worst and 3 mm RMS.
+  stand turned 30° and the array turned 40° inside its mount, 5 tracked rows put all 26 example
+  speakers within about 1.5 mm. Ranging with one capsule instead put every speaker about 5 cm off. The
+  `calibrate_zylia_localize` ctest pins 3 mm worst and 2 mm RMS, with a steady latency and with one
+  that steps 0.2 ms mid-run.
+
+  **The latency per row.** The ZM-1 reaches the Digiface through Dante Via, and Via bridges two
+  clocks: the ZM-1 samples on its own crystal and sends over USB, and the Digiface runs on the Dante
+  clock. The latency through that bridge cannot drift away over a run, or Via's buffer would run dry
+  or overflow. But nothing promises that it holds still: it can wander, or step when Via re-syncs. A
+  solve with one latency for the whole run turns a step between rows into range errors at every
+  later row. With the mic rows bunched near the middle of the room, the latency also trades against
+  every speaker's radius. In `calib_test`, a 0.2 ms step (69 mm) puts the old per-speaker solve
+  8.9 m off, and a joint solve with one latency 2.2 m off. So the run solves one latency per row:
+  each row then only has to hold still for the minute its speakers take. Every row hears every
+  speaker, so its latency is pinned the way a GPS receiver's clock error is pinned by the satellites
+  around it. The cost is K - 1 more unknowns against n × K equations.
+
+  The run prints each row's latency against their median:
+
+  ```
+  localize: system latency 3.6597 m (10.670 ms), the median over the mic rows
+  localize: each row's latency against the median, us: +0.0 +0.1 -0.2 -0.1 +0.3
+  localize: the latency held: 0.5 us spread across the 5 rows (under 10 us)
+  ```
+
+  A spread of 10 µs or more (`CALIB_ROW_LAT_STEADY_S`, 3.4 mm, provisional) prints `WARNING: the
+  latency MOVED`. The positions still hold, because each row has its own latency. What does not
+  hold is a latency carried from this run into another one: measure it in that run with
+  `--ref-speakers`, and run the Via stability check in docs/hardware-validation.md, Stage 0. The
+  Session tab passes the latency to the later steps only when the run printed `the latency held`.
+  `--sim-latency-step row,ms` is the simulated step: from that row on, every speaker plays later, and
+  the arrival window is not told. A row past the last one is refused.
+
+  The fit runs from two starts, each speaker's own linear solve and the layout's positions, and keeps
+  the one with the smaller residual. A moved latency throws the linear solve far off, and the plan is
+  the better start then. With under 4 solved speakers, or when the per-row fit does not converge, it
+  solves one latency for the run. When that fails too, it writes each speaker's own linear solve. On
+  either path it prints `the latency was not checked for movement` with the reason, and the Session
+  tab does not pass that latency on.
+
+  Each speaker line carries its range residuals (measured minus the fit). A capture more than 10 mm
+  off (`CALIB_LOC_RESID_FLAG_M`) is FLAGGED: most often a reflection taken for the direct sound, or the
+  mic moved during that row. The residual shows only part of a bad capture's error. The fit spends
+  the rest on that speaker's position and on that row's latency, which every speaker in the row
+  shares. In `calib_test`, a capture 40 mm late leaves a 17.6 mm residual and puts its speaker 88 mm
+  off. So the flag catches gross errors, not every error. When a capture is past the flag, the run
+  drops the worst one and solves again without it, and prints `dropped speaker S's capture at row R`
+  with its residual before and after. Against the solve that never saw it, the residual reads the
+  whole error. The run drops one capture, never more, the capsule survey's rule: a capture still past
+  the flag after the drop means more than one is bad, so the rest is no longer known to be
+  consistent. The run then prints a WARNING and keeps the FLAGGED markers. Re-take those rows.
 
   The solved latency gets a free sanity check: at open, the capture shell logs the driver's own
   `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; the Digiface reports its Dante
@@ -921,7 +970,8 @@ Where it works: the `--zylia` position survey and live aiming (`--live N --zylia
 refuses it: it already trusts every swept speaker's position and solves the latency with the center,
 and a latency read at the assumed center would tie the acoustic center to the one it checks. Pass it
 `--latency` from `--localize`. `--localize` solves its own. The Session tab does not pass it either:
-its localize step pins the latency from moving mic rows, and every later step gets that.
+its localize step pins the latency from moving mic rows, and every later step gets that, but only
+when the localize run reported that the latency held across its rows.
 
 `--sim-speaker-latency spk,ms` (simulate only, repeatable) makes one speaker play that much later
 than the rest, so the flag has a known outlier. The `calibrate_live_zylia` ctest pins the latency to
@@ -1022,7 +1072,11 @@ two drivers at once.
 
 **Put the ZM-1 on the Dante network.** Dante Via transmits the ZM-1's 19 capsules as Dante
 channels. The Digiface receives them as 19 **inputs on the same ASIO device that already owns the
-array's outputs**. One driver, one clock domain, sample-locked. The capture opens N outputs plus
+array's outputs**. One driver, and on the Digiface one clock: the outputs and the 19 inputs never
+drift apart. That is not the same as sample-locked to the ZM-1. The ZM-1 samples on its own crystal,
+and Via bridges that clock onto the Dante clock, so the latency through Via is bounded but not
+guaranteed constant (see "The latency per row" under `--localize`). Timing between capsules is not
+affected: all 19 are sampled together and cross the bridge together. The capture opens N outputs plus
 19 inputs (`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
 ([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/)
 is the recipe; Dante Via has a trial, so you can prove the route first.)
@@ -1030,9 +1084,10 @@ is the recipe; Dante Via has a trial, so you can prove the route first.)
 What it buys, beyond unblocking the sweep:
 
 - **Absolute latency, so distance becomes real.** `zylia_localize`'s range is only as good as the
-  latency you feed it, and the array is far too small to self-calibrate that. Sample-locked
-  playback and capture make the round-trip a measurable constant, so the ZM-1 delivers full 3D
-  **positions** from one placement, not just directions.
+  latency you feed it, and the array is far too small to self-calibrate that. Playback and capture
+  on one driver make the round trip measurable, so the ZM-1 delivers full 3D **positions** from one
+  placement, not just directions, as long as the latency holds between the measurement that gave it
+  and the run that uses it. Measure it in the same run where you can (`--ref-speakers`).
 - **Sweeps instead of claps** for the capsule survey (`--capsule-survey`): far better SNR,
   sub-sample arrivals off the deconvolved IR peak, every speaker a known source for free.
 - **Spatial room capture** (above) becomes buildable at all: it needs the 19-channel IR.
@@ -1043,9 +1098,12 @@ Caveats to check first. **The capture chain is slow: about 60 ms, not the ~10 ms
 suggests.** Measured with a clap loopback, that is, ZM-1 in, straight back out to a speaker, both
 the clap and its replay recorded on an independent device. The ZM-1's own USB stack, a Via leg in
 each direction, and the ASIO buffer all stack up. This costs nothing as long as you remember it:
-the number is constant and measurable, so `--latency` absorbs it (60 ms is 20.6 m at c), the 0.5 s
+the number is measurable, so `--latency` absorbs it (60 ms is 20.6 m at c), the 0.5 s
 capture tail (`CAL_NTAIL`) covers it many times over, and the production render never runs the ZM-1
-at all. What it does rule out is guessing the latency instead of measuring it.
+at all. What it does rule out is guessing the latency instead of measuring it. Whether it stays
+constant over a session is unmeasured: Via bridges the ZM-1's clock onto Dante's, and that bridge can
+wander or step. `--localize` solves a latency per mic row and warns when they disagree; the Stage 0
+check in docs/hardware-validation.md measures it directly.
 
 24 out + 19 in is **43 channels** (55 with 36 speakers), so confirm the Digiface offers that many
 at your rate. Dante endpoints commonly halve their channel count at 96 kHz; calibrate at 48 kHz.
@@ -1348,7 +1406,8 @@ capsules' heights are then unconstrained.
   surround the array, and the dome in `calib_test` reads 2.75. Over 3 the run prints the latency with a
   WARNING that it is poorly determined, does not offer it as the `--latency` value, and tells you to
   pass the localize run's. The localize run's latency is well pinned, because its
-  mic rows move; the Session tab passes its median.
+  mic rows move; the Session tab passes the median over its rows. It holds only if Via's latency did
+  not move between the two runs, which nothing checks yet.
 
 **Leave-one-out: which speaker does not fit.** One speaker whose layout position is off, or whose
 capture was contaminated, bends the whole table, and the residual hides most of it: the fit spends a
@@ -2179,8 +2238,11 @@ speaker's **Aim speaker N** button, hands over the next speaker and keeps the re
 accepted. The step passes when every listed speaker has one.
 
 The latency the tab hands the capsule survey and live aiming is the localize run's: the median of
-the per-speaker solves. The capsule survey's own latency is weak on a dome around the listening point
-(see "The speaker-sweep capsule survey").
+its per-row latencies. The tab hands it over only when the run printed `the latency held`. When the
+latency MOVED between rows, or the run never checked it (one latency for the run, or each speaker's
+own solve), the tab hands over nothing, and the step summary says which: the later steps then solve
+their own. The capsule survey's own
+latency is weak on a dome around the listening point (see "The speaker-sweep capsule survey").
 
 ### The audio device
 

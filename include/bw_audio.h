@@ -111,8 +111,17 @@ typedef enum {
  * flattest loudness-vs-direction of the two. Which sounds better on a real array is a by-ear
  * call. The plain sampling (projection) decode is NOT selectable: on an irregular array it
  * over-energizes dense speaker regions (dominated by both options above). It survives only as
- * the engine's automatic fallback when a degenerate layout defeats the chosen build. Affects the
- * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
+ * the engine's automatic fallback when a degenerate layout defeats the chosen build. LAYOUT uses
+ * a decoder designed ELSEWHERE (the Ambisonic Decoder Toolbox, via an AmbDec file and
+ * tools/decoder/ambdec_to_json.py), carried in the layout file's `bed_decode` block: one FINAL
+ * matrix per channel set (full-order decoders per order, "full1".."full3", plus optional
+ * mixed-order sets), single- or two-band. A bed takes the decoder for its own set and order, else
+ * the nearest full order (higher first), with a one-time note in bwa_last_error when the match is
+ * not exact. The engine applies it as it is, so bwa_set_max_re and bwa_set_max_re_split do not touch a bed it decodes
+ * (the designer already chose the per-order gains). Selecting LAYOUT with a layout that has no
+ * `bed_decode` leaves bwa_create usable (reason in bwa_last_error) and makes bwa_start refuse
+ * with BWA_ERR_LAYOUT. Affects the ambisonic + reflection BEDS only (and the FDN tail), not the
+ * point-source panner. See docs/spatialization.md. */
 /* Diffuse-bed SH->speaker decoder. Value 0 is RESERVED for default-init (the sokol convention): a
  * zero-filled bwa_desc means "whatever the engine currently defaults to", not a named algorithm, so
  * the default can move without an ABI break and without silently re-pointing callers who did pick
@@ -120,6 +129,7 @@ typedef enum {
 typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current default */
                BWA_DECODE_ALLRAD  = 1,
                BWA_DECODE_EPAD    = 2,
+               BWA_DECODE_LAYOUT  = 3,   /* the layout file's imported `bed_decode` (see above) */
                BWA_DECODE_FORCE_U32 = 0x7FFFFFFF } bwa_bed_decoder;
 
 /* Output-device policy. AUTO (the default) picks by channel count and platform, then falls back
@@ -248,7 +258,9 @@ typedef enum {
     BWA_ERR_DEVICE   = 2,   /* audio device could not be opened / lacked channels / failed to start */
     BWA_ERR_LAYOUT   = 3,   /* bwa_start: an explicitly-passed layout_path failed to load at
                              * create (the reason is in bwa_last_error). Fix the file - or pass
-                             * layout_path = NULL to opt into the 26-grid default deliberately. */
+                             * layout_path = NULL to opt into the 26-grid default deliberately.
+                             * Also: bed_decoder = BWA_DECODE_LAYOUT with a layout that carries
+                             * no `bed_decode` block. */
     BWA_ERR_HRTF     = 4,   /* reserved: HRTF failures are currently non-fatal (bwa_last_error) */
     BWA_ERR_STATE    = 5,   /* reserved: wrong-state calls currently report via bwa_last_error */
     BWA_ERR_INTERNAL = 6,   /* reserved */
@@ -1625,10 +1637,44 @@ BWA_API uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* position
  * weighting when `max_re`, and multiplies through. Writes out[i*n + s] (ndir*n floats; gains may be negative - SH
  * sidelobes); returns ndir. Pure and reentrant, same as the panner batch. A layout that scores well
  * here is a good QUADRATURE for the sphere, which is what ambisonic content wants from an array and
- * what the point-source panners cannot see. */
+ * what the point-source panners cannot see. BWA_DECODE_LAYOUT returns 0: positions carry no
+ * imported matrix, so grade one with bwa_bed_gains_layout. */
 BWA_API uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
                                      const float* positions, uint32_t n,
                                      const float* dirs, uint32_t ndir, float* out);
+
+/* The same grading against a LAYOUT FILE, so it can see what bwa_bed_gains_batch cannot: the
+ * file's imported `bed_decode` (BWA_DECODE_LAYOUT), its listening point, and its speaker count. It
+ * loads `layout_path` exactly as bwa_create would and builds the decode bwa_start would install:
+ * AllRAD / EPAD from the file's geometry, or the imported matrix the engine would pick for a bed of
+ * channel set `channels`.
+ *
+ *   channels  the bed: NULL (a 3rd-order full bed), "full1", "full2" or "full3" for a full-order
+ *             bed of that order, else a mixed-order set name ("1H", "2H", "2H1V", "3H", "3H1V",
+ *             "3H2V"; the FuMa .amb sets). Each direction is encoded with the channels outside the
+ *             bed zeroed, as the loader stores such a bed, then decoded through the matrix that bed
+ *             would get: the imported decoder the engine picks (its own set and order, else the
+ *             nearest full order, higher first), or the built-in full matrix.
+ *   max_re    the taper bwa_set_max_re applies, by the bed's highest order. It has NO effect on
+ *             an imported matrix, exactly as in the engine.
+ *   band      0 = the HF (or only) matrix, 1 = the LF matrix of a two-band imported decoder (a
+ *             single-band one, and every built-in decoder, read the same matrix for both).
+ *   dirs      ndir unit room-space directions (ndir*3 floats), as for bwa_bed_gains_batch.
+ *   out       out[i*N + s] for speaker index s of the file's N speakers; out_cap is its size in
+ *             FLOATS. out = NULL is a SIZE QUERY: it returns N and writes nothing, after the same
+ *             checks the full call makes on everything but dirs/ndir/out_cap (so a size query on a
+ *             file the full call would refuse returns 0, with the same reason in err).
+ *   err       optional; on failure it receives the reason (NUL-terminated, truncated to err_cap-1).
+ *             There is no engine here, so bwa_last_error cannot carry it.
+ *
+ * Returns N (the speaker count) on success, 0 on any failure: NULL path or dirs with out set,
+ * ndir 0, an unloadable layout (layout_load's own message), an unknown `channels`, band not 0 or 1,
+ * out_cap < ndir*N, BWA_DECODE_LAYOUT on a file with no `bed_decode`, or allocation failure. Pure
+ * and reentrant; it reads the file and allocates, so keep it off an audio callback. */
+BWA_API uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
+                                      const char* channels, bool max_re, uint32_t band,
+                                      const float* dirs, uint32_t ndir,
+                                      float* out, uint32_t out_cap, char* err, uint32_t err_cap);
 
 /* ---- listener (control thread; skip when a tracker is connected) ---- */
 /* Position in room space. The quaternion is head orientation. Only the headphone

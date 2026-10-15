@@ -20,7 +20,10 @@ typedef struct {
     uint32_t frames;
     uint32_t sample_rate;
     uint16_t channels;       /* 1 = mono point source; 4/9/16 = ambisonic bed */
-    uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed) */
+    uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed: the HIGHEST order of a mixed set) */
+    uint8_t  chset;          /* ambisonic channel set (spatial/ambiset.h AMBI_SET_*): 0 = full. A
+                              * mixed-order FuMa bed sits in the (order+1)^2 ACN slots with zeros in
+                              * the channels its set lacks; mix_bed picks the decoder by this tag. */
     struct Stream* stream;   /* non-NULL = streamed from disk (mono); the audio thread reads its ring */
 } SoundData;
 
@@ -35,7 +38,10 @@ bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char
 
 /* Like sound_load_ambix, but the file is FuMa B-format (WXYZ | RSTUV | KLMNOPQ, MaxN + the W
  * -3 dB): channels are reordered to ACN and rescaled to SN3D at load, so the stored asset is
- * identical to an AmbiX load of the same field. Full 3D sets only (4/9/16 channels). */
+ * identical to an AmbiX load of the same field. Full 3D sets (4/9/16 channels) and the .amb
+ * MIXED-order sets, identified by channel count the way the format defines them (3 = 1H, 5 = 2H,
+ * 6 = 2H1V, 7 = 3H, 8 = 3H1V, 11 = 3H2V): those land in the ACN slots of their highest order with
+ * zeros elsewhere, and `chset` records the set. */
 bool sound_load_fuma(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap);
 
 void sound_unload(SoundData* s);   /* frees pcm; safe on a zeroed/empty SoundData */

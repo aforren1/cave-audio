@@ -104,6 +104,7 @@ __all__ = [
     "check_abi",
     "panner_gains",
     "bed_gains",
+    "bed_gains_layout",
     "spcap_focus_default",
     "source_preset",
     "tuning_preset",
@@ -279,6 +280,21 @@ def bed_gains(decoder, max_re: bool, positions, directions):
     pos = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1, 3)
     dirs = np.ascontiguousarray(directions, dtype=np.float32).reshape(-1, 3)
     return _bwa.bed_gains_batch(decoder, bool(max_re), pos, dirs)
+
+
+def bed_gains_layout(layout_path, decoder, directions, channels=None, max_re: bool = False, band: int = 0):
+    """The per-speaker gains a LAYOUT FILE's bed decode produces, as an ``(ndir, nspeakers)`` array.
+
+    Unlike ``bed_gains`` it reads the file, so it sees the imported ``bed_decode``
+    (``BedDecoder.LAYOUT``), the file's listening point and its speaker count. ``channels`` names the bed:
+    None for a 3rd-order full bed, "full1"/"full2"/"full3" for a full bed of that order, or a
+    mixed-order set ("3H1V", ...); ``band`` 1 reads the LF matrix of a
+    two-band imported decoder. ``max_re`` never touches an imported matrix. Raises RuntimeError
+    with the reason on a bad file or argument.
+    """
+    np = _np()
+    dirs = np.ascontiguousarray(directions, dtype=np.float32).reshape(-1, 3)
+    return _bwa.bed_gains_layout(str(layout_path), decoder, dirs, channels, bool(max_re), int(band))
 
 
 # ---------------------------------------------------------------------------- handles

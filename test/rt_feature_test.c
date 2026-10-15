@@ -20,6 +20,7 @@
 #include "spatial/hole.h"        /* the hole-floor section derives its expected width straight from hole.c */
 #include "dsp/biquad.h"      /* the zero-band section pins the shared RBJ design's gain floor directly */
 #include "tracking/pose.h"        /* the tracked-listener + prediction sections publish through the seqlock */
+#include "spatial/allrad.h"       /* the imported-decoder section imports the AllRAD matrix itself */
 
 /* ---- tracked listener alignment helpers (rt_set_tracked_align) ----------------------------------
  * The expected per-channel comp: (|spk - ref| - |spk - listener|) * rate / c, with the set's minimum
@@ -100,6 +101,58 @@ static void make_barrel(Layout* L) {
     L->atten_ref_m   = 1.f;
     L->atten_rolloff = 1.f;
     L->atten_min_lin = 0.01f;
+}
+
+/* An N-channel bed of one sine, per-channel amplitudes amp[0..nch-1] (in the FILE's own channel order:
+ * ACN for AmbiX, WXYZ.. for FuMa). The imported-decoder section drives TONES, never DC (CLAUDE.md's
+ * laterality trap: a DC check proved the opposite of what was audible once). */
+static int write_bed_sine_wav(const char* path, int nch, const float* amp, double freq, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, (drwav_uint32)nch, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * nch * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    for (uint32_t i = 0; i < frames; ++i) {
+        const float v = 0.5f * (float)sin(2.0 * 3.14159265358979 * freq * i / RATE);
+        for (int k = 0; k < nch; ++k) buf[(size_t)i * nch + k] = amp[k] * v;
+    }
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+/* imported decoder `d` (channel set `set` at `order`) routes the W channel (ACN 0) to speaker `spk`
+ * only: HF, and LF when lf_spk >= 0 */
+static void imp_route_w(BedDecoder* d, int set, int order, int spk, int lf_spk, float xover_hz) {
+    memset(d, 0, sizeof *d);
+    d->set = (uint8_t)set;
+    d->order = (uint8_t)order;
+    d->hf[spk][0] = 1.f;
+    if (lf_spk >= 0) {                                 /* dlf = LF - HF */
+        d->two_band = 1; d->xover_hz = xover_hz;
+        d->dlf[lf_spk][0] += 1.f;
+        d->dlf[spk][0]    -= 1.f;
+    }
+}
+
+/* The AmbDec / OpenAL Soft band splitter's ANALYTIC response at f for a crossover fc (double, from
+ * the transfer functions, not from rt.c's recurrence): LP = LP1^2 with LP1 = k(1 + z^-1)/(1 + c z^-1),
+ * AP = (c + z^-1)/(1 + c z^-1), HP = AP - LP; c = (sin w0 - 1)/cos w0, k = (c + 1)/2. Writes |LP|^2
+ * and |HP|^2. */
+static void splitter_resp(double fc, double f, double* lp2, double* hp2) {
+    const double PI_ = 3.14159265358979323846;
+    const double w0 = 2.0 * PI_ * fc / RATE, c = (sin(w0) - 1.0) / cos(w0), k = 0.5 * (c + 1.0);
+    const double w = 2.0 * PI_ * f / RATE, zr = cos(w), zi = -sin(w);      /* z^-1 */
+    const double dr = 1.0 + c * zr, di = c * zi, d2 = dr * dr + di * di;
+    const double nr = k * (1.0 + zr), ni = k * zi;
+    const double l1r = (nr * dr + ni * di) / d2, l1i = (ni * dr - nr * di) / d2;
+    const double lr = l1r * l1r - l1i * l1i, li = 2.0 * l1r * l1i;
+    const double anr = c + zr, ani = zi;
+    const double ar = (anr * dr + ani * di) / d2, ai = (ani * dr - anr * di) / d2;
+    *lp2 = lr * lr + li * li;
+    *hp2 = (ar - lr) * (ar - lr) + (ai - li) * (ai - li);
+}
+static double chan_sumsq(int ch) {
+    double e = 0; for (int i = 0; i < N; ++i) { const double v = bus[(size_t)ch * N + i]; e += v * v; } return e;
 }
 
 int main(void) {
@@ -2464,12 +2517,273 @@ int main(void) {
         } else CHECK(0, "write the 3 kHz route tone");
     }
 
+    /* IMPORTED bed decoder (bwa_desc.bed_decoder = BWA_DECODE_LAYOUT; layout `bed_decode`).
+     * (a) an imported single-band matrix EQUAL to the built-in AllRAD one renders bit-identically to
+     *     AllRAD with max-rE OFF, while the imported core has max-rE and the split ON: the imported
+     *     matrix is final, so the taper must not touch it (a double taper would show here);
+     * (b) a two-band import splits at its own crossover with the AmbDec / OpenAL Soft phase-matched
+     *     splitter: each band's level matches the ANALYTIC response from 1/4 to 8x the crossover, the
+     *     LF leak at 2x the crossover is about -14 dB (a one-pole split leaks -7 dB), and LF == HF
+     *     sums to an allpass (flat);
+     * (c) a mixed-order FuMa bed picks the decoder for its own set, a full bed the full one;
+     * (d) decoder 3 with no block falls back to AllRAD, and a live rt_set_layout installs the import;
+     * (e) per-order full decoders: a bed takes its own order, else the lowest above, else the highest
+     *     below (not exact = the engine's notice);
+     * (f) a REPLAYED slot starts with clean band-split state (no ring of the previous bed). */
+    {
+        static Layout LI;                                  /* never a stack local */
+        layout_default(&LI);
+        BedDecoder* d0 = &LI.bed.dec[0];
+        memset(d0, 0, sizeof *d0);
+        d0->set = 0; d0->order = 3;                        /* full3 */
+        CHECK(allrad_build_decode(&LI, d0->hf) == 1, "imported: AllRAD dump for the import");
+        LI.bed.ndec = 1;
+        float amp16[16];
+        for (int k = 0; k < 16; ++k) amp16[k] = 0.7f / (float)(1 + k);    /* every order carries energy */
+        const char* B16 = "bwa_rt_imp16.wav";
+        if (write_bed_sine_wav(B16, 16, amp16, 1500.0, 8 * N)) {
+            RtCore* ca = rt_create(8, 4, RATE, CH);
+            RtCore* ci = rt_create(8, 4, RATE, CH);
+            CHECK(ca && ci, "rt_create (imported a)");
+            if (ca && ci) {
+                rt_set_layout(ca, &LI); rt_set_bed_decoder(ca, 1);
+                rt_set_max_re(ca, 0);
+                rt_set_bed_decoder(ci, 3);                 /* no block yet: AllRAD underneath, not imported */
+                CHECK(!rt_bed_imported(ci), "imported: decoder 3 with no block is not imported");
+                rt_set_layout(ci, &LI);                    /* live layout change: the import installs */
+                CHECK(rt_bed_imported(ci), "imported: rt_set_layout installs the layout's bed_decode");
+                rt_set_max_re(ci, 1); rt_set_max_re_split(ci, 1);
+                uint32_t sa = rt_load_ambix(ca, B16, err, sizeof err), si = rt_load_ambix(ci, B16, err, sizeof err);
+                uint32_t va = rt_source_create(ca), vi = rt_source_create(ci);
+                rt_source_play(ca, va, sa, true); rt_source_play(ci, vi, si, true);
+                rt_commit(ca); rt_commit(ci);
+                static float busa[CH * N];
+                bwa_timestamp t1 = { 0, 0 }, t2 = { 0, 0 };
+                double maxd = 0.0, tot = 0.0;
+                for (int b = 0; b < 6; ++b) {
+                    rt_render(ca, busa, N, &t1);
+                    rt_render(ci, bus,  N, &t2);
+                    for (int i = 0; i < CH * N; ++i) {
+                        const double dd = fabs((double)busa[i] - bus[i]);
+                        if (dd > maxd) maxd = dd;
+                        tot += fabs(busa[i]);
+                    }
+                }
+                printf("imported == AllRAD: max |diff| %.3g over %.3g total\n", maxd, tot);
+                CHECK(tot > 1.0 && maxd == 0.0,
+                      "imported: the AllRAD matrix, imported, renders bit-identically to AllRAD (max-rE has no effect on it)");
+            }
+            rt_destroy(ca); rt_destroy(ci);
+            remove(B16);
+        } else CHECK(0, "write the 16-ch imported bed");
+
+        /* (b) two-band at 750 Hz: config X routes W's LF band to speaker 4 and its HF band to 21; config
+         * Y routes both to speaker 4 (LF == HF, so speaker 4 hears LP + HP = the allpass). Every tone
+         * is a whole number of cycles in the 8-block window (48000 * k / 2048 Hz), so the sum of
+         * squares is the steady-state level with no window ripple. */
+        {
+            static const double tf[5] = { 187.5, 375.0, 750.0, 1500.0, 6000.0 };   /* 1/4 .. 8x the crossover */
+            const float XO = 750.f;
+            double sx4[5] = { 0 }, sx21[5] = { 0 }, sy4[5] = { 0 }, rest = 0;
+            int wrote = 1;
+            for (int cfg = 0; cfg < 2; ++cfg) {
+                imp_route_w(d0, 0, 3, cfg ? 4 : 21, 4, XO);
+                LI.bed.ndec = 1;
+                RtCore* cb = rt_create(8, 8, RATE, CH);
+                CHECK(cb != NULL, "rt_create (imported b)");
+                if (!cb) break;
+                rt_set_limiter(cb, 0);
+                rt_set_layout(cb, &LI); rt_set_bed_decoder(cb, 3);
+                for (int t = 0; t < 5; ++t) {
+                    const char* BT = "bwa_rt_imp_tone.wav";
+                    const float aw1[4] = { 1.f, 0.f, 0.f, 0.f };
+                    if (!write_bed_sine_wav(BT, 4, aw1, tf[t], 16 * N)) { wrote = 0; break; }
+                    uint32_t sb = rt_load_ambix(cb, BT, err, sizeof err);
+                    remove(BT);
+                    uint32_t vb = rt_source_create(cb);
+                    rt_source_play(cb, vb, sb, true); rt_commit(cb);
+                    for (int bl = 0; bl < 4; ++bl) render2(cb);          /* settle the splitter + the ramp */
+                    for (int bl = 0; bl < 8; ++bl) {
+                        bwa_timestamp tb = { 0, 0 }; rt_render(cb, bus, N, &tb);
+                        if (cfg) sy4[t] += chan_sumsq(4);
+                        else { sx4[t] += chan_sumsq(4); sx21[t] += chan_sumsq(21); }
+                        for (int k = 0; k < CH; ++k) if (k != 4 && k != 21) rest += chan_sumsq(k);
+                    }
+                    rt_source_destroy(cb, vb); rt_commit(cb); render2(cb);
+                    rt_unload_sound(cb, sb); rt_commit(cb); render2(cb);
+                }
+                rt_destroy(cb);
+            }
+            CHECK(wrote, "write the two-band tones");
+            CHECK(rest < 1e-9, "imported two-band: no other speaker sounds");
+            for (int t = 0; t < 5; ++t) {
+                double lp2, hp2;
+                splitter_resp(XO, tf[t], &lp2, &hp2);
+                const double want = 10.0 * log10(lp2 / hp2);
+                const double got  = (sx4[t] > 0 && sx21[t] > 0) ? 10.0 * log10(sx4[t] / sx21[t]) : -999.0;
+                printf("imported two-band %6.1f Hz: LF/HF %+7.2f dB (analytic %+7.2f)\n", tf[t], got, want);
+                char msg[160];
+                snprintf(msg, sizeof msg, "imported two-band: LF/HF at %.1f Hz is the AmbDec splitter's (%.2f vs %.2f dB)",
+                         tf[t], got, want);
+                CHECK(fabs(got - want) < 0.3, msg);
+            }
+            CHECK(sx4[0] > 100.0 * sx21[0], "imported two-band: a tone at 1/4 the crossover follows the LF matrix");
+            CHECK(sx21[4] > 1000.0 * sx4[4], "imported two-band: a tone at 8x the crossover follows the HF matrix");
+            /* the LF leak at 2x the crossover, against the allpass level of the same tone: -14 dB for the
+             * 12 dB/oct splitter, where the old one-pole low band leaked -7 dB */
+            const double leak = (sy4[3] > 0) ? 10.0 * log10(sx4[3] / sy4[3]) : 0.0;
+            printf("imported two-band: LF leak at 2x crossover %.2f dB\n", leak);
+            CHECK(leak < -12.5 && leak > -15.5, "imported two-band: the LF band is down ~14 dB at 2x the crossover");
+            /* LF == HF: LP + HP = the allpass, flat in magnitude at every tone (the input level is the
+             * same 0.5-amplitude sine, so every sy4 is the same within the window's exactness) */
+            int flat = 1;
+            for (int t = 1; t < 5; ++t) if (sy4[0] <= 0 || fabs(10.0 * log10(sy4[t] / sy4[0])) > 0.05) flat = 0;
+            printf("imported two-band LF==HF: %.4g %.4g %.4g %.4g %.4g\n", sy4[0], sy4[1], sy4[2], sy4[3], sy4[4]);
+            CHECK(flat, "imported two-band: LF == HF sums to an allpass (flat within 0.05 dB from 1/4 to 8x)");
+        }
+
+        /* (c) a 3H1V decoder beside the full one: a FuMa 8-channel bed (W X Y Z U V P Q) takes it */
+        imp_route_w(&LI.bed.dec[0], 0, 3, 4, -1, 0.f);                 /* full3: W -> speaker 4 */
+        imp_route_w(&LI.bed.dec[1], 5 /* AMBI_SET_3H1V */, 3, 21, -1, 0.f);/* 3H1V: W -> speaker 21 */
+        LI.bed.ndec = 2;
+        const float ampf8[8] = { 1.f, 0, 0, 0, 0, 0, 0, 0 }, ampf4[4] = { 1.f, 0, 0, 0 }, ampf5[5] = { 1.f, 0, 0, 0, 0 };
+        const char* F8 = "bwa_rt_imp_f8.wav", *F4 = "bwa_rt_imp_f4.wav", *F5 = "bwa_rt_imp_f5.wav";
+        if (write_bed_sine_wav(F8, 8, ampf8, 1500.0, 8 * N) && write_bed_sine_wav(F4, 4, ampf4, 1500.0, 8 * N) &&
+            write_bed_sine_wav(F5, 5, ampf5, 1500.0, 8 * N)) {
+            RtCore* cc = rt_create(8, 8, RATE, CH);
+            CHECK(cc != NULL, "rt_create (imported c)");
+            if (cc) {
+                rt_set_layout(cc, &LI); rt_set_bed_decoder(cc, 3);
+                int ex = -1;
+                CHECK(rt_bed_decoder_pick(cc, 5, 3, &ex) == 1 && ex == 1, "imported: a 3H1V bed picks the 3H1V decoder, exactly");
+                CHECK(rt_bed_decoder_pick(cc, 2, 2, &ex) == 0 && ex == 0, "imported: a 2H bed picks full3, not exactly");
+                const char* files[3] = { F8, F4, F5 };
+                const int   want[3]  = { 21, 4, 4 };       /* 3H1V -> its own; full -> full; 2H (no decoder) -> full */
+                for (int f = 0; f < 3; ++f) {
+                    uint32_t sf = rt_load_fuma(cc, files[f], err, sizeof err);
+                    CHECK(sf != 0, err[0] ? err : "imported: load the FuMa bed");
+                    uint32_t vf = rt_source_create(cc);
+                    rt_source_play(cc, vf, sf, true); rt_commit(cc);
+                    for (int b = 0; b < 3; ++b) render2(cc);
+                    const double tot = total_energy();
+                    CHECK(tot > 1.0 && chan_energy(want[f]) > 0.999 * tot,
+                          f == 0 ? "imported: a 3H1V FuMa bed decodes through the 3H1V decoder"
+                          : f == 1 ? "imported: a full FuMa bed decodes through the full decoder"
+                                   : "imported: a 2H bed with no 2H decoder falls back to the full one");
+                    rt_source_destroy(cc, vf); rt_commit(cc); render2(cc);
+                }
+                rt_destroy(cc);
+            }
+            remove(F8); remove(F4); remove(F5);
+        } else CHECK(0, "write the FuMa mixed-order beds");
+
+        /* (e) per-order full decoders, W routed to a speaker per decoder: full1 -> 7, full3 -> 4. A
+         * 1st-order (4-ch) and a 3rd-order (16-ch) AmbiX bed, each carrying W only, and a 3rd-order
+         * bed carrying ONLY ACN 9 (3rd order) for the dropped-orders case. */
+        {
+            const float aw4[4] = { 1.f, 0, 0, 0 };
+            float aw16[16] = { 1.f }, a9[16] = { 0 };
+            a9[9] = 1.f;
+            const char* E4 = "bwa_rt_imp_e4.wav", *E16 = "bwa_rt_imp_e16.wav", *E9 = "bwa_rt_imp_e9.wav";
+            if (write_bed_sine_wav(E4, 4, aw4, 1500.0, 8 * N) && write_bed_sine_wav(E16, 16, aw16, 1500.0, 8 * N) &&
+                write_bed_sine_wav(E9, 16, a9, 1500.0, 8 * N)) {
+                /* which speaker carries a bed's W (or -1 when the bed is silent), on core `ce` */
+                #define IMP_ROUTE(ce, path, out_spk) do {                                                   \
+                    uint32_t s_ = rt_load_ambix((ce), (path), err, sizeof err);                            \
+                    uint32_t v_ = rt_source_create(ce);                                                    \
+                    rt_source_play((ce), v_, s_, true); rt_commit(ce);                                     \
+                    for (int b_ = 0; b_ < 3; ++b_) render2(ce);                                            \
+                    const double t_ = total_energy();                                                     \
+                    (out_spk) = (t_ < 1e-9) ? -1 : (chan_energy(argmax_channel()) > 0.999 * t_ ? argmax_channel() : -2); \
+                    rt_source_destroy((ce), v_); rt_commit(ce); render2(ce);                               \
+                    rt_unload_sound((ce), s_); rt_commit(ce); render2(ce);                                 \
+                } while (0)
+                for (int cfg = 0; cfg < 3; ++cfg) {       /* 0 = full1 + full3, 1 = full3 only, 2 = full1 only */
+                    LI.bed.ndec = 0;
+                    if (cfg != 1) imp_route_w(&LI.bed.dec[LI.bed.ndec++], 0, 1, 7, -1, 0.f);
+                    if (cfg != 2) {                       /* full3 carries ACN 9 too, so "dropped" is
+                                                           * the decoder's order, not an empty column */
+                        imp_route_w(&LI.bed.dec[LI.bed.ndec], 0, 3, 4, -1, 0.f);
+                        LI.bed.dec[LI.bed.ndec++].hf[4][9] = 1.f;
+                    }
+                    RtCore* ce = rt_create(8, 8, RATE, CH);
+                    CHECK(ce != NULL, "rt_create (imported e)");
+                    if (!ce) break;
+                    rt_set_layout(ce, &LI); rt_set_bed_decoder(ce, 3);
+                    int ex1 = -1, ex3 = -1, r1 = -9, r3 = -9, r9 = -9;
+                    rt_bed_decoder_pick(ce, 0, 1, &ex1);
+                    rt_bed_decoder_pick(ce, 0, 3, &ex3);
+                    if (cfg == 0) {                       /* a 2nd-order bed: the order ABOVE wins */
+                        int ex2 = -1;
+                        CHECK(rt_bed_decoder_pick(ce, 0, 2, &ex2) == 1 && ex2 == 0,
+                              "imported: full1 + full3, a 2nd-order bed picks full3 (higher before lower), not exact");
+                    }
+                    IMP_ROUTE(ce, E4, r1);
+                    IMP_ROUTE(ce, E16, r3);
+                    IMP_ROUTE(ce, E9, r9);
+                    printf("imported per-order cfg %d: 1st-order bed -> spk %d (exact %d), 3rd-order -> spk %d (exact %d), "
+                           "ACN 9 only -> %d\n", cfg, r1, ex1, r3, ex3, r9);
+                    if (cfg == 0) {
+                        CHECK(r1 == 7 && ex1 == 1, "imported: full1 + full3, a 1st-order bed picks full1 (exact)");
+                        CHECK(r3 == 4 && ex3 == 1, "imported: full1 + full3, a 3rd-order bed picks full3 (exact)");
+                        CHECK(r9 == 4, "imported: full1 + full3, a 3rd-order bed's ACN 9 reaches full3's column");
+                    } else if (cfg == 1) {
+                        CHECK(r1 == 4 && ex1 == 0, "imported: full3 only, a 1st-order bed picks full3 and is flagged for the notice");
+                        CHECK(r3 == 4 && ex3 == 1, "imported: full3 only, a 3rd-order bed is exact");
+                        CHECK(r9 == 4, "imported: full3 only, a 3rd-order bed's ACN 9 sounds");
+                    } else {
+                        CHECK(r3 == 7 && ex3 == 0, "imported: full1 only, a 3rd-order bed picks full1 and is flagged for the notice");
+                        CHECK(r9 == -1, "imported: full1 only, a 3rd-order bed's 3rd-order content is dropped (silent)");
+                        CHECK(r1 == 7 && ex1 == 1, "imported: full1 only, a 1st-order bed is exact");
+                    }
+                    rt_destroy(ce);
+                }
+                #undef IMP_ROUTE
+            } else CHECK(0, "write the per-order beds");
+            remove(E4); remove(E16); remove(E9);
+        }
+
+        /* (f) the replayed slot: a strong LOW tone through a two-band import fills the splitter state;
+         * stop it, then replay the SAME source handle (so the SAME voice slot) with a silent bed. The
+         * new bed's input is all zeros, so its first block must be exactly silent: any output is the
+         * old tone ringing out of stale low-pass / allpass state. */
+        {
+            imp_route_w(d0, 0, 3, 21, 4, 750.f);
+            LI.bed.ndec = 1;
+            const float aw[4] = { 1.f, 0, 0, 0 }, az[4] = { 0, 0, 0, 0 };
+            const char* RL = "bwa_rt_imp_rl.wav", *RZ = "bwa_rt_imp_rz.wav";
+            if (write_bed_sine_wav(RL, 4, aw, 187.5, 16 * N) && write_bed_sine_wav(RZ, 4, az, 187.5, 16 * N)) {
+                RtCore* cr = rt_create(8, 8, RATE, CH);
+                CHECK(cr != NULL, "rt_create (imported f)");
+                if (cr) {
+                    rt_set_layout(cr, &LI); rt_set_bed_decoder(cr, 3);
+                    uint32_t sl = rt_load_ambix(cr, RL, err, sizeof err), sz = rt_load_ambix(cr, RZ, err, sizeof err);
+                    uint32_t vr = rt_source_create(cr);
+                    rt_source_play(cr, vr, sl, true); rt_commit(cr);
+                    for (int b = 0; b < 3; ++b) render2(cr);
+                    const double before = total_energy();
+                    rt_source_stop(cr, vr); rt_commit(cr);
+                    render2(cr);                                   /* the stop fade, then idle */
+                    rt_source_play(cr, vr, sz, true); rt_commit(cr);   /* same handle: the same slot */
+                    bwa_timestamp tr = { 0, 0 }; rt_render(cr, bus, N, &tr);
+                    const double after = total_energy();
+                    printf("imported replay: tone block %.3g, first block of the silent replay %.3g\n", before, after);
+                    CHECK(before > 1.0, "imported replay: the tone sounded");
+                    CHECK(after == 0.0, "imported replay: a replayed slot carries none of the previous bed's band-split state");
+                    rt_destroy(cr);
+                }
+            } else CHECK(0, "write the replay beds");
+            remove(RL); remove(RZ);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_feature_test: %d FAILURES\n", fails); return 1; }
     printf("rt_feature_test OK (ambisonic-bed, reflection-tap, pathing+EQ, spread+MDAP+spectral+frame, "
            "tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, hole-spread, source-size, "
            "loudness-comp, proximity, manual-directivity, multi-listener, pitch, bed-rotation+orientation, "
            "max-rE+split, extent, asset-meta+attenuation, ISM early-reflections+ground+polarity, "
-           "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural, direct-channel-route+binaural verified)\n");
+           "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural, direct-channel-route+binaural, "
+           "imported-bed-decoder+two-band+mixed-order verified)\n");
     return 0;
 }

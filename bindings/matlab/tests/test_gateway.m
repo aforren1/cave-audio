@@ -9,7 +9,7 @@ tcheck('commands returns a cell of names', iscell(cmds) && ischar(cmds{1}));
 % Every subcommand maps to a bw_audio.h entry point, except `constants`, which has no C twin.
 % The count is the pin: an entry point added to the header and not bound here shows up as a
 % number that stopped matching, which is the only way a binding gap is noticed at all.
-tcheck('the gateway binds 170 subcommands', numel(cmds) == 170, sprintf('%d', numel(cmds)));
+tcheck('the gateway binds 171 subcommands', numel(cmds) == 171, sprintf('%d', numel(cmds)));
 tcheck('constants is one of them', any(strcmp(cmds, 'constants')));
 tcheck('set_output_capture is listed even though it refuses', ...
        any(strcmp(cmds, 'set_output_capture')));
@@ -66,6 +66,24 @@ tcheck('a -x source loads the -x speakers', sum(g(negx, 1)) > sum(g(negx, 2)));
 bm = bwa_mex('bed_gains_batch', C.DECODE_ALLRAD, true, spk, single([0 0 1]));
 tcheck('bed_gains_batch is (speakers, directions)', ...
        size(bm, 1) == size(spk, 1) && size(bm, 2) == 1);
+
+% bed_gains_layout grades a layout FILE (so it can see an imported bed_decode); the C call has no
+% engine, so a refusal comes back as this subcommand's own error carrying the C reason.
+lay = [tempname() '.json'];
+fid = fopen(lay, 'w');
+fprintf(fid, ['{"speakers":[{"index":0,"position":[1,1.4,0]},{"index":1,"position":[-1,1.4,0]},' ...
+              '{"index":2,"position":[0,1.4,1]},{"index":3,"position":[0,1.4,-1]},{"index":4,"position":[0,2.4,0]}]}']);
+fclose(fid);
+bl = bwa_mex('bed_gains_layout', lay, C.DECODE_ALLRAD, [], true, 0, single([0 0 1; 0 1 0]));
+tcheck('bed_gains_layout is (speakers, directions)', isequal(size(bl), [5 2]) && all(isfinite(bl(:))));
+try
+    bwa_mex('bed_gains_layout', lay, C.DECODE_LAYOUT, [], false, 0, single([0 0 1]));
+    refused = false;
+catch gl_err
+    refused = strcmp(gl_err.identifier, 'bwa:bed_gains_layout') && ~isempty(strfind(gl_err.message, 'bed_decode'));
+end
+tcheck('bed_gains_layout refuses LAYOUT on a file with no bed_decode, with the reason', refused);
+delete(lay);
 
 % box_mesh is pure and returns three arrays, the shapes a caller can hand straight back.
 faces = uint32([C.MAT_WOOD C.MAT_WOOD C.MAT_CONCRETE C.MAT_PLASTER C.MAT_WOOD C.MAT_WOOD]);

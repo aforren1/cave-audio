@@ -32,7 +32,11 @@
 #                 survey and the live position readout read DIRECTIONS: exit 4 on a turn. A --zylia --trims
 #                 run and the live tilt meter alone read only the center: the same twist runs to the end.
 #   zylia_localize  --localize rows.txt --zylia on the turned stand, no survey: every speaker lands on the
-#                 layout, because each range is the array center's arrival, which does not turn.
+#                 layout, because each range is the array center's arrival, which does not turn. Then
+#                 the latency steps mid-run (--sim-latency-step), solved from a plan a few centimeters off
+#                 the truth (--sim-truth): the per-row latency carries the step, the positions land on the
+#                 truth, and the warning names the step. A stray sweep makes one capture 40 mm late: the
+#                 run drops it, solves again and lands on the truth. A step past the last row is refused.
 #   sweep_quality  the sweep-quality checks against a simulated interferer (--sim-interferer, its truth the
 #                 simulator's): a trim run with a noise burst on three captures re-sweeps exactly those and
 #                 writes the clean run's trims; a stray sweep louder than the speaker on every sweep of one
@@ -85,6 +89,38 @@ endfunction()
 function(expect name regex what)
   if(NOT "${${name}_OUT}" MATCHES "${regex}")
     message(FATAL_ERROR "calibrate_cli_test: ${name}: ${what} (no match for '${regex}'; log: ${WORK}/${name}.log)")
+  endif()
+endfunction()
+
+# loc_positions(<run name> <written layout>): every speaker in the written layout against LAYOUT, the
+# truth the simulator played from; fails past 3 mm worst (9 mm^2) or 2 mm RMS (4 mm^2 mean square).
+function(loc_positions name file)
+  file(READ "${LAYOUT}" jl)
+  file(READ "${WORK}/${file}" jo)
+  string(JSON n LENGTH "${jl}" speakers)
+  math(EXPR last "${n} - 1")
+  set(worst 0)
+  set(wk 0)
+  set(sum 0)
+  foreach(k RANGE ${last})
+    set(d2 0)
+    foreach(a 0 1 2)
+      string(JSON pa GET "${jl}" speakers ${k} position ${a})
+      string(JSON pb GET "${jo}" speakers ${k} position ${a})
+      to_milli(ma "${pa}")
+      to_milli(mb "${pb}")
+      math(EXPR d2 "${d2} + (${ma} - ${mb}) * (${ma} - ${mb})")
+    endforeach()
+    math(EXPR sum "${sum} + ${d2}")
+    if(d2 GREATER worst)
+      set(worst ${d2})
+      set(wk ${k})
+    endif()
+  endforeach()
+  math(EXPR ms "${sum} / ${n}")
+  message(STATUS "${name}: worst speaker ${wk} at ${worst} mm^2 off the layout, mean square ${ms} mm^2 over ${n}")
+  if(worst GREATER 9 OR ms GREATER 4)
+    message(FATAL_ERROR "calibrate_cli_test: ${name}: the positions are off the layout: worst speaker ${wk} by ${worst} mm^2 (limit 9), mean square ${ms} mm^2 (limit 4)")
   endif()
 endfunction()
 
@@ -1105,38 +1141,75 @@ elseif(MODE STREQUAL "zylia_localize")
   expect(loc "the captures come from the simulated physical ZM-1" "the simulator is the physical array, not the table")
   expect(loc "mount yaw -30\\.0 deg, tilt 1\\.5 deg" "the stand is turned, so an orientation-dependent range would show")
   expect(loc "localize: wrote 26 positions to loc\\.json" "the positions are written")
-  # Every speaker against the layout it was simulated from. Five rows give each speaker's 4-unknown solve
-  # one spare equation, so the geometry amplifies what is left: the tracker's 0.15 mm jitter, and the center
-  # arrival's plane-wave model, which reads late by about R^2 / (3 d c) (0.4 mm at 2 m, 1 mm at 0.8 m). That
-  # lands the worst speaker (2, the corner the rows see from one side) about 7 mm off and the rest within
-  # 2 mm. One capsule's arrival instead of the center's is off by up to R/c (49 mm) with the direction, and
-  # puts speakers several centimeters off. The bounds: worst 12 mm, RMS 3 mm.
-  file(READ "${LAYOUT}" jl)
-  file(READ "${WORK}/loc.json" jo)
-  string(JSON n LENGTH "${jl}" speakers)
-  math(EXPR last "${n} - 1")
-  set(worst 0)
-  set(wk 0)
-  set(sum 0)
-  foreach(k RANGE ${last})
-    set(d2 0)
+  expect(loc "localize: the latency held: [0-9]\\.[0-9] us spread across the 5 rows" "a steady simulated latency reads as held")
+  # Every speaker against the layout it was simulated from, from ONE solve over every speaker with one
+  # latency per row (calib_localize_joint). What is left is the tracker's 0.15 mm jitter and the center
+  # arrival's plane-wave model, which reads late by about R^2 / (3 d c) (0.4 mm at 2 m, 1 mm at 0.8 m):
+  # about 1 mm worst. The per-speaker linear solve this replaced landed the worst speaker 7 mm off, and one
+  # capsule's arrival instead of the center's is off by up to R/c (49 mm) with the direction, which puts
+  # speakers several centimeters off. The positions are read to the millimeter (truncated), so the bounds
+  # carry a millimeter of slack: worst 3 mm, RMS 2 mm.
+  loc_positions(loc loc.json)
+  # The PLAN the next runs start from: every speaker moved a deterministic -60..+60 mm per axis off LAYOUT,
+  # which stays the truth the simulator plays from (--sim-truth). The solve starts at the plan (one of its
+  # two starts), so it has to converge onto the truth rather than stay where it began. The arrival window
+  # reads the plan with its 0.50 m margin (CALIB_WIN_PLAN_M), which the 104 mm worst case sits well inside.
+  # Integer millimeters, because CMake math is integer only; to_milli reads the truth.
+  file(READ "${LAYOUT}" jp)
+  string(JSON np LENGTH "${jp}" speakers)
+  math(EXPR lastp "${np} - 1")
+  foreach(k RANGE ${lastp})
     foreach(a 0 1 2)
-      string(JSON pa GET "${jl}" speakers ${k} position ${a})
-      string(JSON pb GET "${jo}" speakers ${k} position ${a})
+      string(JSON pa GET "${jp}" speakers ${k} position ${a})
       to_milli(ma "${pa}")
-      to_milli(mb "${pb}")
-      math(EXPR d2 "${d2} + (${ma} - ${mb}) * (${ma} - ${mb})")
+      math(EXPR mp "${ma} + (${k} * 37 + ${a} * 23 + 7) % 121 - 60")
+      set(sg "")
+      if(mp LESS 0)
+        set(sg "-")
+        math(EXPR mp "0 - ${mp}")
+      endif()
+      math(EXPR ip "${mp} / 1000")
+      math(EXPR fp "${mp} % 1000 + 1000")
+      string(SUBSTRING "${fp}" 1 3 fp)                  # the three digits, leading zeros kept
+      string(JSON jp SET "${jp}" speakers ${k} position ${a} "${sg}${ip}.${fp}")
     endforeach()
-    math(EXPR sum "${sum} + ${d2}")
-    if(d2 GREATER worst)
-      set(worst ${d2})
-      set(wk ${k})
-    endif()
   endforeach()
-  math(EXPR ms "${sum} / ${n}")
-  message(STATUS "zylia localize: worst speaker ${wk} at ${worst} mm^2 off the layout, mean square ${ms} mm^2 over ${n}")
-  if(worst GREATER 144 OR ms GREATER 9)
-    message(FATAL_ERROR "calibrate_cli_test: loc: the positions are off the layout: worst speaker ${wk} by ${worst} mm^2 (limit 144), mean square ${ms} mm^2 (limit 9)")
+  file(WRITE "${WORK}/plan_off.json" "${jp}")
+  # The latency STEPS 0.2 ms (69 mm) from row 3 on, a Dante Via re-sync. Each row's own latency carries it,
+  # so the positions land on the truth as the steady run's did, and the warning names the step. One latency
+  # for the run, or the old per-speaker solve, puts speakers meters off on the same data (calib_test).
+  run(locstep 0 --layout plan_off.json --sim-truth "${LAYOUT}" --out locstep.json --simulate --zylia --localize rows.txt
+      --track-sim --place-timeout 60 --sim-latency-step 3,0.2)
+  expect(locstep "\\(--sim-truth\\), the worst [0-9]+\\.[0-9] mm" "the plan is off the truth")
+  expect(locstep "from row 3 on, every speaker plays \\+0\\.200 ms later" "the step is announced")
+  expect(locstep "each row's latency against the median, us: -(199|200)\\.[0-9] -(199|200)\\.[0-9] [-+]0\\.[0-9] [-+]0\\.[0-9] [-+]0\\.[0-9]\n"
+         "rows 1 and 2 read the step against the median of the five")
+  expect(locstep "WARNING: the latency MOVED (199|200)\\.[0-9] us across the run" "the step is flagged, at its size")
+  loc_positions(locstep locstep.json)
+  # One BAD capture: a stray sweep 12 dB over the speaker, inside the arrival window, on capture 11 (row 1,
+  # speaker 10; untracked, so the row is the mic). It plays from the interferer's spot 1.543 m off the mic
+  # (CALIB_SIM_INTF_OFFSET), timed so its center arrival lands 40 mm after speaker 10's true one:
+  # t = 512 / 48000 + (2.8320 + 0.040 - 1.5427) / 343.0 = 0.014542 s. One sweep per capture (this mode asks
+  # no agreement) takes it as the arrival. The fit shows only part of it in that capture's residual; the
+  # run drops it, solves again, and the positions land on the truth.
+  run(locdrop 0 --layout plan_off.json --sim-truth "${LAYOUT}" --out locdrop.json --simulate --zylia --localize rows.txt
+      --sim-interferer 11:0.014542:12:sweep)
+  expect(locdrop "localize: dropped speaker 10's capture at row 1: \\+[1-9][0-9]\\.[0-9] mm off the solve, past the 10 mm flag"
+         "the stray sweep's capture is the one dropped")
+  expect(locdrop "against that solve it is \\+(3[5-9]|4[0-5])\\.[0-9] mm off" "without it, its residual reads the whole 40 mm")
+  expect(locdrop "spk 10: [^\n]*\\[row 1 dropped, " "speaker 10's line names the drop")
+  expect(locdrop "localize: the latency held" "the drop leaves a steady latency")
+  if(locdrop_OUT MATCHES "FLAGGED|still carry a capture")
+    message(FATAL_ERROR "calibrate_cli_test: locdrop: a capture is still flagged after the drop (log: ${WORK}/locdrop.log)")
+  endif()
+  loc_positions(locdrop locdrop.json)
+  run(stepnoloc 2 --layout "${LAYOUT}" --simulate --zylia --sim-latency-step 3,0.2)
+  run(steprow1 2 --layout "${LAYOUT}" --simulate --zylia --localize rows.txt --sim-latency-step 1,0.2)
+  # a step past the last of the 5 rows would never happen, so the run would read as held: refused before
+  # any capture
+  run(steppast 2 --layout "${LAYOUT}" --simulate --zylia --localize rows.txt --sim-latency-step 9,0.2)
+  if(steppast_OUT MATCHES "localize: 5 mic positions")
+    message(FATAL_ERROR "calibrate_cli_test: steppast: refused only after it started measuring (log: ${WORK}/steppast.log)")
   endif()
   # the ZM-1 localize takes the plan the way the omni one does
   expect(loc "localize: recorded the plan for 26 of 26 speaker" "the first survey keeps the plan")

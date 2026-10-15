@@ -454,6 +454,171 @@ double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3])
     return sqrt((double)K * col[3]);
 }
 
+/* the inverse of a 3x3, 0 if singular (NaN-safe: a NaN determinant reads singular) */
+static int inv3(const double A[3][3], double I[3][3]) {
+    const double c00 = A[1][1]*A[2][2] - A[1][2]*A[2][1], c01 = A[1][2]*A[2][0] - A[1][0]*A[2][2], c02 = A[1][0]*A[2][1] - A[1][1]*A[2][0];
+    const double det = A[0][0]*c00 + A[0][1]*c01 + A[0][2]*c02;
+    if (!(fabs(det) > 1e-12)) return 0;
+    const double r = 1.0 / det;
+    I[0][0] = c00 * r; I[0][1] = (A[0][2]*A[2][1] - A[0][1]*A[2][2]) * r; I[0][2] = (A[0][1]*A[1][2] - A[0][2]*A[1][1]) * r;
+    I[1][0] = c01 * r; I[1][1] = (A[0][0]*A[2][2] - A[0][2]*A[2][0]) * r; I[1][2] = (A[0][2]*A[1][0] - A[0][0]*A[1][2]) * r;
+    I[2][0] = c02 * r; I[2][1] = (A[0][1]*A[2][0] - A[0][0]*A[2][1]) * r; I[2][2] = (A[0][0]*A[1][1] - A[0][1]*A[1][0]) * r;
+    return 1;
+}
+
+/* Gaussian elimination with partial pivoting, N x N row-major, in place. Returns 0 if singular. */
+static int solve_n(double* A, double* b, double* x, int N) {
+    for (int c = 0; c < N; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < N; ++r) if (fabs(A[r*N + c]) > fabs(A[piv*N + c])) piv = r;
+        if (!(fabs(A[piv*N + c]) >= 1e-12)) return 0;
+        if (piv != c) {
+            for (int j = 0; j < N; ++j) { double t = A[c*N + j]; A[c*N + j] = A[piv*N + j]; A[piv*N + j] = t; }
+            double t = b[c]; b[c] = b[piv]; b[piv] = t;
+        }
+        for (int r = c + 1; r < N; ++r) {
+            const double f = A[r*N + c] / A[c*N + c];
+            for (int j = c; j < N; ++j) A[r*N + j] -= f * A[c*N + j];
+            b[r] -= f * b[c];
+        }
+    }
+    for (int r = N - 1; r >= 0; --r) {
+        double s = b[r];
+        for (int j = r + 1; j < N; ++j) s -= A[r*N + j] * x[j];
+        x[r] = s / A[r*N + r];
+    }
+    return 1;
+}
+
+int calib_localize_joint(const double* range, const float (*mic)[3], int K, int n, const unsigned char* use,
+                         const unsigned char* cap_use, int per_row, float (*pos_io)[3], double* lat_out, double* resid_out) {
+    if (!range || !mic || !pos_io || !lat_out || K < 5 || K > CALIB_LOC_MAX_ROWS || n <= 0) return 0;
+    const int NL = per_row ? K : 1;
+#define LJ_SPK(s)    (!use || use[s])
+#define LJ_CAP(s, k) (LJ_SPK(s) && (!cap_use || cap_use[(size_t)(s) * K + (k)]))
+    /* the counts are of USED captures: a dropped one is an equation gone, from its speaker and its row */
+    int m = 0, neq = 0, cnt[CALIB_LOC_MAX_ROWS] = {0};
+    for (int s = 0; s < n; ++s) {
+        if (!LJ_SPK(s)) continue;
+        int ns = 0;
+        for (int k = 0; k < K; ++k) if (LJ_CAP(s, k)) { ++ns; ++cnt[k]; }
+        if (ns < 4) return 0;                                             /* 3 unknowns and one to spare */
+        ++m; neq += ns;
+    }
+    if (m < 1 || neq <= 3 * m + NL) return 0;
+    if (per_row) for (int k = 0; k < K; ++k) if (cnt[k] < 4) return 0;
+    if (!per_row) { cnt[0] = neq; }                                       /* the one latency sees every equation */
+    for (int s = 0; s < n; ++s)
+        if (LJ_SPK(s) && !(isfinite(pos_io[s][0]) && isfinite(pos_io[s][1]) && isfinite(pos_io[s][2]))) return 0;
+    for (int k = 0; k < K; ++k)
+        if (!(isfinite(mic[k][0]) && isfinite(mic[k][1]) && isfinite(mic[k][2]))) return 0;
+
+    double (*x)[3]     = (double(*)[3])malloc((size_t)n * sizeof *x);
+    double (*Ai)[3][3] = (double(*)[3][3])malloc((size_t)n * sizeof *Ai);   /* A_s^-1 */
+    double (*g)[3]     = (double(*)[3])malloc((size_t)n * sizeof *g);       /* sum_k u e */
+    double* B   = (double*)malloc((size_t)n * NL * 3 * sizeof(double));     /* B_s, NL columns of 3 */
+    double* L   = (double*)malloc((size_t)NL * sizeof(double));
+    double* S   = (double*)malloc((size_t)NL * NL * sizeof(double));
+    double* rhs = (double*)malloc((size_t)NL * sizeof(double));
+    double* dL  = (double*)malloc((size_t)NL * sizeof(double));
+    int ok = 0;
+    if (!x || !Ai || !g || !B || !L || !S || !rhs || !dL) goto done;
+    for (int s = 0; s < n; ++s) for (int a = 0; a < 3; ++a) x[s][a] = pos_io[s][a];
+
+    /* the latency start: the mean residual at the start positions, per row or over the run */
+    for (int j = 0; j < NL; ++j) L[j] = 0.0;
+    for (int s = 0; s < n; ++s) {
+        for (int k = 0; k < K; ++k) {
+            if (!LJ_CAP(s, k)) continue;
+            const double d[3] = { x[s][0] - mic[k][0], x[s][1] - mic[k][1], x[s][2] - mic[k][2] };
+            L[per_row ? k : 0] += range[(size_t)s * K + k] - sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        }
+    }
+    for (int j = 0; j < NL; ++j) L[j] /= cnt[j];
+
+    for (int it = 0; it < 50 && !ok; ++it) {
+        /* the normal equations [A_s B_s; B_s^T D] [dp; dL] = [g_s; h], reduced onto dL */
+        for (int j = 0; j < NL * NL; ++j) S[j] = 0.0;
+        for (int j = 0; j < NL; ++j) { S[j * NL + j] = cnt[j]; rhs[j] = 0.0; }
+        for (int s = 0; s < n; ++s) {
+            if (!LJ_SPK(s)) continue;
+            double A[3][3] = {{0}};
+            double* Bs = &B[(size_t)s * NL * 3];
+            for (int j = 0; j < NL * 3; ++j) Bs[j] = 0.0;
+            g[s][0] = g[s][1] = g[s][2] = 0.0;
+            for (int k = 0; k < K; ++k) {
+                if (!LJ_CAP(s, k)) continue;
+                const double d[3] = { x[s][0] - mic[k][0], x[s][1] - mic[k][1], x[s][2] - mic[k][2] };
+                const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                if (!(r > 1e-6)) goto done;
+                const int j = per_row ? k : 0;
+                const double e = r + L[j] - range[(size_t)s * K + k];     /* model - measured */
+                const double u[3] = { d[0] / r, d[1] / r, d[2] / r };
+                for (int a = 0; a < 3; ++a) {
+                    g[s][a] += u[a] * e;
+                    Bs[j * 3 + a] += u[a];
+                    for (int b = 0; b < 3; ++b) A[a][b] += u[a] * u[b];
+                }
+                rhs[j] += e;
+            }
+            if (!inv3(A, Ai[s])) goto done;
+            /* S -= B^T A^-1 B, rhs -= B^T A^-1 g */
+            double Aig[3];
+            for (int a = 0; a < 3; ++a) Aig[a] = Ai[s][a][0]*g[s][0] + Ai[s][a][1]*g[s][1] + Ai[s][a][2]*g[s][2];
+            for (int j = 0; j < NL; ++j) {
+                const double* bj = &Bs[j * 3];
+                if (bj[0] == 0.0 && bj[1] == 0.0 && bj[2] == 0.0) continue;
+                double w[3];                                              /* A^-1 b_j */
+                for (int a = 0; a < 3; ++a) w[a] = Ai[s][a][0]*bj[0] + Ai[s][a][1]*bj[1] + Ai[s][a][2]*bj[2];
+                rhs[j] -= bj[0]*Aig[0] + bj[1]*Aig[1] + bj[2]*Aig[2];
+                for (int i = 0; i < NL; ++i) {
+                    const double* bi = &Bs[i * 3];
+                    S[i * NL + j] -= bi[0]*w[0] + bi[1]*w[1] + bi[2]*w[2];
+                }
+            }
+        }
+        if (!solve_n(S, rhs, dL, NL)) goto done;
+        double mx = 0.0;
+        for (int j = 0; j < NL; ++j) { L[j] -= dL[j]; if (fabs(dL[j]) > mx) mx = fabs(dL[j]); }
+        for (int s = 0; s < n; ++s) {
+            if (!LJ_SPK(s)) continue;
+            const double* Bs = &B[(size_t)s * NL * 3];
+            double q[3] = { g[s][0], g[s][1], g[s][2] };                  /* g - B dL */
+            for (int j = 0; j < NL; ++j) for (int a = 0; a < 3; ++a) q[a] -= Bs[j * 3 + a] * dL[j];
+            for (int a = 0; a < 3; ++a) {
+                const double dp = Ai[s][a][0]*q[0] + Ai[s][a][1]*q[1] + Ai[s][a][2]*q[2];
+                x[s][a] -= dp;
+                if (fabs(dp) > mx) mx = fabs(dp);
+            }
+            if (!(isfinite(x[s][0]) && isfinite(x[s][1]) && isfinite(x[s][2]))) goto done;
+        }
+        if (!isfinite(mx)) goto done;
+        if (mx < 1e-7) ok = 1;                                            /* every step under 0.1 um */
+    }
+    if (ok) {
+        /* every capture of a used speaker gets its residual, the excluded ones too: against a solve that
+         * did not see it, that is how far off it really was */
+        for (int s = 0; s < n; ++s) {
+            const int u = LJ_SPK(s);
+            for (int k = 0; k < K; ++k) {
+                double res = 0.0;
+                if (u) {
+                    const double d[3] = { x[s][0] - mic[k][0], x[s][1] - mic[k][1], x[s][2] - mic[k][2] };
+                    res = range[(size_t)s * K + k] - (sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) + L[per_row ? k : 0]);
+                }
+                if (resid_out) resid_out[(size_t)s * K + k] = res;
+            }
+            if (u) for (int a = 0; a < 3; ++a) pos_io[s][a] = (float)x[s][a];
+        }
+        for (int j = 0; j < NL; ++j) lat_out[j] = L[j];
+    }
+#undef LJ_SPK
+#undef LJ_CAP
+done:
+    free(x); free(Ai); free(g); free(B); free(L); free(S); free(rhs); free(dL);
+    return ok;
+}
+
 static int dcmp(const void* a, const void* b) {
     double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y ? 1 : 0;
 }

@@ -70,7 +70,7 @@ public:
 	};
 	/* Value 0 is RESERVED for default-init, mirroring the C enum: it means the engine's current
 	 * default rather than a named algorithm, so the default can move without an ABI break. */
-	enum BedDecoder { DECODE_DEFAULT = 0, DECODE_ALLRAD = 1, DECODE_EPAD = 2 };
+	enum BedDecoder { DECODE_DEFAULT = 0, DECODE_ALLRAD = 1, DECODE_EPAD = 2, DECODE_LAYOUT = 3 };   // LAYOUT = the layout file's imported bed_decode
 	enum Setup { SETUP_DEFAULT = 0, SETUP_SEATED = 1, SETUP_ROAMING = 2 };
 	enum Panner { PAN_DBAP = 0, PAN_SPCAP = 1, PAN_VBAP = 2 };
 	enum SpreadMode { SPREAD_LOBE = 0, SPREAD_MDAP = 1, SPREAD_SPECTRAL = 2 };

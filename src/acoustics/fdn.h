@@ -25,8 +25,10 @@ typedef struct Fdn Fdn;
 /* Build the FDN for this layout + rate: line delays, decay filters at the defaults (1.2 s low /
  * 0.7 s high @ 2 kHz), and the line→26 render matrix. `bed_decoder` is the rt-internal decoder id
  * (engine.c maps the public enum): EPAD (2) renders the lines through the same energy-preserving
- * decode the beds use; anything else keeps the FDN's house AllRAD (the sampling decode only as the
- * non-triangulable fallback). NULL on allocation failure. */
+ * decode the beds use; IMPORTED (3) through the HF matrix of the bed_decode full decoder a 3rd-order bed gets, with no max-rE
+ * taper on either render (the matrix is final; AllRAD when the layout has no block); anything else
+ * keeps the FDN's house AllRAD (the sampling decode only as the non-triangulable fallback). NULL on
+ * allocation failure. */
 Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder);
 void fdn_destroy(Fdn* f);
 

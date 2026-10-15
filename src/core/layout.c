@@ -5,6 +5,7 @@
 #include "core/layout.h"
 #include "core/rt.h"      /* BWA_MAX_COORD */
 #include "core/sane.h"    /* bwa_finite3_bounded */
+#include "spatial/ambiset.h" /* bed_decode channel sets */
 #include "os/os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <math.h>
@@ -259,6 +260,115 @@ static char* read_file(const char* path, char* err, size_t errcap) {
     fclose(f);
     buf[rd] = 0;
     return buf;
+}
+
+/* One matrix of a bed_decode decoder (`hf` or `lf`): exactly one row per speaker, keyed by `index`
+ * (never by array position: a writer or a hand edit may reorder the records), 16 finite, bounded
+ * gains per row, and zeros outside the decoder's channel set (a nonzero column there means the set
+ * or order is mislabeled: a mixed bed never feeds it, and a "full1" carrying 2nd-order gains is a
+ * 2nd-order decoder that the selection would hand to the wrong beds). */
+static bool parse_bed_matrix(cJSON* rows, int nspk, uint16_t mask, float m[BWA_CHANNELS][BWA_BED_SH],
+                             const char* what, char* err, size_t errcap) {
+    char msg[160];
+    if (!cJSON_IsArray(rows) || cJSON_GetArraySize(rows) != nspk) {
+        snprintf(msg, sizeof msg, "layout: bed_decode %s needs exactly one row per speaker", what);
+        set_err(err, errcap, msg); return false;
+    }
+    bool seen[BWA_CHANNELS];
+    memset(seen, 0, sizeof seen);
+    for (int r = 0; r < nspk; ++r) {
+        cJSON* row = cJSON_GetArrayItem(rows, r);
+        cJSON* ij  = cJSON_IsObject(row) ? cJSON_GetObjectItemCaseSensitive(row, "index") : NULL;
+        cJSON* gj  = cJSON_IsObject(row) ? cJSON_GetObjectItemCaseSensitive(row, "gains") : NULL;
+        if (!cJSON_IsNumber(ij) || !cJSON_IsArray(gj) || cJSON_GetArraySize(gj) != BWA_BED_SH) {
+            snprintf(msg, sizeof msg, "layout: bed_decode %s row needs a numeric index and gains[16] (ACN/SN3D)", what);
+            set_err(err, errcap, msg); return false;
+        }
+        const int idx = ij->valueint;
+        if ((double)idx != ij->valuedouble || idx < 0 || idx >= nspk || seen[idx]) {
+            snprintf(msg, sizeof msg, "layout: bed_decode %s row index out of range or duplicated", what);
+            set_err(err, errcap, msg); return false;
+        }
+        seen[idx] = true;
+        for (int k = 0; k < BWA_BED_SH; ++k) {
+            cJSON* v = cJSON_GetArrayItem(gj, k);
+            /* a range check, not just finiteness (CLAUDE.md): this matrix scales the bus */
+            const float g = cJSON_IsNumber(v) ? (float)v->valuedouble : NAN;
+            if (!cJSON_IsNumber(v) || !bwa_finite_bounded(g, BWA_MAX_GAIN) || fabs(v->valuedouble) > BWA_MAX_GAIN) {
+                snprintf(msg, sizeof msg, "layout: bed_decode %s gain non-numeric, non-finite, or outside +/-1e4", what);
+                set_err(err, errcap, msg); return false;
+            }
+            if (g != 0.f && !(mask & (1u << k))) {
+                snprintf(msg, sizeof msg, "layout: bed_decode %s has a nonzero gain in ACN %d, outside its channel set", what, k);
+                set_err(err, errcap, msg); return false;
+            }
+            m[idx][k] = g;
+        }
+    }
+    return true;
+}
+
+/* Optional `bed_decode` block (layout.h BedImport). Absent = ndec 0. Present but malformed rejects
+ * the whole file, like `directivity`: a decode the runtime would apply wrongly is worse than none. */
+static bool parse_bed_decode(cJSON* root, int nspk, BedImport* b, char* err, size_t errcap) {
+    memset(b, 0, sizeof *b);
+    cJSON* bj = cJSON_GetObjectItemCaseSensitive(root, "bed_decode");
+    if (!bj) return true;
+    if (!cJSON_IsObject(bj)) { set_err(err, errcap, "layout: bed_decode must be an object"); return false; }
+    cJSON* src = cJSON_GetObjectItemCaseSensitive(bj, "source");
+    if (src && !cJSON_IsString(src)) { set_err(err, errcap, "layout: bed_decode source must be a string"); return false; }
+    cJSON* decs = cJSON_GetObjectItemCaseSensitive(bj, "decoders");
+    if (!cJSON_IsArray(decs)) { set_err(err, errcap, "layout: bed_decode needs a decoders[] array"); return false; }
+    const int nd = cJSON_GetArraySize(decs);
+    if (nd < 1 || nd > BWA_BED_DEC_MAX) {
+        set_err(err, errcap, "layout: bed_decode decoders must have 1..9 entries (one per channel set)"); return false;
+    }
+    int have_full = 0;
+    for (int d = 0; d < nd; ++d) {
+        cJSON* dj = cJSON_GetArrayItem(decs, d);
+        if (!cJSON_IsObject(dj)) { set_err(err, errcap, "layout: bed_decode decoder is not an object"); return false; }
+        cJSON* cj = cJSON_GetObjectItemCaseSensitive(dj, "channels");
+        int set = -1, order = 0;
+        if (!cJSON_IsString(cj) || !ambi_chan_parse(cj->valuestring, &set, &order)) {
+            set_err(err, errcap, (cJSON_IsString(cj) && strcmp(cj->valuestring, "full") == 0)
+                ? "layout: bed_decode channels \"full\" must name its order: full1, full2 or full3 (a decoder's "
+                  "order gains fit one order)"
+                : "layout: bed_decode channels must be full1, full2, full3 or one of 1H, 2H, 2H1V, 3H, 3H1V, 3H2V");
+            return false;
+        }
+        for (int e = 0; e < d; ++e)
+            if (b->dec[e].set == set && b->dec[e].order == order) {
+                set_err(err, errcap, "layout: bed_decode has two decoders for one channel set"); return false;
+            }
+        BedDecoder* D = &b->dec[d];
+        D->set = (uint8_t)set;
+        D->order = (uint8_t)order;
+        if (set == AMBI_SET_FULL) have_full = 1;
+        const uint16_t mask = ambi_set_mask_for(set, order);
+        if (!parse_bed_matrix(cJSON_GetObjectItemCaseSensitive(dj, "hf"), nspk, mask, D->hf, "hf", err, errcap))
+            return false;
+        cJSON* lf = cJSON_GetObjectItemCaseSensitive(dj, "lf");
+        cJSON* xo = cJSON_GetObjectItemCaseSensitive(dj, "xover_hz");
+        if (lf) {
+            /* dlf holds LF first, then becomes LF - HF below */
+            if (!parse_bed_matrix(lf, nspk, mask, D->dlf, "lf", err, errcap)) return false;
+            if (!cJSON_IsNumber(xo) || !(xo->valuedouble >= 100.0 && xo->valuedouble <= 4000.0)) {
+                set_err(err, errcap, "layout: bed_decode two-band decoder needs xover_hz in [100, 4000]"); return false;
+            }
+            D->xover_hz = (float)xo->valuedouble;
+            D->two_band = 1;
+            for (int s = 0; s < nspk; ++s)
+                for (int k = 0; k < BWA_BED_SH; ++k) D->dlf[s][k] -= D->hf[s][k];
+        } else if (xo) {
+            set_err(err, errcap, "layout: bed_decode xover_hz without an lf matrix (a single-band decoder has no crossover)");
+            return false;
+        }
+    }
+    if (!have_full) {
+        set_err(err, errcap, "layout: bed_decode needs a full-order decoder (full1, full2 or full3)"); return false;
+    }
+    b->ndec = (uint8_t)nd;
+    return true;
 }
 
 bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err, size_t errcap) {
@@ -639,6 +749,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         out->dir.nang  = (uint8_t)na;
         directivity_derive(&out->dir);
     }
+    if (!parse_bed_decode(root, nspk, &out->bed, err, errcap)) goto done;
     if (!have_rolloff) {
         /* file omits the blur: derive it from the geometry, r = 0.25 x the mean ref->speaker
          * distance (Sundstrom 2021 recommends 0.2-0.5 of it; docs/spatialization.md). An explicit
