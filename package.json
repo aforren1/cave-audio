@@ -1,6 +1,6 @@
 {
   "name": "com.brainworks.bw_audio",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "displayName": "BwAudio (CAVE Spatial Audio)",
   "description": "Unity control client for the bw_audio spatial-audio engine: a thin P/Invoke binding over the engine's C ABI (no audio crosses the boundary, only control). Drives a speaker array over ASIO/Dante (the CAVE starts with 24 speakers) plus binaural headphone output. Provides a centralized per-frame push (BwAudio.Engine) and a positional emitter (BwAudio.Emitter).\n\nShips the native engine for Windows x64, Linux x64, macOS (universal) and Android arm64; the speaker array needs ASIO on Windows. See the README for the required project setup (disable Unity's built-in audio).",
   "unity": "6000.0",

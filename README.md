@@ -90,14 +90,14 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
 ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Assets under StreamingAssets
 
@@ -181,7 +181,7 @@ Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit 
 sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
 `Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
 Every other binding of this engine ships the same demo, which makes them comparable by ear (see
-`https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/integration.md`, "The minimal example").
+`https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/integration.md`, "The minimal example").
 
 1. Add **`Engine`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,
    the `listener` transform (your OptiTrack head rigid body or XR camera), and - optionally -
@@ -322,7 +322,7 @@ To set a whole configuration at once instead of knob by knob, `Bwa.bwa_tuning_pr
 `Bwa.bwa_apply_tuning` are bound. They are not inspector fields, so call them directly.
 
 Load-time settings (a scene restart to change): the profile, the reverb bed (Steam **or** FDN - they
-share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD), the room box, and all
+share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD / Layout, the layout file's imported `bed_decode`), the room box, and all
 acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
@@ -337,7 +337,7 @@ for the rest.
 ### Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -358,7 +358,7 @@ release. On a tag it also creates the Release with the stamped version.
 
 **Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
 Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
-and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/39bd7fb161d9/docs/build.md#continuous-integration) for the
+and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/build.md#continuous-integration) for the
 rest.
 
 Locally:
