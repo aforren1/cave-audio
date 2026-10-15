@@ -115,7 +115,6 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
     const BedDecoder* imp = (bed_decoder == 3) ? layout_bed_decoder_for(&L->bed, 0 /* full */, BWA_AMBI_ORDER, NULL) : NULL;
     if (imp) {
         memcpy(dec, imp->hf, sizeof dec);
-        for (int k = 0; k < BWA_AMBI_CH; ++k) rw[k] = 1.f;      /* final matrix: no second taper */
         built = 1;
     }
     if (!built && bed_decoder == 2) built = epad_build_decode(L, dec);
@@ -129,7 +128,10 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
             float acc = 0.f, acr = 0.f;
             for (int k = 0; k < BWA_AMBI_CH; ++k) { acc += dec[s][k] * y[k]; acr += dec[s][k] * y[k] * rw[k]; }
             f->dcomb[s][l]    = acc;
-            f->dcomb_re[s][l] = acr;                            /* the max-rE render of the same line */
+            /* the max-rE render of the same line. An imported matrix is final, so its "tapered" render
+             * IS the plain one: copied, because a weight of 1 does not make the two sums equal where the
+             * compiler fuses one multiply-add and not the other (clang on arm64 does) */
+            f->dcomb_re[s][l] = imp ? acc : acr;
         }
         f->in_g[l] = ((l & 1) ? 1.f : -1.f) * 0.25f;            /* 1/sqrt(N), alternating sign */
     }
