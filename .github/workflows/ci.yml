@@ -462,7 +462,9 @@ jobs:
             build-godot-template_release
           # -sdk1: these trees stopped compiling an engine of their own, so an entry saved before
           # that still holds the old targets and cache variables. Bump this suffix, never reuse it.
-          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk1
+          # -sdk2: godot-cpp comes from a tarball now, not a git clone, so an older tree holds a
+          # git-based fetch subbuild.
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk2
 
       - name: Test (Godot binding)
         shell: bash
@@ -1425,7 +1427,7 @@ jobs:
           # Same reasoning as the Windows godot-cpp cache: ~2100 generated binding files dwarf our
           # nine sources. One flavour only here, because a headset runs no editor.
           path: build-android-godot
-          key: godot-cpp-android-${{ env.GODOT_CPP_COMMIT }}-arm64
+          key: godot-cpp-android-${{ env.GODOT_CPP_COMMIT }}-arm64-tar1   # -tar1: the tarball fetch (see the Windows key)
 
       - name: Build the Godot GDExtension (arm64-v8a, template_release)
         shell: bash
@@ -1764,7 +1766,9 @@ jobs:
             build-godot-template_release
           # -sdk1: these trees stopped compiling an engine of their own, so an entry saved before
           # that still holds the old targets and cache variables. Bump this suffix, never reuse it.
-          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk1
+          # -sdk2: godot-cpp comes from a tarball now, not a git clone, so an older tree holds a
+          # git-based fetch subbuild.
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk2
 
       - name: Build the Godot GDExtension (linux x86_64, both flavours)
         shell: bash
@@ -2179,7 +2183,9 @@ jobs:
             build-godot-template_release
           # -sdk1: these trees stopped compiling an engine of their own, so an entry saved before
           # that still holds the old targets and cache variables. Bump this suffix, never reuse it.
-          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk1
+          # -sdk2: godot-cpp comes from a tarball now, not a git clone, so an older tree holds a
+          # git-based fetch subbuild.
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}-sdk2
 
       - name: Build the Godot GDExtension (macos universal, both flavours)
         shell: bash

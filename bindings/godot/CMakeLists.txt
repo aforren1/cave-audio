@@ -28,10 +28,13 @@ if(NOT DEFINED GODOTCPP_TARGET)
   set(GODOTCPP_TARGET "editor" CACHE STRING "godot-cpp build profile: editor|template_debug|template_release")
 endif()
 
+# A tarball of the pinned commit, not a git clone: godot-cpp has no submodules (its .gitmodules is
+# empty), so the archive is the whole tree, and the configure no longer depends on git. The
+# windows-2025-vs2026 image of 2026-10-07 broke CMake's git version probe (Git_VERSION empty), and
+# ExternalProject refuses a recursive submodule update without one; a cache hit hid it for a run.
 FetchContent_Declare(godot_cpp
-  GIT_REPOSITORY https://github.com/godotengine/godot-cpp.git
-  GIT_TAG ${BWA_GODOT_CPP_COMMIT}
-  GIT_SHALLOW FALSE)          # a bare commit is not fetchable shallow
+  URL https://github.com/godotengine/godot-cpp/archive/${BWA_GODOT_CPP_COMMIT}.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(godot_cpp)
 
 add_library(bwa_gdextension SHARED
