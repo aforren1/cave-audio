@@ -1676,6 +1676,24 @@ BWA_API uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder d
                                       const float* dirs, uint32_t ndir,
                                       float* out, uint32_t out_cap, char* err, uint32_t err_cap);
 
+/* The decode bwa_bed_gains_layout evaluates, read back as the MATRIX itself, so it can be compared
+ * with a decoder designed elsewhere (the Ambisonic Decoder Toolbox, for example). Same arguments and
+ * the same refusals, minus the directions.
+ *
+ *   out       out[s*16 + k]: speaker index s of the file's N speakers (rows), ACN channel k (columns),
+ *             SN3D input scaling. The columns are in the bed's AmbiX frame: x = room ahead (+z),
+ *             y = room left (+x), z = room up (+y). Columns outside the `channels` set are 0, and
+ *             the max-rE taper (built-in decoders only) is folded in, so out x Y_SN3D(a), with a the
+ *             AmbiX image (ahead, left, up) of a room direction d, is what bwa_bed_gains_layout
+ *             returns for d, up to float rounding. out_cap is its size in FLOATS, at least
+ *             N*16. out = NULL is the size query, as for bwa_bed_gains_layout.
+ *
+ * Returns N on success, 0 on any failure (reason in err). Pure and reentrant; it reads the file and
+ * allocates, so keep it off an audio callback. */
+BWA_API uint32_t bwa_bed_decode_matrix(const char* layout_path, bwa_bed_decoder decoder,
+                                       const char* channels, bool max_re, uint32_t band,
+                                       float* out, uint32_t out_cap, char* err, uint32_t err_cap);
+
 /* ---- listener (control thread; skip when a tracker is connected) ---- */
 /* Position in room space. The quaternion is head orientation. Only the headphone
  * renders use it; the array render ignores orientation (real speakers, real ears).

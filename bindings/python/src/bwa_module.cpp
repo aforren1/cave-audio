@@ -924,6 +924,29 @@ NB_MODULE(_bwa, m) {
     }, "layout_path"_a, "decoder"_a, "dirs"_a, "channels"_a = nb::none(), "max_re"_a = false, "band"_a = 0u,
        "Pure and reentrant: the (ndir, n) per-speaker gains a LAYOUT FILE's bed decode produces, "
        "including its imported bed_decode (decoder LAYOUT). Raises RuntimeError with the reason.");
+    m.def("bed_decode_matrix", [](const std::string& path, bwa_bed_decoder dec,
+                                  std::optional<std::string> channels, bool max_re, uint32_t band) {
+        const char* ch = channels ? channels->c_str() : nullptr;
+        char err[256] = { 0 };
+        uint32_t n;
+        {
+            nb::gil_scoped_release rel;
+            n = bwa_bed_decode_matrix(path.c_str(), dec, ch, max_re, band, nullptr, 0, err, sizeof err);
+        }
+        if (n == 0) throw std::runtime_error(err[0] ? err : "bed_decode_matrix: failed");
+        std::vector<float> out((size_t)n * 16);
+        float* op = out.data();
+        uint32_t got;
+        {
+            nb::gil_scoped_release rel;
+            got = bwa_bed_decode_matrix(path.c_str(), dec, ch, max_re, band, op, (uint32_t)out.size(),
+                                        err, sizeof err);
+        }
+        if (got == 0) throw std::runtime_error(err[0] ? err : "bed_decode_matrix: failed");
+        return adopt<float, OutF32>(std::move(out), {n, 16});
+    }, "layout_path"_a, "decoder"_a, "channels"_a = nb::none(), "max_re"_a = false, "band"_a = 0u,
+       "Pure and reentrant: the (n, 16) SH->speaker matrix bed_gains_layout evaluates (ACN/SN3D "
+       "columns, AmbiX frame: x ahead, y left, z up). Raises RuntimeError with the reason.");
 
     /* ---- listener and tracking ---- */
     m.def("set_listener_pose", [](Engine& e, float px, float py, float pz,

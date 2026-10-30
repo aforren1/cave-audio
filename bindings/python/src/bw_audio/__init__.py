@@ -105,6 +105,7 @@ __all__ = [
     "panner_gains",
     "bed_gains",
     "bed_gains_layout",
+    "bed_decode_matrix",
     "spcap_focus_default",
     "source_preset",
     "tuning_preset",
@@ -295,6 +296,17 @@ def bed_gains_layout(layout_path, decoder, directions, channels=None, max_re: bo
     np = _np()
     dirs = np.ascontiguousarray(directions, dtype=np.float32).reshape(-1, 3)
     return _bwa.bed_gains_layout(str(layout_path), decoder, dirs, channels, bool(max_re), int(band))
+
+
+def bed_decode_matrix(layout_path, decoder, channels=None, max_re: bool = False, band: int = 0):
+    """The SH-to-speaker matrix ``bed_gains_layout`` evaluates, as an ``(nspeakers, 16)`` array.
+
+    Columns are ACN channels with SN3D scaling, in the AmbiX frame (x = room ahead, y = room left,
+    z = room up). Columns outside ``channels`` are 0 and the max-rE taper is folded in, so
+    ``M @ Y_sn3d(dir)`` equals ``bed_gains_layout`` for that direction. Use it to compare against a
+    decoder designed elsewhere. Same arguments and errors as ``bed_gains_layout``, minus the directions.
+    """
+    return _bwa.bed_decode_matrix(str(layout_path), decoder, channels, bool(max_re), int(band))
 
 
 # ---------------------------------------------------------------------------- handles

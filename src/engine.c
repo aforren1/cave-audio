@@ -1716,50 +1716,54 @@ static void gl_err(char* err, uint32_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
-/* Offline: the bed decode a LAYOUT FILE gets, including its imported matrices. Follows the engine
+/* The argument checks bwa_bed_gains_layout and bwa_bed_decode_matrix share, in the order the first
+ * one always made them, so its error for a given bad call does not change. `fn` prefixes messages. */
+static bool bed_layout_args(const char* fn, const char* layout_path, uint32_t band, const char* channels,
+                            int* set, int* order, char* err, uint32_t err_cap) {
+    char m[200];
+    if (!layout_path) { snprintf(m, sizeof m, "%s: NULL layout_path", fn); gl_err(err, err_cap, m); return false; }
+    if (band > 1) {
+        snprintf(m, sizeof m, "%s: band must be 0 (HF/broadband) or 1 (LF)", fn);
+        gl_err(err, err_cap, m); return false;
+    }
+    *set = AMBI_SET_FULL; *order = BWA_AMBI_ORDER;
+    if (channels && channels[0] && !ambi_chan_parse(channels, set, order)) {
+        snprintf(m, sizeof m, "%s: channels must be NULL (full3), full1, full2, full3, 1H, 2H, "
+                              "2H1V, 3H, 3H1V or 3H2V", fn);
+        gl_err(err, err_cap, m); return false;
+    }
+    return true;
+}
+
+/* The bed decode a LAYOUT FILE gets, as ONE matrix: the decoder with the bed's channel mask and the
+ * max-rE taper folded into its columns, so gains = dec x Y_SN3D(dir) for that bed. Follows the engine
  * step for step: layout_load as bwa_create runs it, the decoder build_bed_decode installs (imported
  * by channel set and order through layout_bed_decoder_for, AllRAD/EPAD from the file's geometry and
  * listening point, SAD on a degenerate array), and mix_bed's taper rule (re_w by the bed's highest
- * order, never on an imported matrix). The SIZE QUERY (out = NULL) validates everything the full
- * call can know without directions: path, band, channels, the file, and an imported decoder for the
- * bed. See the header contract. */
-uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
-                              const char* channels, bool max_re, uint32_t band,
-                              const float* dirs, uint32_t ndir,
-                              float* out, uint32_t out_cap, char* err, uint32_t err_cap) {
-    if (err && err_cap) err[0] = 0;
-    if (!layout_path) { gl_err(err, err_cap, "bwa_bed_gains_layout: NULL layout_path"); return 0; }
-    if (band > 1)     { gl_err(err, err_cap, "bwa_bed_gains_layout: band must be 0 (HF/broadband) or 1 (LF)"); return 0; }
-    int set = AMBI_SET_FULL, order = BWA_AMBI_ORDER;
-    if (channels && channels[0] && !ambi_chan_parse(channels, &set, &order)) {
-        gl_err(err, err_cap, "bwa_bed_gains_layout: channels must be NULL (full3), full1, full2, full3, 1H, 2H, "
-                             "2H1V, 3H, 3H1V or 3H2V");
-        return 0;
-    }
-    if (out && (!dirs || ndir == 0)) { gl_err(err, err_cap, "bwa_bed_gains_layout: NULL dirs or ndir 0"); return 0; }
+ * order, never on an imported matrix; mix_bed tapers the encode rather than the columns, so the
+ * two agree to rounding, not bit for bit). dec = NULL validates only (the file, an imported decoder for
+ * the bed) and skips the build, which is what keeps a size query cheap. Returns N, or 0 with `err` set.
+ * Both bed_layout readers go through here so the gains and the matrix readback cannot disagree. */
+static uint32_t bed_layout_matrix(const char* fn, const char* layout_path, bwa_bed_decoder decoder,
+                                  int set, int order, bool max_re, uint32_t band,
+                                  float (*dec)[BWA_AMBI_CH], char* err, uint32_t err_cap) {
+    char m[200];
     Layout* L = (Layout*)malloc(sizeof *L);              /* never a stack local (layout.h) */
-    if (!L) { gl_err(err, err_cap, "bwa_bed_gains_layout: out of memory"); return 0; }
+    if (!L) { snprintf(m, sizeof m, "%s: out of memory", fn); gl_err(err, err_cap, m); return 0; }
     char lerr[256] = { 0 };
     if (!layout_load(layout_path, 48000, L, lerr, sizeof lerr)) {   /* the rate only converts delay_ms */
-        gl_err(err, err_cap, lerr[0] ? lerr : "bwa_bed_gains_layout: layout load failed");
+        snprintf(m, sizeof m, "%s: layout load failed", fn);
+        gl_err(err, err_cap, lerr[0] ? lerr : m);
         free(L); return 0;
     }
     const uint32_t n = L->count;
     const int id = resolve_bed_decoder(decoder);
     const BedDecoder* imp = (id == 3) ? layout_bed_decoder_for(&L->bed, set, order, NULL) : NULL;
     if (id == 3 && !imp) {
-        gl_err(err, err_cap, "bwa_bed_gains_layout: BWA_DECODE_LAYOUT, but the layout carries no bed_decode block");
-        free(L); return 0;
-    }
-    if (!out) { free(L); return n; }                     /* size query: everything above held */
-    if ((uint64_t)ndir * n > out_cap) {
-        char m[160];
-        snprintf(m, sizeof m, "bwa_bed_gains_layout: out_cap %u floats is too small (need ndir*N = %u*%u)",
-                 (unsigned)out_cap, (unsigned)ndir, (unsigned)n);
+        snprintf(m, sizeof m, "%s: BWA_DECODE_LAYOUT, but the layout carries no bed_decode block", fn);
         gl_err(err, err_cap, m); free(L); return 0;
     }
-    float (*dec)[BWA_AMBI_CH] = (float (*)[BWA_AMBI_CH])malloc(sizeof(float) * BWA_CHANNELS * BWA_AMBI_CH);
-    if (!dec) { gl_err(err, err_cap, "bwa_bed_gains_layout: out of memory"); free(L); return 0; }
+    if (!dec) { free(L); return n; }
     float w[BWA_AMBI_CH];
     for (int k = 0; k < BWA_AMBI_CH; ++k) w[k] = 1.f;
     if (imp) {
@@ -1772,11 +1776,42 @@ uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
         if (max_re) ambi_max_re_weights(order, w);
     }
     const uint16_t mask = ambi_set_mask_for(set, order);
+    for (int k = 0; k < BWA_AMBI_CH; ++k) {
+        const float c = (mask & (1u << k)) ? w[k] : 0.f;
+        for (uint32_t s = 0; s < n; ++s) dec[s][k] *= c;
+    }
+    free(L);
+    return n;
+}
+
+/* Offline: the bed decode a LAYOUT FILE gets, including its imported matrices, evaluated at
+ * directions. The SIZE QUERY (out = NULL) validates everything the full call can know without
+ * directions: path, band, channels, the file, and an imported decoder for the bed. See the header
+ * contract. */
+uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
+                              const char* channels, bool max_re, uint32_t band,
+                              const float* dirs, uint32_t ndir,
+                              float* out, uint32_t out_cap, char* err, uint32_t err_cap) {
+    static const char fn[] = "bwa_bed_gains_layout";
+    if (err && err_cap) err[0] = 0;
+    int set, order;
+    if (!bed_layout_args(fn, layout_path, band, channels, &set, &order, err, err_cap)) return 0;
+    if (out && (!dirs || ndir == 0)) { gl_err(err, err_cap, "bwa_bed_gains_layout: NULL dirs or ndir 0"); return 0; }
+    if (!out) return bed_layout_matrix(fn, layout_path, decoder, set, order, max_re, band, NULL, err, err_cap);
+    float (*dec)[BWA_AMBI_CH] = (float (*)[BWA_AMBI_CH])malloc(sizeof(float) * BWA_CHANNELS * BWA_AMBI_CH);
+    if (!dec) { gl_err(err, err_cap, "bwa_bed_gains_layout: out of memory"); return 0; }
+    const uint32_t n = bed_layout_matrix(fn, layout_path, decoder, set, order, max_re, band, dec, err, err_cap);
+    if (!n) { free(dec); return 0; }
+    if ((uint64_t)ndir * n > out_cap) {
+        char m[160];
+        snprintf(m, sizeof m, "bwa_bed_gains_layout: out_cap %u floats is too small (need ndir*N = %u*%u)",
+                 (unsigned)out_cap, (unsigned)ndir, (unsigned)n);
+        gl_err(err, err_cap, m); free(dec); return 0;
+    }
     for (uint32_t i = 0; i < ndir; ++i) {
         float a[3], y[BWA_AMBI_CH];
         room_to_ambi(&dirs[(size_t)i * 3], a);
         ambi_encode_sn3d(a, y);
-        for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] = (mask & (1u << k)) ? y[k] * w[k] : 0.f;
         float* o = &out[(size_t)i * n];
         for (uint32_t s = 0; s < n; ++s) {
             float acc = 0.f;
@@ -1785,7 +1820,32 @@ uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
         }
     }
     free(dec);
-    free(L);
+    return n;
+}
+
+/* Offline: the same decode as bwa_bed_gains_layout, read back as the N x 16 matrix itself (ACN/SN3D
+ * columns in the bed's AmbiX frame), for comparison against an external decoder design. See the
+ * header contract. */
+uint32_t bwa_bed_decode_matrix(const char* layout_path, bwa_bed_decoder decoder,
+                               const char* channels, bool max_re, uint32_t band,
+                               float* out, uint32_t out_cap, char* err, uint32_t err_cap) {
+    static const char fn[] = "bwa_bed_decode_matrix";
+    if (err && err_cap) err[0] = 0;
+    int set, order;
+    if (!bed_layout_args(fn, layout_path, band, channels, &set, &order, err, err_cap)) return 0;
+    if (!out) return bed_layout_matrix(fn, layout_path, decoder, set, order, max_re, band, NULL, err, err_cap);
+    float (*dec)[BWA_AMBI_CH] = (float (*)[BWA_AMBI_CH])malloc(sizeof(float) * BWA_CHANNELS * BWA_AMBI_CH);
+    if (!dec) { gl_err(err, err_cap, "bwa_bed_decode_matrix: out of memory"); return 0; }
+    const uint32_t n = bed_layout_matrix(fn, layout_path, decoder, set, order, max_re, band, dec, err, err_cap);
+    if (!n) { free(dec); return 0; }
+    if ((uint64_t)n * BWA_AMBI_CH > out_cap) {
+        char m[160];
+        snprintf(m, sizeof m, "bwa_bed_decode_matrix: out_cap %u floats is too small (need N*16 = %u*16)",
+                 (unsigned)out_cap, (unsigned)n);
+        gl_err(err, err_cap, m); free(dec); return 0;
+    }
+    memcpy(out, dec, sizeof(float) * (size_t)n * BWA_AMBI_CH);   /* rows are contiguous: out[s*16 + k] */
+    free(dec);
     return n;
 }
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap) {

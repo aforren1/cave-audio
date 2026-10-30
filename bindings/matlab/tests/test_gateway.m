@@ -9,7 +9,7 @@ tcheck('commands returns a cell of names', iscell(cmds) && ischar(cmds{1}));
 % Every subcommand maps to a bw_audio.h entry point, except `constants`, which has no C twin.
 % The count is the pin: an entry point added to the header and not bound here shows up as a
 % number that stopped matching, which is the only way a binding gap is noticed at all.
-tcheck('the gateway binds 171 subcommands', numel(cmds) == 171, sprintf('%d', numel(cmds)));
+tcheck('the gateway binds 172 subcommands', numel(cmds) == 172, sprintf('%d', numel(cmds)));
 tcheck('constants is one of them', any(strcmp(cmds, 'constants')));
 tcheck('set_output_capture is listed even though it refuses', ...
        any(strcmp(cmds, 'set_output_capture')));
@@ -83,6 +83,14 @@ catch gl_err
     refused = strcmp(gl_err.identifier, 'bwa:bed_gains_layout') && ~isempty(strfind(gl_err.message, 'bed_decode'));
 end
 tcheck('bed_gains_layout refuses LAYOUT on a file with no bed_decode, with the reason', refused);
+% bed_decode_matrix is the (speakers, 16) matrix the grading multiplies through. At order 1 the SN3D
+% encode in the AmbiX frame is [1; room x; room y; room z], so M * Y reproduces bed_gains_layout.
+dm = bwa_mex('bed_decode_matrix', lay, C.DECODE_ALLRAD, 'full1', true, 0);
+tcheck('bed_decode_matrix is (speakers, 16)', isequal(size(dm), [5 16]) && all(all(dm(:, 5:16) == 0)));
+d1 = single([0 0 1; 0.6 0 0.8]);
+g1 = bwa_mex('bed_gains_layout', lay, C.DECODE_ALLRAD, 'full1', true, 0, d1);
+tcheck('bed_decode_matrix * Y reproduces bed_gains_layout', ...
+       max(max(abs(dm(:, 1:4) * [ones(1, 2, 'single'); d1.'] - g1))) < 1e-5);
 delete(lay);
 
 % box_mesh is pure and returns three arrays, the shapes a caller can hand straight back.

@@ -94,7 +94,9 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   offline panner and bed-decode evaluation for layout tools
   (`bwa_panner_gains_batch`, which also takes SPCAP's focus and density knobs so a
   layout can be graded at the tuning it ships with, `bwa_bed_gains_batch`, and
-  `bwa_bed_gains_layout`, which grades a layout file's own decode, imported matrix included).
+  `bwa_bed_gains_layout`, which grades a layout file's own decode, imported matrix included,
+  and `bwa_bed_decode_matrix`, which reads that decode back as a matrix for comparison with
+  external tools).
 
 ## Quickstart
 
@@ -2614,6 +2616,9 @@ uint32_t bwa_bed_gains_layout(const char* layout_path, bwa_bed_decoder decoder,
                               const char* channels, bool max_re, uint32_t band,
                               const float* dirs, uint32_t ndir,
                               float* out, uint32_t out_cap, char* err, uint32_t err_cap);
+uint32_t bwa_bed_decode_matrix(const char* layout_path, bwa_bed_decoder decoder,
+                               const char* channels, bool max_re, uint32_t band,
+                               float* out, uint32_t out_cap, char* err, uint32_t err_cap);
 ```
 
 The first two take no engine handle. They run the engine's own solves over a **candidate** layout you pass
@@ -2665,7 +2670,26 @@ It returns N on success and 0 on any failure. There is no engine to carry the re
 to the optional `err` buffer (always NUL-terminated, truncated to `err_cap - 1`). It reads the file
 and allocates: pure and reentrant, but never on an audio callback.
 
-`bwa_layout_tool` drives all three: the Score board, the rE coverage overlay, the badness map, and the
+`bwa_bed_decode_matrix` reads back the matrix that `bwa_bed_gains_layout` multiplies through.
+Use it to compare the engine's decode with one designed in another tool, such as the Ambisonic
+Decoder Toolbox. It takes the same arguments, minus the directions, and refuses the same calls.
+
+- `out[s*16 + k]` is the gain from ACN channel `k` to speaker index `s`, with SN3D input scaling.
+  The rows are speakers and the columns are channels, the same shape ADT writes. ADT often writes
+  N3D: multiply each order-l column of an N3D matrix by sqrt(2l+1) to get SN3D before you compare.
+- The columns are in the bed's AmbiX frame: x is room ahead (+z), y is room left (+x), z is room
+  up (+y). Rotate your directions into that frame before you compare.
+- The columns outside `channels` are 0, and the max-rE taper is folded in, so `out` times the SN3D
+  encode of a direction is exactly what `bwa_bed_gains_layout` returns for it.
+- `out = NULL` is the same size query. Otherwise `out_cap` must be at least `N*16`.
+
+Expect a broad match, not a bit-exact one. The built-in AllRAD and EPAD differ from ADT's in their
+virtual t-design, imaginary-speaker handling and normalization, so compare decoders on rE, rV and
+energy over the sphere, not coefficient by coefficient. An imported ADT matrix is the exception:
+read it back with `BWA_DECODE_LAYOUT` and it matches the preset, after the conversion
+`ambdec_to_json.py` applies.
+
+`bwa_layout_tool` drives the first three: the Score board, the rE coverage overlay, the badness map, and the
 optimizer cost all go through them. See [`layout-authoring.md`](./layout-authoring.md#scoring-and-the-observer-model).
 
 ## Tracked room EQ (control thread; live)

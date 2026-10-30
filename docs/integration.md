@@ -258,7 +258,8 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   zero-filled one. See docs/api.md for what each field rests on.
 - **Offline evaluation (pure, no engine handle)**: `bwa_panner_gains_batch`,
   `bwa_bed_gains_batch`, `bwa_bed_gains_layout` (a layout FILE's bed decode, imported
-  `bed_decode` included), and `bwa_spcap_focus_default`, for layout scoring from
+  `bed_decode` included), `bwa_bed_decode_matrix` (that decode as an N x 16 matrix), and
+  `bwa_spcap_focus_default`, for layout scoring from
   C# tooling. They never touch a running engine.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`, `bwa_set_dual_band_cap`,
   `bwa_set_spcap_focus`, `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,

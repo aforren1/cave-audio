@@ -1544,6 +1544,42 @@ CMD(bed_gains_layout)
     if (!n) mexErrMsgIdAndTxt("bwa:bed_gains_layout", "%s", err[0] ? err : "bwa_bed_gains_layout failed");
 }
 
+/* bwa_mex('bed_decode_matrix', layout_path, decoder, channels, max_re, band) -> (N, 16): the matrix
+ * bed_gains_layout evaluates (ACN/SN3D columns, AmbiX frame), so M * Y with Y as (16, ndir) gives
+ * bed_gains_layout's (N, ndir). (N, 16) is the shape the Ambisonic Decoder Toolbox hands out, which
+ * costs a transpose here: the C rows are speakers. */
+CMD(bed_decode_matrix)
+{
+    const char* cmd = "bed_decode_matrix";
+    uint32_t n;
+    char err[256] = { 0 };
+    char *path, *chans;
+    bwa_bed_decoder dec;
+    bool max_re;
+    uint32_t band;
+    (void)nlhs; need(nrhs, 5, cmd);
+    path   = get_str(prhs[0], cmd);
+    dec    = (bwa_bed_decoder)(int)get_u32(prhs[1], cmd);
+    chans  = get_str_or_null(prhs[2], cmd);
+    max_re = get_bool(prhs[3], cmd);
+    band   = get_u32(prhs[4], cmd);
+    n = bwa_bed_decode_matrix(path, dec, chans, max_re, band, NULL, 0, err, sizeof err);
+    if (n) {
+        float* rows = (float*)mxMalloc(sizeof(float) * n * 16u);
+        if (bwa_bed_decode_matrix(path, dec, chans, max_re, band, rows, n * 16u, err, sizeof err) == 0) n = 0;
+        else {
+            mxArray* out = mxCreateNumericMatrix((mwSize)n, 16, mxSINGLE_CLASS, mxREAL);
+            float* o = (float*)mxGetData(out);
+            for (uint32_t s = 0; s < n; ++s)
+                for (uint32_t k = 0; k < 16u; ++k) o[(size_t)k * n + s] = rows[(size_t)s * 16u + k];
+            plhs[0] = out;
+        }
+        mxFree(rows);
+    }
+    mxFree(path); if (chans) mxFree(chans);
+    if (!n) mexErrMsgIdAndTxt("bwa:bed_decode_matrix", "%s", err[0] ? err : "bwa_bed_decode_matrix failed");
+}
+
 /* ------------------------------------------------------------------ listener and tracking */
 
 CMD(set_listener_pose)
@@ -1816,7 +1852,7 @@ static const bwa_cmd_entry g_cmds[] = {
     ENT(set_limiter), ENT(set_limiter_ceiling), ENT(load_headphone_eq), ENT(set_headphone_eq),
     ENT(set_bed_renderer), ENT(set_tracked_room_eq), ENT(set_tracked_directivity), ENT(set_tracked_align),
     ENT(set_tracked_align_guards), ENT(tuning_preset), ENT(apply_tuning), ENT(get_tuning),
-    ENT(panner_gains_batch), ENT(bed_gains_batch), ENT(bed_gains_layout),
+    ENT(panner_gains_batch), ENT(bed_gains_batch), ENT(bed_gains_layout), ENT(bed_decode_matrix),
     /* listener and tracking */
     ENT(set_listener_pose), ENT(get_listener_pose), ENT(tracker_connect),
     ENT(tracker_disconnect), ENT(tracker_status), ENT(set_pose_prediction),

@@ -4,6 +4,13 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: `bwa_bed_decode_matrix`
+
+`Bwa.bwa_bed_decode_matrix` reads back the SH-to-speaker matrix that `bwa_bed_gains_layout`
+evaluates (N x 16, ACN/SN3D, AmbiX frame), so a decode can be compared with one designed elsewhere,
+such as in the Ambisonic Decoder Toolbox. It is a new export, so this package needs a DLL that
+carries it.
+
 ## [0.18.1]
 
 ### Added: imported bed decoders (`BwaBedDecoder.Layout`, `bwa_bed_gains_layout`)

@@ -147,6 +147,23 @@ def test_bed_gains_layout_reads_the_file():
         bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, channels="4H")
 
 
+def test_bed_decode_matrix_reproduces_the_gains():
+    """M @ Y_sn3d(dir) is bed_gains_layout; order 1 keeps Y closed-form ([1, room x, room y, room z])."""
+    dome = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "examples", "dome_24.json")
+    if not os.path.exists(dome):
+        pytest.skip("examples/dome_24.json is not beside this test (running outside a repo checkout)")
+    M = bwa.bed_decode_matrix(dome, bwa.BedDecoder.ALLRAD, channels="full1", max_re=True)
+    assert M.shape == (24, 16)
+    assert np.all(M[:, 4:] == 0.0)
+    dirs = np.array([[0, 1, 0], [0.6, 0, 0.8]], dtype=np.float32)
+    g = bwa.bed_gains_layout(dome, bwa.BedDecoder.ALLRAD, dirs, channels="full1", max_re=True)
+    Y = np.hstack([np.ones((2, 1), dtype=np.float32), dirs])
+    assert np.allclose(Y @ M[:, :4].T, g, atol=1e-5)
+    assert bwa.bed_decode_matrix(dome, bwa.BedDecoder.EPAD).shape == (24, 16)
+    with pytest.raises(RuntimeError, match="no bed_decode"):   # every message starts bwa_bed_decode_matrix:
+        bwa.bed_decode_matrix(dome, bwa.BedDecoder.LAYOUT)
+
+
 def test_box_mesh_is_pure_and_bounded():
     mesh = bwa.box_mesh(4.0, 3.0, 5.0, [0, 0, 0, 0, 0, 0])
     assert mesh is not None

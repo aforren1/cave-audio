@@ -715,6 +715,11 @@ namespace BwAudio
         // is a size query (returns the speaker count N); else it needs ndir*N floats (outCap). Returns
         // N, or 0 with the reason in err (UTF-8, NUL-terminated). Pure and reentrant; reads the file.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_layout([MarshalAs(UnmanagedType.LPUTF8Str)] string layoutPath, BwaBedDecoder decoder, [MarshalAs(UnmanagedType.LPUTF8Str)] string channels, [MarshalAs(UnmanagedType.I1)] bool maxRe, uint band, float[] dirs, uint ndir, [Out] float[] outGains, uint outCap, [Out] byte[] err, uint errCap);
+        // The decode bwa_bed_gains_layout evaluates, read back as the matrix: outMatrix[s*16 + k] for
+        // speaker s, ACN channel k (SN3D, AmbiX frame: x = room ahead, y = room left, z = room up),
+        // channel mask and max-rE taper folded in. Same arguments, size query and refusals as
+        // bwa_bed_gains_layout, minus the directions; outCap must be at least N*16.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_decode_matrix([MarshalAs(UnmanagedType.LPUTF8Str)] string layoutPath, BwaBedDecoder decoder, [MarshalAs(UnmanagedType.LPUTF8Str)] string channels, [MarshalAs(UnmanagedType.I1)] bool maxRe, uint band, [Out] float[] outMatrix, uint outCap, [Out] byte[] err, uint errCap);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

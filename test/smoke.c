@@ -699,6 +699,68 @@ static int run_bed_layout(void) {
         if (bwa_bed_gains_batch(BWA_DECODE_LAYOUT, false, (const float*)g, 1, up, 1, g) != 0) {
             fprintf(stderr, "FAIL[bedL]: the positions batch must refuse BWA_DECODE_LAYOUT\n"); break; }
 
+        /* bwa_bed_decode_matrix: the imported rows come back as written, and a built-in decode's
+         * matrix reproduces bwa_bed_gains_layout. full1 keeps the encode closed-form (SN3D order 1
+         * in the AmbiX frame is [1, room x, room y, room z]), which pins the documented frame too. */
+        float M[8 * 16];
+        if (bwa_bed_decode_matrix(LB, BWA_DECODE_LAYOUT, NULL, false, 0, NULL, 0, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedM]: size query did not return the speaker count: %s\n", err); break; }
+        if (bwa_bed_decode_matrix(LB, BWA_DECODE_LAYOUT, "full1", false, 0, M, 8 * 16, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedM]: imported readback failed: %s\n", err); break; }
+        int okm = 1;
+        for (int s = 0; s < 8; ++s)
+            for (int k = 0; k < 16; ++k) {
+                const float want = k == 0 ? 0.1f : k == 2 ? 0.2f * ((s & 2) ? 1.f : -1.f) : 0.f;
+                if (fabsf(M[s * 16 + k] - want) > 1e-6f) okm = 0;
+            }
+        if (!okm) { fprintf(stderr, "FAIL[bedM]: imported matrix is not the file's HF rows\n"); break; }
+        if (bwa_bed_decode_matrix(LB, BWA_DECODE_ALLRAD, "full1", true, 0, M, 8 * 16, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedM]: AllRAD readback failed: %s\n", err); break; }
+        const float probe[3][3] = { { 0.f, 1.f, 0.f }, { 0.6f, 0.f, 0.8f }, { -0.48f, 0.6f, -0.64f } };
+        for (int i = 0; i < 3 && okm; ++i) {
+            if (bwa_bed_gains_layout(LB, BWA_DECODE_ALLRAD, "full1", true, 0, probe[i], 1, g, 8, err, sizeof err) != 8u) {
+                okm = 0; break; }
+            for (int s = 0; s < 8; ++s) {
+                const float* r = &M[s * 16];
+                const float mg = r[0] + r[1] * probe[i][0] + r[2] * probe[i][1] + r[3] * probe[i][2];
+                if (fabsf(mg - g[s]) > 1e-5f) okm = 0;
+                for (int k = 4; k < 16; ++k) if (r[k] != 0.f) okm = 0;     /* outside full1: zeroed */
+            }
+        }
+        if (!okm) { fprintf(stderr, "FAIL[bedM]: AllRAD matrix x Y(dir) does not match bwa_bed_gains_layout\n"); break; }
+        /* the taper is IN the matrix, checked against closed-form order-1 max-rE weights (sqrt 2 on
+         * W, sqrt 2/3 on the dipoles), not against bwa_bed_gains_layout, which shares the builder and
+         * would stay equal with the fold deleted from both */
+        float M0[8 * 16];
+        if (bwa_bed_decode_matrix(LB, BWA_DECODE_ALLRAD, "full1", false, 0, M0, 8 * 16, err, sizeof err) != 8u) {
+            fprintf(stderr, "FAIL[bedM]: untapered readback failed: %s\n", err); break; }
+        int nchk = 0;
+        for (int s = 0; s < 8; ++s)
+            for (int k = 0; k < 4; ++k) {
+                if (fabsf(M0[s * 16 + k]) < 1e-4f) continue;
+                const float want = k == 0 ? 1.4142136f : 0.8164966f;
+                if (fabsf(M[s * 16 + k] / M0[s * 16 + k] - want) > 1e-4f) okm = 0;
+                ++nchk;
+            }
+        if (!okm || nchk < 8) {
+            fprintf(stderr, "FAIL[bedM]: max-rE taper not folded into the matrix (%d entries checked)\n", nchk); break; }
+        struct { const char* path; bwa_bed_decoder d; uint32_t band; uint32_t cap; const char* why; } badm[] = {
+            { NULL, BWA_DECODE_ALLRAD, 0, 8 * 16, "NULL layout_path" },
+            { LB, BWA_DECODE_ALLRAD, 2, 8 * 16, "band" },
+            { LB, BWA_DECODE_ALLRAD, 0, 8 * 16 - 1, "too small" },
+            { LN, BWA_DECODE_LAYOUT, 0, 8 * 16, "no bed_decode" },
+        };
+        for (size_t i = 0; i < sizeof badm / sizeof badm[0]; ++i) {
+            err[0] = 0;
+            if (bwa_bed_decode_matrix(badm[i].path, badm[i].d, NULL, false, badm[i].band, M, badm[i].cap,
+                                      err, sizeof err) != 0 || !strstr(err, badm[i].why)
+                || !strstr(err, "bwa_bed_decode_matrix")) {
+                fprintf(stderr, "FAIL[bedM]: bad case %u not refused with '%s' (err: %s)\n", (unsigned)i, badm[i].why, err);
+                okm = 0;
+            }
+        }
+        if (!okm) break;
+
         /* the engine: LAYOUT without the block creates (reason readable) but refuses to start */
         bwa_desc d; memset(&d, 0, sizeof d);
         d.profile = BWA_PROFILE_CAVE; d.sink = BWA_SINK_MANUAL; d.block_size = 256;
