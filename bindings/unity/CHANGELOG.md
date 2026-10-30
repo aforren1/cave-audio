@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.19.0]
+
 ### Added: `bwa_bed_decode_matrix`
 
 `Bwa.bwa_bed_decode_matrix` reads back the SH-to-speaker matrix that `bwa_bed_gains_layout`
