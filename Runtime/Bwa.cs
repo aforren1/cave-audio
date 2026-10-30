@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/api.md + https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/1e98bbdbf4d7/docs/api.md + https://github.com/aforren1/cave-audio/blob/1e98bbdbf4d7/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -40,7 +40,7 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
     /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
-    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/api.md, "What each preset rests on".</summary>
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/1e98bbdbf4d7/docs/api.md, "What each preset rests on".</summary>
     public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -80,7 +80,7 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
-    /// https://github.com/aforren1/cave-audio/blob/be85a0de6367/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    /// https://github.com/aforren1/cave-audio/blob/1e98bbdbf4d7/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
     public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 
@@ -534,7 +534,7 @@ namespace BwAudio
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. tools/release.ps1
         // rewrites this line with the header's defines, and CI fails a push where the two disagree.
-        public const uint BoundVersion = (0u << 16) | (18u << 8) | 1u;   // 0.18.1
+        public const uint BoundVersion = (0u << 16) | (19u << 8) | 0u;   // 0.19.0
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
@@ -715,6 +715,11 @@ namespace BwAudio
         // is a size query (returns the speaker count N); else it needs ndir*N floats (outCap). Returns
         // N, or 0 with the reason in err (UTF-8, NUL-terminated). Pure and reentrant; reads the file.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_layout([MarshalAs(UnmanagedType.LPUTF8Str)] string layoutPath, BwaBedDecoder decoder, [MarshalAs(UnmanagedType.LPUTF8Str)] string channels, [MarshalAs(UnmanagedType.I1)] bool maxRe, uint band, float[] dirs, uint ndir, [Out] float[] outGains, uint outCap, [Out] byte[] err, uint errCap);
+        // The decode bwa_bed_gains_layout evaluates, read back as the matrix: outMatrix[s*16 + k] for
+        // speaker s, ACN channel k (SN3D, AmbiX frame: x = room ahead, y = room left, z = room up),
+        // channel mask and max-rE taper folded in. Same arguments, size query and refusals as
+        // bwa_bed_gains_layout, minus the directions; outCap must be at least N*16.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_decode_matrix([MarshalAs(UnmanagedType.LPUTF8Str)] string layoutPath, BwaBedDecoder decoder, [MarshalAs(UnmanagedType.LPUTF8Str)] string channels, [MarshalAs(UnmanagedType.I1)] bool maxRe, uint band, [Out] float[] outMatrix, uint outCap, [Out] byte[] err, uint errCap);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);
