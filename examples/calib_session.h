@@ -80,7 +80,7 @@ struct SesInputs {
     std::string plan;                    /* the plan layout: read, never written */
     std::string driver;                  /* ASIO driver, empty = auto */
     int         input_first = 0;         /* the ZM-1's first capsule input */
-    std::string nn_server, nn_multicast = "239.255.42.99", body;
+    std::string nn_server, nn_multicast = "239.255.42.99", nn_local, body;
     std::string mount_offset;            /* "ring", "x,y,z", or empty (0: the pivot is the center) */
     std::string temp;                    /* --temp, empty = the layout's or 20 C */
     std::string localize_rows, grid_rows;

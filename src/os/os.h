@@ -288,6 +288,12 @@ int  os_udp_sendto(os_socket s, const void* buf, size_t len, const char* ipv4, u
 /* Receive one datagram (the sender address is discarded — natnet never inspects it). Returns the
  * byte count, OS_UDP_TIMEOUT when the receive timeout expired, or OS_UDP_ERROR. */
 int  os_udp_recv(os_socket s, void* buf, size_t cap);
+/* os_udp_recv that keeps the sender, for something answering requests (natnet's test server). ip_out
+ * holds at least 46 bytes. Same returns. */
+int  os_udp_recv_from(os_socket s, void* buf, size_t cap, char* ip_out, uint16_t* port_out);
+/* The local IPv4 the routing table would send from to reach peer_ipv4, written to out (at least 46
+ * bytes). No packet goes out: connect() on a UDP socket only picks the route. 0 = ok. */
+int  os_udp_route_local_ipv4(const char* peer_ipv4, char* out, size_t cap);
 
 bool os_ipv4_valid(const char* s);   /* a numeric IPv4 literal, not a hostname */
 

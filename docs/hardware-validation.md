@@ -293,7 +293,7 @@ On failure:
   [Record these numbers](#record-these-numbers).
 - Never opens, `turning` on an untouched stand: Motive's orientation jitter is above the 0.3
   degree floor. Record it; do not loosen the check by hand on the day.
-- `no live pose`: occluded markers, a wrong body name or ID, or Motive not streaming.
+- `no live pose`: the line says what the stream is doing. See [No live pose](#no-live-pose).
 - Exit 4: re-place the ZM-1 and run the step again.
 
 ### Step 1: Motive frame check
@@ -630,13 +630,14 @@ The NatNet parser and lifecycle are tested off-wire. Stage 2's frame check alrea
 room frame from the speakers; this stage proves the head body.
 
 ```
-bwa_track_monitor <motive-ip> <head body name or ID>
+bwa_track_monitor <motive-ip> <head body name or ID> [this machine's IP]
 ```
 
-No audio device needed. Names need the server; on multicast only, pass the numeric streaming ID.
+No audio device needed. Names need the server. On multicast only, pass the numeric streaming ID, and
+the version comes from the frames. The first column reads `LIVE`, `NO BODY` or `NO DATA`.
 
-- [ ] **Data flows**: the pose updates when the body moves. A pose stuck at identity means no
-      frames: check multicast routing and the interface, the firewall, and Motive's streaming.
+- [ ] **Data flows**: the first column reads `LIVE` and the pose updates when the body moves. For
+      anything else, see [No live pose](#no-live-pose).
 - [ ] **Right body**: hide the head markers; the readout freezes with your body, not someone
       else's.
 - [ ] **Frame**: stand at the room center and the position reads about `[0, head height, 0]`.
@@ -645,6 +646,38 @@ No audio device needed. Names need the server; on multicast only, pass the numer
       turn left and right and check the sign. Fix any disagreement in Motive, never in the client.
 - [ ] **Lifecycle**: disconnect and reconnect with new settings mid-run, glitch-free. A failed
       connect leaves the engine on the last committed pose.
+
+### No live pose
+
+The Placement panel and the console print one line that names the failure.
+
+| The line says | Check |
+|---|---|
+| `no NatNet frames` | Motive's Transmission Type is Multicast. The firewall allows this program. The adapter it names is on Motive's network |
+| `do not parse as NatNet` | The version on the `track:` line against Motive's. Report it: this is a bug |
+| `is not in them` | The streaming ID in Motive's rigid-body properties, and the body is enabled |
+| `untracked` | The markers are in view of the cameras. Motive shows the body solid |
+| `none holds a rigid body` or `hold no rigid body` | Rigid Bodies is on in Motive's streaming settings |
+
+Three facts behind that table:
+
+- **Firewall rules are per executable.** Windows treats each copy of a tool at a new path as a new
+  program, and a tool can read Motive's handshake and still lose every frame, because the handshake is
+  a reply and the frames are inbound. To cover every copy, run this as an administrator:
+  ```powershell
+  New-NetFirewallRule -DisplayName "bwa NatNet data" -Direction Inbound -Protocol UDP -LocalPort 1511 -Action Allow -Profile Any
+  ```
+  A Block rule on a tool overrides this. Delete those rules in Windows Defender Firewall.
+- **The tools do not speak unicast.** A client built on the NatNet SDK can work in unicast while these
+  tools get nothing.
+- **`netsh interface ipv4 show joins`** shows which adapter holds `239.255.42.99` while a tool is
+  connected. `--natnet-local` changes it.
+
+To see every body Motive sends, map the one you want and read the report:
+
+```powershell
+bwa_speaker_survey cave_layout.json --server <motive-ip> --map "<body>=0"
+```
 
 ## Stage 4: end-to-end on the array
 

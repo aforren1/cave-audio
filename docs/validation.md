@@ -1054,6 +1054,7 @@ through different capsules, which separates capsule error from field structure f
 | `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
+| `--natnet-local <ip>` | this machine's IP on Motive's network (default: the adapter that routes to `--natnet-server`) |
 | `--track-sim` | with `--simulate`: a scripted stand instead of Motive. See "Two safety behaviors" |
 | `--track-sim-bump <n>` | knock the scripted stand 15 mm after the nth capture |
 | `--track-sim-twist <n>` | turn the scripted stand 2° about the array center after the nth capture; no center moves |

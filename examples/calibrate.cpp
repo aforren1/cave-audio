@@ -1380,6 +1380,7 @@ int main(int argc, char** argv) {
     const char* track_body = NULL;                           /* --track: the ZM-1 stand's rigid body (id or name) */
     const char* nn_server = NULL;                             /* --natnet-server: Motive's host */
     const char* nn_multicast = "239.255.42.99";               /* --natnet-multicast */
+    const char* nn_local = NULL;                              /* --natnet-local: this machine's IP on Motive's network */
     int    track_sim = 0, track_sim_bump = 0;                 /* --track-sim, --track-sim-bump N */
     int    track_sim_twist = 0;                               /* --track-sim-twist N */
     int    mount_ring = 0, mount_off_set = 0;                 /* --mount-offset ring | x,y,z */
@@ -1502,6 +1503,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--track") && i+1<argc)           track_body = argv[++i];
         else if (!strcmp(argv[i],"--natnet-server") && i+1<argc)   nn_server = argv[++i];
         else if (!strcmp(argv[i],"--natnet-multicast") && i+1<argc) nn_multicast = argv[++i];
+        else if (!strcmp(argv[i],"--natnet-local") && i+1<argc) nn_local = argv[++i];
         else if (!strcmp(argv[i],"--track-sim"))                   track_sim = 1;
         else if (!strcmp(argv[i],"--track-sim-bump") && i+1<argc) {
             track_sim_bump = atoi(argv[++i]);
@@ -1581,7 +1583,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] [--natnet-local ip] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
                                "  --zylia: the mic is a ZM-1; --input is the FIRST of its 19 consecutive capture channels,\n"
                                "  --mic is the array center. Alone it is the single-placement position survey: distances\n"
                                "  need --latency (loopback, m at c) or --ref <spk> <m> (one tape-measured center->speaker\n"
@@ -1642,7 +1644,9 @@ int main(int argc, char** argv) {
                                "  markers from Motive's model definition, needs --natnet-server; it assumes the marker ring sits\n"
                                "  at the array center's height), else 0. Only the modes that turn capsule arrival differences into\n"
                                "  a room DIRECTION need a body-frame survey: the --zylia survey, and the --live position readout.\n"
-                               "  --natnet-server is REQUIRED to track by name. On the rig a key takes the current reading anyway,\n"
+                               "  --natnet-server is REQUIRED to track by name. --natnet-local names this machine's IP on Motive's\n"
+                               "  network, when the adapter routing to --natnet-server is the wrong one to join the multicast group\n"
+                               "  on. On the rig a key takes the current reading anyway,\n"
                                "  with a warning; --place-timeout s (default 300) aborts the wait. Unverified against live Motive.\n"
                                "  --track-sim (simulate only): a scripted stand walks in from 8 cm off the target, settles about\n"
                                "  5 mm off it, and the captures come from its TRUE center; --track-sim-bump N knocks it 15 mm\n"
@@ -1776,8 +1780,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: --track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
     if ((track_sim_bump || track_sim_twist) && !track_sim) {
         fprintf(stderr, "calibrate: --track-sim-bump/--track-sim-twist act on the SIMULATED stand; pass --track-sim\n"); return 2; }
-    if (!g_tracked && (tol_set || timeout_set || mount_off_set || nn_server)) {
-        fprintf(stderr, "calibrate: --place-tol-mm/--place-timeout/--mount-offset/--natnet-server are --track options\n"); return 2; }
+    if (!g_tracked && (tol_set || timeout_set || mount_off_set || nn_server || nn_local)) {
+        fprintf(stderr, "calibrate: --place-tol-mm/--place-timeout/--mount-offset/--natnet-server/--natnet-local are --track options\n"); return 2; }
     if (g_tracked && (check || (live_speaker >= 0 && !zylia) || aim_csv)) {
         fprintf(stderr, "calibrate: --track places the mic for the trims, --verify, --localize, --room-eq-grid, the --zylia\n"
                         "           survey, --capsule-survey and --live N --zylia; --check, the omni --live and --aim-sheet\n"
@@ -1986,7 +1990,7 @@ int main(int argc, char** argv) {
     if (g_tracked) {   /* the survey (if any) loads through the tracker, which knows what the mode needs */
         MicTrackCfg mc;
         memset(&mc, 0, sizeof mc);
-        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast;
+        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast; mc.local_iface = nn_local;
         mc.survey_path = survey_path;
         mc.need_body_frame = zylia_survey_mode;               /* the one mode that turns DOAs into room directions */
         mc.have_offset = mount_off_set && !mount_ring;

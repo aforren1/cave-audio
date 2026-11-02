@@ -130,6 +130,7 @@ struct ClickerCfg {
     char  body[64];           /* rigid-body streaming id or name ("clicker" resolves in simulate too) */
     char  server[64];         /* Motive host: needed for a name and for the bitstream version */
     char  multicast[64];      /* "" = 239.255.42.99 */
+    char  local_iface[64];    /* this machine's IP on Motive's network; "" = the NIC routing to server */
     float tip_m[3];           /* pivot -> tip, body axes (m); 0 = the pivot IS the tip */
     int   sim;                /* CLICKER_SIM_* */
     float sim_anchor[3];      /* simulate: the true array center the legs are placed around */

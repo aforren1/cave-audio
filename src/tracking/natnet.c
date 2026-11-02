@@ -277,6 +277,31 @@ int natnet_parse_bodies(const uint8_t* p, size_t len, int major, int minor,
     return w;
 }
 
+/* One rigid-body record on the wire: ID, position, quaternion, meanError, params. */
+#define NN_RB_RECORD_BYTES 38
+
+bool natnet_sniff_version(const uint8_t* p, size_t len, int* major, int* minor) {
+    size_t off = 0;
+    int32_t n, sect;
+    /* The size prefixes check each other here: the other-markers section must be exactly 12 bytes an
+     * item and the rigid-body section must hold its records, which a shifted 3.x read does not manage. */
+    if (rd_skip(len, &off, 4) &&
+        rd_i32(p, len, &off, &n) && n >= 0 && rd_i32(p, len, &off, &sect) && sect >= 0 && rd_skip(len, &off, (size_t)sect) &&
+        rd_i32(p, len, &off, &n) && n >= 0 && rd_i32(p, len, &off, &sect) && (int64_t)sect == (int64_t)n * 12 && rd_skip(len, &off, (size_t)sect) &&
+        rd_i32(p, len, &off, &n) && n >= 1 && rd_i32(p, len, &off, &sect) && (int64_t)sect >= (int64_t)n * NN_RB_RECORD_BYTES &&
+        (size_t)sect <= len - off) {
+        *major = 4; *minor = 1;
+        return true;
+    }
+    size_t rb_end;
+    if (seek_rigid_bodies(p, len, 3, 1, &off, &n, &rb_end) && n >= 1 &&
+        (uint64_t)n * NN_RB_RECORD_BYTES <= (uint64_t)(len - off)) {
+        *major = 3; *minor = 1;
+        return true;
+    }
+    return false;
+}
+
 /* Copy a NUL-terminated string that must end before `end` into dst (truncated to cap - 1). */
 static bool rd_name(const uint8_t* b, size_t end, size_t* off, char* dst, size_t cap) {
     size_t k = 0;
@@ -383,6 +408,7 @@ int natnet_parse_modeldef(const uint8_t* p, size_t len, int major, int minor,
 
 #include "os/os.h"
 #include <stdatomic.h>
+#include <stdio.h>
 
 /* How the receiver derives pose_write_t's t_ns. Chosen ONCE at open and fixed for the
  * connection's lifetime — pose.h's contract is one writer, ONE clock, differences only, and a
@@ -401,7 +427,7 @@ struct NatNet {
     os_socket sock;
     os_thread thread;
     _Atomic int stop;
-    int       major, minor;
+    int       major, minor;  /* 0.0 until a frame fixes them when nothing else could; the receiver's */
     int       stamp_mode;    /* NN_STAMP_* */
     double    ticks_to_ns;   /* NN_STAMP_MIDEXPO: 1e9 / server HighResClockFrequency */
     int32_t   rigid_body;
@@ -412,6 +438,14 @@ struct NatNet {
      * thread - relaxed atomics, because a stamp orders nothing else. */
     _Atomic uint64_t last_frame_ns;
     _Atomic uint64_t last_pose_ns;
+    /* natnet_info: written by the receiver, read anywhere; a status line needs no ordering either */
+    _Atomic int      version;        /* major << 8 | minor */
+    _Atomic int      why;            /* NatNetWhy */
+    _Atomic uint64_t n_frames, n_malformed, n_missing, n_untracked, n_poses;
+    /* fixed at open */
+    bool     handshake_ok, version_from_frame;
+    uint16_t data_port;
+    char     server[NATNET_IP_MAX], multicast[NATNET_IP_MAX], iface[NATNET_IP_MAX];
 };
 
 static void nn_err(char* err, size_t cap, const char* msg) {
@@ -427,7 +461,16 @@ static void to_room(const float src_p[3], const float src_q[4], float p[3], floa
     memcpy(q, src_q, sizeof(float) * 4);
 }
 
-/* Best-effort version handshake: ask the server (command port) for its NatNet version.
+/* The connect payload, the size PacketClient sends: sSender (264) + sConnectionOptions (5) + 4, all
+ * zero. A zero BitstreamVersion asks for the most current. An empty NAT_CONNECT is the older form, and
+ * nothing promises that every Motive answers it. */
+#define NN_CONNECT_BYTES 273
+/* UDP, so one lost packet must not read as "no server"; 3 x 300 ms keeps the "about a second" a caller
+ * was promised. A healthy LAN answers in a millisecond. */
+#define NN_HANDSHAKE_TRIES 3
+#define NN_HANDSHAKE_WAIT_MS 300
+
+/* Version handshake: ask the server (command port) for its NatNet version.
  * Returns true and sets major/minor on success. NatNet 3.0+ servers append their high-res
  * clock frequency (ticks/s) right after the version block (sSender_Server, NatNetTypes.h) —
  * it converts the frame suffix's CameraMidExposureTimestamp ticks to time; left 0 if absent. */
@@ -435,26 +478,89 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, u
     if (!cfg->server || !cfg->server[0]) return false;
     os_socket s = os_udp_open();
     if (s == OS_INVALID_SOCKET) return false;
-    os_udp_set_rcvtimeo_ms(s, 500);
+    os_udp_set_rcvtimeo_ms(s, NN_HANDSHAKE_WAIT_MS);
 
     const uint16_t port = cfg->command_port ? cfg->command_port : 1510;
-    uint8_t req[4]; uint16_t id = NAT_CONNECT, nb = 0;          /* {messageID, nDataBytes} */
+    uint8_t req[4 + NN_CONNECT_BYTES];
+    const uint16_t id = NAT_CONNECT, nb = NN_CONNECT_BYTES;     /* {messageID, nDataBytes} */
+    memset(req, 0, sizeof req);
     memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
-    os_udp_sendto(s, req, sizeof req, cfg->server, port);
 
-    uint8_t buf[2048];
-    int got = os_udp_recv(s, buf, sizeof buf);
-    os_udp_close(s);
-    if (got < 4) return false;
-    uint16_t msg; memcpy(&msg, buf, 2);
-    if (msg != NAT_SERVERINFO) return false;
     /* payload = sSender { char szName[256]; uint8 Version[4]; uint8 NatNetVersion[4]; }
      * then (3.0+, sSender_Server) uint64 HighResClockFrequency — 264 is 8-aligned, no padding */
     const int nnv = 4 + 256 + 4;                               /* header + szName + Version */
-    if (got < nnv + 2) return false;
-    *major = buf[nnv]; *minor = buf[nnv + 1];
-    if (freq && got >= nnv + 4 + 8) memcpy(freq, buf + nnv + 4, 8);
-    return (*major > 0);
+    bool ok = false;
+    for (int t = 0; t < NN_HANDSHAKE_TRIES && !ok; ++t) {
+        os_udp_sendto(s, req, sizeof req, cfg->server, port);
+        uint8_t buf[2048];
+        const int got = os_udp_recv(s, buf, sizeof buf);
+        if (got < nnv + 2) continue;
+        uint16_t msg; memcpy(&msg, buf, 2);
+        if (msg != NAT_SERVERINFO || buf[nnv] == 0) continue;
+        *major = buf[nnv]; *minor = buf[nnv + 1];
+        if (freq && got >= nnv + 4 + 8) memcpy(freq, buf + nnv + 4, 8);
+        ok = true;
+    }
+    os_udp_close(s);
+    return ok;
+}
+
+static void nn_copy_ip(char* dst, const char* src) {
+    dst[0] = 0;
+    if (src) { strncpy(dst, src, NATNET_IP_MAX - 1); dst[NATNET_IP_MAX - 1] = 0; }
+}
+
+/* Open, bind and join: the data socket both session kinds use. iface_out gets the NIC actually joined
+ * on, "" for the OS default. An interface the caller named must work; one we derived may fall back,
+ * since a derived loopback, say, has no multicast at all on some kernels. */
+static os_socket nn_open_data_socket(const NatNetConfig* cfg, char* iface_out, char* err, size_t errcap) {
+    iface_out[0] = 0;
+    os_socket s = os_udp_open();
+    if (s == OS_INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); return s; }
+    os_udp_set_reuseaddr(s);
+    os_udp_set_rcvtimeo_ms(s, 200);                             /* so the owner can poll its stop flag */
+    /* multicast binds ANY, then joins */
+    if (os_udp_bind_any(s, cfg->data_port ? cfg->data_port : 1511) != 0) {
+        nn_err(err, errcap, "natnet: bind() failed"); os_udp_close(s); return OS_INVALID_SOCKET;
+    }
+    if (!cfg->multicast || !cfg->multicast[0]) return s;
+    if (cfg->local_iface && cfg->local_iface[0]) {
+        if (os_udp_join_multicast(s, cfg->multicast, cfg->local_iface) != 0) {
+            nn_err(err, errcap, "natnet: multicast join failed on the local interface given"); os_udp_close(s); return OS_INVALID_SOCKET;
+        }
+        nn_copy_ip(iface_out, cfg->local_iface);
+        return s;
+    }
+    char derived[NATNET_IP_MAX];
+    if (cfg->server && cfg->server[0] && os_udp_route_local_ipv4(cfg->server, derived, sizeof derived) == 0 &&
+        os_udp_join_multicast(s, cfg->multicast, derived) == 0) {
+        nn_copy_ip(iface_out, derived);
+        return s;
+    }
+    if (os_udp_join_multicast(s, cfg->multicast, NULL) != 0) {
+        nn_err(err, errcap, "natnet: multicast join failed"); os_udp_close(s); return OS_INVALID_SOCKET;
+    }
+    return s;
+}
+
+/* The address checks both session kinds share. */
+static bool nn_check_addrs(const NatNetConfig* cfg, char* err, size_t errcap) {
+    /* inet_pton accepts only numeric IPv4 literals; a hostname or typo silently becomes 0.0.0.0,
+     * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".
+     * Reject a bad address up front with a clear message. */
+    if (cfg->server && cfg->server[0] && !os_ipv4_valid(cfg->server)) {
+        nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname");
+        return false;
+    }
+    if (cfg->multicast && cfg->multicast[0] && !os_ipv4_valid(cfg->multicast)) {
+        nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)");
+        return false;
+    }
+    if (cfg->local_iface && cfg->local_iface[0] && !os_ipv4_valid(cfg->local_iface)) {
+        nn_err(err, errcap, "natnet: tracker local interface must be this machine's numeric IPv4 address on Motive's network");
+        return false;
+    }
+    return true;
 }
 
 /* Request the model definitions from the server and resolve a rigid-body name to its streaming
@@ -499,13 +605,31 @@ static void receiver(void* arg) {
         if (msg != NAT_FRAMEOFDATA) continue;
         const uint64_t now_ns = os_monotonic_ns();             /* one read: liveness stamps + arrival stamp */
         atomic_store_explicit(&nn->last_frame_ns, now_ns, memory_order_relaxed);  /* a frame arrived (any body) */
+        atomic_fetch_add_explicit(&nn->n_frames, 1, memory_order_relaxed);
         size_t plen = (size_t)got - 4;
         if (nbytes <= plen) plen = nbytes;                     /* trust the smaller of header/recv */
+        if (nn->major <= 0) {                                  /* nothing else could say: this frame might */
+            if (!natnet_sniff_version(buf + 4, plen, &nn->major, &nn->minor)) {
+                atomic_store_explicit(&nn->why, NN_WHY_UNDECIDED, memory_order_relaxed);
+                continue;
+            }
+            atomic_store_explicit(&nn->version, nn->major << 8 | nn->minor, memory_order_relaxed);
+        }
         float sp[3], sq[4];
         bool tv = true;
         NatNetStamps st;
-        if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv, &st) && tv) {
+        if (!natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv, &st)) {
+            /* the parser's false is "cut" or "not there": only the failure path pays to tell them apart */
+            const bool cut = natnet_parse_bodies(buf + 4, plen, nn->major, nn->minor, NULL, 0) < 0;
+            atomic_fetch_add_explicit(cut ? &nn->n_malformed : &nn->n_missing, 1, memory_order_relaxed);
+            atomic_store_explicit(&nn->why, cut ? NN_WHY_MALFORMED : NN_WHY_MISSING, memory_order_relaxed);
+        } else if (!tv) {
+            atomic_fetch_add_explicit(&nn->n_untracked, 1, memory_order_relaxed);
+            atomic_store_explicit(&nn->why, NN_WHY_UNTRACKED, memory_order_relaxed);
+        } else {
             atomic_store_explicit(&nn->last_pose_ns, now_ns, memory_order_relaxed);  /* a valid pose for our body */
+            atomic_fetch_add_explicit(&nn->n_poses, 1, memory_order_relaxed);
+            atomic_store_explicit(&nn->why, NN_WHY_NONE, memory_order_relaxed);
             float p[3], q[4];
             to_room(sp, sq, p, q);
             /* stamp with the connection's clock (stamp_mode, fixed at open): rt.c differences
@@ -551,6 +675,86 @@ NatNetStatus natnet_status(const NatNet* nn) {
     return natnet_classify(now, frame, pose, (int64_t)NN_STALE_MS * 1000000);
 }
 
+void natnet_info(const NatNet* nn, NatNetInfo* out) {
+    memset(out, 0, sizeof *out);
+    out->status = natnet_status(nn);
+    if (!nn) return;
+    const int v = atomic_load_explicit(&nn->version, memory_order_relaxed);
+    out->major = v >> 8; out->minor = v & 0xff;
+    out->why = (NatNetWhy)atomic_load_explicit(&nn->why, memory_order_relaxed);
+    out->handshake_ok = nn->handshake_ok;
+    out->version_from_frame = nn->version_from_frame;
+    out->rigid_body = nn->rigid_body;
+    out->data_port = nn->data_port;
+    memcpy(out->server, nn->server, sizeof out->server);
+    memcpy(out->multicast, nn->multicast, sizeof out->multicast);
+    memcpy(out->iface, nn->iface, sizeof out->iface);
+    out->frames    = atomic_load_explicit(&nn->n_frames, memory_order_relaxed);
+    out->malformed = atomic_load_explicit(&nn->n_malformed, memory_order_relaxed);
+    out->missing   = atomic_load_explicit(&nn->n_missing, memory_order_relaxed);
+    out->untracked = atomic_load_explicit(&nn->n_untracked, memory_order_relaxed);
+    out->poses     = atomic_load_explicit(&nn->n_poses, memory_order_relaxed);
+}
+
+static void nn_body_words(const NatNetInfo* i, char* buf, size_t cap) {
+    if (i->rigid_body > 0) snprintf(buf, cap, "rigid body id %d", (int)i->rigid_body);
+    else                   snprintf(buf, cap, "the first rigid body");
+}
+
+void natnet_explain(const NatNetInfo* i, char* buf, size_t cap) {
+    char body[40];
+    nn_body_words(i, body, sizeof body);
+    if (i->status == NN_STATUS_LIVE) { snprintf(buf, cap, "%s is live", body); return; }
+    if (i->status == NN_STATUS_NO_DATA) {
+        const char* lead = i->frames ? "NatNet frames stopped" : "no NatNet frames";
+        if (i->multicast[0])
+            snprintf(buf, cap, "%s on UDP %u: check that Motive streams multicast to %s (not unicast), that the firewall "
+                               "allows this program, and that %s is on Motive's network",
+                     lead, (unsigned)i->data_port, i->multicast, i->iface[0] ? i->iface : "the OS default adapter");
+        else
+            snprintf(buf, cap, "%s on UDP %u: no multicast group set, so only a sender aimed at this port reaches it",
+                     lead, (unsigned)i->data_port);
+        return;
+    }
+    switch (i->why) {
+    case NN_WHY_UNDECIDED:
+        snprintf(buf, cap, "NatNet frames arrive, but none holds a rigid body to read the version from: turn on "
+                           "rigid bodies in Motive's streaming settings, or give Motive's IP");
+        break;
+    case NN_WHY_MALFORMED:
+        snprintf(buf, cap, "NatNet frames arrive, but do not parse as NatNet %d.%d (%llu malformed): a version mismatch",
+                 i->major, i->minor, (unsigned long long)i->malformed);
+        break;
+    case NN_WHY_UNTRACKED:
+        snprintf(buf, cap, "NatNet frames arrive, and Motive reports %s untracked: occluded or out of view", body);
+        break;
+    default:
+        if (i->rigid_body > 0)
+            snprintf(buf, cap, "NatNet frames arrive, but %s is not in them: a wrong id, or the body is disabled in Motive", body);
+        else
+            snprintf(buf, cap, "NatNet frames arrive, but hold no rigid body: turn on rigid bodies in Motive's streaming settings");
+        break;
+    }
+}
+
+void natnet_describe(const NatNetInfo* i, char* buf, size_t cap) {
+    char ver[120], where[120];
+    if (i->handshake_ok)
+        snprintf(ver, sizeof ver, "NatNet %d.%d from Motive at %s", i->major, i->minor, i->server);
+    else if (!i->version_from_frame)
+        snprintf(ver, sizeof ver, "NatNet %d.%d from the config, no handshake reply from %s", i->major, i->minor,
+                 i->server[0] ? i->server : "(no server set)");
+    else if (i->server[0])
+        snprintf(ver, sizeof ver, "NO HANDSHAKE REPLY from %s: the NatNet version comes from the frames", i->server);
+    else
+        snprintf(ver, sizeof ver, "no Motive IP set: the NatNet version comes from the frames");
+    if (!i->multicast[0])
+        snprintf(where, sizeof where, "no multicast group, listening on UDP %u", (unsigned)i->data_port);
+    else
+        snprintf(where, sizeof where, "multicast %s on %s", i->multicast, i->iface[0] ? i->iface : "the OS default adapter");
+    snprintf(buf, cap, "%s; %s", ver, where);
+}
+
 /* The pose, read out for a caller that is not the audio thread (bwa_validate's tracked placement).
  * It exists so a C++ tool never has to include pose.h, whose seqlock is C11-atomics code. */
 bool natnet_read_pose(const NatNet* nn, float p[3], float q[4]) {
@@ -570,25 +774,23 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * pose.h's payload is atomic, and the slot stays "never published" either way (seq == 0). */
     atomic_store_explicit(&nn->pose.q[3], 1.0f, memory_order_relaxed);
 
-    /* inet_pton accepts only numeric IPv4 literals; a hostname or typo silently becomes 0.0.0.0,
-     * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".
-     * Reject a bad server/multicast address up front with a clear message. */
-    if (cfg->server && cfg->server[0] && !os_ipv4_valid(cfg->server)) {
-        nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname"); goto fail;
-    }
-    if (cfg->multicast && cfg->multicast[0] && !os_ipv4_valid(cfg->multicast)) {
-        nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)"); goto fail;
-    }
+    if (!nn_check_addrs(cfg, err, errcap)) goto fail;
+    nn_copy_ip(nn->server, cfg->server);
+    nn_copy_ip(nn->multicast, cfg->multicast);
+    nn->data_port = cfg->data_port ? cfg->data_port : 1511;
 
     /* Bitstream version. The server knows its own version, so when one is configured the
      * handshake is authoritative — it can't be desynced by a wrong version override (a
      * 4.0-vs-4.1 mistake silently mis-parses the size-prefixed sections). The env value is only
-     * a fallback for a pure multicast listen with no command channel; 3.1 is the last resort. */
+     * a fallback for a pure multicast listen with no command channel. With neither, the receiver
+     * reads the layout off the frames: no fixed guess can be right, because 3.1 never parses the
+     * 4.x stream every Motive since 3.0 sends and 4.1 never parses a 3.x one. */
     nn->major = 0; nn->minor = 0;
     uint64_t clock_freq = 0;
-    if (cfg->server && cfg->server[0]) handshake_version(cfg, &nn->major, &nn->minor, &clock_freq);
-    if (nn->major <= 0) { nn->major = cfg->major; nn->minor = cfg->minor; clock_freq = 0; }
-    if (nn->major <= 0) { nn->major = 3; nn->minor = 1; }
+    if (cfg->server && cfg->server[0]) nn->handshake_ok = handshake_version(cfg, &nn->major, &nn->minor, &clock_freq);
+    if (!nn->handshake_ok) { nn->major = cfg->major > 0 ? cfg->major : 0; nn->minor = cfg->major > 0 ? cfg->minor : 0; clock_freq = 0; }
+    nn->version_from_frame = nn->major <= 0;
+    atomic_store_explicit(&nn->version, nn->major << 8 | nn->minor, memory_order_relaxed);
 
     /* Pose stamp policy, fixed for the connection (see the NN_STAMP_* enum): the frame suffix's
      * server-clock stamps on 4.1..4.5 (mid-exposure ticks when the handshake gave the tick rate,
@@ -596,7 +798,8 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * otherwise — including bitstreams NEWER than the certified hop (stamps_supported), which
      * must degrade to a working arrival-clock prediction, not a dead one. rt.c only ever
      * differences the stamps, so which clock they're on is free to choose — but it must be ONE
-     * clock (pose.h). */
+     * clock (pose.h). A version read off the frames stays on arrival too: it says "4.1 or later",
+     * and the suffix hop needs the exact one. */
     if (stamps_supported(nn->major, nn->minor)) {
         if (clock_freq) { nn->stamp_mode = NN_STAMP_MIDEXPO; nn->ticks_to_ns = 1e9 / (double)clock_freq; }
         else            nn->stamp_mode = NN_STAMP_FTS;
@@ -608,29 +811,23 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
         if (!cfg->server || !cfg->server[0]) {
             nn_err(err, errcap, "natnet: tracking by name needs the server address"); goto fail;
         }
+        if (nn->major <= 0) {   /* the same port just stayed silent, so "not in the definitions" would be a lie */
+            char m[160];
+            snprintf(m, sizeof m, "natnet: no reply from Motive at %s:%u: check the address, that Motive is streaming, and the firewall",
+                     cfg->server, (unsigned)(cfg->command_port ? cfg->command_port : 1510));
+            nn_err(err, errcap, m); goto fail;
+        }
         int32_t id;
         if (!resolve_name_via_modeldef(cfg, nn->major, nn->minor, cfg->rigid_body_name, &id)) {
-            nn_err(err, errcap, "natnet: rigid body name not found in model definitions"); goto fail;
+            char m[NATNET_NAME_MAX + 96];
+            snprintf(m, sizeof m, "natnet: rigid body \"%s\" not in Motive's model definitions (names are case sensitive)", cfg->rigid_body_name);
+            nn_err(err, errcap, m); goto fail;
         }
         nn->rigid_body = id;
     }
 
-    nn->sock = os_udp_open();
-    if (nn->sock == OS_INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
-
-    os_udp_set_reuseaddr(nn->sock);
-    os_udp_set_rcvtimeo_ms(nn->sock, 200);                      /* so the thread can poll ->stop */
-
-    /* multicast binds ANY, then joins */
-    if (os_udp_bind_any(nn->sock, cfg->data_port ? cfg->data_port : 1511) != 0) {
-        nn_err(err, errcap, "natnet: bind() failed"); goto fail;
-    }
-
-    if (cfg->multicast && cfg->multicast[0]) {
-        if (os_udp_join_multicast(nn->sock, cfg->multicast, cfg->local_iface) != 0) {
-            nn_err(err, errcap, "natnet: multicast join failed"); goto fail;
-        }
-    }
+    nn->sock = nn_open_data_socket(cfg, nn->iface, err, errcap);
+    if (nn->sock == OS_INVALID_SOCKET) goto fail;
 
     if (os_thread_create(&nn->thread, receiver, nn) != 0) {
         nn_err(err, errcap, "natnet: receiver thread failed to start"); goto fail;
@@ -664,23 +861,18 @@ void natnet_close(NatNet* nn) {
 struct NatNetRaw {
     os_socket sock;
     int       major, minor;
+    bool      handshake_ok;
     char      server[64];          /* copied: the caller's config need not outlive the open */
+    char      iface[NATNET_IP_MAX];
     uint16_t  command_port;
     uint8_t   pkt[65536];          /* one whole datagram (max UDP); heap-resident with the session */
 };
 
 NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     if (!cfg) { nn_err(err, errcap, "natnet: null config"); return NULL; }
-    if (cfg->server && cfg->server[0] && !os_ipv4_valid(cfg->server)) {
-        nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname");
-        return NULL;
-    }
+    if (!nn_check_addrs(cfg, err, errcap)) return NULL;
     if (cfg->server && strlen(cfg->server) >= sizeof ((NatNetRaw*)0)->server) {
         nn_err(err, errcap, "natnet: tracker server address too long"); return NULL;
-    }
-    if (cfg->multicast && cfg->multicast[0] && !os_ipv4_valid(cfg->multicast)) {
-        nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)");
-        return NULL;
     }
     if (os_net_startup() != 0) { nn_err(err, errcap, "natnet: socket startup failed"); return NULL; }
     NatNetRaw* r = (NatNetRaw*)calloc(1, sizeof *r);
@@ -689,34 +881,22 @@ NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     if (cfg->server) strcpy(r->server, cfg->server);
     r->command_port = cfg->command_port ? cfg->command_port : 1510;
 
-    /* the same version policy as natnet_open: the handshake is authoritative when a server is set */
-    if (r->server[0]) handshake_version(cfg, &r->major, &r->minor, NULL);
-    if (r->major <= 0) { r->major = cfg->major; r->minor = cfg->minor; }
-    if (r->major <= 0) { r->major = 3; r->minor = 1; }
+    /* the same version policy as natnet_open: the handshake, else the config, else the frames */
+    if (r->server[0]) r->handshake_ok = handshake_version(cfg, &r->major, &r->minor, NULL);
+    if (!r->handshake_ok) { r->major = cfg->major > 0 ? cfg->major : 0; r->minor = cfg->major > 0 ? cfg->minor : 0; }
 
-    r->sock = os_udp_open();
-    if (r->sock == OS_INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
-    os_udp_set_reuseaddr(r->sock);
-    os_udp_set_rcvtimeo_ms(r->sock, 200);
-    if (os_udp_bind_any(r->sock, cfg->data_port ? cfg->data_port : 1511) != 0) {
-        nn_err(err, errcap, "natnet: bind() failed"); goto fail;
-    }
-    if (cfg->multicast && cfg->multicast[0] &&
-        os_udp_join_multicast(r->sock, cfg->multicast, cfg->local_iface) != 0) {
-        nn_err(err, errcap, "natnet: multicast join failed"); goto fail;
-    }
+    r->sock = nn_open_data_socket(cfg, r->iface, err, errcap);
+    if (r->sock == OS_INVALID_SOCKET) { free(r); os_net_cleanup(); return NULL; }
     return r;
-fail:
-    os_udp_close(r->sock);
-    free(r);
-    os_net_cleanup();
-    return NULL;
 }
 
 void natnet_raw_version(const NatNetRaw* r, int* major, int* minor) {
     if (major) *major = r ? r->major : 0;
     if (minor) *minor = r ? r->minor : 0;
 }
+
+bool natnet_raw_handshake_ok(const NatNetRaw* r) { return r && r->handshake_ok; }
+const char* natnet_raw_iface(const NatNetRaw* r) { return r ? r->iface : ""; }
 
 int natnet_raw_modeldef(NatNetRaw* r, uint8_t* buf, size_t cap) {
     if (!r || !r->server[0] || !buf) return -1;
@@ -760,6 +940,7 @@ int natnet_raw_next_frame(NatNetRaw* r, uint8_t* buf, size_t cap) {
         if (nbytes <= plen) plen = nbytes;             /* trust the smaller of header/recv */
         if (plen > cap) plen = cap;                    /* a cut payload fails the parser, safely */
         memcpy(buf, pkt + 4, plen);
+        if (r->major <= 0) natnet_sniff_version(buf, plen, &r->major, &r->minor);
         return (int)plen;
     }
 }

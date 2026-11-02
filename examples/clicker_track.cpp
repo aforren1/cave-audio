@@ -311,6 +311,7 @@ static void run_live(ClickerTrack* T) {
     memset(&nc, 0, sizeof nc);
     nc.multicast = T->cfg.multicast[0] ? T->cfg.multicast : "239.255.42.99";
     nc.server = T->cfg.server[0] ? T->cfg.server : NULL;
+    nc.local_iface = T->cfg.local_iface[0] ? T->cfg.local_iface : NULL;
     nc.data_port = 1511; nc.command_port = 1510;
     char e[256] = { 0 }, why[320];
     NatNetRaw* r = natnet_raw_open(&nc, e, sizeof e);
@@ -323,7 +324,10 @@ static void run_live(ClickerTrack* T) {
     T->state.store(CLICKER_LIVE, std::memory_order_release);
     while (!T->stop.load(std::memory_order_relaxed)) {
         const int n = natnet_raw_next_frame(r, buf, sizeof buf);   /* 0 = the 200 ms timeout: re-poll stop */
-        if (n > 0) ingest(T, buf, (size_t)n, major, minor, clicker_clock_s());
+        if (n > 0) {
+            natnet_raw_version(r, &major, &minor);     /* with no handshake it comes from the frames */
+            ingest(T, buf, (size_t)n, major, minor, clicker_clock_s());
+        }
         else if (n < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));   /* a hard error backs off */
     }
     natnet_raw_close(r);

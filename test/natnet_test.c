@@ -1,5 +1,6 @@
 /*
- * natnet_test.c — M6: the off-wire NatNet FrameOfData parser + the pose seqlock (no socket).
+ * natnet_test.c — M6: the off-wire NatNet FrameOfData parser + the pose seqlock, then the session
+ * itself on loopback against a fake Motive (the handshake, the version from the frames, the status).
  * Build synthetic frames in memory and assert the parser extracts the selected rigid body,
  * honors the tracking-valid flag, handles the NatNet 4.1+ per-section size prefix, recovers
  * the frame-suffix stamps (4.1+/4.5+ section hop), and rejects truncated/old-version input
@@ -7,7 +8,9 @@
  */
 #include "tracking/natnet.h"
 #include "tracking/pose.h"
+#include "os/os.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -121,6 +124,290 @@ static void build_prefix_v3(Buf* o) {
     w_f32(o, 1); w_f32(o, 1); w_f32(o, 1);
     w_i32(o, 1);                               /* nOtherMarkers */
     w_f32(o, 9); w_f32(o, 9); w_f32(o, 9);
+}
+
+/* ---- the session on loopback: a fake Motive answers the command port, and the test aims frames at the
+ * data port. Only the multicast delivery itself goes untested: a bound socket takes unicast too. ---- */
+#define FAKE_DATA_PORT 47811
+#define FAKE_CMD_PORT  47812
+
+typedef struct {
+    os_socket   s;
+    os_thread   th;
+    _Atomic int stop;
+    int         major, minor;
+    _Atomic int connect_bytes;     /* the last NAT_CONNECT's datagram size */
+    _Atomic int connect_declared;  /* ... and its header's nDataBytes */
+    Buf         model;
+} FakeMotive;
+
+static void fake_motive(void* arg) {
+    FakeMotive* f = (FakeMotive*)arg;
+    uint8_t in[2048];
+    while (!atomic_load(&f->stop)) {
+        char ip[64]; uint16_t port = 0;
+        const int got = os_udp_recv_from(f->s, in, sizeof in, ip, &port);
+        if (got < 4) continue;
+        uint16_t msg, nb; memcpy(&msg, in, 2); memcpy(&nb, in + 2, 2);
+        if (msg == 0) {                                  /* NAT_CONNECT -> NAT_SERVERINFO */
+            atomic_store(&f->connect_bytes, got);
+            atomic_store(&f->connect_declared, nb);
+            uint8_t r[4 + 256 + 4 + 4 + 8];
+            memset(r, 0, sizeof r);
+            const uint16_t id = 1, n = (uint16_t)(sizeof r - 4);
+            memcpy(r, &id, 2); memcpy(r + 2, &n, 2);
+            memcpy(r + 4, "Motive", 6);
+            r[4 + 256 + 4] = (uint8_t)f->major; r[4 + 256 + 4 + 1] = (uint8_t)f->minor;
+            const uint64_t freq = 10000000ull;
+            memcpy(r + 4 + 256 + 4 + 4, &freq, 8);
+            os_udp_sendto(f->s, r, sizeof r, ip, port);
+        } else if (msg == 4) {                           /* NAT_REQUEST_MODELDEF -> NAT_MODELDEF */
+            Buf r = { 0 };
+            const uint16_t id = 5, n = (uint16_t)f->model.n;
+            memcpy(r.b, &id, 2); memcpy(r.b + 2, &n, 2); r.n = 4;
+            memcpy(r.b + 4, f->model.b, f->model.n); r.n += f->model.n;
+            os_udp_sendto(f->s, r.b, r.n, ip, port);
+        }
+    }
+}
+
+static void frame_v41(Buf* o, int nbodies, int32_t id, int valid) {
+    o->n = 0;
+    w_i32(o, 7);
+    w_i32(o, 0); w_i32(o, 0);                   /* markersets */
+    w_i32(o, 0); w_i32(o, 0);                   /* other markers */
+    w_i32(o, nbodies); w_i32(o, nbodies * 38);
+    for (int i = 0; i < nbodies; ++i) w_rb(o, id + i, 1.5f, 2.5f, 3.5f, 0, 0, 0, 1, valid);
+}
+
+static void frame_v31(Buf* o, int32_t id) {
+    o->n = 0;
+    build_prefix_v3(o);
+    w_i32(o, 1);
+    w_rb(o, id, 1.5f, 2.5f, 3.5f, 0, 0, 0, 1, 1);
+}
+
+/* Aim the frame at the data port until the session reports this status and reason, or 3 s pass. */
+static bool pump(NatNet* nn, os_socket tx, const Buf* frame, NatNetStatus want, NatNetWhy why, NatNetInfo* out) {
+    Buf pkt = { 0 };
+    const uint16_t id = 7, n = (uint16_t)frame->n;
+    memcpy(pkt.b, &id, 2); memcpy(pkt.b + 2, &n, 2);
+    memcpy(pkt.b + 4, frame->b, frame->n);
+    pkt.n = 4 + frame->n;
+    for (int t = 0; t < 1500; ++t) {
+        os_udp_sendto(tx, pkt.b, pkt.n, "127.0.0.1", FAKE_DATA_PORT);
+        os_sleep_ms(2);
+        natnet_info(nn, out);
+        if (out->status == want && out->why == why) return true;
+    }
+    return false;
+}
+
+static NatNetConfig loop_cfg(const char* server, int32_t id) {
+    NatNetConfig c;
+    memset(&c, 0, sizeof c);
+    c.server = server;
+    c.data_port = FAKE_DATA_PORT; c.command_port = FAKE_CMD_PORT;
+    c.rigid_body = id;
+    return c;
+}
+
+static void live_session_tests(void) {
+    if (os_net_startup() != 0) return;
+    os_socket tx = os_udp_open();
+    static FakeMotive f;
+    f.s = os_udp_open();
+    if (tx == OS_INVALID_SOCKET || f.s == OS_INVALID_SOCKET ||
+        os_udp_bind_any(f.s, FAKE_CMD_PORT) != 0) {        /* wasi has no sockets; a port can be taken */
+        printf("natnet_test: no loopback socket here, the live session section is skipped\n");
+        os_udp_close(tx); os_udp_close(f.s); os_net_cleanup();
+        return;
+    }
+    os_udp_set_rcvtimeo_ms(f.s, 50);
+    f.major = 4; f.minor = 4;                               /* what a Motive 3.x sends: size prefixes */
+    w_i32(&f.model, 1);
+    w_rbdesc(&f.model, "stand", 12, 16);
+    CHECK(os_thread_create(&f.th, fake_motive, &f) == 0, "fake motive thread");
+
+    char err[320] = { 0 }, line[320];
+    NatNetInfo info;
+    Buf fr = { 0 };
+    float p[3], q[4];
+
+    char routed[NATNET_IP_MAX] = { 0 };
+    CHECK(os_udp_route_local_ipv4("127.0.0.1", routed, sizeof routed) == 0 && !strcmp(routed, "127.0.0.1"),
+          "the route to loopback leaves from loopback");
+    CHECK(os_udp_route_local_ipv4("not an ip", routed, sizeof routed) != 0, "route: a bad address fails");
+
+    /* by name, through the handshake and the model definitions: the path the tools take */
+    {
+        NatNetConfig c = loop_cfg("127.0.0.1", 0);
+        c.rigid_body_name = "stand";
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(atomic_load(&f.connect_bytes) == 4 + 273 && atomic_load(&f.connect_declared) == 273,
+                  "NAT_CONNECT carries the SDK's payload, and its header declares it");
+            CHECK(info.handshake_ok && !info.version_from_frame && info.major == 4 && info.minor == 4, "handshake: 4.4");
+            CHECK(info.rigid_body == 12, "name resolved to its streaming id");
+            CHECK(info.status == NN_STATUS_NO_DATA, "no frame yet: NO_DATA");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "no NatNet frames") != NULL, line);
+            natnet_describe(&info, line, sizeof line);
+            CHECK(strstr(line, "NatNet 4.4 from Motive at 127.0.0.1") != NULL, line);
+
+            frame_v41(&fr, 2, 11, 1);                       /* ids 11 and 12: the second is ours */
+            CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "4.4 frames: LIVE");
+            CHECK(natnet_read_pose(nn, p, q) && p[0] == 1.5f && p[1] == 2.5f && p[2] == 3.5f, "the pose came through");
+            CHECK(info.poses > 0, "poses counted");
+
+            frame_v41(&fr, 1, 12, 0);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_NO_BODY, NN_WHY_UNTRACKED, &info), "the body marked untracked: NO_BODY");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "untracked") != NULL && strstr(line, "id 12") != NULL, line);
+
+            frame_v41(&fr, 1, 99, 1);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_NO_BODY, NN_WHY_MISSING, &info), "another body only: NO_BODY");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "not in them") != NULL, line);
+            natnet_close(nn);
+        }
+    }
+
+    /* A numeric id and no server: this read 3.1 by default and so never parsed a 4.x stream. */
+    {
+        NatNetConfig c = loop_cfg(NULL, 12);
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(!info.handshake_ok && info.version_from_frame && info.major == 0, "no server: the version is unknown at open");
+            frame_v41(&fr, 1, 12, 1);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "no server, 4.x frames: LIVE");
+            CHECK(info.major == 4 && info.minor == 1, "no server: the layout came from the frames");
+            natnet_close(nn);
+        }
+        nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            frame_v31(&fr, 12);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "no server, 3.x frames: LIVE");
+            CHECK(info.major == 3, "no server: a 3.x layout read as 3.x");
+            natnet_close(nn);
+        }
+        nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            frame_v41(&fr, 0, 0, 1);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_NO_BODY, NN_WHY_UNDECIDED, &info), "no bodies at all: the version stays undecided");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "rigid body") != NULL, line);
+            /* and the undecided frames did not fix a wrong answer */
+            frame_v41(&fr, 1, 12, 1);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "a body turns up: LIVE");
+            natnet_close(nn);
+        }
+    }
+
+    /* A server that does not answer: a port with nobody on it. */
+    {
+        NatNetConfig c = loop_cfg("127.0.0.1", 12);
+        c.command_port = FAKE_CMD_PORT + 1;
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(!info.handshake_ok && info.version_from_frame, "no reply: not a handshake");
+            natnet_describe(&info, line, sizeof line);
+            CHECK(strstr(line, "NO HANDSHAKE REPLY") != NULL, line);
+            frame_v41(&fr, 1, 12, 1);
+            CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "no reply, numeric id: still LIVE off the frames");
+            natnet_close(nn);
+        }
+        c.rigid_body = 0;
+        c.rigid_body_name = "stand";
+        err[0] = 0;
+        nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn == NULL && strstr(err, "no reply") != NULL, "no reply, by name: the error says no reply, not 'not found'");
+        if (nn) natnet_close(nn);
+    }
+
+    /* A name Motive does not have, with Motive answering. */
+    {
+        NatNetConfig c = loop_cfg("127.0.0.1", 0);
+        c.rigid_body_name = "nobody";
+        err[0] = 0;
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn == NULL && strstr(err, "\"nobody\"") != NULL, "an unknown name is named");
+        if (nn) natnet_close(nn);
+    }
+
+    /* A version the config forces is taken as given: a frame it cannot read says so. */
+    {
+        NatNetConfig c = loop_cfg(NULL, 12);
+        c.major = 4; c.minor = 1;
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            fr.n = 0; w_i32(&fr, 7); w_i32(&fr, 0);         /* cut */
+            CHECK(pump(nn, tx, &fr, NN_STATUS_NO_BODY, NN_WHY_MALFORMED, &info), "a cut frame: malformed");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "do not parse as NatNet 4.1") != NULL, line);
+            natnet_describe(&info, line, sizeof line);
+            CHECK(strstr(line, "from the config") != NULL, line);
+            natnet_close(nn);
+        }
+    }
+
+    /* The interface: the NIC routing to the server, unless the caller names one. */
+    {
+        NatNetConfig c = loop_cfg("127.0.0.1", 12);
+        c.multicast = "239.255.42.99";
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        if (!nn) printf("natnet_test: no multicast here, the interface check is skipped (%s)\n", err);
+        else {
+            natnet_info(nn, &info);
+#if defined(_WIN32)
+            CHECK(!strcmp(info.iface, "127.0.0.1"), "joined on the NIC routing to the server");
+#else       /* a kernel with no multicast on lo falls back to the OS default, and reads "" */
+            CHECK(!strcmp(info.iface, "127.0.0.1") || info.iface[0] == 0, "joined on the NIC routing to the server");
+#endif
+            natnet_close(nn);
+        }
+        c.local_iface = "stand";
+        err[0] = 0;
+        CHECK(natnet_open(&c, err, sizeof err) == NULL && strstr(err, "local interface") != NULL, "a bad local interface is refused");
+    }
+
+    /* The raw session: the frames fix the version, for the clicker and for a tool with no server. */
+    {
+        NatNetConfig c = loop_cfg(NULL, 0);
+        NatNetRaw* r = natnet_raw_open(&c, err, sizeof err);
+        CHECK(r != NULL, err);
+        if (r) {
+            int ma = -1, mi = -1;
+            natnet_raw_version(r, &ma, &mi);
+            CHECK(ma == 0 && !natnet_raw_handshake_ok(r), "raw, no server: unknown at open");
+            frame_v41(&fr, 1, 12, 1);
+            Buf pkt = { 0 };
+            const uint16_t id = 7, n = (uint16_t)fr.n;
+            memcpy(pkt.b, &id, 2); memcpy(pkt.b + 2, &n, 2);
+            memcpy(pkt.b + 4, fr.b, fr.n);
+            os_udp_sendto(tx, pkt.b, 4 + fr.n, "127.0.0.1", FAKE_DATA_PORT);
+            uint8_t rb[512];
+            const int got = natnet_raw_next_frame(r, rb, sizeof rb);
+            natnet_raw_version(r, &ma, &mi);
+            CHECK(got == (int)fr.n && ma == 4, "raw, no server: the frame fixed the version");
+            natnet_raw_close(r);
+        }
+    }
+
+    atomic_store(&f.stop, 1);
+    os_thread_join(&f.th);
+    os_udp_close(f.s);
+    os_udp_close(tx);
+    os_net_cleanup();
 }
 
 int main(void) {
@@ -366,6 +653,43 @@ int main(void) {
         CHECK(bad == 0, "modeldef: garbage stays in range, names terminated");
     }
 
+    /* --- the version read off a frame, with no handshake to ask --- */
+    {
+        int ma = 0, mi = 0;
+        CHECK(natnet_sniff_version(v.b, v.n, &ma, &mi) && ma == 4 && mi == 1, "sniff: a 4.1 frame");
+        CHECK(natnet_sniff_version(w.b, w.n, &ma, &mi) && ma == 4 && mi == 1, "sniff: a 4.1 frame with a suffix");
+        ma = mi = 0;
+        CHECK(natnet_sniff_version(o.b, o.n, &ma, &mi) && ma == 3 && mi == 1, "sniff: a 3.1 frame");
+        Buf none = { 0 };
+        frame_v41(&none, 0, 0, 1);
+        CHECK(!natnet_sniff_version(none.b, none.n, &ma, &mi), "sniff: no rigid body, no vote");
+        /* 3.x with markersets ahead of the bodies, whose names shift a 4.1 read off its fields */
+        Buf named = { 0 };
+        w_i32(&named, 9);
+        w_i32(&named, 1); w_cstr(&named, "all"); w_i32(&named, 1); w_f32(&named, 0); w_f32(&named, 0); w_f32(&named, 0);
+        w_i32(&named, 0);
+        w_i32(&named, 1); w_rb(&named, 12, 1, 2, 3, 0, 0, 0, 1, 1);
+        CHECK(natnet_sniff_version(named.b, named.n, &ma, &mi) && ma == 3, "sniff: 3.x with a markerset");
+        /* 4.1 with markersets and other markers */
+        Buf full = { 0 };
+        w_i32(&full, 9);
+        w_i32(&full, 1); w_i32(&full, 20);
+        w_cstr(&full, "all"); w_i32(&full, 1); w_f32(&full, 0); w_f32(&full, 0); w_f32(&full, 0);
+        w_i32(&full, 2); w_i32(&full, 24);
+        for (int i = 0; i < 6; ++i) w_f32(&full, 0);
+        w_i32(&full, 1); w_i32(&full, 38); w_rb(&full, 12, 1, 2, 3, 0, 0, 0, 1, 1);
+        CHECK(natnet_sniff_version(full.b, full.n, &ma, &mi) && ma == 4, "sniff: 4.1 with markersets and other markers");
+        CHECK(natnet_parse_frame(full.b, full.n, ma, mi, 12, p, q, &tv, NULL) && p[1] == 2, "sniff's answer parses that frame");
+        /* a cut or a garbage frame never reads past its length */
+        for (size_t k = 0; k < full.n; ++k) (void)natnet_sniff_version(full.b, k, &ma, &mi);
+        for (int it = 0; it < 20000; ++it) {
+            uint8_t g[256];
+            const size_t gl = lcg() % sizeof g;
+            for (size_t k = 0; k < gl; ++k) g[k] = (uint8_t)lcg();
+            (void)natnet_sniff_version(g, gl, &ma, &mi);
+        }
+    }
+
     /* --- stream-liveness classifier (pure; the live socket path is on-hardware-pending) --- */
     {
         const int64_t S = 1000;                 /* stale threshold, abstract ticks */
@@ -386,7 +710,9 @@ int main(void) {
     CHECK(pose_read(&slot, rp, rq), "pose_read after write");
     CHECK(rp[0] == 1 && rp[1] == 2 && rp[2] == 3 && rq[3] == 1, "pose roundtrip values");
 
+    live_session_tests();
+
     if (fails) { printf("natnet_test: %d FAILURES\n", fails); return 1; }
-    printf("natnet_test OK (parse v3/v4.1/v4.5, RB select, tracking-valid, suffix stamps, truncation-safe, every-body frames, MODELDEF markers 3.0-4.5, garbage-safe, liveness classify, seqlock)\n");
+    printf("natnet_test OK (parse v3/v4.1/v4.5, RB select, tracking-valid, suffix stamps, truncation-safe, every-body frames, MODELDEF markers 3.0-4.5, garbage-safe, liveness classify, seqlock, version sniff, loopback session)\n");
     return 0;
 }

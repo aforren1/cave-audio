@@ -1682,12 +1682,12 @@ do not call this: the engine samples the freshest OptiTrack pose at block time.
 typedef struct {
     const char* multicast;       // NULL -> "239.255.42.99"
     const char* server;          // Motive host (handshake + rigid-body names); NULL -> multicast-only
-    const char* local_iface;     // local interface IP to bind/join on; NULL -> any
+    const char* local_iface;     // local interface IP to join on; NULL -> the one routing to `server`, else the OS default
     uint16_t    data_port;       // 0 -> 1511
     uint16_t    command_port;    // 0 -> 1510
     int32_t     rigid_body_id;   // streaming ID; 0 -> first rigid body in the frame
     const char* rigid_body_name; // by name instead of ID (needs `server`); NULL -> use the ID
-    int32_t     version_major, version_minor;   // 0 -> handshake (or default 3.1)
+    int32_t     version_major, version_minor;   // used if the handshake does not answer; 0 -> read from the frames
     uint32_t    reserved[4];
 } bwa_tracker_desc;
 bwa_result bwa_tracker_connect(bwa_engine* e, const bwa_tracker_desc* desc);   // may block

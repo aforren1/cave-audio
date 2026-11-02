@@ -461,6 +461,10 @@ int  os_udp_sendto(os_socket s, const void* b, size_t n, const char* ip, uint16_
     (void)s; (void)b; (void)n; (void)ip; (void)p; return -1;
 }
 int  os_udp_recv(os_socket s, void* b, size_t cap) { (void)s; (void)b; (void)cap; return OS_UDP_ERROR; }
+int  os_udp_recv_from(os_socket s, void* b, size_t cap, char* ip, uint16_t* port) {
+    (void)s; (void)b; (void)cap; (void)ip; (void)port; return OS_UDP_ERROR;
+}
+int  os_udp_route_local_ipv4(const char* peer, char* out, size_t cap) { (void)peer; (void)out; (void)cap; return 1; }
 
 /* The one call here that is pure string work and has a real answer without a socket. natnet.c
  * validates a configured address before it ever opens one, and a config check must not depend on
@@ -531,6 +535,34 @@ int os_udp_recv(os_socket s, void* buf, size_t cap) {
     const ssize_t got = recvfrom(s, buf, cap, 0, NULL, NULL);
     if (got >= 0) return (int)got;
     return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? OS_UDP_TIMEOUT : OS_UDP_ERROR;
+}
+
+int os_udp_recv_from(os_socket s, void* buf, size_t cap, char* ip_out, uint16_t* port_out) {
+    struct sockaddr_in a; socklen_t alen = sizeof a;
+    memset(&a, 0, sizeof a);
+    const ssize_t got = recvfrom(s, buf, cap, 0, (struct sockaddr*)&a, &alen);
+    if (got < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? OS_UDP_TIMEOUT : OS_UDP_ERROR;
+    if (ip_out && !inet_ntop(AF_INET, &a.sin_addr, ip_out, 46)) ip_out[0] = 0;
+    if (port_out) *port_out = ntohs(a.sin_port);
+    return (int)got;
+}
+
+int os_udp_route_local_ipv4(const char* peer_ipv4, char* out, size_t cap) {
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(9);                  /* any nonzero port: nothing is sent */
+    if (!peer_ipv4 || inet_pton(AF_INET, peer_ipv4, &a.sin_addr) != 1) return 1;
+    const int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) return 1;
+    int rc = 1;
+    if (connect(s, (struct sockaddr*)&a, sizeof a) == 0) {
+        struct sockaddr_in me; socklen_t mlen = sizeof me;
+        if (getsockname(s, (struct sockaddr*)&me, &mlen) == 0 && me.sin_addr.s_addr != htonl(INADDR_ANY) &&
+            inet_ntop(AF_INET, &me.sin_addr, out, (socklen_t)cap))
+            rc = 0;
+    }
+    close(s);
+    return rc;
 }
 
 bool os_ipv4_valid(const char* s) {

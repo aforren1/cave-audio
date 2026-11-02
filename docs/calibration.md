@@ -1595,9 +1595,9 @@ bwa_speaker_survey cave_layout.json --server 192.168.1.10
 ```
 
 It collects 3 seconds of frames (`--seconds`), averages each body and prints the report.
-`--local` pins the network interface, `--multicast` the group, and `--natnet M.m` the
-bitstream version when the handshake fails. Every other rigid body is listed once as ignored,
-so a typo in a name shows.
+`--local` pins the network interface (the default is the adapter that routes to `--server`),
+`--multicast` the group, and `--natnet M.m` the bitstream version when the handshake fails. Every
+other rigid body is listed once as ignored, so a typo in a name shows.
 
 `--baffle-offset-m x` says the layout's point for a speaker sits x m behind the baffle. Layout
 positions are acoustic centers ([layout-schema.md](./layout-schema.md#positions-are-acoustic-centers)),
@@ -1759,6 +1759,9 @@ that row twice.
   (the ZM-1 stand prep in [hardware-validation.md](./hardware-validation.md#prepare-the-zm-1-stand)).
 - A rigid body for the stand in Motive. Note its streaming ID and its name. Tracking by name needs
   `--natnet-server <ip>`, because the name resolves through Motive's model definitions.
+- The network. The tool joins the multicast group on the adapter that routes to `--natnet-server`.
+  With no server, or when that adapter is wrong, pass `--natnet-local <this machine's IP>`. The first
+  `track:` line says which version and adapter it used.
 - The mount offset: from the rigid body's pivot to the array's acoustic center, in the body's own
   axes. The tool computes `center = p + R(q) · offset` from every pose. Give it one of:
   - **a body-frame survey** (`--survey`), which carries the probed offset;
@@ -2168,7 +2171,7 @@ the session's own outputs. Load `grid.json` (or `trims.json`) into the engine wh
 | 8 | validate | `bwa_validate --layout grid.json --survey capsules.json --out validate.csv --azimuths <n> [--positions <file>]` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
 
 Every `bwa_calibrate` step also gets the device (`--driver`, `--input`) or `--simulate`, the
-tracker (`--track`, `--natnet-server`, `--natnet-multicast`, `--place-timeout`) or `--track-sim`,
+tracker (`--track`, `--natnet-server`, `--natnet-multicast`, `--natnet-local`, `--place-timeout`) or `--track-sim`,
 and `--temp` when you set one. Localize and the capsule survey take `--mount-offset`; after them
 the body-frame survey carries the offset. The full command line is in the log and in the step's
 tooltip.

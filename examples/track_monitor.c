@@ -6,11 +6,12 @@
  * device needed — this is about tracking, not sound), connects the tracker, and polls
  * bwa_get_listener_pose. The tracker is configured by command line:
  *
- *   bwa_track_monitor [server] [rigid-body]
+ *   bwa_track_monitor [server] [rigid-body] [local-ip]
  *
  *   server      Motive host IP for the command handshake (omit for multicast-only)
  *   rigid-body  a rigid-body name (needs the server), or a numeric streaming ID;
  *               omit to follow the first rigid body in the frame
+ *   local-ip    this machine's IP on Motive's network; omit to use the adapter routing to the server
  */
 #include "bw_audio.h"
 
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
         char* end; long v = strtol(rb, &end, 10);
         if (*end == 0) td.rigid_body_id = (int32_t)v; else td.rigid_body_name = rb;
     }
+    if (argc > 3 && argv[3][0]) td.local_iface = argv[3];
     if (bwa_tracker_connect(e, &td) != BWA_OK) {
         printf("tracker connect failed: %s\n", bwa_last_error(e));
         bwa_destroy(e);
@@ -50,7 +52,10 @@ int main(int argc, char** argv) {
     while (!bwa_key_pressed()) {
         float p[3], q[4];
         bwa_get_listener_pose(e, p, q);
-        printf("\rpos [% .3f % .3f % .3f]  quat [% .3f % .3f % .3f % .3f]   ",
+        const bwa_tracker_state st = bwa_tracker_status(e);
+        /* a pose that holds still could be a still body or a dead stream: say which */
+        printf("\r%-8s pos [% .3f % .3f % .3f]  quat [% .3f % .3f % .3f % .3f]   ",
+               st == BWA_TRACKER_LIVE ? "LIVE" : st == BWA_TRACKER_NO_BODY ? "NO BODY" : "NO DATA",
                p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
         fflush(stdout);
         bwa_sleep_ms(33);                                 /* ~30 Hz readout */

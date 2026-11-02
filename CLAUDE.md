@@ -928,6 +928,18 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   What CATCHES the class is the link line, not the reading: with nothing linked, a missed symbol is
   an undefined reference at build time rather than a crash on a machine that has no alsa-lib. The
   CI assertion is the same shape - `nm -D --undefined-only | grep -cE ' (snd_|jack_)'` must be 0.
+- **A NatNet session must say which of its three failures it has, and must not guess a version.** The
+  tools printed "occluded, wrong id, or not streaming" for all of them, while `natnet_status` already
+  knew frames from no frames. Three defects hid behind that one line: `mic_track` could not name an
+  interface, so the group join took the OS default on a box with Dante, Wi-Fi, VPN and Hyper-V adapters;
+  a numeric id with no reply assumed 3.1, which never parses the 4.x stream every Motive since 3.0 sends;
+  and a Windows firewall rule is per executable path, while the handshake is a reply and passes anyway, so
+  a tool can connect and lose every frame. Now the join defaults to the NIC routing to `server`
+  (`os_udp_route_local_ipv4`), the version comes off the frames when nothing else says
+  (`natnet_sniff_version`; a frame with no body gets no vote, because empty sections read the same in both
+  layouts, and the suffix stamps stay off since it only knows "4.1 or later"), and `natnet_explain` is the
+  line every tool prints. `test_natnet` drives the real socket path on loopback against a fake Motive;
+  only multicast delivery itself still needs a rig. Unverified against live Motive 3.3.4.1.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
 - **Proprietary VR-toolkit integrations (MiddleVR, Igloo) live OUTSIDE this repo**, in their own

@@ -359,11 +359,12 @@ struct PlaceSnap {
     float     yaw_deg, tilt_deg;
     bool      have_truth; float truth[3];/* simulate: the stand's true center */
     unsigned long long seq;              /* polls published */
+    char      why[320];                  /* with no pose: what the stream is doing, and what to check */
 };
 
 struct PlaceJob {
     /* config: the UI writes these only while disconnected */
-    char  body[64], server[64], multicast[64], survey[512];
+    char  body[64], server[64], multicast[64], local_iface[64], survey[512];
     bool  sim, sim_bump, sim_twist;
     int   offset_mode;                   /* 0 = the x,y,z field, 1 = ring */
     float offset[3];
@@ -385,10 +386,21 @@ static PlaceJob PL;
 static bool pl_live(void) { return PL.state.load(std::memory_order_acquire) == 2; }
 static PlaceSnap pl_snap(void) { std::lock_guard<std::mutex> lk(PL.mu); return PL.d; }
 
+/* The next item stays on this line if it fits, and takes a new one if not: a row of fixed-width fields
+ * runs off the window otherwise, and nothing can scroll it back. */
+static void same_line_if_fits(float next_w) {
+    ImGui::SameLine();
+    if (ImGui::GetContentRegionAvail().x < next_w) ImGui::NewLine();
+}
+static float radio_width(const char* label) {
+    return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label).x;
+}
+
 static void pl_worker(void) {
     MicTrackCfg mc;
     memset(&mc, 0, sizeof mc);
     mc.body = PL.body; mc.server = PL.server[0] ? PL.server : NULL; mc.multicast = PL.multicast[0] ? PL.multicast : NULL;
+    mc.local_iface = PL.local_iface[0] ? PL.local_iface : NULL;
     mc.survey_path = PL.survey[0] ? PL.survey : NULL;
     mc.have_offset = PL.offset_mode == 0;
     memcpy(mc.offset_m, PL.offset, sizeof mc.offset_m);
@@ -461,6 +473,8 @@ static void pl_worker(void) {
         if (have) {
             memcpy(s.q, ps.q, sizeof s.q);
             place_mount_angles(ps.q, &s.yaw_deg, &s.tilt_deg);
+        } else {
+            mic_track_why(&PL.mt, s.why, sizeof s.why);
         }
         s.g = g;
         s.gd = gd;
@@ -589,19 +603,31 @@ static void placement_panel(const float* ref, const char* ref_for, bool run_busy
     ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(110));
     ImGui::InputText("##plmc", PL.multicast, sizeof PL.multicast);
     bwTip("NatNet multicast group");
-    ImGui::SameLine(); ImGui::Checkbox("simulate##pl", &PL.sim);
+    same_line_if_fits(uiScaled(110)); ImGui::SetNextItemWidth(uiScaled(110));
+    ImGui::InputTextWithHint("##pllocal", "local IP (optional)", PL.local_iface, sizeof PL.local_iface);
+    bwTip("this machine's IP on Motive's network. Empty: the adapter that routes to the Motive IP, which is "
+          "right unless that adapter is not the one the multicast arrives on");
+    same_line_if_fits(radio_width("simulate")); ImGui::Checkbox("simulate##pl", &PL.sim);
     bwTip("no Motive: a scripted stand walks in from 8 cm off the target over 2 s and settles about 5 mm off it");
-    if (PL.sim) { ImGui::SameLine(); ImGui::Checkbox("bump mid-run##pl", &PL.sim_bump);
+    if (PL.sim) { same_line_if_fits(radio_width("bump mid-run")); ImGui::Checkbox("bump mid-run##pl", &PL.sim_bump);
                   bwTip("knock the simulated stand 15 mm after the third capture of a run");
-                  ImGui::SameLine(); ImGui::Checkbox("twist mid-run##pl", &PL.sim_twist);
+                  same_line_if_fits(radio_width("twist mid-run")); ImGui::Checkbox("twist mid-run##pl", &PL.sim_twist);
                   bwTip("turn the simulated stand 2 deg about the array center after the third capture: no center "
                         "moves, so only the Aim tab's position readout (a direction) stops on it"); }
-    ImGui::SetNextItemWidth(-uiScaled(300));
+    /* the survey field takes what the offset controls leave, measured: they scale with the font */
+    const ImGuiStyle& sty = ImGui::GetStyle();
+    const float browse_w = ImGui::CalcTextSize("...").x + 2.f * sty.FramePadding.x;
+    const float offset_w = radio_width("offset") + sty.ItemSpacing.x + uiScaled(170) + sty.ItemSpacing.x + radio_width("ring");
+    const float row_w = ImGui::GetContentRegionAvail().x;
+    const float survey_room = row_w - browse_w - sty.ItemSpacing.x;
+    const bool offset_wraps = survey_room - sty.ItemSpacing.x - offset_w < uiScaled(140);
+    ImGui::SetNextItemWidth(offset_wraps ? survey_room : survey_room - sty.ItemSpacing.x - offset_w);
     ImGui::InputTextWithHint("##plsurvey", "survey (optional)", PL.survey, sizeof PL.survey);
     bwTip("a capsule survey. BODY-FRAME: it carries the mount offset and follows the stand (the Aim tab's position "
           "readout needs one). Room axes: channel order and geometry only. Trims and the tilt meter need no survey");
     ImGui::SameLine(); if (ImGui::Button("...##plsv")) pick_file(PL.survey, sizeof PL.survey, "survey json (*.json)\0*.json\0all files (*.*)\0*.*\0");
-    ImGui::SameLine(); ImGui::RadioButton("offset##plo", &PL.offset_mode, 0);
+    if (!offset_wraps) ImGui::SameLine();
+    ImGui::RadioButton("offset##plo", &PL.offset_mode, 0);
     ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(170));
     ImGui::BeginDisabled(PL.offset_mode != 0);
     ImGui::InputFloat3("##ploff", PL.offset, "%.3f");
@@ -653,7 +679,7 @@ static void placement_panel(const float* ref, const char* ref_for, bool run_busy
         if (s.have_pose) ImGui::TextColored(col, "%.1f mm", s.g.dist_m * 1e3f);
         else             ImGui::TextColored(col, "no pose");
         ImGui::PopFont();
-        ImGui::TextColored(col, "%s", ok ? "OK: in tolerance and still" : (s.have_pose ? place_state_name(s.g.state) : "occluded, wrong id, or not streaming"));
+        if (ok || s.have_pose) ImGui::TextColored(col, "%s", ok ? "OK: in tolerance and still" : place_state_name(s.g.state));
         ImGui::EndGroup();
         ImGui::SameLine(0, uiScaled(24));
         /* the compass: seen from above, screen up = the front (+z), screen right = room-right (-x) */
@@ -706,6 +732,11 @@ static void placement_panel(const float* ref, const char* ref_for, bool run_busy
                                     s.g.state == PLACE_OK && s.gd.state != PLACE_OK ? ": the Aim position readout waits" : "");
         }
         ImGui::EndGroup();
+        if (!s.have_pose) {
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextWrapped("%s", s.why);
+            ImGui::PopStyleColor();
+        }
         if (PL.desc[0]) ImGui::TextDisabled("%s", PL.desc);
     }
     ImGui::PopID();
@@ -2066,6 +2097,7 @@ static void tab_zylia(void) {
                     snprintf(cc.body, sizeof cc.body, "%s", Z.ck_body);
                     snprintf(cc.server, sizeof cc.server, "%s", Z.ck_server);
                     snprintf(cc.multicast, sizeof cc.multicast, "%s", Z.ck_mc);
+                    snprintf(cc.local_iface, sizeof cc.local_iface, "%s", PL.local_iface);   /* one machine, one network */
                     memcpy(cc.tip_m, Z.ck_tip, sizeof cc.tip_m);
                     cc.sim = Z.ck_sim ? (Z.ck_sim_ring ? CLICKER_SIM_RING : CLICKER_SIM_SPREAD) : CLICKER_SIM_OFF;
                     cc.sim_moving_leg = Z.ck_sim_ring ? 0 : ZY_CK_SIM_MOVING_LEG;
@@ -2926,7 +2958,7 @@ static size_t    g_ses_shown;                      /* log lines shown: scroll to
 static char      g_ses_msg[600];
 static char      g_ses_note[200];                  /* the note a skip records */
 struct SesUi {
-    char dir[512], plan[512], driver[128], server[64], multicast[64], body[64], offset[64], temp[32];
+    char dir[512], plan[512], driver[128], server[64], multicast[64], local_iface[64], body[64], offset[64], temp[32];
     char lrows[512], grows[512], fspk[128], cspk[128], aspk[128], vpos[512], truth[512];
 };
 static SesUi SU;
@@ -2973,6 +3005,7 @@ static void ses_ui_from(void) {
     snprintf(SU.driver, sizeof SU.driver, "%s", I.driver.c_str());
     snprintf(SU.server, sizeof SU.server, "%s", I.nn_server.c_str());
     snprintf(SU.multicast, sizeof SU.multicast, "%s", I.nn_multicast.c_str());
+    snprintf(SU.local_iface, sizeof SU.local_iface, "%s", I.nn_local.c_str());
     snprintf(SU.body, sizeof SU.body, "%s", I.body.c_str());
     snprintf(SU.offset, sizeof SU.offset, "%s", I.mount_offset.c_str());
     snprintf(SU.temp, sizeof SU.temp, "%s", I.temp.c_str());
@@ -2986,7 +3019,7 @@ static void ses_ui_from(void) {
 }
 static void ses_ui_to(void) {
     SesInputs& I = SES.in;
-    I.plan = SU.plan; I.driver = SU.driver; I.nn_server = SU.server; I.nn_multicast = SU.multicast;
+    I.plan = SU.plan; I.driver = SU.driver; I.nn_server = SU.server; I.nn_multicast = SU.multicast; I.nn_local = SU.local_iface;
     I.body = SU.body; I.mount_offset = SU.offset; I.temp = SU.temp;
     I.localize_rows = SU.lrows; I.grid_rows = SU.grows; I.frame_speakers = SU.fspk;
     I.capsule_speakers = SU.cspk; I.aim_speakers = SU.aspk; I.validate_positions = SU.vpos; I.sim_truth = SU.truth;
@@ -3060,12 +3093,14 @@ static void ses_aim_hand(int spk) {
     if (trk) {
         const bool want_sim = SES.simulate;
         const bool same = pl_live() && PL.sim == want_sim && !strcmp(PL.survey, cs.c_str()) &&
-                          (want_sim || (!strcmp(PL.body, SES.in.body.c_str()) && !strcmp(PL.server, SES.in.nn_server.c_str())));
+                          (want_sim || (!strcmp(PL.body, SES.in.body.c_str()) && !strcmp(PL.server, SES.in.nn_server.c_str()) &&
+                                        !strcmp(PL.local_iface, SES.in.nn_local.c_str())));
         if (!same) {
             if (PL.state.load() == 1 || PL.state.load() == 2) PL.stop.store(true);
             if (PL.th_live) { PL.th.join(); PL.th_live = false; }
             snprintf(PL.body, sizeof PL.body, "%s", SES.in.body.c_str());
             snprintf(PL.server, sizeof PL.server, "%s", SES.in.nn_server.c_str());
+            snprintf(PL.local_iface, sizeof PL.local_iface, "%s", SES.in.nn_local.c_str());
             if (!SES.in.nn_multicast.empty()) snprintf(PL.multicast, sizeof PL.multicast, "%s", SES.in.nn_multicast.c_str());
             snprintf(PL.survey, sizeof PL.survey, "%s", cs.c_str());   /* body-frame: it carries the mount offset */
             PL.sim = want_sim; PL.sim_bump = PL.sim_twist = false;
@@ -3286,7 +3321,9 @@ static void tab_session(void) {
         ImGui::SameLine(); ses_input("mount offset##ses", "ring or x,y,z", SU.offset, sizeof SU.offset, w_mid,
                                      "body origin to the array center (--mount-offset) for localize and the capsule survey; "
                                      "after that the body-frame survey carries it");
-        ImGui::SetNextItemWidth(w_short);
+        ses_input("##seslocal", "local IP (optional)", SU.local_iface, sizeof SU.local_iface, w_mid,
+                  "this machine's IP on Motive's network (--natnet-local, --local). Empty: the adapter that routes to the Motive IP");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(w_short);
         if (ImGui::InputDouble("baffle offset (m)##ses", &SES.in.baffle_offset_m, 0.0, 0.0, "%.4f")) {
             if (!(fabs(SES.in.baffle_offset_m) <= SES_BAFFLE_MAX_M)) SES.in.baffle_offset_m = 0.0;
             g_ses_dirty = true;
@@ -4457,6 +4494,68 @@ static void register_tests(ImGuiTestEngine* e) {
      * computed apart from placement.c), never the value under test. */
     /* the gate goes green only once the stand has settled: it reads MOVING on the way in, and OK no
      * sooner than the 2 s approach plus the 1 s hold, with the truth by then at its settled spot */
+    /* The fixed-width rows stay inside the window at any width. A resize of the real window (ASYNC: tests
+     * run on a coroutine thread the main thread waits on, so a synchronous one deadlocks), because the
+     * panel lays out against the viewport. The right edge is what a user loses: nothing scrolls it back. */
+    t = IM_REGISTER_TEST(e, "placement", "fits_the_window");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        ctx->ItemOpen("**/Placement (tracked ZM-1)");
+        ctx->Yield(2);
+        if (PL.state.load() == 2) { ctx->ItemClick("**/Disconnect##pl"); pl_wait_state(ctx, 0, 10.0); }
+        ctx->ItemCheck("**/simulate##pl");                        /* the widest top row */
+        RECT was;
+        GetWindowRect(g_hwnd, &was);
+        static const int widths[] = { 1800, 1400, 1100, 900, 760 };
+        for (int w : widths) {
+            SetWindowPos(g_hwnd, NULL, 0, 0, w, was.bottom - was.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            ctx->Yield(4);
+            const float right = ctx->GetWindowByRef("")->InnerRect.Max.x;
+            static const char* items[] = { "**/simulate##pl", "**/twist mid-run##pl", "**/##pllocal", "**/...##plsv", "**/ring##plo" };
+            for (const char* item : items) {
+                const ImGuiTestItemInfo info = ctx->ItemInfo(item, ImGuiTestOpFlags_NoError);
+                printf("placement layout: window %d: %s right edge %.0f of %.0f\n", w, item, info.ID ? info.RectFull.Max.x : -1.f, right);
+                IM_CHECK(info.ID != 0);
+                IM_CHECK(info.RectFull.Max.x <= right);
+            }
+        }
+        SetWindowPos(g_hwnd, NULL, 0, 0, was.right - was.left, was.bottom - was.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        ctx->Yield(4);
+        ctx->ItemUncheck("**/simulate##pl");
+    };
+
+    /* A live session with nothing streaming shows the reason, not a guess. Real sockets, no server, and
+     * an id nothing sends: nothing here depends on the network beyond opening the port. */
+    t = IM_REGISTER_TEST(e, "placement", "no_pose_says_why");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        ctx->ItemOpen("**/Placement (tracked ZM-1)");
+        ctx->Yield(2);
+        if (PL.state.load() == 2) { ctx->ItemClick("**/Disconnect##pl"); pl_wait_state(ctx, 0, 10.0); }
+        ctx->ItemUncheck("**/simulate##pl");
+        ctx->ItemClick("**/##plbody"); ctx->KeyCharsReplaceEnter("4242");
+        ctx->ItemClick("**/Connect##pl");
+        for (int i = 0; i < 600 && PL.state.load() == 1; ++i) ctx->Yield();
+        if (PL.state.load() == 3) {
+            printf("placement test: no multicast on this machine, nothing to read (%s)\n", PL.msg);
+        } else {
+            IM_CHECK_EQ(PL.state.load(), 2);
+            ctx->Yield(30);
+            const PlaceSnap s = pl_snap();
+            printf("placement test: %s\n", s.why);
+            IM_CHECK(!s.have_pose);
+            IM_CHECK(strstr(s.why, "NatNet frames") != NULL || strstr(s.why, "rigid body id 4242") != NULL);
+            IM_CHECK(strstr(PL.desc, "no Motive IP set") != NULL);
+            ctx->ItemClick("**/Disconnect##pl");
+            pl_wait_state(ctx, 0, 10.0);
+        }
+        ctx->ItemClick("**/##plbody"); ctx->KeyCharsReplaceEnter("");
+    };
+
     t = IM_REGISTER_TEST(e, "placement", "sim_gate");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
@@ -5541,6 +5640,41 @@ static void register_tests(ImGuiTestEngine* e) {
      * to it makes a passed frame step STALE (which then blocks localize), the way a changed input file
      * does. Typing the value it ran with makes it current again. No tool runs: the frame record is made
      * by hand, so this is the model and the field, not the survey. */
+    /* The local IP field reaches both tools, under each one's own flag name, and survives a reopen. */
+    t = IM_REGISTER_TEST(e, "session", "local_iface");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_local";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        ses_ui_type(ctx, "**/##seslocal", "10.0.0.2");
+        ctx->Yield(2);
+        IM_CHECK(SES.in.nn_local == "10.0.0.2");
+        ses_save_now();
+        Session R;
+        IM_CHECK(ses_load(&R, SES.folder, NULL));
+        IM_CHECK(R.in.nn_local == "10.0.0.2");
+
+        /* a rig session's command lines: on the copy, so the tab never sees a tracked session */
+        R.simulate = false;
+        R.in.nn_server = "10.0.0.5";
+        R.in.body = "stand";
+        SesTools T;
+        T.survey = "bwa_speaker_survey.exe";                      /* never run here */
+        T.calibrate = "bwa_calibrate.exe";
+        std::string cmd, why;
+        std::vector<SesFile> cons;
+        IM_CHECK(ses_command(R, SES_FRAME, T, &cmd, &cons, &why));
+        IM_CHECK(cmd.find(" --local 10.0.0.2") != std::string::npos);
+        ses_begin(&R, SES_FRAME, cmd, cons);                      /* localize is blocked until the frame passes */
+        IM_CHECK(ses_write_text(ses_join(R.folder, "frame_check.csv").c_str(), "index\n"));
+        ses_finish(&R, SES_FRAME, 0, "summary: matched 4\n", false);
+        cmd.clear(); cons.clear();
+        const bool have_cmd = ses_command(R, SES_LOCALIZE, T, &cmd, &cons, &why);
+        printf("session test: localize command: %s%s\n", cmd.c_str(), why.c_str());
+        IM_CHECK(have_cmd);
+        IM_CHECK(cmd.find(" --natnet-local 10.0.0.2") != std::string::npos);
+    };
+
     t = IM_REGISTER_TEST(e, "session", "baffle_offset");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         static const char* dir = "calibview_session_baffle";

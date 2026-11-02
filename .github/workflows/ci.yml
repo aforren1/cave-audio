@@ -37,7 +37,8 @@
 #     restore it. The with-SDK tests (reflect/bake/path/steam_decode) run, binaural is
 #     the real HRTF decode, and phonon lives INSIDE bw_audio.dll: there is no second
 #     file to ship or to keep beside it. On a tag its corresponding source ships too.
-#   - Tools (playground/layout_tool/calib_view + calibrate/zylia_probe): BUILT and
+#   - Tools (playground/layout_tool/calib_view + calibrate/validate/speaker_survey/
+#     track_monitor/zylia_probe): BUILT and
 #     shipped in the artifact. Their imgui-test-engine UI suites need a display +
 #     OpenGL, which runners don't have — ctest excludes those three suites here
 #     (they run locally / at the rig).
@@ -529,6 +530,9 @@ jobs:
                     build/RelWithDebInfo/bwa_layout_tool.exe,
                     build/RelWithDebInfo/bwa_calib_view.exe,
                     build/RelWithDebInfo/bwa_calibrate.exe,
+                    build/RelWithDebInfo/bwa_validate.exe,
+                    build/RelWithDebInfo/bwa_speaker_survey.exe,
+                    build/RelWithDebInfo/bwa_track_monitor.exe,
                     build/RelWithDebInfo/bwa_zylia_probe.exe dist/RelWithDebInfo/
           Copy-Item build/Debug/bw_audio.dll,
                     build/Debug/bw_audio.lib,
@@ -548,7 +552,8 @@ jobs:
                    there is no second library to keep beside it),
                    bwa_minimal.exe (smoke check: runs the whole client lifecycle, no
                    hardware needed), tools: bwa_playground / bwa_layout_tool /
-                   bwa_calib_view (GUI — need a display), bwa_calibrate + bwa_zylia_probe
+                   bwa_calib_view (GUI — need a display), bwa_calibrate + bwa_validate +
+                   bwa_speaker_survey + bwa_track_monitor + bwa_zylia_probe
                    (console), cave_layout.json + constraints.json (example layout +
                    room, read by the tools from their own directory). Debug/ — engine
                    dll/.lib/.pdb + bwa_minimal. Root — include/bw_audio.h.
@@ -1112,7 +1117,8 @@ jobs:
 
           ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` (Steam Audio is **linked
           statically**, so there is nothing to keep beside it), ``bw_audio.h``, and the tools:
-          ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_zylia_probe``.
+          ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_validate``,
+          ``bwa_speaker_survey``, ``bwa_track_monitor``, ``bwa_zylia_probe``.
           Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
 
           ## Android

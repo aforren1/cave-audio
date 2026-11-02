@@ -1742,12 +1742,14 @@ typedef struct {
     const char* multicast;       /* NatNet multicast group; NULL -> "239.255.42.99" */
     const char* server;          /* Motive host, for the command handshake + rigid-body names;
                                   * NULL -> multicast-only (no handshake) */
-    const char* local_iface;     /* local interface IP to bind; NULL -> any */
+    const char* local_iface;     /* local interface IP to join the group on; NULL -> the interface
+                                  * that routes to `server`, else the OS default */
     uint16_t    data_port;       /* 0 -> 1511 */
     uint16_t    command_port;    /* 0 -> 1510 */
     int32_t     rigid_body_id;   /* streaming ID to follow; 0 -> first rigid body in the frame */
     const char* rigid_body_name; /* follow by name instead of ID (needs `server`); NULL -> use the ID */
-    int32_t     version_major;   /* NatNet bitstream version; 0 -> handshake (or default 3.1) */
+    int32_t     version_major;   /* NatNet bitstream version, used when the handshake does not answer;
+                                  * 0 -> read from the first frame holding a rigid body */
     int32_t     version_minor;
     uint32_t    reserved[4];     /* zero; reserved so the struct can grow without an ABI break */
 } bwa_tracker_desc;

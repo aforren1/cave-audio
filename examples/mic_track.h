@@ -63,6 +63,7 @@ struct MicTrackCfg {
     const char* body;              /* rigid-body streaming id or name (ignored by a simulated source) */
     const char* server;            /* Motive host; REQUIRED to track by name */
     const char* multicast;         /* NULL = 239.255.42.99 */
+    const char* local_iface;       /* this machine's IP on Motive's network; NULL = the NIC routing to server */
     const char* survey_path;       /* NULL = no survey */
     int         need_body_frame;   /* a direction mode: refuse anything but a body-frame survey */
     int         have_offset;       /* --mount-offset x,y,z given */
@@ -130,6 +131,8 @@ int    mic_track_sim_orientation(MicTrack* T, float q[4]);
 /* One LIVE pose and its center. A live tracker must report NN_STATUS_LIVE (see the comment in
  * mic_track.cpp); a refused pose or offset reads as no pose. Returns 1 with out filled, else 0. */
 int    mic_track_read(MicTrack* T, MicPose* out);
+/* Why mic_track_read has no pose right now, and what to check: one ASCII line, no newline. */
+void   mic_track_why(const MicTrack* T, char* buf, size_t cap);
 
 /* With a body-frame survey: rotate the body table by q and install it (zylia_set_capsules), the
  * array as it is turned right now. Returns 1; 0 = no body-frame table, nothing installed. */

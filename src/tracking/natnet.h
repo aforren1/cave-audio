@@ -48,13 +48,18 @@ typedef struct {
                                 * synthetic feeds; multicast is the supported transport, and
                                 * bwa_tracker_connect always passes a group (engine.c defaults it). */
     const char* server;        /* server IP, for the version handshake; NULL => skip handshake */
-    const char* local_iface;   /* local NIC IP to bind/join on; NULL => INADDR_ANY */
+    const char* local_iface;   /* local NIC IP to join the group on. NULL/"" => the NIC that routes to
+                                * `server` (Motive streams on that network, and on a multi-homed box
+                                * the OS default may well be the Dante, Wi-Fi or VPN adapter), else
+                                * the OS default */
     uint16_t    data_port;     /* NatNet data port (default 1511) */
     uint16_t    command_port;  /* NatNet command port (default 1510) */
     int32_t     rigid_body;    /* streaming ID to track; <= 0 => first rigid body in the frame */
     const char* rigid_body_name; /* track by name instead of ID; resolved to an ID via the model
                                   * definitions at open (needs `server`). NULL/"" => use rigid_body. */
-    int         major, minor;  /* NatNet bitstream version; <= 0 => handshake, else default 3.1 */
+    int         major, minor;  /* NatNet bitstream version: used only if the handshake does not answer
+                                * (the server knows best). <= 0 => read it from the first frame that
+                                * holds a rigid body (natnet_sniff_version) */
 } NatNetConfig;
 
 /* Open the data socket, learn the bitstream version (handshake if a server is given), and
@@ -84,6 +89,44 @@ typedef enum {
     NN_STATUS_LIVE
 } NatNetStatus;
 NatNetStatus natnet_status(const NatNet* nn);
+
+/* Why the selected body has no pose: what the most recent frame said. */
+typedef enum {
+    NN_WHY_NONE = 0,     /* the last frame gave a pose, or no frame has arrived */
+    NN_WHY_UNDECIDED,    /* no version from the handshake, and no frame with a rigid body to read one from */
+    NN_WHY_MALFORMED,    /* the frame does not parse at the version in use */
+    NN_WHY_MISSING,      /* it parses, and the selected body is not in it */
+    NN_WHY_UNTRACKED     /* the body is in it, and Motive marks it not tracked this frame */
+} NatNetWhy;
+
+#define NATNET_IP_MAX 46
+
+/* A snapshot of what the session knows, for a status line. Counters run from open. Any thread. */
+typedef struct {
+    NatNetStatus status;
+    NatNetWhy    why;
+    int          major, minor;       /* 0.0 = not known yet */
+    bool         handshake_ok;       /* the server answered; false with no server, too */
+    bool         version_from_frame; /* major.minor was read from a frame, so 4.1 means "4.1 or later" */
+    int32_t      rigid_body;         /* the streaming ID in use; <= 0 = the first in the frame */
+    uint16_t     data_port;
+    char         server[NATNET_IP_MAX];
+    char         multicast[NATNET_IP_MAX];
+    char         iface[NATNET_IP_MAX];   /* the NIC the group was joined on; "" = the OS default */
+    uint64_t     frames, malformed, missing, untracked, poses;
+} NatNetInfo;
+void natnet_info(const NatNet* nn, NatNetInfo* out);
+
+/* One ASCII line each, no newline, truncated to cap. natnet_explain: what the stream is doing now and
+ * what to check. natnet_describe: how the session connected. Pure, so the wording is testable. */
+void natnet_explain(const NatNetInfo* info, char* buf, size_t cap);
+void natnet_describe(const NatNetInfo* info, char* buf, size_t cap);
+
+/* Pure (no socket): the bitstream layout of a NAT_FRAMEOFDATA payload, for a session with no handshake
+ * to ask. Sets 4.1 ("size-prefixed sections", which holds for every later version too) or 3.1 ("no size
+ * prefixes") and returns true. A frame with no rigid body returns false: empty sections read the same
+ * in both layouts, and a false answer would be fatal for the rest of the session. */
+bool natnet_sniff_version(const uint8_t* payload, size_t len, int* major, int* minor);
 
 /* Pure classifier (no socket): decide liveness from monotonic-clock stamps. `now`, `last_frame`
  * (last NAT_FRAMEOFDATA received) and `last_pose` (last valid pose published) share one clock;
@@ -177,14 +220,20 @@ int natnet_parse_modeldef(const uint8_t* payload, size_t len, int major, int min
 /* ---- a thread-free session for control-side tools --------------------------------------------
  * natnet_open above owns a receiver thread and the audio thread's pose slot. A survey tool needs
  * neither: it wants the MODELDEF once and then raw frames, on its own thread, blocking. Same
- * config struct (rigid_body/rigid_body_name are ignored), same handshake, same sockets. */
+ * config struct (rigid_body/rigid_body_name are ignored), same handshake, same interface rule, same
+ * sockets. */
 typedef struct NatNetRaw NatNetRaw;
 
 /* Handshake (when cfg->server is set), then bind the data port and join the group. NULL on
  * failure with a message in err. */
 NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap);
-/* The bitstream version in use (handshake, else cfg->major/minor, else 3.1). */
+/* The bitstream version in use: the handshake, else cfg->major/minor, else read from the frames, so it
+ * reads 0.0 until natnet_raw_next_frame has seen a frame with a rigid body. Read it again per frame
+ * when there is no handshake. */
 void       natnet_raw_version(const NatNetRaw* r, int* major, int* minor);
+bool       natnet_raw_handshake_ok(const NatNetRaw* r);
+/* The NIC the group was joined on; "" = the OS default. Stable for the session. */
+const char* natnet_raw_iface(const NatNetRaw* r);
 /* Ask the server for the model definitions and copy the NAT_MODELDEF payload (without the 4-byte
  * packet header) into buf. Returns the payload length, or -1 (no server, no reply, or cap too
  * small). Blocks up to about a second. */

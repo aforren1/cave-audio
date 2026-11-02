@@ -682,6 +682,7 @@ int main(int argc, char** argv) {
     const char* survey_path = NULL;  /* body-frame capsule survey to follow it with */
     const char* nn_server = NULL;
     const char* nn_multicast = "239.255.42.99";
+    const char* nn_local = NULL;
     int track_sim = 0;               /* the scripted stand: exercises the tracked path, no rig */
     int track_sim_bump = 0;          /* --track-sim-bump N: knock it after the Nth capture */
     int track_sim_twist = 0;         /* --track-sim-twist N: turn it about the array center after the Nth */
@@ -731,6 +732,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--survey")    && i+1 < argc)     survey_path = argv[++i];
         else if (!strcmp(argv[i], "--natnet-server") && i+1 < argc) nn_server = argv[++i];
         else if (!strcmp(argv[i], "--natnet-multicast") && i+1 < argc) nn_multicast = argv[++i];
+        else if (!strcmp(argv[i], "--natnet-local") && i+1 < argc) nn_local = argv[++i];
         else if (!strcmp(argv[i], "--track-sim"))                   track_sim = 1;
         else if (!strcmp(argv[i], "--track-sim-bump") && i+1 < argc) {
             char* end = NULL; long v = strtol(argv[++i], &end, 10);
@@ -913,6 +915,8 @@ int main(int argc, char** argv) {
                    "  --natnet-server <ip>  Motive host; REQUIRED to --track by name (the streaming id\n"
                    "                        is resolved from Motive's model definitions)\n"
                    "  --natnet-multicast <g>  NatNet group (default 239.255.42.99)\n"
+                   "  --natnet-local <ip>   this machine's IP on Motive's network (default: the adapter\n"
+                   "                        that routes to --natnet-server)\n"
                    "  --tone <hz>           measure with a sustained TONE instead of broadband. Two\n"
                    "                        mechanisms make this the hard case: room standing waves\n"
                    "                        (hardware only), AND the array's own frequency-dependent\n"
@@ -952,8 +956,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
     if ((track_sim_bump || track_sim_twist) && !track_sim) {
         fprintf(stderr, "--track-sim-bump/--track-sim-twist act on the SIMULATED stand; pass --track-sim\n"); return 2; }
-    if (!tracked_run && (tol_set || timeout_set || mount_off_set || nn_server)) {
-        fprintf(stderr, "--place-tol-mm/--place-timeout/--mount-offset/--natnet-server are --track options\n"); return 2; }
+    if (!tracked_run && (tol_set || timeout_set || mount_off_set || nn_server || nn_local)) {
+        fprintf(stderr, "--place-tol-mm/--place-timeout/--mount-offset/--natnet-server/--natnet-local are --track options\n"); return 2; }
     if (inject != -1 && (inject < 0 || inject >= ZYLIA_MICS)) {
         fprintf(stderr, "--inject-fault must be 0..%d\n", ZYLIA_MICS-1); return 2; }
 
@@ -1136,7 +1140,7 @@ int main(int argc, char** argv) {
          * stand. */
         MicTrackCfg mc;
         memset(&mc, 0, sizeof mc);
-        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast;
+        mc.body = track_body; mc.server = nn_server; mc.multicast = nn_multicast; mc.local_iface = nn_local;
         mc.survey_path = survey_path;
         mc.need_body_frame = 1;
         mc.have_offset = mount_off_set && !mount_ring;

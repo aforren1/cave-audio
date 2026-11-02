@@ -365,6 +365,37 @@ int os_udp_recv(os_socket s, void* buf, size_t cap) {
     return (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) ? OS_UDP_TIMEOUT : OS_UDP_ERROR;
 }
 
+int os_udp_recv_from(os_socket s, void* buf, size_t cap, char* ip_out, uint16_t* port_out) {
+    struct sockaddr_in a; int alen = (int)sizeof a;
+    memset(&a, 0, sizeof a);
+    int got = recvfrom((SOCKET)s, (char*)buf, (int)cap, 0, (struct sockaddr*)&a, &alen);
+    if (got == SOCKET_ERROR) {
+        const int e = WSAGetLastError();
+        return (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) ? OS_UDP_TIMEOUT : OS_UDP_ERROR;
+    }
+    if (ip_out && !inet_ntop(AF_INET, &a.sin_addr, ip_out, 46)) ip_out[0] = 0;
+    if (port_out) *port_out = ntohs(a.sin_port);
+    return got;
+}
+
+int os_udp_route_local_ipv4(const char* peer_ipv4, char* out, size_t cap) {
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(9);                  /* any nonzero port: nothing is sent */
+    if (!peer_ipv4 || inet_pton(AF_INET, peer_ipv4, &a.sin_addr) != 1) return 1;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 1;
+    int rc = 1;
+    if (connect(s, (struct sockaddr*)&a, sizeof a) == 0) {
+        struct sockaddr_in me; int mlen = (int)sizeof me;
+        if (getsockname(s, (struct sockaddr*)&me, &mlen) == 0 && me.sin_addr.s_addr != htonl(INADDR_ANY) &&
+            inet_ntop(AF_INET, &me.sin_addr, out, cap))
+            rc = 0;
+    }
+    closesocket(s);
+    return rc;
+}
+
 bool os_ipv4_valid(const char* s) {
     struct in_addr a;
     return s && inet_pton(AF_INET, s, &a) == 1;

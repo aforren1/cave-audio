@@ -88,6 +88,7 @@ static int ring_offset(MicTrack* T, const MicTrackCfg* c, char* err, size_t errc
         memset(&nc, 0, sizeof nc);
         nc.multicast = c->multicast ? c->multicast : "239.255.42.99";
         nc.server = c->server;
+        nc.local_iface = c->local_iface;
         nc.data_port = 1511; nc.command_port = 1510;
         NatNetRaw* r = natnet_raw_open(&nc, e, sizeof e);
         if (!r) { snprintf(m, sizeof m, "tracker: %s", e); set_err(err, errcap, m); return 1; }
@@ -202,6 +203,7 @@ int mic_track_open(MicTrack* T, const MicTrackCfg* c, char* err, size_t errcap) 
     memset(&nc, 0, sizeof nc);
     nc.multicast = c->multicast ? c->multicast : "239.255.42.99";
     nc.server = c->server;
+    nc.local_iface = c->local_iface;
     nc.data_port = 1511; nc.command_port = 1510;
     char* endp = NULL;
     long id = strtol(c->body, &endp, 10);
@@ -224,7 +226,7 @@ void mic_track_close(MicTrack* T) {
     T->nn = NULL;
 }
 
-void mic_track_describe(const MicTrack* T, char* buf, size_t cap) {
+static void describe_offset(const MicTrack* T, char* buf, size_t cap) {
     const float* o = T->offset;
     const int nonzero = o[0] != 0.f || o[1] != 0.f || o[2] != 0.f;
     const char* table = T->body_frame ? (T->have_survey ? "body-frame survey: the capsule table follows the stand"
@@ -247,6 +249,26 @@ void mic_track_describe(const MicTrack* T, char* buf, size_t cap) {
     else
         snprintf(buf, cap, "mount offset 0: the rigid body's pivot is taken as the array center (move the pivot\n"
                            "there in Motive, or pass --mount-offset x,y,z)\n%s", table);
+}
+
+void mic_track_describe(const MicTrack* T, char* buf, size_t cap) {
+    describe_offset(T, buf, cap);
+    if (!T->nn) return;
+    NatNetInfo info;
+    natnet_info(T->nn, &info);
+    char conn[280];
+    natnet_describe(&info, conn, sizeof conn);
+    const size_t n = strlen(buf);
+    if (n < cap) snprintf(buf + n, cap - n, "\n%s", conn);
+}
+
+void mic_track_why(const MicTrack* T, char* buf, size_t cap) {
+    if (!T->nn) { snprintf(buf, cap, "the simulated stand has no pose yet"); return; }
+    NatNetInfo info;
+    natnet_info(T->nn, &info);
+    /* live and still no pose: mic_track_read refused it */
+    if (info.status == NN_STATUS_LIVE) snprintf(buf, cap, "Motive's pose is live, but no center follows from it: a degenerate orientation");
+    else natnet_explain(&info, buf, cap);
 }
 
 double mic_track_now(MicTrack* T) {
@@ -409,6 +431,7 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
     const double t0 = mic_track_now(T);
     double last_print = -1.0;
     MicPose ps; int have = 0;
+    char why[320] = "";                                       /* printed when it changes, not every 100 ms */
     char tol[48];
     if (g.cfg.tol_m > 0.f) snprintf(tol, sizeof tol, "%.1f mm", g.cfg.tol_m * 1e3);
     else                   snprintf(tol, sizeof tol, "none (accept on stillness)");
@@ -423,9 +446,16 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
         const PlaceState st = place_gate_update_q(&g, t, have ? ps.center : NULL, have ? ps.q : NULL, target);
         if (last_print < 0.0 || t - last_print >= 0.1 || st == PLACE_OK) {
             last_print = t;
-            if (st == PLACE_NO_POSE)
-                printf("\r  no live pose (occluded, wrong id, or Motive not streaming)  HOLD                                                ");
-            else {
+            if (st == PLACE_NO_POSE) {
+                char now_why[320];
+                mic_track_why(T, now_why, sizeof now_why);
+                if (strcmp(why, now_why) != 0) {
+                    snprintf(why, sizeof why, "%s", now_why);
+                    printf("\n  no live pose: %s\n", why);
+                }
+                printf("\r  no live pose  HOLD                                                                                  ");
+            } else {
+                why[0] = 0;
                 /* a direction mode adds the mount's yaw: the one number a turn about the center changes */
                 char yaw[24] = "";
                 float y = 0.f;

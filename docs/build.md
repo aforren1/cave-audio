@@ -465,8 +465,9 @@ the fixed-name handoff the `package` job downloads.
   application's CRT is unaffected, since it only ever loads this DLL across a C ABI.
 - **The tools are built and shipped.** CI configures with `BWA_BUILD_PLAYGROUND`,
   `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries `bwa_playground`,
-  `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display), plus `bwa_calibrate` and
-  `bwa_zylia_probe` (console).
+  `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display), plus `bwa_calibrate`,
+  `bwa_validate`, `bwa_speaker_survey`, `bwa_track_monitor` and `bwa_zylia_probe` (console). The
+  Session tab runs the first three from beside itself.
 - **The Godot binding is built AND tested.** Unlike the imgui tools, Godot's `--headless` needs
   no display, so its scene tests run on the runner (against a cached editor download).
 - **`bw_audio.dll` stands alone.** Steam Audio is linked statically, so a with-SDK build and a

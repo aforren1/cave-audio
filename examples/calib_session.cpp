@@ -245,6 +245,7 @@ bool ses_save(const Session& S, std::string* err) {
     put_str(in, "plan", I.plan); put_str(in, "driver", I.driver);
     cJSON_AddNumberToObject(in, "input_first", I.input_first);
     put_str(in, "natnet_server", I.nn_server); put_str(in, "natnet_multicast", I.nn_multicast);
+    put_str(in, "natnet_local", I.nn_local);
     put_str(in, "stand_body", I.body); put_str(in, "mount_offset", I.mount_offset); put_str(in, "temp", I.temp);
     put_str(in, "localize_rows", I.localize_rows); put_str(in, "grid_rows", I.grid_rows);
     put_str(in, "frame_speakers", I.frame_speakers); put_str(in, "capsule_speakers", I.capsule_speakers);
@@ -322,6 +323,7 @@ bool ses_load(Session* S, const std::string& folder, std::string* err) {
     I.plan = get_str(in, "plan"); I.driver = get_str(in, "driver");
     I.input_first = (int)get_num(in, "input_first", 0);
     I.nn_server = get_str(in, "natnet_server"); I.nn_multicast = get_str(in, "natnet_multicast");
+    I.nn_local = get_str(in, "natnet_local");
     I.body = get_str(in, "stand_body"); I.mount_offset = get_str(in, "mount_offset"); I.temp = get_str(in, "temp");
     I.localize_rows = get_str(in, "localize_rows"); I.grid_rows = get_str(in, "grid_rows");
     I.frame_speakers = get_str(in, "frame_speakers"); I.capsule_speakers = get_str(in, "capsule_speakers");
@@ -483,6 +485,7 @@ static std::string track_flags(const Session& S) {
         c += " --track " + quote(I.body);
         if (!I.nn_server.empty()) c += " --natnet-server " + I.nn_server;
         if (!I.nn_multicast.empty()) c += " --natnet-multicast " + I.nn_multicast;
+        if (!I.nn_local.empty()) c += " --natnet-local " + I.nn_local;
     } else return c;
     c += " --place-timeout " + std::to_string(I.place_timeout_s > 0 ? I.place_timeout_s : 300);
     return c;
@@ -556,6 +559,7 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         } else {
             c += " --server " + I.nn_server;
             if (!I.nn_multicast.empty()) c += " --multicast " + I.nn_multicast;
+            if (!I.nn_local.empty()) c += " --local " + I.nn_local;
         }
         use_input("plan", plan, consumed);
         break;
