@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+More NatNet QOL.
+
 ## [0.19.1]
 
 Attempted fixes for NatNet, and include more tools in the distribution.
