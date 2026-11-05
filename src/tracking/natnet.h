@@ -39,7 +39,9 @@ typedef struct PoseSlot PoseSlot;
 typedef struct NatNet NatNet;
 
 typedef struct {
-    const char* multicast;     /* group address, e.g. "239.255.42.99". NULL/"" => a PASSIVE unicast
+    const char* multicast;     /* group address, e.g. "239.255.42.99". When the handshake answers,
+                                * Motive's own group and data port replace this one and data_port: the
+                                * reply says where it streams, and only it can know. NULL/"" => a PASSIVE unicast
                                 * listen: bind the data port and take what arrives. That is NOT a
                                 * working Motive unicast client — unicast streaming requires the
                                 * NAT_CONNECT subscription + periodic NAT_KEEPALIVE pings on the
@@ -109,10 +111,18 @@ typedef struct {
     bool         handshake_ok;       /* the server answered; false with no server, too */
     bool         version_from_frame; /* major.minor was read from a frame, so 4.1 means "4.1 or later" */
     int32_t      rigid_body;         /* the streaming ID in use; <= 0 = the first in the frame */
-    uint16_t     data_port;
+    uint16_t     data_port;          /* the port in use */
     char         server[NATNET_IP_MAX];
-    char         multicast[NATNET_IP_MAX];
+    char         multicast[NATNET_IP_MAX];   /* the group in use; "" = none */
     char         iface[NATNET_IP_MAX];   /* the NIC the group was joined on; "" = the OS default */
+    /* What the server said about its own stream (NatNet 3.0+ replies carry it). */
+    bool         stream_known;
+    bool         stream_multicast;   /* false: Motive's Transmission Type is Unicast */
+    uint8_t      server_version[4];  /* Motive's own version, valid with handshake_ok */
+    char         asked[NATNET_IP_MAX + 8];   /* "group:port" the config named, when Motive's reply replaced it */
+    uint64_t     datagrams;          /* anything that reached the socket, frames or not */
+    int          last_other_msg;     /* the message id of the last datagram that was not a frame; -1 = none */
+    uint64_t     socket_errors;      /* hard receive errors (a timeout is not one) */
     uint64_t     frames, malformed, missing, untracked, poses;
 } NatNetInfo;
 void natnet_info(const NatNet* nn, NatNetInfo* out);
@@ -232,8 +242,9 @@ NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap);
  * when there is no handshake. */
 void       natnet_raw_version(const NatNetRaw* r, int* major, int* minor);
 bool       natnet_raw_handshake_ok(const NatNetRaw* r);
-/* The NIC the group was joined on; "" = the OS default. Stable for the session. */
-const char* natnet_raw_iface(const NatNetRaw* r);
+/* How the session connected, for natnet_describe. The counters and status stay zero: a raw session has
+ * no receiver to count for it. */
+void       natnet_raw_info(const NatNetRaw* r, NatNetInfo* out);
 /* Ask the server for the model definitions and copy the NAT_MODELDEF payload (without the 4-byte
  * packet header) into buf. Returns the payload length, or -1 (no server, no reply, or cap too
  * small). Blocks up to about a second. */

@@ -1760,8 +1760,9 @@ that row twice.
 - A rigid body for the stand in Motive. Note its streaming ID and its name. Tracking by name needs
   `--natnet-server <ip>`, because the name resolves through Motive's model definitions.
 - The network. The tool joins the multicast group on the adapter that routes to `--natnet-server`.
-  With no server, or when that adapter is wrong, pass `--natnet-local <this machine's IP>`. The first
-  `track:` line says which version and adapter it used.
+  With no server, or when that adapter is wrong, pass `--natnet-local <this machine's IP>`. With a
+  server, Motive's reply sets the group and port, over `--natnet-multicast`. The `track:` line says
+  which version, group, port and adapter it used.
 - The mount offset: from the rigid body's pivot to the array's acoustic center, in the body's own
   axes. The tool computes `center = p + R(q) · offset` from every pose. Give it one of:
   - **a body-frame survey** (`--survey`), which carries the probed offset;

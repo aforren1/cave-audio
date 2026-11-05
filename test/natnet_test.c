@@ -136,6 +136,9 @@ typedef struct {
     os_thread   th;
     _Atomic int stop;
     int         major, minor;
+    /* what the reply says about the stream */
+    _Atomic int reply_kind;        /* 0 multicast + group + port below, 1 unicast, 2 a pre-3.0 short reply */
+    _Atomic int reply_port;
     _Atomic int connect_bytes;     /* the last NAT_CONNECT's datagram size */
     _Atomic int connect_declared;  /* ... and its header's nDataBytes */
     Buf         model;
@@ -152,15 +155,23 @@ static void fake_motive(void* arg) {
         if (msg == 0) {                                  /* NAT_CONNECT -> NAT_SERVERINFO */
             atomic_store(&f->connect_bytes, got);
             atomic_store(&f->connect_declared, nb);
-            uint8_t r[4 + 256 + 4 + 4 + 8];
+            uint8_t r[4 + 256 + 4 + 4 + 8 + 2 + 1 + 4];
             memset(r, 0, sizeof r);
-            const uint16_t id = 1, n = (uint16_t)(sizeof r - 4);
+            const int kind = atomic_load(&f->reply_kind);
+            const size_t rlen = kind == 2 ? 4 + 256 + 4 + 4 : sizeof r;
+            const uint16_t id = 1, n = (uint16_t)(rlen - 4);
             memcpy(r, &id, 2); memcpy(r + 2, &n, 2);
             memcpy(r + 4, "Motive", 6);
             r[4 + 256 + 4] = (uint8_t)f->major; r[4 + 256 + 4 + 1] = (uint8_t)f->minor;
             const uint64_t freq = 10000000ull;
             memcpy(r + 4 + 256 + 4 + 4, &freq, 8);
-            os_udp_sendto(f->s, r, sizeof r, ip, port);
+            r[4 + 256] = 3; r[4 + 256 + 1] = 3; r[4 + 256 + 2] = 4; r[4 + 256 + 3] = 1;   /* Motive 3.3.4.1 */
+            const uint16_t dport = (uint16_t)atomic_load(&f->reply_port);
+            memcpy(r + 4 + 256 + 4 + 4 + 8, &dport, 2);
+            r[4 + 256 + 4 + 4 + 8 + 2] = kind == 1 ? 0 : 1;
+            const uint8_t group[4] = { 239, 255, 42, 100 };
+            memcpy(r + 4 + 256 + 4 + 4 + 8 + 2 + 1, group, 4);
+            os_udp_sendto(f->s, r, rlen, ip, port);
         } else if (msg == 4) {                           /* NAT_REQUEST_MODELDEF -> NAT_MODELDEF */
             Buf r = { 0 };
             const uint16_t id = 5, n = (uint16_t)f->model.n;
@@ -187,20 +198,24 @@ static void frame_v31(Buf* o, int32_t id) {
     w_rb(o, id, 1.5f, 2.5f, 3.5f, 0, 0, 0, 1, 1);
 }
 
-/* Aim the frame at the data port until the session reports this status and reason, or 3 s pass. */
-static bool pump(NatNet* nn, os_socket tx, const Buf* frame, NatNetStatus want, NatNetWhy why, NatNetInfo* out) {
+/* Aim the frame at a data port until the session reports this status and reason, or 3 s pass. */
+static bool pump_port(NatNet* nn, os_socket tx, uint16_t port, const Buf* frame, NatNetStatus want, NatNetWhy why, NatNetInfo* out) {
     Buf pkt = { 0 };
     const uint16_t id = 7, n = (uint16_t)frame->n;
     memcpy(pkt.b, &id, 2); memcpy(pkt.b + 2, &n, 2);
     memcpy(pkt.b + 4, frame->b, frame->n);
     pkt.n = 4 + frame->n;
     for (int t = 0; t < 1500; ++t) {
-        os_udp_sendto(tx, pkt.b, pkt.n, "127.0.0.1", FAKE_DATA_PORT);
+        os_udp_sendto(tx, pkt.b, pkt.n, "127.0.0.1", port);
         os_sleep_ms(2);
         natnet_info(nn, out);
         if (out->status == want && out->why == why) return true;
     }
     return false;
+}
+
+static bool pump(NatNet* nn, os_socket tx, const Buf* frame, NatNetStatus want, NatNetWhy why, NatNetInfo* out) {
+    return pump_port(nn, tx, FAKE_DATA_PORT, frame, want, why, out);
 }
 
 static NatNetConfig loop_cfg(const char* server, int32_t id) {
@@ -225,6 +240,7 @@ static void live_session_tests(void) {
     }
     os_udp_set_rcvtimeo_ms(f.s, 50);
     f.major = 4; f.minor = 4;                               /* what a Motive 3.x sends: size prefixes */
+    atomic_store(&f.reply_port, FAKE_DATA_PORT);
     w_i32(&f.model, 1);
     w_rbdesc(&f.model, "stand", 12, 16);
     CHECK(os_thread_create(&f.th, fake_motive, &f) == 0, "fake motive thread");
@@ -255,7 +271,7 @@ static void live_session_tests(void) {
             natnet_explain(&info, line, sizeof line);
             CHECK(strstr(line, "no NatNet frames") != NULL, line);
             natnet_describe(&info, line, sizeof line);
-            CHECK(strstr(line, "NatNet 4.4 from Motive at 127.0.0.1") != NULL, line);
+            CHECK(strstr(line, "NatNet 4.4 from Motive 3.3.4.1 at 127.0.0.1") != NULL, line);
 
             frame_v41(&fr, 2, 11, 1);                       /* ids 11 and 12: the second is ours */
             CHECK(pump(nn, tx, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "4.4 frames: LIVE");
@@ -360,6 +376,90 @@ static void live_session_tests(void) {
         }
     }
 
+    /* Motive's streaming settings are not the defaults: the reply says so, and the session follows. The
+     * group cannot be proven on loopback, so the frames arrive unicast at the port it must have moved to. */
+    {
+        const uint16_t moved = FAKE_DATA_PORT + 2;
+        atomic_store(&f.reply_port, moved);
+        NatNetConfig c = loop_cfg("127.0.0.1", 12);
+        c.multicast = "239.255.42.99";
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        if (!nn) printf("natnet_test: no multicast here, the follow check is skipped (%s)\n", err);
+        else {
+            natnet_info(nn, &info);
+            CHECK(info.stream_known && info.stream_multicast, "the reply described a multicast stream");
+            CHECK(info.data_port == moved && !strcmp(info.multicast, "239.255.42.100"), "Motive's group and port replaced the config's");
+            natnet_describe(&info, line, sizeof line);
+            CHECK(strstr(line, "239.255.42.100:47813") != NULL && strstr(line, "239.255.42.99:47811") != NULL, line);
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "Motive says it streams multicast to 239.255.42.100") != NULL, line);
+            frame_v41(&fr, 1, 12, 1);
+            CHECK(pump_port(nn, tx, moved, &fr, NN_STATUS_LIVE, NN_WHY_NONE, &info), "frames at Motive's port: LIVE");
+            natnet_close(nn);
+        }
+        atomic_store(&f.reply_port, FAKE_DATA_PORT);
+
+        /* a passive listen stays where it was put */
+        atomic_store(&f.reply_port, moved);
+        c = loop_cfg("127.0.0.1", 12);
+        nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(info.data_port == FAKE_DATA_PORT && info.multicast[0] == 0, "a passive listen does not follow");
+            natnet_close(nn);
+        }
+        atomic_store(&f.reply_port, FAKE_DATA_PORT);
+
+        /* Motive on unicast: the frames will never come, and the session says so */
+        atomic_store(&f.reply_kind, 1);
+        c = loop_cfg("127.0.0.1", 12);
+        c.multicast = "239.255.42.99";
+        nn = natnet_open(&c, err, sizeof err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(info.stream_known && !info.stream_multicast, "the reply described a unicast stream");
+            CHECK(info.status == NN_STATUS_NO_DATA, "unicast: no data");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "Transmission Type Unicast") != NULL, line);
+            natnet_describe(&info, line, sizeof line);
+            CHECK(strstr(line, "UNICAST") != NULL, line);
+            natnet_close(nn);
+        }
+
+        /* a pre-3.0 short reply describes nothing: keep the config */
+        atomic_store(&f.reply_kind, 2);
+        nn = natnet_open(&c, err, sizeof err);
+        if (nn) {
+            natnet_info(nn, &info);
+            CHECK(info.handshake_ok && !info.stream_known, "a short reply: handshake, no stream facts");
+            CHECK(info.data_port == FAKE_DATA_PORT && !strcmp(info.multicast, "239.255.42.99"), "a short reply keeps the config");
+            natnet_close(nn);
+        }
+        atomic_store(&f.reply_kind, 0);
+    }
+
+    /* Something other than frames reached the socket: "no frames" alone would hide it. */
+    {
+        NatNetConfig c = loop_cfg(NULL, 12);
+        NatNet* nn = natnet_open(&c, err, sizeof err);
+        CHECK(nn != NULL, err);
+        if (nn) {
+            const uint8_t other[4] = { 8, 0, 0, 0 };             /* a NAT_MESSAGESTRING with no text */
+            bool seen = false;
+            for (int t = 0; t < 500 && !seen; ++t) {
+                os_udp_sendto(tx, other, sizeof other, "127.0.0.1", FAKE_DATA_PORT);
+                os_sleep_ms(2);
+                natnet_info(nn, &info);
+                seen = info.last_other_msg == 8;
+            }
+            CHECK(seen && info.frames == 0 && info.datagrams > 0, "another message id was counted");
+            natnet_explain(&info, line, sizeof line);
+            CHECK(strstr(line, "other datagrams") != NULL && strstr(line, "message id 8") != NULL, line);
+            natnet_close(nn);
+        }
+    }
+
     /* The interface: the NIC routing to the server, unless the caller names one. */
     {
         NatNetConfig c = loop_cfg("127.0.0.1", 12);
@@ -389,6 +489,9 @@ static void live_session_tests(void) {
             int ma = -1, mi = -1;
             natnet_raw_version(r, &ma, &mi);
             CHECK(ma == 0 && !natnet_raw_handshake_ok(r), "raw, no server: unknown at open");
+            NatNetInfo ri;
+            natnet_raw_info(r, &ri);
+            CHECK(!ri.handshake_ok && ri.data_port == FAKE_DATA_PORT, "raw info: how it connected");
             frame_v41(&fr, 1, 12, 1);
             Buf pkt = { 0 };
             const uint16_t id = 7, n = (uint16_t)fr.n;

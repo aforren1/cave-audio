@@ -441,11 +441,10 @@ struct NatNet {
     /* natnet_info: written by the receiver, read anywhere; a status line needs no ordering either */
     _Atomic int      version;        /* major << 8 | minor */
     _Atomic int      why;            /* NatNetWhy */
+    _Atomic int      last_other_msg; /* -1 = none */
+    _Atomic uint64_t n_datagrams, n_socket_errors;
     _Atomic uint64_t n_frames, n_malformed, n_missing, n_untracked, n_poses;
-    /* fixed at open */
-    bool     handshake_ok, version_from_frame;
-    uint16_t data_port;
-    char     server[NATNET_IP_MAX], multicast[NATNET_IP_MAX], iface[NATNET_IP_MAX];
+    NatNetInfo conn;                 /* how it connected, fixed at open; natnet_info adds the live fields */
 };
 
 static void nn_err(char* err, size_t cap, const char* msg) {
@@ -470,11 +469,24 @@ static void to_room(const float src_p[3], const float src_q[4], float p[3], floa
 #define NN_HANDSHAKE_TRIES 3
 #define NN_HANDSHAKE_WAIT_MS 300
 
-/* Version handshake: ask the server (command port) for its NatNet version.
- * Returns true and sets major/minor on success. NatNet 3.0+ servers append their high-res
- * clock frequency (ticks/s) right after the version block (sSender_Server, NatNetTypes.h) —
- * it converts the frame suffix's CameraMidExposureTimestamp ticks to time; left 0 if absent. */
-static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, uint64_t* freq) {
+/* What a NAT_SERVERINFO reply says. */
+typedef struct {
+    int      major, minor;
+    uint8_t  app_version[4];
+    uint64_t clock_freq;       /* 0 if absent */
+    bool     stream_known, stream_multicast;
+    uint16_t stream_port;
+    char     stream_group[NATNET_IP_MAX];
+} NNServerInfo;
+
+/* Version handshake: ask the server (command port) about itself. Returns true and fills *si on
+ * success. NatNet 3.0+ servers append sSender_Server's tail (NatNetTypes.h, packed) to the version
+ * block: the high-res clock frequency (ticks/s), which converts the frame suffix's
+ * CameraMidExposureTimestamp ticks to time, then the data port, the multicast flag and the group. Those
+ * last three are how a client learns where the stream really is: Motive's streaming settings can change
+ * all of them, so a client that assumes the defaults connects fine and then hears nothing. */
+static bool handshake_info(const NatNetConfig* cfg, NNServerInfo* si) {
+    memset(si, 0, sizeof *si);
     if (!cfg->server || !cfg->server[0]) return false;
     os_socket s = os_udp_open();
     if (s == OS_INVALID_SOCKET) return false;
@@ -487,8 +499,11 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, u
     memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
 
     /* payload = sSender { char szName[256]; uint8 Version[4]; uint8 NatNetVersion[4]; }
-     * then (3.0+, sSender_Server) uint64 HighResClockFrequency — 264 is 8-aligned, no padding */
-    const int nnv = 4 + 256 + 4;                               /* header + szName + Version */
+     * then (3.0+, sSender_Server) uint64 HighResClockFrequency, uint16 DataPort, bool IsMulticast,
+     * uint8 MulticastGroupAddress[4] */
+    const int ver = 4 + 256;                                   /* header + szName */
+    const int nnv = ver + 4;                                   /* ... + Version */
+    const int tail = nnv + 4;                                  /* ... + NatNetVersion */
     bool ok = false;
     for (int t = 0; t < NN_HANDSHAKE_TRIES && !ok; ++t) {
         os_udp_sendto(s, req, sizeof req, cfg->server, port);
@@ -497,8 +512,22 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, u
         if (got < nnv + 2) continue;
         uint16_t msg; memcpy(&msg, buf, 2);
         if (msg != NAT_SERVERINFO || buf[nnv] == 0) continue;
-        *major = buf[nnv]; *minor = buf[nnv + 1];
-        if (freq && got >= nnv + 4 + 8) memcpy(freq, buf + nnv + 4, 8);
+        si->major = buf[nnv]; si->minor = buf[nnv + 1];
+        memcpy(si->app_version, buf + ver, 4);
+        if (got >= tail + 8) memcpy(&si->clock_freq, buf + tail, 8);
+        if (got >= tail + 8 + 2 + 1 + 4) {
+            uint16_t dport;
+            memcpy(&dport, buf + tail + 8, 2);
+            const bool multicast = buf[tail + 10] != 0;
+            const uint8_t* g = buf + tail + 11;
+            /* a zero port, or a "group" outside 224/4, is a reply this layout does not describe */
+            if (dport != 0 && (!multicast || (g[0] >= 224 && g[0] <= 239))) {
+                si->stream_known = true;
+                si->stream_multicast = multicast;
+                si->stream_port = dport;
+                snprintf(si->stream_group, sizeof si->stream_group, "%u.%u.%u.%u", g[0], g[1], g[2], g[3]);
+            }
+        }
         ok = true;
     }
     os_udp_close(s);
@@ -541,6 +570,28 @@ static os_socket nn_open_data_socket(const NatNetConfig* cfg, char* iface_out, c
         nn_err(err, errcap, "natnet: multicast join failed"); os_udp_close(s); return OS_INVALID_SOCKET;
     }
     return s;
+}
+
+/* The config a session actually opens with: Motive's own group and port when it said so. A passive listen
+ * (no group) stays passive. Fills conn with how that went; si outlives the returned copy's strings. */
+static NatNetConfig nn_follow_server(const NatNetConfig* cfg, const NNServerInfo* si, bool handshake_ok, NatNetInfo* conn) {
+    NatNetConfig e = *cfg;
+    const uint16_t asked_port = cfg->data_port ? cfg->data_port : 1511;
+    const bool asked_group = cfg->multicast && cfg->multicast[0];
+    conn->handshake_ok = handshake_ok;
+    conn->stream_known = si->stream_known;
+    conn->stream_multicast = si->stream_multicast;
+    memcpy(conn->server_version, si->app_version, 4);
+    if (asked_group && si->stream_known && si->stream_multicast) {
+        if (asked_port != si->stream_port || strcmp(cfg->multicast, si->stream_group) != 0)
+            snprintf(conn->asked, sizeof conn->asked, "%s:%u", cfg->multicast, (unsigned)asked_port);
+        e.multicast = si->stream_group;
+        e.data_port = si->stream_port;
+    }
+    nn_copy_ip(conn->server, cfg->server);
+    nn_copy_ip(conn->multicast, e.multicast);
+    conn->data_port = e.data_port ? e.data_port : 1511;
+    return e;
 }
 
 /* The address checks both session kinds share. */
@@ -596,13 +647,20 @@ static void receiver(void* arg) {
     while (!atomic_load_explicit(&nn->stop, memory_order_relaxed)) {
         int got = os_udp_recv(nn->sock, buf, sizeof buf);
         if (got < 0) {                                         /* timeout is normal (200 ms, to re-poll stop); */
-            if (got == OS_UDP_ERROR) os_sleep_ms(50);          /* a HARD error must back off, not hot-spin a core */
+            if (got == OS_UDP_ERROR) {                         /* a HARD error must back off, not hot-spin a core */
+                atomic_fetch_add_explicit(&nn->n_socket_errors, 1, memory_order_relaxed);
+                os_sleep_ms(50);
+            }
             continue;
         }
+        atomic_fetch_add_explicit(&nn->n_datagrams, 1, memory_order_relaxed);
         if (got < 4) continue;                                 /* runt: re-poll stop */
         uint16_t msg, nbytes;
         memcpy(&msg, buf, 2); memcpy(&nbytes, buf + 2, 2);
-        if (msg != NAT_FRAMEOFDATA) continue;
+        if (msg != NAT_FRAMEOFDATA) {                          /* "no frames" must not hide "something else came" */
+            atomic_store_explicit(&nn->last_other_msg, (int)msg, memory_order_relaxed);
+            continue;
+        }
         const uint64_t now_ns = os_monotonic_ns();             /* one read: liveness stamps + arrival stamp */
         atomic_store_explicit(&nn->last_frame_ns, now_ns, memory_order_relaxed);  /* a frame arrived (any body) */
         atomic_fetch_add_explicit(&nn->n_frames, 1, memory_order_relaxed);
@@ -677,18 +735,19 @@ NatNetStatus natnet_status(const NatNet* nn) {
 
 void natnet_info(const NatNet* nn, NatNetInfo* out) {
     memset(out, 0, sizeof *out);
+    out->last_other_msg = -1;
     out->status = natnet_status(nn);
     if (!nn) return;
+    const NatNetStatus status = out->status;
+    *out = nn->conn;
+    out->status = status;
     const int v = atomic_load_explicit(&nn->version, memory_order_relaxed);
     out->major = v >> 8; out->minor = v & 0xff;
     out->why = (NatNetWhy)atomic_load_explicit(&nn->why, memory_order_relaxed);
-    out->handshake_ok = nn->handshake_ok;
-    out->version_from_frame = nn->version_from_frame;
     out->rigid_body = nn->rigid_body;
-    out->data_port = nn->data_port;
-    memcpy(out->server, nn->server, sizeof out->server);
-    memcpy(out->multicast, nn->multicast, sizeof out->multicast);
-    memcpy(out->iface, nn->iface, sizeof out->iface);
+    out->last_other_msg = atomic_load_explicit(&nn->last_other_msg, memory_order_relaxed);
+    out->datagrams     = atomic_load_explicit(&nn->n_datagrams, memory_order_relaxed);
+    out->socket_errors = atomic_load_explicit(&nn->n_socket_errors, memory_order_relaxed);
     out->frames    = atomic_load_explicit(&nn->n_frames, memory_order_relaxed);
     out->malformed = atomic_load_explicit(&nn->n_malformed, memory_order_relaxed);
     out->missing   = atomic_load_explicit(&nn->n_missing, memory_order_relaxed);
@@ -707,7 +766,20 @@ void natnet_explain(const NatNetInfo* i, char* buf, size_t cap) {
     if (i->status == NN_STATUS_LIVE) { snprintf(buf, cap, "%s is live", body); return; }
     if (i->status == NN_STATUS_NO_DATA) {
         const char* lead = i->frames ? "NatNet frames stopped" : "no NatNet frames";
-        if (i->multicast[0])
+        if (i->stream_known && !i->stream_multicast) {
+            snprintf(buf, cap, "%s: Motive reports Transmission Type Unicast, and this client only receives multicast. "
+                               "Set it to Multicast in Motive's streaming settings", lead);
+        } else if (i->last_other_msg >= 0 && i->frames == 0) {
+            snprintf(buf, cap, "%s on UDP %u, but %llu other datagrams arrived (last message id %d)",
+                     lead, (unsigned)i->data_port, (unsigned long long)i->datagrams, i->last_other_msg);
+        } else if (i->socket_errors) {
+            snprintf(buf, cap, "%s on UDP %u: the receive socket reports errors (%llu)",
+                     lead, (unsigned)i->data_port, (unsigned long long)i->socket_errors);
+        } else if (i->stream_known) {
+            snprintf(buf, cap, "%s on UDP %u: Motive says it streams multicast to %s, and nothing reaches %s. Check Motive's "
+                               "Local Interface is on this network, then the switch (capture UDP %u on this adapter), then the firewall",
+                     lead, (unsigned)i->data_port, i->multicast, i->iface[0] ? i->iface : "the OS default adapter", (unsigned)i->data_port);
+        } else if (i->multicast[0])
             snprintf(buf, cap, "%s on UDP %u: check that Motive streams multicast to %s (not unicast), that the firewall "
                                "allows this program, and that %s is on Motive's network",
                      lead, (unsigned)i->data_port, i->multicast, i->iface[0] ? i->iface : "the OS default adapter");
@@ -738,9 +810,10 @@ void natnet_explain(const NatNetInfo* i, char* buf, size_t cap) {
 }
 
 void natnet_describe(const NatNetInfo* i, char* buf, size_t cap) {
-    char ver[120], where[120];
+    char ver[120], where[256];
     if (i->handshake_ok)
-        snprintf(ver, sizeof ver, "NatNet %d.%d from Motive at %s", i->major, i->minor, i->server);
+        snprintf(ver, sizeof ver, "NatNet %d.%d from Motive %u.%u.%u.%u at %s", i->major, i->minor,
+                 i->server_version[0], i->server_version[1], i->server_version[2], i->server_version[3], i->server);
     else if (!i->version_from_frame)
         snprintf(ver, sizeof ver, "NatNet %d.%d from the config, no handshake reply from %s", i->major, i->minor,
                  i->server[0] ? i->server : "(no server set)");
@@ -748,10 +821,14 @@ void natnet_describe(const NatNetInfo* i, char* buf, size_t cap) {
         snprintf(ver, sizeof ver, "NO HANDSHAKE REPLY from %s: the NatNet version comes from the frames", i->server);
     else
         snprintf(ver, sizeof ver, "no Motive IP set: the NatNet version comes from the frames");
-    if (!i->multicast[0])
+    if (i->stream_known && !i->stream_multicast)
+        snprintf(where, sizeof where, "MOTIVE IS STREAMING UNICAST, and this client only receives multicast");
+    else if (!i->multicast[0])
         snprintf(where, sizeof where, "no multicast group, listening on UDP %u", (unsigned)i->data_port);
     else
-        snprintf(where, sizeof where, "multicast %s on %s", i->multicast, i->iface[0] ? i->iface : "the OS default adapter");
+        snprintf(where, sizeof where, "multicast %s:%u%s%s%s on %s", i->multicast, (unsigned)i->data_port,
+                 i->asked[0] ? " (Motive's settings, not the " : "", i->asked, i->asked[0] ? " asked for)" : "",
+                 i->iface[0] ? i->iface : "the OS default adapter");
     snprintf(buf, cap, "%s; %s", ver, where);
 }
 
@@ -774,10 +851,8 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * pose.h's payload is atomic, and the slot stays "never published" either way (seq == 0). */
     atomic_store_explicit(&nn->pose.q[3], 1.0f, memory_order_relaxed);
 
+    atomic_store_explicit(&nn->last_other_msg, -1, memory_order_relaxed);
     if (!nn_check_addrs(cfg, err, errcap)) goto fail;
-    nn_copy_ip(nn->server, cfg->server);
-    nn_copy_ip(nn->multicast, cfg->multicast);
-    nn->data_port = cfg->data_port ? cfg->data_port : 1511;
 
     /* Bitstream version. The server knows its own version, so when one is configured the
      * handshake is authoritative — it can't be desynced by a wrong version override (a
@@ -785,11 +860,13 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * a fallback for a pure multicast listen with no command channel. With neither, the receiver
      * reads the layout off the frames: no fixed guess can be right, because 3.1 never parses the
      * 4.x stream every Motive since 3.0 sends and 4.1 never parses a 3.x one. */
-    nn->major = 0; nn->minor = 0;
-    uint64_t clock_freq = 0;
-    if (cfg->server && cfg->server[0]) nn->handshake_ok = handshake_version(cfg, &nn->major, &nn->minor, &clock_freq);
-    if (!nn->handshake_ok) { nn->major = cfg->major > 0 ? cfg->major : 0; nn->minor = cfg->major > 0 ? cfg->minor : 0; clock_freq = 0; }
-    nn->version_from_frame = nn->major <= 0;
+    NNServerInfo si;
+    const bool answered = handshake_info(cfg, &si);
+    nn->major = answered ? si.major : (cfg->major > 0 ? cfg->major : 0);
+    nn->minor = answered ? si.minor : (cfg->major > 0 ? cfg->minor : 0);
+    const uint64_t clock_freq = answered ? si.clock_freq : 0;
+    const NatNetConfig stream = nn_follow_server(cfg, &si, answered, &nn->conn);
+    nn->conn.version_from_frame = nn->major <= 0;
     atomic_store_explicit(&nn->version, nn->major << 8 | nn->minor, memory_order_relaxed);
 
     /* Pose stamp policy, fixed for the connection (see the NN_STAMP_* enum): the frame suffix's
@@ -826,7 +903,7 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
         nn->rigid_body = id;
     }
 
-    nn->sock = nn_open_data_socket(cfg, nn->iface, err, errcap);
+    nn->sock = nn_open_data_socket(&stream, nn->conn.iface, err, errcap);
     if (nn->sock == OS_INVALID_SOCKET) goto fail;
 
     if (os_thread_create(&nn->thread, receiver, nn) != 0) {
@@ -861,9 +938,8 @@ void natnet_close(NatNet* nn) {
 struct NatNetRaw {
     os_socket sock;
     int       major, minor;
-    bool      handshake_ok;
+    NatNetInfo conn;               /* how it connected, fixed at open */
     char      server[64];          /* copied: the caller's config need not outlive the open */
-    char      iface[NATNET_IP_MAX];
     uint16_t  command_port;
     uint8_t   pkt[65536];          /* one whole datagram (max UDP); heap-resident with the session */
 };
@@ -882,10 +958,14 @@ NatNetRaw* natnet_raw_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     r->command_port = cfg->command_port ? cfg->command_port : 1510;
 
     /* the same version policy as natnet_open: the handshake, else the config, else the frames */
-    if (r->server[0]) r->handshake_ok = handshake_version(cfg, &r->major, &r->minor, NULL);
-    if (!r->handshake_ok) { r->major = cfg->major > 0 ? cfg->major : 0; r->minor = cfg->major > 0 ? cfg->minor : 0; }
+    NNServerInfo si;
+    const bool answered = handshake_info(cfg, &si);
+    r->major = answered ? si.major : (cfg->major > 0 ? cfg->major : 0);
+    r->minor = answered ? si.minor : (cfg->major > 0 ? cfg->minor : 0);
+    const NatNetConfig stream = nn_follow_server(cfg, &si, answered, &r->conn);
+    r->conn.version_from_frame = r->major <= 0;
 
-    r->sock = nn_open_data_socket(cfg, r->iface, err, errcap);
+    r->sock = nn_open_data_socket(&stream, r->conn.iface, err, errcap);
     if (r->sock == OS_INVALID_SOCKET) { free(r); os_net_cleanup(); return NULL; }
     return r;
 }
@@ -895,8 +975,16 @@ void natnet_raw_version(const NatNetRaw* r, int* major, int* minor) {
     if (minor) *minor = r ? r->minor : 0;
 }
 
-bool natnet_raw_handshake_ok(const NatNetRaw* r) { return r && r->handshake_ok; }
-const char* natnet_raw_iface(const NatNetRaw* r) { return r ? r->iface : ""; }
+bool natnet_raw_handshake_ok(const NatNetRaw* r) { return r && r->conn.handshake_ok; }
+
+void natnet_raw_info(const NatNetRaw* r, NatNetInfo* out) {
+    memset(out, 0, sizeof *out);
+    out->last_other_msg = -1;
+    if (!r) return;
+    *out = r->conn;
+    out->last_other_msg = -1;
+    out->major = r->major; out->minor = r->minor;
+}
 
 int natnet_raw_modeldef(NatNetRaw* r, uint8_t* buf, size_t cap) {
     if (!r || !r->server[0] || !buf) return -1;

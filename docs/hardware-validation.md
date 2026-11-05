@@ -653,13 +653,16 @@ The Placement panel and the console print one line that names the failure.
 
 | The line says | Check |
 |---|---|
-| `no NatNet frames` | Motive's Transmission Type is Multicast. The firewall allows this program. The adapter it names is on Motive's network |
+| `Transmission Type Unicast` | Set it to Multicast in Motive's streaming settings |
+| `Motive says it streams multicast` | Motive's Local Interface is on this network, not its camera network. Then capture `udp.port == <port>` on this adapter: no packets means Motive, the switch, or a PC bridge in the path (below), packets mean this machine |
+| `other datagrams arrived` | Something else uses that port. Report the message id |
+| `no NatNet frames` with no handshake | The IP is right and NatNet streaming is on in Motive. VRPN can work with it off |
 | `do not parse as NatNet` | The version on the `track:` line against Motive's. Report it: this is a bug |
 | `is not in them` | The streaming ID in Motive's rigid-body properties, and the body is enabled |
 | `untracked` | The markers are in view of the cameras. Motive shows the body solid |
 | `none holds a rigid body` or `hold no rigid body` | Rigid Bodies is on in Motive's streaming settings |
 
-Three facts behind that table:
+Facts behind that table:
 
 - **Firewall rules are per executable.** Windows treats each copy of a tool at a new path as a new
   program, and a tool can read Motive's handshake and still lose every frame, because the handshake is
@@ -669,9 +672,17 @@ Three facts behind that table:
   ```
   A Block rule on a tool overrides this. Delete those rules in Windows Defender Firewall.
 - **The tools do not speak unicast.** A client built on the NatNet SDK can work in unicast while these
-  tools get nothing.
+  tools get nothing. Motive's handshake reply says which mode it is in, and the tools read it.
+- **Motive's reply also names its group and data port.** The tools follow them over
+  `--natnet-multicast` and print both on the `track:` line.
 - **`netsh interface ipv4 show joins`** shows which adapter holds `239.255.42.99` while a tool is
   connected. `--natnet-local` changes it.
+- **A PC bridge can pass commands and drop frames.** On the rig, the client machines first reached
+  Motive through a network bridge on the Motive PC. The handshake and the data descriptions crossed
+  it, the live frames did not, and the NatNet SDK's own `SampleClient` failed the same way. An
+  unmanaged switch fixed it. To split Motive from the path, run `SampleClient` (in the SDK's
+  `Samples\bin\x64`) on the Motive PC itself: frames there and none on the client means the path
+  between them, not Motive and not these tools.
 
 To see every body Motive sends, map the one you want and read the report:
 

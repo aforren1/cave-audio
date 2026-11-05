@@ -581,8 +581,13 @@ int main(int argc, char** argv) {
         nmodel = natnet_raw_modeldef(raw, g_buf, sizeof g_buf);
         printf("source: Motive at %s (NatNet %d.%d), multicast %s\n", a.nc.server, major, minor,
                a.nc.multicast ? a.nc.multicast : "(none)");
-        if (a.nc.multicast && a.nc.multicast[0])
-            printf("  group joined on %s\n", natnet_raw_iface(raw)[0] ? natnet_raw_iface(raw) : "the OS default adapter");
+        {
+            NatNetInfo info;
+            char conn[280];
+            natnet_raw_info(raw, &info);
+            natnet_describe(&info, conn, sizeof conn);
+            printf("  %s\n", conn);
+        }
         if (!natnet_raw_handshake_ok(raw))
             printf("warning: no handshake reply from %s, so the NatNet version above is not Motive's own\n", a.nc.server);
         if (nmodel < 0) { printf("error: no model definitions from %s (is Motive streaming? right --server?)\n", a.nc.server); natnet_raw_close(raw); return 2; }

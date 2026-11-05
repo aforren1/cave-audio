@@ -938,7 +938,9 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   (`os_udp_route_local_ipv4`), the version comes off the frames when nothing else says
   (`natnet_sniff_version`; a frame with no body gets no vote, because empty sections read the same in both
   layouts, and the suffix stamps stay off since it only knows "4.1 or later"), and `natnet_explain` is the
-  line every tool prints. `test_natnet` drives the real socket path on loopback against a fake Motive;
+  line every tool prints. NAT_SERVERINFO also carries sSender_Server's DataPort, IsMulticast and group, and
+  the handshake ignored them for years: a Motive on unicast or a moved port connects fine and then sends
+  nothing here. A multicast session now follows them. `test_natnet` drives the real socket path on loopback against a fake Motive;
   only multicast delivery itself still needs a rig. Unverified against live Motive 3.3.4.1.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
