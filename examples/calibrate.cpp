@@ -109,6 +109,7 @@ static MicTrack  g_mt;                    /* static: it carries an atomic; main 
 static int       g_tracked, g_track_sim;
 static float     g_tol_m = PLACE_TOL_DEFAULT_M;
 static double    g_place_timeout = 300.0;
+static double    g_clear_s = -1.0;        /* --place-clear-s; < 0 = the default for this run */
 static MicPlaced g_placed;
 static float     g_taken[3];              /* the center the current placement took */
 static float     g_sim_at[3];             /* --track-sim: the true center the next capture comes from */
@@ -136,12 +137,28 @@ static float loose_tol_m(void) { return g_tol_m > LOCALIZE_TOL_M ? g_tol_m : LOC
  * says why a miss costs nothing; NULL = the strict gate. turn_limit_deg > 0: a direction mode, whose
  * gate also waits for the orientation to hold still and whose bump check stops on a turn.
  * Returns 0, or 1 (timed out). */
+static double clear_seconds(void) { return g_clear_s >= 0.0 ? g_clear_s : mic_track_default_clear(g_track_sim); }
+
+/* The untracked rows' stop. Enter pressed during the last row's sweeps would otherwise answer this prompt
+ * and take the next row with the mic still at the old spot, and no check could tell. */
+static void place_by_hand(const float p[3]) {
+    while (_kbhit()) (void)_getch();
+    printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", p[0], p[1], p[2]);
+    fflush(stdout);
+    getchar();
+    const double s = clear_seconds();
+    if (s > 0.0) {
+        printf("  clear the space: the sweeps start in %.0f s\n", s);
+        std::this_thread::sleep_for(std::chrono::duration<double>(s));
+    }
+}
+
 static int track_place(const float target[3], const char* loose_why, const char* what, float mic_out[3], float turn_limit_deg) {
     PlaceCfg cfg;
     place_cfg_default(&cfg, loose_why ? loose_tol_m() : g_tol_m);
     if (turn_limit_deg > 0.f) place_cfg_direction(&cfg, turn_limit_deg);
     g_turn_limit = turn_limit_deg > 0.f ? turn_limit_deg : 0.f;
-    if (mic_track_place_console(&g_mt, target, &cfg, g_place_timeout, !g_track_sim, what, &g_placed)) return 1;
+    if (mic_track_place_console(&g_mt, target, &cfg, g_place_timeout, !g_track_sim, clear_seconds(), what, &g_placed)) return 1;
     memcpy(mic_out, g_placed.center, sizeof g_placed.center);
     memcpy(g_taken, g_placed.center, sizeof g_taken);
     if (loose_why && g_placed.dist_m > g_tol_m)
@@ -1525,6 +1542,12 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "calibrate: --place-timeout wants seconds, 1 to 86400 (got %s)\n", argv[i]); return 2; }
             g_place_timeout = v; timeout_set = 1;
         }
+        else if (!strcmp(argv[i],"--place-clear-s") && i+1<argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 0.0 && v <= 120.0)) {
+                fprintf(stderr, "calibrate: --place-clear-s wants seconds, 0 to 120 (got %s)\n", argv[i]); return 2; }
+            g_clear_s = v;
+        }
         else if (!strcmp(argv[i],"--mount-offset") && i+1<argc) {   /* "ring" or "x,y,z" (body axes, m) */
             const char* s = argv[++i];
             if (!strcmp(s, "ring")) mount_ring = 1;
@@ -1583,7 +1606,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] [--natnet-local ip] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] [--natnet-local ip] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--place-clear-s s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
                                "  --zylia: the mic is a ZM-1; --input is the FIRST of its 19 consecutive capture channels,\n"
                                "  --mic is the array center. Alone it is the single-placement position survey: distances\n"
                                "  need --latency (loopback, m at c) or --ref <spk> <m> (one tape-measured center->speaker\n"
@@ -1646,7 +1669,7 @@ int main(int argc, char** argv) {
                                "  a room DIRECTION need a body-frame survey: the --zylia survey, and the --live position readout.\n"
                                "  --natnet-server is REQUIRED to track by name. --natnet-local names this machine's IP on Motive's\n"
                                "  network, when the adapter routing to --natnet-server is the wrong one to join the multicast group\n"
-                               "  on. On the rig a key takes the current reading anyway,\n"
+                               "  on. On the rig F takes the current reading anyway,\n"
                                "  with a warning; --place-timeout s (default 300) aborts the wait. Unverified against live Motive.\n"
                                "  --track-sim (simulate only): a scripted stand walks in from 8 cm off the target, settles about\n"
                                "  5 mm off it, and the captures come from its TRUE center; --track-sim-bump N knocks it 15 mm\n"
@@ -2169,7 +2192,7 @@ int main(int argc, char** argv) {
 #endif
                     return 1;
                 }
-            } else if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
+            } else if (!simulate) place_by_hand(micpos[k]);
             if (sim_step_row && k + 1 == sim_step_row) {
                 calib_sim_set_latency_step(sim_step_s);
                 printf("localize: simulate: from row %d on, every speaker plays %+.3f ms later (--sim-latency-step)\n",
@@ -2888,7 +2911,7 @@ int main(int argc, char** argv) {
                 if (track_place(rq_rows[k], "the grid key", what, mic, 0.f)) { rc = 1; break; }
             } else {
                 memcpy(mic, rq_rows[k], sizeof mic);
-                if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", mic[0], mic[1], mic[2]); fflush(stdout); getchar(); }
+                if (!simulate) place_by_hand(mic);
             }
             memcpy(keys[k], mic, sizeof keys[k]);              /* P.c.sim_at points at mic (or g_sim_at) */
             printf("%s: grid key (%.4f %.4f %.4f)%s\n", what, mic[0], mic[1], mic[2],

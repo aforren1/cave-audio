@@ -140,6 +140,22 @@ PlaceState place_gate_update(PlaceGate* g, double t, const float center[3], cons
     return place_gate_update_q(g, t, center, NULL, target);
 }
 
+int place_clear_step(double* end_t, double t, int gate_open, double clear_s) {
+    if (!end_t) return 0;
+    if (!gate_open || !(clear_s > 0.0)) { *end_t = -1.0; return 0; }
+    if (*end_t < 0.0) *end_t = t + clear_s;
+    return t < *end_t;
+}
+
+PlaceKey place_key_action(int key, PlaceState st) {
+    if (key == '\r' || key == '\n') return st == PLACE_OK ? PLACE_KEY_GO : PLACE_KEY_NONE;
+    if (key == 'f' || key == 'F') {
+        if (st == PLACE_NO_POSE) return PLACE_KEY_ABORT;
+        return st == PLACE_OK ? PLACE_KEY_GO : PLACE_KEY_FORCE;
+    }
+    return PLACE_KEY_NONE;
+}
+
 PlaceState place_gate_update_q(PlaceGate* g, double t, const float center[3], const float q[4], const float target[3]) {
     if (!g) return PLACE_NO_POSE;
     double uq[4];

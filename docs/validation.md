@@ -548,7 +548,7 @@ tolerance, 10 mm. At the 1.4 m source radius that is 0.4° of direction, a fifth
 the published chamber measurement reports (see "The physical reference arm"). A placement with a full knob sweep can take an hour, and a tighter limit would stop
 it for creep no result can resolve.
 
-On the rig a key takes the current reading anyway, with a warning. With no live pose it skips that
+On the rig `F` takes the current reading anyway, with a warning. With no live pose it skips that
 placement. `--place-timeout <s>` (default 300) gives up on a gate that never opens and also skips the
 placement. A skipped placement is reported, never measured from a guess.
 
@@ -1052,6 +1052,7 @@ through different capsules, which separates capsule error from field structure f
 | `--mount-offset x,y,z` or `ring` | the body origin to the array center, body axes, meters; only beside a body-frame survey that carries no offset. See "The mount offset" |
 | `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it, and the turn limit is the same budget at `--radius` (0.41° at the defaults) |
 | `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
+| `--place-clear-s <s>` | count this long once the gate opens, in place of waiting for Enter. 0 starts at once. With no console the default is 5 |
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
 | `--natnet-local <ip>` | this machine's IP on Motive's network (default: the adapter that routes to `--natnet-server`) |

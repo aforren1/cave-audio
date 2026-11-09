@@ -469,6 +469,38 @@ static void ring_markers(const double c[3], const double n[3], double r, const d
     }
 }
 
+/* The count restarts on a shut gate: otherwise a stand knocked on the way out is measured anyway. */
+static void test_clear(void) {
+    double e = -1.0;
+    CHECK(place_clear_step(&e, 10.0, 0, 5.0) == 0 && e < 0.0, "clear: a shut gate does not start the count");
+    CHECK(place_clear_step(&e, 10.0, 1, 5.0) == 1, "clear: an open gate starts it");
+    CHECK(place_clear_step(&e, 14.9, 1, 5.0) == 1, "clear: still counting before the end");
+    CHECK(place_clear_step(&e, 15.0, 1, 5.0) == 0, "clear: done at the end");
+    e = -1.0;
+    CHECK(place_clear_step(&e, 20.0, 1, 5.0) == 1, "clear: second run starts");
+    CHECK(place_clear_step(&e, 24.0, 0, 5.0) == 0 && e < 0.0, "clear: a shut gate drops the count");
+    CHECK(place_clear_step(&e, 24.5, 1, 5.0) == 1, "clear: reopening starts again");
+    CHECK(place_clear_step(&e, 29.4, 1, 5.0) == 1, "clear: the full count, not the remainder");
+    CHECK(place_clear_step(&e, 29.5, 1, 5.0) == 0, "clear: done after the full restart");
+    e = -1.0;
+    CHECK(place_clear_step(&e, 30.0, 1, 0.0) == 0 && e < 0.0, "clear: 0 s is off");
+    CHECK(place_clear_step(NULL, 30.0, 1, 5.0) == 0, "clear: NULL state");
+}
+
+/* A stray key must do nothing: that is the defect this replaced. */
+static void test_keys(void) {
+    CHECK(place_key_action(0, PLACE_OK) == PLACE_KEY_NONE, "key: no key");
+    CHECK(place_key_action('x', PLACE_MOVING) == PLACE_KEY_NONE, "key: a stray key on a shut gate does nothing");
+    CHECK(place_key_action('x', PLACE_OK) == PLACE_KEY_NONE, "key: a stray key on an open gate does not start");
+    CHECK(place_key_action('\r', PLACE_MOVING) == PLACE_KEY_NONE, "key: Enter on a shut gate does nothing");
+    CHECK(place_key_action('\r', PLACE_OK) == PLACE_KEY_GO, "key: Enter on an open gate starts");
+    CHECK(place_key_action('f', PLACE_MOVING) == PLACE_KEY_FORCE, "key: f overrides a shut gate");
+    CHECK(place_key_action('F', PLACE_MOVING) == PLACE_KEY_FORCE, "key: F overrides a shut gate");
+    CHECK(place_key_action('f', PLACE_OK) == PLACE_KEY_GO, "key: f on an open gate is a clean start, not a forced one");
+    CHECK(place_key_action('f', PLACE_NO_POSE) == PLACE_KEY_ABORT, "key: f with no pose aborts");
+    CHECK(place_key_action('\r', PLACE_NO_POSE) == PLACE_KEY_NONE, "key: Enter with no pose does nothing");
+}
+
 static void test_ring(void) {
     PlaceRing r;
     float mk[16][3];
@@ -582,11 +614,13 @@ int main(void) {
     test_turn_limits();
     test_bump_pose();
     test_gate_turn();
+    test_clear();
+    test_keys();
     CHECK(strcmp(place_state_name(PLACE_OK), "OK") == 0 && strcmp(place_state_name((PlaceState)99), "no pose") == 0,
           "state names");
     if (fails) { printf("placement_test: %d FAILURES\n", fails); return 1; }
     printf("placement_test OK (center under rotation + offset, ring fit, refusals, mount angles, defaults, stillness, "
            "gate settle + jolt, tolerance edges, NaN gate, bump, turn angle, turn limits, orientation bump, "
-           "orientation gate, move words)\n");
+           "orientation gate, move words, clear count, keys)\n");
     return 0;
 }

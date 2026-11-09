@@ -11,7 +11,8 @@
 #include <string.h>
 #include <thread>
 #ifdef _WIN32
-#include <conio.h>         /* _kbhit/_getch: a key takes the reading */
+#include <conio.h>         /* _kbhit/_getch: Enter starts the sweeps, F overrides the gate */
+#include <io.h>            /* _isatty: is there a console to press a key on */
 #endif
 
 static void set_err(char* err, size_t cap, const char* m) { if (err && cap) snprintf(err, cap, "%s", m); }
@@ -415,23 +416,46 @@ static void sleep_poll(MicTrack* T) {
     else std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-static int key_hit(void) {
+static int key_read(void) {
 #ifdef _WIN32
-    if (_kbhit()) { (void)_getch(); return 1; }
+    if (_kbhit()) {
+        const int c = _getch();
+        if (c == 0 || c == 0xE0) { (void)_getch(); return 0; }   /* an arrow or function key is two codes */
+        return c;
+    }
 #endif
     return 0;
 }
 
+double mic_track_default_clear(int sim) {
+    if (sim) return 0.0;
+#ifdef _WIN32
+    if (_isatty(_fileno(stdin))) return MIC_TRACK_CLEAR_KEY;
+#endif
+    return MIC_TRACK_CLEAR_S;
+}
+
+/* A key pressed during the previous row's sweeps waits in the console buffer. Left there, it answers the
+ * NEXT wait before the operator has moved: a forced reading at the old spot, or an abort with no pose. */
+static void keys_drain(void) {
+#ifdef _WIN32
+    while (_kbhit()) (void)_getch();
+#endif
+}
+
 int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* cfg, double timeout_s,
-                            int keys, const char* what, MicPlaced* out) {
+                            int keys, double clear_s, const char* what, MicPlaced* out) {
     PlaceGate g;
     place_gate_init(&g, cfg);
     const int dir = g.cfg.still_deg > 0.f;                    /* a direction mode: the orientation counts */
     mic_track_sim_target(T, target);
-    const double t0 = mic_track_now(T);
+    double t0 = mic_track_now(T);
     double last_print = -1.0;
     MicPose ps; int have = 0;
+    const int wait_key = keys && clear_s < 0.0;
     char why[320] = "";                                       /* printed when it changes, not every 100 ms */
+    double clear_end = -1.0;                                  /* place_clear_step's state */
+    int announced = 0;
     char tol[48];
     if (g.cfg.tol_m > 0.f) snprintf(tol, sizeof tol, "%.1f mm", g.cfg.tol_m * 1e3);
     else                   snprintf(tol, sizeof tol, "none (accept on stillness)");
@@ -439,12 +463,28 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
     if (dir) snprintf(turn, sizeof turn, " and turning under %.2f deg", g.cfg.still_deg);
     printf("placement: %s: target (%.3f %.3f %.3f), tolerance %s, still within %.1f mm%s for %.1f s, then hold %.1f s\n",
            what, target[0], target[1], target[2], tol, g.cfg.still_m * 1e3, turn, g.cfg.window_s, g.cfg.hold_s);
-    if (keys) printf("placement:   press a key to take the current reading anyway\n");
+    if (keys) {
+        keys_drain();
+        printf("placement:   press F to take the current reading anyway\n");
+    }
     for (;;) {
         const double t = mic_track_now(T);
         have = mic_track_read(T, &ps);
         const PlaceState st = place_gate_update_q(&g, t, have ? ps.center : NULL, have ? ps.q : NULL, target);
-        if (last_print < 0.0 || t - last_print >= 0.1 || st == PLACE_OK) {
+        const int clearing = place_clear_step(&clear_end, t, st == PLACE_OK, clear_s);
+        const int awaiting = wait_key && st == PLACE_OK;
+        if (clearing && !announced) {
+            printf("\nplacement: clear the space: the sweeps start in %.0f s (a knocked stand restarts the count)\n", clear_s);
+            announced = 1;
+        }
+        if (awaiting && !announced) {
+            printf("\nplacement: settled. Clear the space, then press Enter to start the sweeps\n");
+            announced = 1;
+        }
+        if (st != PLACE_OK) announced = 0;
+        char clear_txt[24];
+        snprintf(clear_txt, sizeof clear_txt, "clear %.1fs", clear_end - t);
+        if (last_print < 0.0 || t - last_print >= 0.1 || (st == PLACE_OK && !clearing && !awaiting)) {
             last_print = t;
             if (st == PLACE_NO_POSE) {
                 char now_why[320];
@@ -463,19 +503,21 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
                 printf("\r  center (%+.3f %+.3f %+.3f)  target (%+.3f %+.3f %+.3f)  dx %+6.1f dy %+6.1f dz %+6.1f mm  |d| %5.1f mm%s  %s %-10s",
                        g.center[0], g.center[1], g.center[2], target[0], target[1], target[2],
                        g.delta[0] * 1e3, g.delta[1] * 1e3, g.delta[2] * 1e3, g.dist_m * 1e3, yaw,
-                       st == PLACE_OK ? "OK  " : "HOLD", st == PLACE_OK ? "" : place_gate_reason(&g));
+                       st == PLACE_OK ? "OK  " : "HOLD", clearing ? clear_txt : awaiting ? "press Enter" : st == PLACE_OK ? "" : place_gate_reason(&g));
             }
             fflush(stdout);
         }
-        int forced = 0;
-        if (st != PLACE_OK && keys && key_hit()) {
-            if (st == PLACE_NO_POSE) {
-                printf("\nplacement: aborted: a key with no live pose to take\n");
+        int forced = 0, go = !wait_key;
+        if (keys) {                                           /* read every pass, so a key pressed during HOLD is spent */
+            const PlaceKey k = place_key_action(key_read(), st);
+            if (k == PLACE_KEY_ABORT) {
+                printf("\nplacement: aborted: F with no live pose to take\n");
                 return 1;
             }
-            forced = 1;
+            forced = k == PLACE_KEY_FORCE;
+            if (k == PLACE_KEY_GO) go = 1;
         }
-        if (st == PLACE_OK || forced) {
+        if ((st == PLACE_OK && !clearing && go) || forced) {
             /* forced before the window filled: the latest center is all there is */
             const float* c = (g.n >= 3) ? g.mean : g.center;
             memcpy(out->center, c, sizeof out->center);
@@ -498,8 +540,13 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             float tru[3];
             if (mic_track_sim_truth(T, tru))
                 printf("track-sim: true center (%.4f %.4f %.4f)\n", tru[0], tru[1], tru[2]);
+            if (forced && clear_s > 0.0) {                    /* the reading is taken, the operator still has to leave */
+                printf("placement: clear the space: the sweeps start in %.0f s\n", clear_s);
+                for (const double end = mic_track_now(T) + clear_s; mic_track_now(T) < end; ) sleep_poll(T);
+            }
             return 0;
         }
+        if (st == PLACE_OK) t0 = t;                           /* the timeout bounds a gate that never opens, not the walk out */
         if (t - t0 > timeout_s) {
             printf("\nplacement: timed out after %.0f s (%s): the ZM-1 never sat %s and still for %.1f s.\n"
                    "           Check the rigid body, the target and the tolerance (--place-tol-mm), or raise\n"

@@ -291,7 +291,8 @@ typedef struct {
     float      tol_m;                       /* the gate's tolerance; the bump limit is half of it */
     float      turn_limit_deg;              /* the bump check's turn limit (place_turn_limit_deg) */
     double     timeout_s;
-    int        keys;                        /* on the rig a key takes the current reading anyway */
+    int        keys;                        /* on the rig F takes the current reading anyway */
+    double     clear_s;                     /* the count between an open gate and the reading */
     int        sim;                         /* --track-sim: sync the true center after every read */
     MicPlaced  placed;
     float      taken[3];                    /* the center the current placement took */
@@ -315,7 +316,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
     place_cfg_direction(&cfg, T->turn_limit_deg);           /* a direction mode: the orientation must hold too */
     char what[48];
     snprintf(what, sizeof what, "position %d", li + 1);
-    if (mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, what, &T->placed)) {
+    if (mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, T->clear_s, what, &T->placed)) {
         fprintf(stderr, "  no settled, LIVE pose for the tracked rigid body - refusing to measure this\n"
                         "  placement from a guess\n");
         return 0;
@@ -688,6 +689,7 @@ int main(int argc, char** argv) {
     int track_sim_twist = 0;         /* --track-sim-twist N: turn it about the array center after the Nth */
     float place_tol_m = VAL_PLACE_TOL_M;
     double place_timeout = 300.0;
+    double place_clear_s = -1.0;           /* < 0 = the default for this run */
     int tol_set = 0, timeout_set = 0;
     int mount_ring = 0, mount_off_set = 0;   /* --mount-offset ring | x,y,z */
     float mount_off[3] = { 0.f, 0.f, 0.f };
@@ -757,6 +759,12 @@ int main(int argc, char** argv) {
             if (end == argv[i] || *end || !(v >= 1.0 && v <= 86400.0)) {
                 fprintf(stderr, "--place-timeout wants seconds, 1 to 86400 (got %s)\n", argv[i]); return 2; }
             place_timeout = v; timeout_set = 1;
+        }
+        else if (!strcmp(argv[i], "--place-clear-s") && i+1 < argc) {
+            char* end = NULL; double v = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || !(v >= 0.0 && v <= 120.0)) {
+                fprintf(stderr, "--place-clear-s wants seconds, 0 to 120 (got %s)\n", argv[i]); return 2; }
+            place_clear_s = v;
         }
         else if (!strcmp(argv[i], "--mount-offset") && i+1 < argc) {   /* "ring" or "x,y,z" (body axes, m) */
             const char* s = argv[++i];
@@ -909,8 +917,9 @@ int main(int argc, char** argv) {
                    "                        --natnet-server; assumes the ring sits at the array\n"
                    "                        center's height)\n"
                    "  --place-tol-mm <mm>   placement tolerance (default 20); the bump limit is half\n"
+                   "  --place-clear-s <s>   count this long once the gate opens, in place of waiting for Enter\n"
                    "  --place-timeout <s>   give up on a placement's gate after this (default 300);\n"
-                   "                        the placement is skipped. On the rig a key takes the\n"
+                   "                        the placement is skipped. On the rig F takes the\n"
                    "                        current reading anyway, with a warning\n"
                    "  --natnet-server <ip>  Motive host; REQUIRED to --track by name (the streaming id\n"
                    "                        is resolved from Motive's model definitions)\n"
@@ -1162,6 +1171,7 @@ int main(int argc, char** argv) {
         trk.turn_limit_deg = place_turn_limit_deg(place_tol_m, radius);   /* the directions are read at the radius */
         trk.timeout_s = place_timeout;
         trk.keys = !track_sim;
+        trk.clear_s = place_clear_s >= 0.0 ? place_clear_s : mic_track_default_clear(track_sim);
         trk.sim = track_sim;
         if (track_sim && !survey_path)
             printf("track self-check: no --survey, using the built-in capsule table as the body frame\n");

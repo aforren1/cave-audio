@@ -152,11 +152,22 @@ struct MicPlaced {
 /* Wait for the gate on a live single-line readout (console \r updates): the measured center, the
  * target, dx/dy/dz and the total in mm, and HOLD or OK. A direction mode (cfg->still_deg > 0, see
  * place_cfg_direction) also shows the mount's yaw and holds while the stand turns ("turning"). keys != 0
- * (the rig): a key takes the current reading anyway, with a warning; with no pose at all it aborts.
+ * (the rig): F takes the current reading anyway, with a warning; with no pose at all it aborts.
+ * clear_s > 0: once the gate opens, count this long before taking the reading (place_clear_step).
+ * clear_s = MIC_TRACK_CLEAR_KEY: once the gate opens, wait for Enter (needs keys != 0).
  * Returns 0 placed (out filled, the capsule table re-aimed when it can be), 1 timed out or aborted (the
  * reason printed). */
 int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* cfg, double timeout_s,
-                            int keys, const char* what, MicPlaced* out);
+                            int keys, double clear_s, const char* what, MicPlaced* out);
+
+/* Leaving the space matters: a body beside the array is a reflector the sweep measures, and footsteps are
+ * what the noise floor check refuses. With a console the operator says when they have left. With none
+ * (calib_view's Session tab runs the tools with no console, so no key can ever arrive) a wait for Enter
+ * would hang until the timeout, so that path counts instead. */
+#define MIC_TRACK_CLEAR_S   5.0
+#define MIC_TRACK_CLEAR_KEY (-1.0)
+/* The clear_s a run gets when the command line does not set one. sim: 0. */
+double mic_track_default_clear(int sim);
 
 /* The bump check after one capture: note it, read the pose, place_bump_pose against the center and the
  * orientation the run took. turn_limit_deg <= 0 (or q_taken NULL) is center only, for the modes that

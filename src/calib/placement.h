@@ -186,6 +186,19 @@ PlaceState place_gate_update_q(PlaceGate* g, double t, const float center[3], co
  * place_state_name(g->state). */
 const char* place_gate_reason(const PlaceGate* g);
 
+/* The countdown between an open gate and the reading being taken, so whoever placed the stand can leave
+ * before the sweeps start. The gate keeps running through it and the reading comes from its END: a stand
+ * knocked on the way out closes the gate and restarts the count, and the center taken is the one left
+ * standing, not the one the operator's hand was still near. *end_t is the state (start it at -1). Returns
+ * 1 while the count runs; 0 when it has finished, the gate is shut, or clear_s <= 0. */
+int place_clear_step(double* end_t, double t, int gate_open, double clear_s);
+
+/* What a console key means during a placement wait. Only Enter starts the sweeps, and only on an open
+ * gate; only F overrides a shut one. Any other key is nothing, because a stray key during the sweeps
+ * used to take a reading at the old spot. F with no pose has no reading to take, so it aborts. */
+typedef enum { PLACE_KEY_NONE, PLACE_KEY_GO, PLACE_KEY_FORCE, PLACE_KEY_ABORT } PlaceKey;
+PlaceKey place_key_action(int key, PlaceState st);
+
 /* The bump check: did the center move more than half the tolerance between the center a run took
  * (`taken`) and now? Returns 1 = bumped, 0 = in place, -1 = cannot tell (a refused input or a
  * non-positive tolerance). moved_m (NULL ok) gets the distance when both inputs are usable. Half the

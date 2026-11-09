@@ -832,6 +832,10 @@ elseif(MODE STREQUAL "track_bump")
   endif()
   # the same knock on --verify
   run(vbump 4 --layout "${LAYOUT}" ${SIM} --zylia --verify --track-sim --track-sim-bump 3)
+  # the count between the open gate and the reading actually runs in the placement wait
+  run(clearcount 4 --layout "${LAYOUT}" ${SIM} --zylia --verify --track-sim --track-sim-bump 3 --place-clear-s 2)
+  expect(clearcount "placement: clear the space: the sweeps start in 2 s" "the count is announced")
+  expect(clearcount "OK +clear 1\\.[0-9]s" "the readout counts down")
 
 elseif(MODE STREQUAL "track_refuse")
   # the --zylia position survey turns DOAs into room directions: tracked, it needs a BODY-FRAME survey

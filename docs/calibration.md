@@ -1842,8 +1842,13 @@ window's mean orientation, and starts.
 A pose only counts while NatNet reports the body LIVE: the last published pose stays readable
 forever, so an occluded stand would otherwise hand back an old one.
 
-On the rig a key takes the current reading anyway, with a warning. With no pose at all it aborts.
-`--place-timeout <s>` (default 300) aborts a wait that never ends.
+On the rig `F` takes the current reading anyway, with a warning. With no pose at all it aborts. No
+other key overrides the gate.
+`--place-timeout <s>` (default 300) aborts a wait that never ends. Once the gate opens, the tool waits
+for Enter, so you can leave the space first. It takes the reading when you press Enter. If the stand
+gets knocked on your way out, the gate closes and Enter does nothing until it opens again.
+`--place-clear-s <s>` counts that many seconds instead, and 0 starts at once. With no console, as in
+the Session tab, a wait for Enter could never end, so the default there is a 5 second count.
 
 ### The bump check
 
