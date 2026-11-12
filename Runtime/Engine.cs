@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/2535e3118f05/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/32479ec8aac0/docs/integration.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -21,18 +21,22 @@ namespace BwAudio
                  "(create that folder and put cave_layout.json in it). EMPTY runs the engine's built-in " +
                  "default 26-speaker grid — the only way to opt into it. A non-empty path MUST load: on " +
                  "a failed load the engine logs the reason and REFUSES to start (BWA_ERR_LAYOUT), so a " +
-                 "session can never silently pan over geometry that isn't the one in the room.")]
+                 "session can never silently pan over geometry that isn't the one in the room. " +
+                 "Binaural is the exception: it drives no speakers, so a MISSING file there runs the " +
+                 "default grid with a log line instead.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
         [Tooltip("Output-device policy. Auto: for a headphone profile try WASAPI then ASIO, for the " +
-                 "array try ASIO, and fall back to the SILENT offline sink either way (the engine " +
+                 "array try ASIO (Linux: JACK then ALSA; macOS: CoreAudio; Android: AAudio), and fall " +
+                 "back to the SILENT offline sink either way (the engine " +
                  "keeps rendering — the inspector flags the silent fallback). Naming a backend is a " +
                  "demand, so a missing device fails startup loudly. Null: force the offline sink.")]
         public BwaSinkType sink = BwaSinkType.Auto;
         [Tooltip("Device to open, for whichever backend opens it: the exact friendly name or stable " +
                  "id from Engine.Devices. Empty = that backend's default (ASIO: the first driver with " +
-                 "enough output channels; WASAPI: the Windows default render endpoint).")]
+                 "enough output channels; WASAPI: the Windows default render endpoint; CoreAudio: " +
+                 "the macOS default output device).")]
         // FormerlySerializedAs: this field was `asioDriver` through 0.13, so a scene saved then
         // keeps its value instead of silently reverting to the backend default on load.
         [UnityEngine.Serialization.FormerlySerializedAs("asioDriver")]
@@ -40,7 +44,8 @@ namespace BwAudio
         [Tooltip("Backend options. Exclusive takes a WASAPI endpoint from every other application on " +
                  "the machine; leave it off for a monitor that shares the device with a VR runtime. " +
                  "ExactRate fails the open rather than letting the OS resample. TightBuffer takes " +
-                 "the smallest device buffer the backend can, trading dropout margin for latency.")]
+                 "the smallest device buffer the backend can, trading dropout margin for latency. " +
+                 "DeepBuffer affects only the browser sink, so it does nothing here.")]
         public BwaSinkFlags sinkFlags = BwaSinkFlags.None;
 
         /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>
@@ -263,13 +268,26 @@ namespace BwAudio
                 return;                                              // Instance NOT claimed
             }
 
+            // Empty maps to layout_path = NULL, the ABI's only way to run the default grid, exactly
+            // like asioDriver below. Path.Combine of an empty string would yield the StreamingAssets
+            // DIRECTORY: still an explicit path, which fails to load and then fails bwa_start
+            // (BWA_ERR_LAYOUT), leaving the default grid unreachable.
+            string layoutFull = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null;
+            // Binaural drives no speakers: the layout only places the virtual speakers the diffuse
+            // bed decodes through, and the default grid serves that fine. The refusal exists so the
+            // ARRAY never pans over the wrong room, so a desk scene on the default profile must not
+            // go silent for want of a file it does not need. A file that exists still has to load.
+            // (On Android StreamingAssets sits inside the APK, which the engine cannot fopen either.)
+            if (layoutFull != null && profile == BwaProfile.Binaural && !File.Exists(layoutFull))
+            {
+                Debug.Log($"[bw_audio] Binaural: no layout at '{layoutFull}', so the diffuse bed decodes " +
+                          "through the built-in default grid. The array profiles need the file.");
+                layoutFull = null;
+            }
+
             var cfg = new BwaDesc {
                 profile = profile,
-                // Empty maps to layout_path = NULL — the ABI's only way to run the default grid —
-                // exactly like asioDriver below. Path.Combine of an empty string would yield the
-                // StreamingAssets DIRECTORY: still an explicit path, which fails to load and then
-                // fails bwa_start (BWA_ERR_LAYOUT), leaving the default grid unreachable.
-                layoutPath = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null,
+                layoutPath = layoutFull,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
                 sink = sink,
                 device = device.Length > 0 ? device : null,
@@ -567,7 +585,7 @@ namespace BwAudio
 
         /// <summary>Load a legacy FuMa B-format soundfield (.amb-style: WXYZ order, MaxN, W -3 dB) for a
         /// world-locked bed (cached). Converted to AmbiX at load — past this call it IS an AmbiX asset.
-        /// Full 3D sets only (4/9/16 channels). Returns 0 on failure.</summary>
+        /// Full 3D sets (4/9/16 channels) and the .amb mixed-order sets (3/5/6/7/8/11). Returns 0 on failure.</summary>
         public uint LoadFuma(string clip) => Acquire(clip, BwaLoadFlags.Fuma);
 
         /// <summary>The handle for a clip that is ALREADY resident, or 0. Pure probe: it never loads,
@@ -1063,7 +1081,8 @@ namespace BwAudio
         }
 
         // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
-        // seeds the ISM early-reflection room — valid only before start, so it stays on this path. Any
+        // seeds the ISM early-reflection room. The ABI takes it live too, but Engine only calls it here
+        // and on scene loads, so it stays on this path. Any
         // acoustic geometry goes through RebuildSceneMesh, which is runtime-safe and shared with the
         // per-scene re-bake below.
         void SetupScene()

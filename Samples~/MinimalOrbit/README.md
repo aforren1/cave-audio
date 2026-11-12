@@ -8,8 +8,9 @@ same stimulus, so you can compare them by ear.
 
 1. Make a GameObject named `BwAudio` and add the `Engine` component. Set **profile** to
    `Binaural` and **sink** to `Auto`.
-2. Make a GameObject for the head, put it where the listener stands, and drag it into the
-   Engine's **listener** field. The XR camera works too.
+2. Make a GameObject for the head, put it at (0, 1.5, 0), and drag it into the Engine's
+   **listener** field. The XR camera works too. The orbit is centered on that room point, not on
+   the listener, so a head somewhere else hears the click circle around a different spot.
 3. Make a third GameObject, add `PushEmitter` and `MinimalOrbit` to it, and press Play.
 
 You need no audio file. `MinimalOrbit` synthesizes the stimulus and feeds it to the push voice.

@@ -7,7 +7,7 @@
 //
 // The voice consumes from create: silence until your first Push, and an underrun renders silence without
 // losing your place (the data-driven clock slips, it never drops). Feed mono float frames at the engine
-// sample rate (Engine.SampleRate), from Unity's main thread like every other call, a frame or so ahead —
+// sample rate (Engine.sampleRate), from Unity's main thread like every other call, a frame or so ahead —
 // pace against PushSpace. PushEnd ends the voice once the ring drains (one-way: a push voice is not
 // restartable — disabling and re-enabling this component creates a FRESH one). The ring is fixed at 65536
 // frames (~1.37 s at 48 kHz); there is no capacity argument (bwa_source_create_push takes none). While
@@ -28,7 +28,7 @@ namespace BwAudio
 
         // ---- the push feed (the reason this component exists) ----------------------------------------
 
-        /// <summary>Feed `pcm` (mono float frames at Engine.SampleRate) to the voice. Returns the count
+        /// <summary>Feed `pcm` (mono float frames at Engine.sampleRate) to the voice. Returns the count
         /// ACCEPTED — less than pcm.Length when the ring is full, so pace against <see cref="PushSpace"/>
         /// rather than assuming it all landed. Non-finite samples become 0. Call from the main thread, a
         /// frame or so ahead. Refused (returns 0) after PushEnd/Stop/FadeOut — the voice is one-way.</summary>
