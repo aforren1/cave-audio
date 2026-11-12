@@ -2,23 +2,23 @@
 
 A GDExtension binding for the CAVE spatial audio engine. Godot is a **thin control
 client**: no rendered audio crosses the boundary, and Godot's own `AudioServer` is
-unused. The engine drives ASIO itself.
+unused. The engine opens the audio device itself (ASIO for the array).
 
 ## Install
 
-**From the Asset Store** (in the editor: AssetLib tab, search "bw_audio"), or by hand:
-download `bw_audio-godot-<version>.zip` from a GitHub Release and unzip it into your project
-so you end up with `addons/bw_audio/`. Either way, restart the editor afterwards. A
-GDExtension loads on project open, so there is no plugin to enable.
+The addon has no store listing yet. Install it by hand: download `bw_audio-godot-<version>.zip`
+from a GitHub Release and unzip it into your project, so you end up with `addons/bw_audio/`. You
+can also copy `addons/bw_audio/` out of an archive of the `godot` branch. Then restart the editor.
+A GDExtension loads on project open, so there is no plugin to enable.
 
 Godot has **no equivalent of Unity's "add package from git URL"**. The documented routes are
-the store's own listing and a manual zip extract. The editor has no install-from-URL or
+a store listing and a manual zip extract. The editor has no install-from-URL or
 install-from-file entry point. So unlike the Unity binding, you cannot install *from* the
-`godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
-archive.
+`godot` distribution branch directly. The branch exists for a future store listing that pulls a
+repo archive.
 
 Four platforms: **Windows x64** for the desktop, where the engine's device path is ASIO,
-**Linux x86_64** (JACK or ALSA), **macOS universal** and **Android arm64-v8a** for a standalone
+**Linux x86_64** (JACK or ALSA), **macOS universal** (CoreAudio) and **Android arm64-v8a** for a standalone
 headset. Each carries an editor library and an export library, except Android, which runs no
 editor.
 
@@ -50,8 +50,9 @@ editor and a template_release library for each, so the extension loads in the ed
   library sits in `bin/linux/`, one level down from the others, because Android's has the same file
   name and one addon carries both. The extension finds it through an `$ORIGIN` run path, in the
   editor and in an exported game alike.
-- **macOS** has **no device backend yet**, so the engine runs its offline sinks there: everything
-  works except making sound. Its libraries are universal (x86_64 and arm64).
+- **macOS** outputs through CoreAudio, on the system output device by default. The device runs
+  at the engine's sample rate or the start fails, so the open sets the device's rate when the two
+  differ. Its libraries are universal (x86_64 and arm64).
 - The macOS libraries are **not signed or notarized**. Gatekeeper blocks a downloaded unsigned
   library, so clear the quarantine flag once after unzipping:
   `xattr -dr com.apple.quarantine addons/bw_audio`.
@@ -64,12 +65,12 @@ The smallest scene that makes sound. Build this tree:
 Main (Node3D)
   BwaEngine    profile = Binaural, listener = ../Listener
   Listener     a Node3D at (0, 1.5, 0), or your Camera3D
-  BwaEmitter   clip = "res://click.wav", loop = on, at (0, 1.5, 2)
+  BwaEmitter   clip = "res://click.wav", loop = on, at (0, 1.5, -2)
 ```
 
 Press play. `BwaEmitter.autoplay` is on by default, so the clip starts when the emitter is ready,
-2 m in front of the listener. Move the emitter and the sound follows: `BwaEngine` pushes every
-source and the listener each frame.
+2 m in front of the listener (a Godot node faces -Z). Move the emitter and the sound follows:
+`BwaEngine` pushes every source and the listener each frame.
 
 Keep `BwaEngine` ABOVE every source in the tree. Godot runs siblings' `_ready` top to bottom, the
 engine starts in its own `_ready`, and a source that is ready first finds no running engine and
@@ -147,10 +148,13 @@ call lives as a method on whichever class owns the handle it operates on.
 **`BwaEngine : Node`** - everything engine-global: lifecycle, the registration transform,
 listener and tracker wiring, the asset cache, master gain/pause and mix groups, the reverb
 configuration (Steam bed *or* FDN), materials and scene geometry, the clock, the
-diagnostics readbacks, and the live A/B knobs (panner, dual-band, spread mode,
-decorrelation, near-spread, max-rE and its band split, bed renderer, tracked room EQ,
-limiter). Those are exported properties that also apply live, so the inspector *is* the
-A/B tool.
+diagnostics readbacks, and the live A/B knobs (panner, dual-band and its CAP, SPCAP focus
+and density, spread mode, decorrelation, near-spread, hole spread, speed of sound, max-rE
+and its band split, bed renderer, tracked room EQ, tracked directivity, tracked alignment,
+master gain, limiter). Those are exported properties that also apply live, so the inspector
+*is* the A/B tool. `apply_setup(SETUP_SEATED)` or `apply_setup(SETUP_ROAMING)` sets them all
+from one engine preset; `get_setup_tuning()` returns a preset as a Dictionary without applying
+it, and `get_live_tuning()` reads back what the engine runs.
 
 **`BwaSource : Node3D`** (abstract) - everything a spatial voice can do regardless of where
 its audio comes from: gain, priority, group, fades, pause, spread/extent/size, Doppler, air
@@ -163,7 +167,8 @@ fades, pause, and the per-frame manual occlusion level are calls, not configurat
 
 **`BwaEmitter : BwaSource`** - plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
 gapless `queue`, `seek_frames`/`seek_seconds`, `set_region_frames`/`set_region_seconds`,
-`pitch`, `async_load` with `is_loading()`, and the `finished` and `looped` signals.
+`pitch`, `streaming` (play a long file from disk instead of RAM), `async_load` with
+`is_loading()`, and the `finished` and `looped` signals.
 
 **`BwaPushSource : BwaSource`** - you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
@@ -353,7 +358,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/2535e3118f05/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/32479ec8aac0/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -370,7 +375,7 @@ what the engine is rendering.
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/2535e3118f05/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/32479ec8aac0/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
@@ -391,6 +396,10 @@ for name in BwaEngine.get_devices(BwaEngine.SINK_WASAPI):
 Prefer the id (`get_device_id(backend, i)`) when you persist a choice: friendly names collide
 between a headset and its dock. The ASIO-only spelling (`get_asio_drivers()`,
 `get_asio_driver_count()`, `get_asio_driver_name(i)`) stays as a wrapper.
+
+For the headphone profiles, `load_headphone_eq(path)` loads an AutoEq `ParametricEQ.txt` as a
+correction EQ on the stereo output. Call it after the engine starts. `""` clears it.
+`set_headphone_eq(on)` switches the EQ without a click. It is on by default.
 
 ### Is the device being starved?
 
@@ -455,7 +464,10 @@ noise without removing a decision.
 
 `addons/bw_audio/playground/` is the by-ear harness, and it ships **inside the addon**.
 However you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
-Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
+The panel's render picker selects CaveSim (the default: the array auditioned over headphones),
+Binaural, or Cave (the array itself). A new pick rebuilds the engine. If the pick has no device,
+for example Cave with no ASIO driver, the playground runs silent and visual-only and says so in
+the HUD.
 
 The array is `dome_24.json` from the same folder: a generated 24-speaker dome, 2 m around a
 listening point 1.5 m up, spread evenly over the sphere above the floor. To audition a
@@ -486,6 +498,6 @@ Two things worth knowing:
   left SPCAP selected or a spread mode engaged would silently change what the *next* scene
   appears to demonstrate. That reset list is ported verbatim for exactly that reason.
 
-With no ASIO device the engine falls back to the null sink and everything still runs, just
+With no usable device the engine falls back to the null sink and everything still runs, just
 silent. Visual-only is a supported state, not a failure, and the HUD says so.
 

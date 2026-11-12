@@ -13,7 +13,7 @@
 ##   5 Blind A/B/X    - double-blind over live knobs, with a binomial p-value
 ##   6 Ambisonic bed  - a world-locked 3rd-order field; spin, tilt, renderer, max-rE
 ##   7 Reverb bed     - a shoebox + reverb; REBUILDS the engine on entry/exit
-##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/2535e3118f05/docs/api.md "listener submerges" recipe: dive and the FDN retunes
+##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/32479ec8aac0/docs/api.md "listener submerges" recipe: dive and the FDN retunes
 ##                      LIVE, the speed of sound glides, crossing sources muffle, and the
 ##                      pressure-release surface throws the Lloyd's-mirror bounce. Rebuilds
 ##                      like scene 7 (its FDN is load-time), phonon-free.
@@ -75,7 +75,7 @@ var want_sink := BwaEngine.SINK_AUTO
 # The panel's "render" picker (create-time, so switching rebuilds):
 # 0 = CAVE_SIM, the array audition — the speaker meters show what lights the speakers;
 # 1 = BINAURAL, the direct per-source render — point sources and beds bypass the speaker
-# bus, so quiet meters there are CORRECT; 2 = CAVE, the array ITSELF over 26-ch ASIO (the
+# bus, so quiet meters there are CORRECT; 2 = CAVE, the array ITSELF over multichannel ASIO (the
 # by-ear harness on the rig machine; with no such device the null sink runs visual-only).
 # Mirrors the C++ playground's picker.
 var render_pick := 0

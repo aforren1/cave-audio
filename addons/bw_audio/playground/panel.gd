@@ -66,7 +66,7 @@ func _ready() -> void:
 		+ "the meters show exactly what lights the speakers.\n"
 		+ "binaural: the direct per-source render (per-voice HRTF with the Steam build);\n"
 		+ "point sources and beds bypass the speaker bus, so quiet meters there are correct.\n"
-		+ "cave: the ARRAY ITSELF over 26-ch ASIO - the by-ear harness on the rig machine\n"
+		+ "cave: the ARRAY ITSELF over multichannel ASIO - the by-ear harness on the rig machine\n"
 		+ "(with no such device the null sink runs visual-only).\n"
 		+ "Create-time: switching rebuilds the rig (brief gap).")
 	col.add_child(_row("render", _render_pick))
