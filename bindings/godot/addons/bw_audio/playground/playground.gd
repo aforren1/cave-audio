@@ -75,7 +75,7 @@ var want_sink := BwaEngine.SINK_AUTO
 # The panel's "render" picker (create-time, so switching rebuilds):
 # 0 = CAVE_SIM, the array audition — the speaker meters show what lights the speakers;
 # 1 = BINAURAL, the direct per-source render — point sources and beds bypass the speaker
-# bus, so quiet meters there are CORRECT; 2 = CAVE, the array ITSELF over 26-ch ASIO (the
+# bus, so quiet meters there are CORRECT; 2 = CAVE, the array ITSELF over multichannel ASIO (the
 # by-ear harness on the rig machine; with no such device the null sink runs visual-only).
 # Mirrors the C++ playground's picker.
 var render_pick := 0

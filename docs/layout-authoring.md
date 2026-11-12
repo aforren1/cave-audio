@@ -289,15 +289,16 @@ places on different random paths, and a stiff seed may barely improve. Two token
 loosen it, and both always keep and ship the **best layout seen**. `anneal` also
 accepts some moves that make the cost worse (simulated annealing: a move that raises
 the cost by `slip` passes with probability exp(-slip/T), and T cools every trial).
-`restarts=<n>` re-climbs n times from the best layout plus a 0.25 m kick. Restarts
+`restarts=<n>` (1 to 16) climbs n times in total. Each climb after the first starts from the
+best layout plus a 0.25 m kick. Restarts
 explore near the seed's basin; seed shape still dominates. On a good seed the upgrade
 costs several times the iterations for no real gain, but it can rescue a stiff seed
 outright. VBAP's cost landscape is flat-bottomed, so it gains nothing. Use the upgrade
 when a seed underperforms, not as the default. The GUI's `anneal` checkbox is the same switch,
 and stopping the optimizer (or entering preview) always restores the best layout.
 
-Every climb terminates on its own: the step floor (0.02 m) or a 120k-iteration
-cap, in the GUI and headless alike. Pressing **O** again re-climbs with a fresh
+Every climb stops on its own at the step floor (0.02 m), in the GUI and headless alike.
+Headless runs also stop at a 120k-iteration cap. Pressing **O** again re-climbs with a fresh
 step schedule.
 
 ### Beds in the cost

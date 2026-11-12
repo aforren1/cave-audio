@@ -9,7 +9,7 @@
  * through the two rings and the staging->active snapshot.
  *
  * The mixing is the full production path: mix_voice plays sound->pcm through the
- * listener-relative DBAP/SPCAP/VBAP 26-gain solve with per-block gain ramps, plus occlusion,
+ * listener-relative DBAP/SPCAP/VBAP per-speaker gain solve with per-block gain ramps, plus occlusion,
  * directivity, Doppler, air absorption, reflection/pathing sends, dual-band panning, the
  * ambisonic bed, streaming, pause/seek, the direct output-channel route, and the output limiter.
  * See NOTES.md for history.
@@ -293,7 +293,7 @@ void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clam
 void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
 
 /* Post-mix aux-send tap: rt_render calls it on the AUDIO thread AFTER the voice loop and BEFORE
- * align_process, handing it the 26-ch bus, the block size, the active listener pose, and the summed
+ * align_process, handing it the N-channel speaker bus, the block size, the active listener pose, and the summed
  * mono aux send (the post-occlusion/directivity signal of voices opted in via rt_source_set_reflections).
  * A phonon-free seam — the reflection bed registers a tap that convolves `aux` and sums onto `bus`.
  * Set while the audio thread is stopped (the audio thread reads the pointer). NULL detaches. */
@@ -305,7 +305,7 @@ void    rt_source_set_reflection_distance(RtCore* c, uint32_t h, bool on);   /* 
 
 /* Pathing seam: rt_render SH-encodes every pathing voice's signal (s * shCoeffs[k]) into a shared
  * ambisonic accumulator, then hands it to this tap AFTER the voice loop. The tap (steam_path) decodes
- * the ambisonic field to the 26-ch bus via phonon's own decoder, so phonon's convention is consistent
+ * the ambisonic field to the N-channel speaker bus via phonon's own decoder, so phonon's convention is consistent
  * end-to-end. `ambi` is ambi_ch planar channels of n samples each. Set while stopped; NULL detaches. */
 typedef void (*RtPathTap)(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch);
 void    rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch);

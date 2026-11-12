@@ -228,7 +228,7 @@ struct bwa_engine {                /* abridged; see engine.c */
     bwa_desc    cfg;
     bwa_profile   profile;
     RtCore*     rt;              /* rings + voice/sound tables + mixer */
-    Monitor*    monitor;         /* binaural/both: speaker bus -> stereo decode */
+    Monitor*    monitor;         /* headphone profiles: speaker bus -> stereo decode */
     Layout      layout;          /* effective geometry; layout.count IS the channel count */
     bwa_sink*     sink;            /* primary device (cave: layout.count ch / binaural: 2 ch) */
     bwa_sink*     sink_mon;        /* both: the monitor (2-ch) device */

@@ -263,10 +263,10 @@ Everything above, sorted by what it actually ends up in:
 
 - **`bw_audio.dll`** (the artifact CI distributes, under this repo's GPLv3) links four
   third-party components: the ASIO SDK under its **GPLv3** option, Steam Audio
-  (**Apache-2.0**, statically linked, so phonon and its mysofa, zlib and pffft archives
-  are inside this DLL), dr_libs (**public domain / MIT-0**, your choice), and cJSON
-  (**MIT**). All four are GPLv3-compatible, so distributing the DLL under GPLv3 is
-  consistent. Two of them ship their source beside the binaries rather than behind a
+  (**Apache-2.0**, statically linked, so phonon and its mysofa (**BSD-3-Clause**), zlib
+  (**zlib**) and pffft (**FFTPACK**, BSD-style) archives are inside this DLL), dr_libs
+  (**public domain / MIT-0**, your choice), and cJSON (**MIT**). All four are GPLv3-compatible,
+  so distributing the DLL under GPLv3 is consistent. Two of them ship their source beside the binaries rather than behind a
   link: `bw_audio-asio-sdk-src-<tag>.zip` and `bw_audio-steam-audio-src-<tag>.zip`.
   Apache-2.0 does not require the second one (Steam Audio ships no `NOTICE` file, so
   section 4(d) never triggers, and the pinned commit plus the in-repo patch is a
@@ -300,6 +300,9 @@ Everything above, sorted by what it actually ends up in:
   code-signed and not notarized**, which is a distribution question rather than a license one:
   internal use clears the quarantine flag, and shipping outside the lab needs a Developer ID
   signature and notarization.
+- **The Python wheels** carry the engine library plus the `_bwa` extension, which links
+  nanobind (**BSD-3-Clause**, with its bundled robin_map, **MIT**) statically (`NB_STATIC`). The
+  wheel installs `LICENSE` and `THIRD_PARTY-NOTICES.md` beside them.
 - **The Godot GDExtension** (`bw_audio_gd.*`, one per platform and flavor inside the addon) links
   godot-cpp (**MIT**) beside the engine's C ABI. It ships with the addon's `LICENSE` and
   `THIRD_PARTY-NOTICES.md`, like the engine library it sits next to.
@@ -432,10 +435,11 @@ cuts the release. A second workflow, `.github/workflows/pages.yml`, publishes th
 - **Steam Audio is built static, and cached.** The recipe from
   [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal core, `/MD`,
   `BUILD_SHARED_LIBS=OFF`) lives in the composite action `.github/actions/build-phonon/`, which
-  takes a platform, an arch, a toolchain and a staging directory. All four build jobs call it, the
-  android job twice, once per ABI. CI caches `third_party/steam-audio-artifacts/` keyed on the
-  submodule sha + the patch hash, with the platform and, on Android, the ABI in the key so no job
-  restores another's archives (a cache is scoped to the repository, not to the runner OS). The
+  takes a platform, an arch, a toolchain and a staging directory. The `windows`, `android` and
+  `macos` jobs call it, the android job twice, once per ABI. The `linux` job runs the same script,
+  `tools/phonon/build-phonon.sh`, inside the manylinux container instead (see below). CI caches
+  `third_party/steam-audio-artifacts/` keyed on the submodule sha + the patch hash, with the
+  platform and, on Android, the ABI in the key so no job restores another's archives (a cache is scoped to the repository, not to the runner OS). The
   first run pays the phonon build; every later run restores it. The five with-SDK tests
   (`reflect`/`bake`/`path`/`dynmesh`/`steam_decode`) run, and binaural is the real HRTF decode.
   One CI-only tweak: the pinned phonon build scripts hard-code the VS 2022 generator, so the
@@ -864,8 +868,9 @@ Set `ANDROID_HOME` to the SDK root. Accept the licenses once with `sdkmanager --
 
 ### The two ABIs
 
-Build `arm64-v8a` for a headset and `x86_64` for the emulator. Nothing in the engine is
-architecture-specific: the DSP is scalar C with no intrinsics, so ARM needs no port.
+Build `arm64-v8a` for a headset and `x86_64` for the emulator. ARM needs no port: the
+SIMD kernels in `src/dsp/vec.h` have an AArch64 NEON path beside the SSE one, and a plain C
+fallback for anything else.
 
 ```powershell
 $ninja = "$env:ANDROID_HOME\cmake\3.31.6\bin\ninja.exe"   # or any ninja on PATH

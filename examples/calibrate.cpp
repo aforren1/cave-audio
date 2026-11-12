@@ -1697,13 +1697,15 @@ int main(int argc, char** argv) {
                                "  --sim-truth f.json (simulate): the speakers really stand where f.json says (position, aim),\n"
                                "  not where --layout says: a rehearsal whose as-built differs from its plan.\n"
                                "  Sweep quality (every mode that sweeps): the arrival is searched only in a window around\n"
-                               "  the latency plus the layout distance over c; a capture whose strongest tap lies outside it,\n"
+                               "  the latency plus the layout distance over c, and the arrival is the EARLIEST tap within\n"
+                               "  %.0f dB of the window's strongest (a reflection can outshout the direct sound). A capture\n"
+                               "  whose strongest tap lies outside the window,\n"
                                "  or whose IR peak is under %.0f dB over its noise floor, is re-swept with the reason printed,\n"
                                "  and the trims and --verify count a speaker only once two sweeps agree (%.0f sample, %.1f dB).\n"
                                "  --window-m m: the window's position margin (default %.2f m for a surveyed speaker, %.2f m at\n"
                                "  its plan and in the modes that find a position). --sim-interferer captures[:t_s[:dB[:kind]]]\n"
                                "  (simulate): a click, a noise burst or a stray sweep from 1.5 m off on those 1-based captures.\n",
-                               REFSPK_FLAG_S * 1e6, CSURVEY_RANGE_FLAG_MM, CALIB_SWEEP_MIN_SNR_DB, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB,
+                               REFSPK_FLAG_S * 1e6, CSURVEY_RANGE_FLAG_MM, -MEASURE_FIRST_DB, CALIB_SWEEP_MIN_SNR_DB, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB,
                                CALIB_WIN_SURVEYED_M, CALIB_WIN_PLAN_M); return 2; }
     }
     if (n_temp && n_c) {

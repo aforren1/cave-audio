@@ -48,7 +48,7 @@ The new APIs do not promise a fixed callback size:
 | AAudio                         | `setFramesPerDataCallback` is a hint; the callback can deliver other sizes |
 | Wasm Audio Worklet             | fixed at 128 frames by the Web Audio 1.0 spec, and not negotiable. The 1.1 `renderSizeHint` moves it; nothing makes it vary |
 
-So every backend except ALSA goes through the **fixed-quantum adapter** (`sink_quant`, below).
+So every backend in that table except ALSA goes through the **fixed-quantum adapter** (`sink_quant`, below).
 It renders whole engine blocks into a small FIFO and hands the device any count it asks for.
 When the device size equals the block size it is a straight pass-through with no copy and no
 added latency, so a backend that manages to pin the device size pays nothing. A rig box pins
@@ -103,9 +103,9 @@ Where each backend gets the pair:
 | ASIO      | `ASIOTime.timeInfo`: `samplePosition` when `kSamplePositionValid`, and for the time, the driver's `systemTime` ONLY when its stamps show it is on QPC, else QPC read at callback entry. See "ASIO's `systemTime`" below |
 | WASAPI    | `IAudioClock::GetPosition(&pos, &qpc)`, normalized by `GetFrequency()` to frames. Do not assume the units: `frames = pos * rate / freq`. `qpc` is in 100 ns units |
 | CoreAudio | the IOProc's `inOutputTime`: `mSampleTime` and `mHostTime` when both valid flags are set; `mach_timebase_info` converts host ticks to ns |
-| JACK      | `jack_get_cycle_times` at the top of the process callback: `current_frames` and `current_usecs`, the server's DLL-filtered pair in microseconds on `CLOCK_MONOTONIC`. Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
+| JACK      | Position: the adapter's own stream count. Time: `current_usecs` from `jack_get_cycle_times` at the top of the process callback, the server's DLL-filtered time in microseconds on `CLOCK_MONOTONIC` (the sink ignores `current_frames`). Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
-| AAudio    | `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. Fails until the stream has run a little; keep the previous pair and set `measured` only after the first success |
+| AAudio    | Position: the adapter's own stream count. Time: `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. It fails until the stream has run a little. Until then the host clock at the callback stands in, and `measured` sets only after the first success |
 | Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat: `AudioWorkletGlobalScope` has no `performance`, so Emscripten's `CLOCK_MONOTONIC` returns `ENOSYS` on the audio thread. `os_monotonic_ns` checks that and falls back to `emscripten_get_now`, which is `Date.now` in that scope: same epoch as the control thread's, a thousand times coarser, and not monotonic. That makes both of the adapter's backward-step rules load-bearing rather than defensive: a stamp never steps back, and a render time that would go negative books 0 |
 
 **ASIO's `systemTime`.** The ASIO SDK says `systemTime` is derived from `timeGetTime` on Windows
@@ -156,7 +156,7 @@ ALSA.
 |------------------|----------------------------------------------------------|--------------------------------------------|---------------------------------------------|---------------------------------------------------|-------------------------------------|
 | `dropouts`       | **exclusive:** the queued depth `written - device_pos` went negative, the device consumed frames never written. **shared:** the interval between two `ReleaseBuffer` calls exceeded the buffer depth. Every event refills the buffer to full, so the device is holding `bufferFrameCount` after each release and runs dry that many frames later; a later release proves it had nothing in between. The depth rule cannot serve shared mode: the request size is exactly what the engine consumed since the last callback, so `written` telescopes to follow the device position and the depth never goes negative | `sink_position_gap` on `mSampleTime`, as ASIO | the xrun callback (`jack_set_xrun_callback`) | `-EPIPE` from the write (an underrun)          | `AAudioStream_getXRunCount` delta   |
 | `dropped_frames` | **exclusive:** the size of that deficit. **shared:** the release interval minus the buffer depth, at the nominal rate. Not an estimate: it is the measured excess | the gap                                    | `jack_get_xrun_delayed_usecs` at the nominal rate | the elapsed monotonic time since the last good write minus the buffer depth, at the nominal rate | unknown: 0                          |
-| `driver_resyncs` | 0                                                        | the `kAudioDeviceProcessorOverload` listener | 0                                         | `-ESTRPIPE` (a suspend), after recovery         | 0                                   |
+| `driver_resyncs` | event-wait timeouts: the device stopped handing out buffers | the `kAudioDeviceProcessorOverload` listener | 0                                         | `-ESTRPIPE` (a suspend), after recovery         | 0                                   |
 | `measured`       | **exclusive:** once `GetPosition` has succeeded. **shared:** `bufferFrameCount > period`, and nothing to do with `IAudioClock`. The release-interval rule needs headroom between a normal cycle and the dry deadline; with a one-period buffer a normal cycle sits on it and ordinary jitter would read as a fault, so the honest answer is that the configuration cannot judge | once a timestamp with both flags arrived   | always (the server reports xruns directly)  | always (the write reports underruns directly)     | once `getTimestamp` has succeeded   |
 
 The **Wasm Audio Worklet** has no column because every cell would say the same thing: Web Audio
@@ -290,7 +290,8 @@ cannot.
 
 Planar float in, one of {float32, int32, int24 packed, int16} out, planar or interleaved, with
 one set of NaN and clamp rules. The ASIO sink calls the planar variants. Test: every format times
-both layouts, the clamps, NaN to 0, and a 26-channel interleave round trip.
+both layouts, the clamps, NaN to 0, and an interleave round trip at the `BWA_MAX_CHANNELS` capacity
+width.
 
 ### `src/sink/sink_quant.h`, `src/sink/sink_quant.c`
 
@@ -301,7 +302,7 @@ rendered blocks, the render function, the health counters the adapter can measur
 One entry point for the backend's callback:
 
 ```
-quant_pull(q, n, device_pos_now, device_pos_valid, host_now_ns, out_fn)
+sink_quant_pull(q, n, device_pos_now, device_pos_valid, host_now_ns, out_fn)
     while held < n:
         ts = { sample_pos = q.rendered, system_time_ns = host_now_ns + (q.rendered - q.written) * 1e9 / rate }
         render(B frames) into the next FIFO slot, timing it
@@ -623,16 +624,19 @@ Open sequence, shared mode (the default):
 1. `IMMDeviceEnumerator` to the endpoint (`GetDefaultAudioEndpoint(eRender, eConsole)` or the
    selected one), `Activate(IAudioClient3)`.
 2. Format: `WAVEFORMATEXTENSIBLE`, float32, the engine rate, the requested channel count.
-   `IsFormatSupported(SHARED)` with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` in the flags lets a
-   mismatched engine rate through with a warning (rule 6). Shared mode is stereo or the
+   `IsFormatSupported(SHARED)` says whether the endpoint takes the engine rate as-is. When it
+   does not, the open initializes with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` and lets the
+   mismatched rate through with a warning (rule 6). Shared mode is stereo or the
    endpoint's own channel layout only; an array-width request in shared mode fails at open with
    a message pointing at exclusive mode.
 3. Period: `GetSharedModeEnginePeriod` gives default, fundamental, min, max. Choose the engine
    block size when it is in range and a multiple of the fundamental, else the minimum. A
    period that is not the block size is fine: the adapter bridges it.
-4. `InitializeSharedAudioStream(EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, period,
-   fmt, NULL)`, `SetEventHandle`, `GetBufferSize`, `GetService(IAudioRenderClient)`,
-   `GetService(IAudioClock)`.
+4. `InitializeSharedAudioStream(EVENTCALLBACK, period, fmt, NULL)` for a native rate. For a
+   converted rate, or when `IAudioClient3` refuses, the open falls back to the classic
+   `IAudioClient::Initialize(SHARED)` at the default device period. It passes `EVENTCALLBACK`, plus
+   the convert flags when it converts. Then `SetEventHandle`, `GetBufferSize`,
+   `GetService(IAudioRenderClient)`, `GetService(IAudioClock)`.
 5. Prefill the buffer with silence and `Start` on `start()`.
 
 Exclusive mode (`BWA_SINK_FLAG_EXCLUSIVE`): try float32, int32, int24, int16 through
@@ -657,7 +661,7 @@ Shared mode matters here: the runtime keeps its own audio open on the same endpo
 
 The thread: wait on the event with a timeout of a few periods (a timeout means the device
 stalled; count it and keep pacing from the host clock, rule 4), `GetCurrentPadding` (shared)
-to size the request, `GetBuffer`, `quant_pull` converting straight into it, `ReleaseBuffer`, then
+to size the request, `GetBuffer`, `sink_quant_pull` converting straight into it, `ReleaseBuffer`, then
 the release-interval check of rule 4.
 
 `GetCurrentPadding() == 0` at a wake is **not** the shared-mode underrun test, though it reads like
@@ -726,7 +730,7 @@ Open sequence:
    Fewer matching ports than channels is an error naming both counts.
 5. Read the playback latency range on the ports after connecting (rule 5).
 
-The process callback: `jack_get_cycle_times` for the pair, `quant_pull` with `nframes`,
+The process callback: `jack_get_cycle_times` for the host time, `sink_quant_pull` with `nframes`,
 copying each block channel into `jack_port_get_buffer` of its port. The xrun callback counts
 one dropout and converts `jack_get_xrun_delayed_usecs` to frames. The shutdown callback (the
 server went away) sets `device_lost` and starts the host-paced thread, per rule 4.
@@ -742,7 +746,7 @@ Behavior worth knowing. The reasons are in
   verbatim. `start()` only lifts a gate; until then the process callback writes silence.
 - The xrun callback runs on a notification thread. It parks the event and the frame estimate in
   two atomics, and the next process callback folds them in through `sink_quant_note_dropout`.
-- `quant_pull` is called with `device_pos_valid` clear, and `measured` comes from the xrun route.
+- `sink_quant_pull` is called with `device_pos_valid` clear, and `measured` comes from the xrun route.
 - The adapter's FIFO is allocated for 8192 frames at open. The buffer-size callback only records
   the new size; a cycle larger than the ceiling is silenced past it and booked as a dropout.
 
@@ -783,8 +787,8 @@ The thread: render one block, convert and interleave into a preallocated frame b
 `snd_pcm_writei` (blocking; the wait is the pacing), then `snd_pcm_status` for the pair and
 the delay. `-EPIPE` is an underrun: count it, estimate the frames from the elapsed time, and
 `snd_pcm_prepare`. `-ESTRPIPE` is a suspend: `snd_pcm_resume` until it stops returning
-`-EAGAIN`, then `prepare`, and tick `driver_resyncs`. Any other negative result sets
-`device_lost` and the loop keeps pacing from the host clock.
+`-EAGAIN`, then `prepare` if the resume failed, and tick `driver_resyncs`. Any other negative
+result sets `device_lost` and the loop keeps pacing from the host clock.
 
 PipeWire and PulseAudio: their ALSA plugins answer `default`. Latency and timestamps are then
 theirs and are reported as they come. That is enough for a desk monitor, and on a PipeWire box
@@ -820,8 +824,8 @@ for rule 5. `BWA_SINK_FLAG_TIGHT_BUFFER` asks for ONE burst there instead, which
 at all: every late callback is then an xrun. The emulator grants it (960 frames instead of 1920),
 and the read-back is what says whether a given device did.
 
-The data callback calls `quant_pull` with the frame count it was given and returns
-`AAUDIO_CALLBACK_RESULT_CONTINUE`. Position and time come from `AAudioStream_getTimestamp`,
+The data callback calls `sink_quant_pull` with the frame count it was given and returns
+`AAUDIO_CALLBACK_RESULT_CONTINUE`. The host time comes from `AAudioStream_getTimestamp`,
 read once per callback and tolerated when it fails early. Dropouts are the OS's own count,
 `AAudioStream_getXRunCount`, read as a delta per callback. The error callback receives
 `AAUDIO_ERROR_DISCONNECTED` on a route change; AAudio forbids reopening from that thread, so
@@ -834,7 +838,7 @@ Behavior worth knowing. The reasons are in
 - Stereo only: an explicit multichannel `BWA_SINK_AAUDIO` open fails with a message naming the
   width.
 - `setUsage` is never called, so the usage stays `AAUDIO_USAGE_MEDIA`.
-- `quant_pull` is called with `device_pos_valid` clear; dropouts are `getXRunCount` deltas.
+- `sink_quant_pull` is called with `device_pos_valid` clear; dropouts are `getXRunCount` deltas.
 - The device's own rate is probed with a throwaway stream before the real open, so a resampled
   shared-mode stream is reported and a failed open names both rates.
 
@@ -1109,9 +1113,10 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   [verify list](./backend-development.md#verify-before-relying-on-it).
 - **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`.** This is the
   port's regression gate, and none of it touches a device. The two jobs sit in `ci.yml` beside the
-  Windows one and catch a Win32 call sneaking back in. Off Windows the suite is smaller:
-  `bwa_calib_view` and the ASIO capture tools are skipped targets, so the viewer's suite and the
-  `validate_*` and capture-tool calibrate runs are absent, and the two raylib tools sit behind an
+  Windows one and catch a Win32 call sneaking back in. The Linux job builds and tests its engine
+  inside a `manylinux_2_28` container (`tools/ci/build-engine-manylinux.sh`). Off Windows the suite
+  is smaller: `bwa_calib_view` and the ASIO capture tools are skipped targets, so the viewer's
+  suite and the `validate_*` and capture-tool calibrate runs are absent, and the two raylib tools sit behind an
   option the jobs leave off. Both jobs build phonon, so the SDK-gated tests run. `ctest -N` in a
   build tree gives the count for that configuration. Configure a Linux tree with
   `-DBWA_BUILD_PLAYGROUND=ON` and the `playground` and `layout_tool` suites come back too. They need

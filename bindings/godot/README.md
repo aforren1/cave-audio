@@ -2,7 +2,7 @@
 
 A GDExtension binding for the CAVE spatial audio engine. Godot is a **thin control
 client**: no rendered audio crosses the boundary, and Godot's own `AudioServer` is
-unused. The engine drives ASIO itself.
+unused. The engine opens the audio device itself (ASIO for the array).
 
 <!-- dev -->
 <!-- Everything between dev markers is SOURCE-TREE material: it describes bindings/godot/
@@ -111,12 +111,12 @@ The smallest scene that makes sound. Build this tree:
 Main (Node3D)
   BwaEngine    profile = Binaural, listener = ../Listener
   Listener     a Node3D at (0, 1.5, 0), or your Camera3D
-  BwaEmitter   clip = "res://click.wav", loop = on, at (0, 1.5, 2)
+  BwaEmitter   clip = "res://click.wav", loop = on, at (0, 1.5, -2)
 ```
 
 Press play. `BwaEmitter.autoplay` is on by default, so the clip starts when the emitter is ready,
-2 m in front of the listener. Move the emitter and the sound follows: `BwaEngine` pushes every
-source and the listener each frame.
+2 m in front of the listener (a Godot node faces -Z). Move the emitter and the sound follows:
+`BwaEngine` pushes every source and the listener each frame.
 
 Keep `BwaEngine` ABOVE every source in the tree. Godot runs siblings' `_ready` top to bottom, the
 engine starts in its own `_ready`, and a source that is ready first finds no running engine and
@@ -270,10 +270,13 @@ call lives as a method on whichever class owns the handle it operates on.
 **`BwaEngine : Node`** - everything engine-global: lifecycle, the registration transform,
 listener and tracker wiring, the asset cache, master gain/pause and mix groups, the reverb
 configuration (Steam bed *or* FDN), materials and scene geometry, the clock, the
-diagnostics readbacks, and the live A/B knobs (panner, dual-band, spread mode,
-decorrelation, near-spread, max-rE and its band split, bed renderer, tracked room EQ,
-limiter). Those are exported properties that also apply live, so the inspector *is* the
-A/B tool.
+diagnostics readbacks, and the live A/B knobs (panner, dual-band and its CAP, SPCAP focus
+and density, spread mode, decorrelation, near-spread, hole spread, speed of sound, max-rE
+and its band split, bed renderer, tracked room EQ, tracked directivity, tracked alignment,
+master gain, limiter). Those are exported properties that also apply live, so the inspector
+*is* the A/B tool. `apply_setup(SETUP_SEATED)` or `apply_setup(SETUP_ROAMING)` sets them all
+from one engine preset; `get_setup_tuning()` returns a preset as a Dictionary without applying
+it, and `get_live_tuning()` reads back what the engine runs.
 
 **`BwaSource : Node3D`** (abstract) - everything a spatial voice can do regardless of where
 its audio comes from: gain, priority, group, fades, pause, spread/extent/size, Doppler, air
@@ -286,7 +289,8 @@ fades, pause, and the per-frame manual occlusion level are calls, not configurat
 
 **`BwaEmitter : BwaSource`** - plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
 gapless `queue`, `seek_frames`/`seek_seconds`, `set_region_frames`/`set_region_seconds`,
-`pitch`, `async_load` with `is_loading()`, and the `finished` and `looped` signals.
+`pitch`, `streaming` (play a long file from disk instead of RAM), `async_load` with
+`is_loading()`, and the `finished` and `looped` signals.
 
 **`BwaPushSource : BwaSource`** - you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
@@ -515,6 +519,10 @@ Prefer the id (`get_device_id(backend, i)`) when you persist a choice: friendly 
 between a headset and its dock. The ASIO-only spelling (`get_asio_drivers()`,
 `get_asio_driver_count()`, `get_asio_driver_name(i)`) stays as a wrapper.
 
+For the headphone profiles, `load_headphone_eq(path)` loads an AutoEq `ParametricEQ.txt` as a
+correction EQ on the stereo output. Call it after the engine starts. `""` clears it.
+`set_headphone_eq(on)` switches the EQ without a click. It is on by default.
+
 ### Is the device being starved?
 
 `get_health()` returns a Dictionary - `measured`, `blocks`, `xruns`, `dropped_frames`,
@@ -636,7 +644,10 @@ positive run from passing vacuously.
 
 `addons/bw_audio/playground/` is the by-ear harness, and it ships **inside the addon**.
 However you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
-Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
+The panel's render picker selects CaveSim (the default: the array auditioned over headphones),
+Binaural, or Cave (the array itself). A new pick rebuilds the engine. If the pick has no device,
+for example Cave with no ASIO driver, the playground runs silent and visual-only and says so in
+the HUD.
 
 The array is `dome_24.json` from the same folder: a generated 24-speaker dome, 2 m around a
 listening point 1.5 m up, spread evenly over the sphere above the floor. To audition a
@@ -683,7 +694,7 @@ Two things worth knowing:
   left SPCAP selected or a spread mode engaged would silently change what the *next* scene
   appears to demonstrate. That reset list is ported verbatim for exactly that reason.
 
-With no ASIO device the engine falls back to the null sink and everything still runs, just
+With no usable device the engine falls back to the null sink and everything still runs, just
 silent. Visual-only is a supported state, not a failure, and the HUD says so.
 
 <!-- dev -->

@@ -128,9 +128,11 @@ int measure_response_win(const float* capture, int ncap, const float* ref, int n
 /* measure_response_win with an EXPECTED-ARRIVAL window: the arrival peak is searched in
  * [exp_lo, exp_hi) only (clamped to the capture), and out->outside says whether a stronger tap sits
  * anywhere else in [0, ncap). exp_hi <= exp_lo = no window, exactly measure_response_win. The noise
- * floor and snr_db are filled either way. A peak search inside a window returns the same tap the
- * whole-IR search would whenever the strongest tap is inside it, so the window costs nothing on a
- * clean capture; it changes the answer only for a capture it also flags. */
+ * floor and snr_db are filled either way. Inside the window the arrival is the EARLIEST tap within
+ * MEASURE_FIRST_DB of the window's strongest (the walk back above), so on an unflagged capture it is the
+ * whole-IR peak unless a near-equal tap leads it: that lead is the case the walk back exists for, a
+ * reflection outshouting the direct sound. It differs from the whole-IR search only there, or on a
+ * capture the window also flags. */
 /* measure_response_ex with the arrival search narrowed to [pick_lo, pick_hi) and no walk back: the strongest
  * tap there. exp_lo/exp_hi still set the quality fields. The ZM-1 uses it so all 19 capsules read the same
  * physical arrival: decided per capsule, a capsule in the sphere's shadow picks a reflection its neighbors

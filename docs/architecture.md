@@ -143,7 +143,7 @@ that implement and configure it. This ASCII version is canonical for structure.)
  │ └→ ISM: per-voice ring → 6 shoebox mirror         × group gain × timed fades
  │       images (frac delay · HF damp · per-         BINAURAL profile: the solve is instead
  │       image panner gains) ──────────→ BUS         16 SH gains at the TRUE direction ×
- air-absorption LP → loudness shelf → Doppler ring   atten × gain (spread = per-degree
+ air LP → loudness + proximity shelves → Doppler     atten × gain (spread = per-degree
  │ └→ decor split (× √spread) ─────────→ DECOR       taper); voice + ISM images then
  pan: single gains · dual-band (700 Hz) ·            accumulate to DIRECT, not BUS (dual-
       spectral (6 bands × 6 gain sets) ─→ BUS        band/decor/spectral gated off). Mode 2
@@ -156,7 +156,7 @@ that implement and configure it. This ASCII version is canonical for structure.)
  ────────────────────────────────
  SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
  ├→ matrix render: × max-rE taper (crossfaded; opt. band-split - taper > 700 Hz
- │       only, rV decode below) → bed decode (AllRAD · EPAD) ────────────────→ BUS
+ │       only, rV decode below) → bed decode (AllRAD · EPAD · imported) ─────→ BUS
  ├→ BINAURAL profile: SH->SH pass - × ambi_canon_to_phonon (one diagonal) ──→ DIRECT
  │       (max-rE + parametric are speaker-decode concerns: gated off)
  └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
@@ -188,13 +188,14 @@ that implement and configure it. This ASCII version is canonical for structure.)
       ├ binaural   DIRECT (SH, unlimited - hard-clamped post-decode) + the bus's
       │            virtual-speaker encode → ONE phonon HRTF decode, then the mode-2
       │            per-voice point taps each through their OWN IPLBinauralEffect,
-      │            summed (cardioid+pan fallback, field-only) → 2 ch
+      │            summed (cardioid+pan fallback, field-only) → headphone EQ →
+      │            hard clamp ±1 → 2 ch
       ├ cave_sim   each bus channel = a virtual speaker at its room position →
       │            the array-sim room, on a copy (arraysim.c): directivity graphic EQ at
       │            that speaker's angle to the listener (with a model) · distance gain
       │            r0/d · propagation delay (d - C)/c, 3 m/s creep →
       │            3rd-order SH encode from the LIVE position → phonon HRTF decode
-      │            (simple-pan fallback) → 2 ch
+      │            (simple-pan fallback) → headphone EQ → hard clamp ±1 → 2 ch
       ├ cave_both  the array sink + the cave_sim monitor on a second device (double-buffered)
       └ null       no device: keeps rendering in real time, silent (tools' visual mode)
 ```
@@ -216,6 +217,8 @@ The tap ordering is deliberate, not incidental:
   above 700 Hz; the rV-optimal plain decode keeps the low band; bed matrix paths only, the
   FDN stays broadband). The parametric analysis and its re-panned direct stream see the
   raw field, and phonon's decodes (reflection bed, pathing, the HRTF monitor) are its own.
+  An imported decoder (`BWA_DECODE_LAYOUT`) is final, so neither the bed matrix nor the FDN
+  tapers it.
 - **Master gain sits before align** so per-speaker trims stay calibrated. The **test
   signal enters after align** so a wiring check is a raw channel, untouched by trims or
   delays. The **limiter is last** so nothing (test signal included) can clip a driver.

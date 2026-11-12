@@ -25,7 +25,7 @@ occlusion, pathing, and a real HRTF monitor. Feature by feature:
 | **Arbitrary scene geometry** | any mesh | shoebox only (ISM) | **Steam** |
 | **Cost in sources** | O(1) - one shared bed, N sends | ISM is **O(N)** - six solves + six taps per wet voice | **Steam** at scale |
 | **Determinism** | ray count drives CPU; sims update at 10 to 30 Hz | fixed cost, updates every block (~5 ms) | **Homegrown** |
-| **Dependency** | submodule + built static archives + an alignment patch | ~200 lines each, no deps | **Homegrown** |
+| **Dependency** | submodule + built static archives + an alignment patch | small (`ism.c` under 50 lines, `fdn.c` under 300), no deps | **Homegrown** |
 
 **Reflections are where the homegrown path wins the argument that matters here.** Steam's reflection
 bed is listener-*centric*: one ambisonic field decoded around one point. Structurally, it cannot

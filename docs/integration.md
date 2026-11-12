@@ -52,8 +52,8 @@ ground-plane square defines the floor), so tracked rigid-body poses pass through
 unchanged: no rotation, no translation. An identity head quaternion faces +Z, the
 listener's right ear is at −X, and y is height above the floor.
 
-The engine references the **array centroid** as its nominal listening point, so the
-origin's exact spot is not audio-load-bearing.
+The engine's nominal listening point is the layout's `listening_point_m`, or the **array
+centroid** when the file declares none, so the origin's exact spot is not audio-load-bearing.
 
 Game engines do not share this frame. Convert every position and quaternion at the
 boundary:

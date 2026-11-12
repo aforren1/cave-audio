@@ -9,7 +9,7 @@ give you with headers.
 |------|------------|
 | `coi-serviceworker.js` | vendored [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker), MIT, pinned by commit in its header. Do not hand-edit it. |
 | `coi-serviceworker.LICENSE` | the MIT text that travels with it. |
-| `index.html` | the landing shell. Registers the worker, reports isolation, links to the two demos. |
+| `index.html` | the landing shell. Registers the worker, reports isolation, links to the three demo pages. |
 | `stage.sh` | assembles the artifact: `dist/`, `example/`, `playground/`, `xr/`, plus this shell and the worker at the root, plus `.nojekyll`. |
 
 `.github/workflows/pages.yml` runs the build, runs `stage.sh` and deploys. Nothing else in the

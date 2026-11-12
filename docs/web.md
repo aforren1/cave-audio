@@ -71,8 +71,9 @@ It regenerates the raw layer from the header, configures with `BWA_WITH_WORKLET=
 BWA_BUILD_WEB=ON`, and stages a self-contained `bindings/web/dist/`: `bw_audio.mjs` (120 kB),
 `bw_audio.wasm` (6.4 MB with a static phonon), and the binding's JavaScript. No bundler and no
 server-side step. To try it locally, run `node bindings/web/example/serve.mjs`, which serves it
-with the two isolation headers, and open `http://localhost:8181/`. The playground is at
-`/playground/` and the XR page at `/xr/`.
+with the two isolation headers, and open `http://localhost:8181/`. The server serves the repo
+root and lists no directories, so the playground is at `/bindings/web/playground/index.html` and
+the XR page at `/bindings/web/xr/index.html`.
 
 The module is linked `-sENVIRONMENT=web,worker,node` so the SHIPPED artifact is the TESTED one:
 `ctest -R web_bindings` runs the node tests against it. `bindings/web/README.md` has the whole
@@ -109,8 +110,9 @@ worker that adds them to every response it serves (coi-serviceworker, vendored u
 true from the second load on: measured in headless Edge against a server that sends no headers,
 including a cold deep link into `example/`. `.github/workflows/pages.yml` builds the wasm engine
 and phonon in the `emscripten/emsdk` container on every push to main, stages the artifact with
-`bindings/web/deploy/stage.sh` (the site root mirrors `bindings/web`: `dist/` and `example/` side
-by side, the shell and the worker at the root) and deploys it to
+`bindings/web/deploy/stage.sh` (the site root mirrors `bindings/web`: `dist/`, `example/`,
+`playground/` and `xr/` side by side, with `dist/` renamed to a content-addressed `dist-<hash>/`,
+and the shell and the worker at the root) and deploys it to
 `https://aforren1.github.io/cave-audio/`.
 
 The worker does not soften the CORP rule, it moves it. Every asset the pages load has to be

@@ -31,6 +31,7 @@ MonoBehaviours built around two of them - a scene manager (`Engine`) and a posit
 | ambient / 2D music | `AmbisonicBed` - a world-locked AmbiX soundfield decoded to every speaker |
 | procedural audio (`OnAudioFilterRead`) | `PushEmitter` - a positional source you feed mono PCM you generate |
 | Audio Reverb Zone | the shared reverb bed: **Steam Audio reflections**, or the **FDN reverb** (no SDK needed) |
+| early reflections (3rd-party) | `Emitter.earlyReflections`: image-source wall bounces off the room box, panned as point sources (no SDK needed) |
 | occlusion (3rd-party) | `Emitter.occlusion`, ray-traced against the acoustic geometry - or `SetOcclusionManual` from game logic (no SDK needed) |
 | Doppler / rolloff curves | `Emitter.doppler`, `airAbsorption`, `loudnessComp` (all physically derived from distance) |
 | output device / AudioMixer | the engine (ASIO/Dante speaker array + binaural monitor); Unity's audio output is disabled |
@@ -60,8 +61,9 @@ https://github.com/aforren1/cave-audio.git#unity
 
 `unity` is a distribution branch whose **root** is the package: `package.json` at the top level, with
 every platform's engine library already in it. That is the only layout UPM's git installer accepts. CI republishes the
-branch on every `v*` tag. Once a tag exists, use a tag ref (`#v0.4.0`) to pin a release instead of
-tracking the branch.
+branch on every `v*` tag, as one commit named `unity <version>`. The `v*` tags themselves point at
+`main`, where `package.json` is not at the root, so a tag ref does not work. To pin a release
+instead of tracking the branch, use that commit's hash as the ref (`#<commit>`).
 
 ### From a release tarball
 
@@ -91,8 +93,8 @@ the real components against the real DLL on the offline sink. Point CMake at an 
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
 [docs/integration.md → Tests](../../docs/integration.md#tests) for what it covers and why it needs
-PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
-ignores any folder whose name ends in `~`.
+PlayMode. `test~/` never ships: the pack script stages `Runtime`, `Editor` and `Samples~` only, and
+Unity itself ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
@@ -160,6 +162,12 @@ to read raw.
 Pair it with `Engine.TestSignal(channel, kind, gain)` for wiring checks: drive one raw output channel
 and confirm the speaker that lights up is the one that makes noise.
 
+To see the room itself in a build, add **`RoomView`** beside `RoomConstraints`. It draws the
+truss, screens and projectors as unlit wireframes and follows the same show toggles. It does not
+need an engine, so it still draws when the engine fails to start. Call `RoomView.Rebuild()` after
+you change `Room.UnityToRoom`, because `RoomView` bakes the transform into the boxes when it builds
+them.
+
 > **While the Unity Editor is open it holds `bw_audio.dll` loaded**, so the file is locked. A CMake
 > rebuild will fail its POST_BUILD copy into `Runtime/Plugins/x86_64/`, and so will `pack.ps1`. Close
 > the editor before rebuilding the engine. (Packing an *unchanged* DLL is fine - the script hashes it
@@ -185,9 +193,15 @@ Every other binding of this engine ships the same demo, which makes them compara
 
 1. Add **`Engine`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,
    the `listener` transform (your OptiTrack head rigid body or XR camera), and - optionally -
-   reflections and a room box (both load-time).
+   reflections and a room box (both load-time). `sink`, `device` and `sinkFlags` pick the output
+   device; `Engine.Devices(backend)` lists the exact strings `device` accepts. To let the engine
+   read NatNet itself instead of following a transform, turn `feedListener` off and set
+   `natnetServer` and `natnetRigidBody`. `Engine.TrackerStatus` reports whether poses arrive.
 2. Add **`Emitter`** to each sound source. Set the `clip`, `loop`, `gain`, and the spatial toggles
    (`occlusion`, `reflections`, `directivity`). Its transform drives the source position every frame.
+   The inspector's **Preset** and **Apply** fill every field from one of the engine's source
+   presets (`BwaSourceKind`: Default, Prop, Voice, Ambience, Ui). `loadAsync` decodes the clip on
+   the engine's loader thread, for content that appears mid-session.
 3. `Engine` runs the **centralized per-frame push** in `LateUpdate`: all emitters, then the
    listener, then one `bwa_commit`. The audio thread therefore never sees a half-moved frame, which
    is what makes the moving-observer case correct. Do not push from individual emitters.
@@ -270,13 +284,21 @@ you must, but hand the finished buffers to `Push` from `Update`/`LateUpdate`.
 
 ## Acoustic geometry and materials (authoring)
 
-Occlusion and reflections need the room's geometry. Two ways to author it, both **load-time**:
+Occlusion and reflections need the room's geometry. Three ways to author it:
 
 - **Simple box** - tick `Enable Room Box` on `Engine`, set the size (meters) and a material preset.
 - **Per-object meshes** - add **`AcousticGeometry`** to any object with a mesh (or set a low-poly
   `Mesh Override`) and assign a **material**. `Engine` bakes every one of them (plus the box, if on)
-  into the engine's scene at startup, and transforms each mesh from Unity world into room space. The
-  scene view draws selected or `alwaysDrawGizmo` geometry as a cyan wireframe.
+  into the engine's scene at startup, and again whenever a Unity scene loads or unloads (additive
+  scenes included). It transforms each mesh from Unity world into room space. The scene view draws
+  selected or `alwaysDrawGizmo` geometry as a cyan wireframe.
+- **Moving meshes** - add **`DynamicAcousticGeometry`** instead, for a door, a lift, or a panel.
+  It pushes position and rotation live (throttled by `positionEpsilon` and `angleEpsilon`), so
+  occlusion and real-time reflections follow the mesh. It reads the scale once. Baked reflections
+  do not follow it.
+
+With no room box, `Engine.SceneSetGround(worldY, material, pressureRelease)` adds one ground
+plane for the ground bounce. It replaces the room box, so leave `Enable Room Box` off.
 
 Materials are project assets: **Create → BwAudio → Acoustic Material** (`MaterialAsset`) - either a
 named engine preset (`concrete`, `glass`, …) or custom 3-band absorption / scattering / transmission.
@@ -284,7 +306,8 @@ Reference one asset from many objects; it's minted once. No material = the engin
 
 > **Keep acoustic meshes SIMPLE** - tens to hundreds of triangles. The engine ray-traces them every
 > frame; render meshes (thousands of tris) are far too heavy. Use a low-poly proxy via `Mesh Override`
-> or a dedicated renderer-less object. Geometry is static (baked once before `bwa_start`).
+> or a dedicated renderer-less object. `AcousticGeometry` is static: moving one does nothing until
+> the next scene load re-bakes it. Use `DynamicAcousticGeometry` for anything that moves.
 
 ### Coordinate seam
 
@@ -298,8 +321,11 @@ the physical room origin/axes). **Getting this wrong silently swaps front/back o
 
 - All calls come from Unity's **main thread**; per-frame calls are non-blocking (they enqueue onto an
   SPSC ring). `bwa_create`/`bwa_start`/`bwa_load_*` allocate/do I/O - they run once at startup.
-- **Materials, the room box, and the reflection config are load-time** - `Engine` sets them between
-  `bwa_create` and `bwa_start`. Calling them after start is rejected (`bwa_last_error`).
+- **The reflection config and the FDN config are load-time** - `Engine` sets them between
+  `bwa_create` and `bwa_start`. The engine rejects them after start (`bwa_last_error`). `Engine`
+  bakes the room box and static geometry at start and on each scene load, not when you edit them.
+  It mints each material asset once and reuses it across scene loads, because the engine's
+  material table holds 64 entries.
 - **Native plugins persist across Editor play sessions.** `Engine` guards its singleton and tears the
   engine down in `OnDestroy`; the engine's own globals are re-init-safe.
 
@@ -315,15 +341,20 @@ crossfaded), so `Engine` re-pushes them whenever you touch the inspector: the pa
 SPCAP / VBAP), dual-band panning and dual-band CAP, SPCAP focus and density, the spread mode (LOBE /
 MDAP / SPECTRAL), max-rE (and its band split), decorrelation, near-listener widening, the hole-aware
 spread floor, tracked alignment (with its dead zone and slew guards), the bed renderer (MATRIX /
-**PARAMETRIC** - a recorded soundfield you can walk through), tracked room EQ, master gain, and the
-limiter. That is an A/B you can *hear*, not a restart.
+**PARAMETRIC** - a recorded soundfield you can walk through), tracked room EQ, tracked directivity,
+the speed of sound, the reverb and early-reflection levels, master gain, and the limiter. That is an
+A/B you can *hear*, not a restart.
 
-To set a whole configuration at once instead of knob by knob, `Bwa.bwa_tuning_preset` and
-`Bwa.bwa_apply_tuning` are bound. They are not inspector fields, so call them directly.
+To set a whole configuration at once instead of knob by knob, pick `situation` (Seated or Roaming)
+and call `Engine.ApplySituation()`. It copies the engine's preset into the inspector fields and
+pushes them, so the inspector shows what is set. `Engine.TryGetEngineTuning` reads back what the
+engine runs. `Bwa.bwa_tuning_preset` and `Bwa.bwa_apply_tuning` are bound too, but the next
+inspector edit overwrites what you set through them.
 
-Load-time settings (a scene restart to change): the profile, the reverb bed (Steam **or** FDN - they
-share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD / Layout, the layout file's imported `bed_decode`), the room box, and all
-acoustic geometry.
+Load-time settings (a scene restart to change): the profile, the layout, the sample rate and block
+size, the output device, the reverb bed (Steam **or** FDN - they share one reverb tap, so pick one),
+the bed *decoder* (AllRAD / EPAD / Layout, the layout file's imported `bed_decode`), sound pathing,
+the room box, and the static acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
 speaker count - **size meter arrays with it, never hard-code a speaker count**), `BusLevels()` (per-channel output
@@ -331,6 +362,13 @@ peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one 
 checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
 for the rest.
+
+For AV sync, `DspTimeFramesAt(realtime)` and `RealtimeAt(dspSample)` map between the dsp clock and
+`Time.realtimeSinceStartupAsDouble`. `HostTimeNs` reads the engine's host clock, and
+`OutputLatencyFrames` / `OutputLatencySeconds` give the device latency. For dropouts, `GetHealth`
+returns the counters and `Xruns` is the short form. `GetHealth` returns false when nothing can
+observe a dropout (not started, the manual sink, a driver with no valid sample position). Then a
+zero count proves nothing.
 
 ## Maintainers
 
@@ -367,6 +405,11 @@ Locally:
 cmake --build build --config RelWithDebInfo         # produces the DLLs
 powershell -File tools/upm/pack.ps1                 # -> dist/com.brainworks.bw_audio-<version>.tgz
 ```
+
+The pack refuses to run unless all four platforms' engine libraries are in `Runtime/Plugins/`. A
+Windows build stages only `bw_audio.dll`, so hand the other three over with `-AndroidFrom`,
+`-LinuxFrom` and `-MacFrom` (a directory each), or build for those platforms first (each build
+stages its own library there).
 
 Without a `-Version`, the local pack derives its version from `git describe`, for example
 `0.2.0-dev.32.gcf83c8e` (32 commits past `v0.2.0`). A dev tarball is therefore traceable to a commit

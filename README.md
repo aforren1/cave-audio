@@ -305,7 +305,7 @@ macOS runs the null and manual sinks, so the offline render path works there and
 reaches a speaker. The web build keeps the engine's two-thread model over
 `SharedArrayBuffer`, which is why it needs the isolation headers; on GitHub Pages a service
 worker supplies them. A wasi-sdk build of the same core runs the offline suite under
-wasmtime and is the CI leg. [`docs/backends.md`](./docs/backends.md) has the sink contract
+wasmtime. No CI job runs it yet. [`docs/backends.md`](./docs/backends.md) has the sink contract
 and the per-backend rules, [`docs/web.md`](./docs/web.md) the browser side.
 
 **GPLv3** ([`LICENSE`](./LICENSE)). Third-party components keep their own licenses; see

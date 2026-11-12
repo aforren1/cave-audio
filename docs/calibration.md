@@ -238,10 +238,11 @@ center's window. `--verify` moves each speaker's window by its own `delay_ms`, w
 sweep carries. `--window-m m` sets the distance margin for every mode.
 
 **A window cannot bias a clean measurement.** It only restricts where the peak is searched. When
-the strongest tap lies inside the window, the search returns the same tap the whole-IR search
-would, and the parabolic refinement reads the same three samples, so the arrival is the same to the
-bit (`test_measure` pins this). The answer changes only on a capture the window also flags, and a
-flagged capture is re-swept, never used. That is why the position-finding modes can carry one: a
+the strongest tap lies inside the window and no earlier tap comes within 12 dB of it, the search
+returns the same tap the whole-IR search would, and the parabolic refinement reads the same three
+samples, so the arrival is the same to the bit (`test_measure` pins this). The answer changes in
+two cases only: an earlier tap within 12 dB wins, or the window flags the capture. A flagged
+capture is re-swept, never used. That is why the position-finding modes can carry one: a
 speaker more than 0.5 m from its plan is flagged with its arrival printed, not mis-measured, and
 `--window-m` widens it.
 
@@ -1700,9 +1701,10 @@ as measured, and read a depth of about 0.
 ### Write the aims
 
 The tool only reports by default. `--write out.json` copies the measured aims of the matched
-speakers into a copy of the layout. Every other field is kept. `--fields position` or
-`--fields aim,position` writes positions too. That replaces the acoustic survey's position with
-the optical one, so do it only when you trust the optical one more. It refuses a mirrored frame
+speakers into a copy of the layout. Every other field is kept. `--fields position` writes the
+positions instead, and `--fields aim,position` writes both. A position write replaces the
+acoustic survey's position with the optical one, so do it only when you trust the optical one
+more. It refuses a mirrored frame
 and warns when the frame disagrees, because the values are in Motive's frame.
 
 Measured optical positions are what `bwa_calibrate --ref-speakers` wants: the system latency from

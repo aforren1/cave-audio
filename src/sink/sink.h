@@ -2,7 +2,7 @@
  * sink.h — internal device-sink abstraction (NOT part of the public ABI).
  *
  * The architecture keeps ASIO "just the Windows sink": the engine renders into an
- * in-memory 26-channel master bus, and one or more *sinks* consume it (see
+ * in-memory N-channel master bus (N = the layout's speaker count), and one or more *sinks* consume it (see
  * docs/architecture.md). This header is the seam. Do not let ASIO types leak past
  * the asio_sink.c boundary — everything here is device-agnostic.
  *
@@ -314,7 +314,7 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
                           uint32_t flags, bool exact_rate,
                           bwa_render_fn render, void* user, char* err, size_t errcap);
 /* The distinct client prefixes of the physical playback ports ("system", "RAVENNA"), one device
- * each, so a picker offers the card rather than 26 ports. The prefix IS the id. Control thread;
+ * each, so a picker offers the card rather than one entry per port. The prefix IS the id. Control thread;
  * opens a throwaway client, because asking the server anything needs a connection. */
 uint32_t sink_jack_device_count(void);
 bool     sink_jack_device_name(uint32_t index, char* buf, uint32_t cap);

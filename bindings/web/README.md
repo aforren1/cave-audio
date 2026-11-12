@@ -137,13 +137,15 @@ The ACTIVE count is `engine.info.channelCount`: the layout's speaker count, anyw
 | `topology` | `"worker"` (default) or `"main"` |
 | `audioContext` | an `AudioContext` the page created. Selects `"main"` and `SinkType.WORKLET` |
 | `maxSources` | frame-slab capacity, default 256 |
-| `profile` | `bwa_desc.profile` |
+| `profile` | `bwa_desc.profile`. Default `Profile.BINAURAL`, not the C default of `CAVE` |
 | `sampleRate` | Hz. 0 or absent takes the engine default (48000) |
 | `blockSize` | frames. 0 or absent takes the engine default (256) |
 | `sink` | `bwa_desc.sink` |
 | `device` | `bwa_desc.device` |
 | `sinkFlags` | `BWA_SINK_FLAG_*` |
 | `layoutPath`, `hrtfPath` | paths inside the wasm file system |
+| `bedDecoder` | `bwa_desc.bed_decoder`, default 0 |
+| `enablePathing` | `bwa_desc.enable_pathing`, default false |
 | `files` | `{path: Uint8Array}` written into that file system before `bwa_create` runs |
 | `module` | `"main"` topology only: an engine module this page already instantiated |
 
@@ -219,8 +221,11 @@ It does **not** lay out structs, and that is deliberate. JavaScript has no `offs
 building a `bwa_fdn_desc` by hand would hard-code field offsets a header change could move without
 a word. That is the reason `src/bwa_web.c` exists at all. An array of one scalar type is a different
 thing, because `float[3]` is three floats in every ABI. A struct-taking call needs a field by field
-wrapper in `bwa_web.c`, not a byte buffer from here. Three calls are out of reach until one is
-written: `bwa_fdn_config`, `bwa_reflections_config` and `bwa_apply_tuning`.
+wrapper in `bwa_web.c`, not a byte buffer from here. `bwa_create` and `bwa_get_health` have a
+wrapper. These calls have none yet, so JavaScript cannot reach them: `bwa_fdn_config`,
+`bwa_reflections_config`, `bwa_apply_tuning`, `bwa_get_tuning`, `bwa_tuning_preset`, `bwa_source_create_desc`,
+`bwa_source_apply`, `bwa_source_get_desc`, `bwa_source_preset`, `bwa_get_clock_model` and
+`bwa_tracker_connect`.
 
 ### Files the engine opens
 
@@ -405,8 +410,9 @@ three mistakes anyone makes first - not JSON, a count outside 4 to `MAX_CHANNELS
 number - and the engine is the authority for the rest: a file it refuses is reported with its own
 `bwa_last_error` text and the page falls back to the 24-speaker dome, because an engine whose
 `bwa_start` refused is an engine nobody can hear. The cones are placed from `bwa_get_speakers`
-afterwards, so what is drawn is what the engine loaded. The schema carries no per-speaker
-orientation, so the cones keep aiming at the array's nominal listening point.
+afterwards, so what is drawn is what the engine loaded. `bwa_get_speakers` reports positions
+only, so the cones keep aiming at the array's nominal listening point, even for a layout that sets
+a per-speaker `aim`.
 
 
 ### The coordinate seam
@@ -618,7 +624,7 @@ ctest --test-dir <build> -R web_bindings
 or directly:
 
 ```
-node --test bindings/web/tests
+node --test bindings/web/tests/*.test.mjs
 ```
 
 They run against the module that was just built, under node, with the null and manual sinks: the

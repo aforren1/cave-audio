@@ -10,7 +10,7 @@ Links below are relative to this file in the repository,
 from a checkout.
 
 It exists for two experiment shapes, described in
-[docs/backends.md](../../docs/backend-development.md#experiments-from-psychtoolbox-or-psychopy). PsychoPy is
+[docs/backend-development.md](../../docs/backend-development.md#experiments-from-psychtoolbox-or-psychopy). PsychoPy is
 Python, so it uses this package directly. Psychtoolbox is MATLAB and Octave, and uses the MEX
 binding in [`bindings/matlab`](../matlab/README.md).
 
@@ -121,14 +121,20 @@ from bw_audio import _bwa
 _bwa.set_hole_spread(engine.raw, 1.0)
 ```
 
+Some module-level calls do not need an engine: `list_devices`, `host_time_ns`, `source_preset`
+and `tuning_preset`, and the pure solves `panner_gains`, `bed_gains`, `bed_gains_layout` and
+`bed_decode_matrix`. The solves return numpy arrays. Use them to see what a panner or a bed
+decoder does to a layout without opening a device.
+
 ### What is not bound
 
 `bwa_set_output_capture` is excluded on purpose. Its callback runs on the **audio thread**, and an
 interpreter must never run there: taking the GIL inside a device callback allocates, blocks on a
 lock, and runs arbitrary bytecode, which breaks the engine's first invariant. The offline path is
 the manual sink and `Engine.render_block()`, which hands you the same post-limiter samples on your
-own thread. This is the rule [docs/backends.md](../../docs/backends.md) states for this binding by
-name.
+own thread. This is the rule
+[docs/backend-development.md](../../docs/backend-development.md#experiments-from-psychtoolbox-or-psychopy)
+states for this binding by name.
 
 Everything else in the ABI is bound. A test parses the header and fails if a new call arrives
 unbound.

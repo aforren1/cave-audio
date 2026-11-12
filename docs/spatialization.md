@@ -406,14 +406,17 @@ in order:
 - **LF room-EQ cuts** (`room_eq`, up to `BWA_ROOM_EQ_MAX` = 8 sections): RBJ peaking
   cuts for room modes, written by `--room-eq`. Static-listener installs only. Also
   before the gain+delay.
+- **Directivity comp**: a broadband gain plus a high shelf from the layout's `directivity`
+  model, re-aimed at the tracked listener. Calibration does not write it. See
+  "Compensating speaker directivity for the tracked listener" below.
 - **Gain trim**: per-speaker level equalization.
 - **Delay line**: a short integer-sample delay aligning arrival times to a
   reference.
 
 The gain trim + delay are not optional for a real array, but they are trivial DSP.
 The two EQ stages are optional and bypass when absent. See
-[calibration.md](./calibration.md) for how `bwa_calibrate` measures and writes all
-four.
+[calibration.md](./calibration.md) for how `bwa_calibrate` measures and writes the
+other four.
 
 ### Re-aligning to the tracked listener (`bwa_set_tracked_align`, off by default)
 
@@ -609,6 +612,8 @@ that belong here:
   at lower levels the ear loses LF sensitivity (ISO 226), so an attenuated source
   reads *thin* as well as far. An LF shelf restores 0.4 dB per dB of attenuation,
   capped +8 dB. A stylization, not physics: strict realism leaves it off.
+- **Near-field proximity** (`bwa_source_set_proximity`) is the near mirror of loudness
+  compensation: an LF shelf that rises linearly from 0 dB at 1 m to +6 dB at the head.
 
 All ramp per sample (no zipper) and tap the reflection send *before* themselves.
 

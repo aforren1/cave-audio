@@ -188,7 +188,7 @@ namespace BwAudio
 
         /// <summary>Play with an intro→loop region: the intro <c>[0, loopBeg)</c> plays once, then the
         /// body <c>[loopBeg, loopEnd)</c> loops forever (wraps at loopEnd back to loopBeg, not the clip
-        /// end). Frames are engine-rate (seconds × Engine.SampleRate). loopEnd 0 = the clip end. Always
+        /// end). Frames are engine-rate (seconds × Engine.sampleRate). loopEnd 0 = the clip end. Always
         /// loops (ignores this.loop). In-memory clips only. Author the loop points on matched endpoints —
         /// the seam is a hard wrap.</summary>
         public void PlayLoop(ulong loopBeg, ulong loopEnd, string clipOverride = null)

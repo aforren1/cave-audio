@@ -925,7 +925,7 @@ So the axis worth optimizing is not the same for every panner. VBAP puts all ene
 speakers and gets direction right by construction, so image focus carries the variation. DBAP
 spreads energy over many speakers, so its direction error genuinely varies and tracks the acoustic
 outcome. `bwa_layout_tool` now defaults its focus weight and its badness-map metric per panner on
-exactly this basis, see `layout-schema.md`.
+exactly this basis, see `layout-authoring.md`.
 
 ## Limits
 
@@ -1022,7 +1022,7 @@ through different capsules, which separates capsule error from field structure f
 
 ## Flags
 
-`bwa_validate --help` prints all but `--inject-fault`, `--track-sim-bump` and `--track-sim-twist`.
+`bwa_validate --help` prints every flag below.
 
 | flag | meaning |
 | --- | --- |

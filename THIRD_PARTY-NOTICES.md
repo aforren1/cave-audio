@@ -25,6 +25,23 @@ Everything else is in every platform's build of the library.
   source, at the pinned commit and with the one patch this repo applies, ships as
   `bw_audio-steam-audio-src-<tag>.zip` on each GitHub Release.
   License: https://github.com/ValveSoftware/steam-audio/blob/master/LICENSE.md
+  phonon links these archives, so they are in the library too:
+  - **libmysofa**: BSD-3-Clause (text below). Copyright 2016 Christian Hoene, Symonics GmbH.
+  - **zlib** 1.3.1: zlib License (text below). Copyright (C) 1995-2024 Jean-loup Gailly and
+    Mark Adler.
+  - **PFFFT**: the FFTPACK license (text below). Copyright (c) 2004 the University
+    Corporation for Atmospheric Research ("UCAR"); Copyright (c) 2013 Julien Pommier.
+  - **FlatBuffers** 1.12 (header code compiled into phonon): Apache License 2.0, Copyright
+    2014 Google Inc.
+
+## In the Python wheels (`bw_audio-*.whl`)
+
+The wheel carries the engine library above, plus the `_bwa` extension module:
+
+- **nanobind**: BSD-3-Clause (text below). Copyright (c) 2022 Wenzel Jakob. Statically
+  linked into `_bwa` (`NB_STATIC`).
+- **robin_map** (bundled with nanobind): MIT (text below). Copyright (c) 2017 Thibaut
+  Goetghebuer-Planchon.
 
 ## In the tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`)
 
@@ -64,7 +81,7 @@ the `bw_audio.dll` list.
   imports it from there because the site is served under COEP require-corp, where a CDN script is
   blocked. https://github.com/mrdoob/three.js
 
-## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js)
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js, robin_map)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -84,7 +101,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## zlib/libpng License (raylib, rlImGui)
+## zlib/libpng License (raylib, rlImGui, zlib)
 
 This software is provided "as-is", without any express or implied warranty. In
 no event will the authors be held liable for any damages arising from the use
@@ -101,3 +118,56 @@ the following restrictions:
 2. Altered source versions must be plainly marked as such, and must not be
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
+
+## BSD 3-Clause License (libmysofa, nanobind, Tracy)
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## FFTPACK License (PFFFT)
+
+Copyright (c) 2004 the University Corporation for Atmospheric Research ("UCAR").
+All rights reserved. Developed by NCAR's Computational and Information Systems
+Laboratory, UCAR, www.cisl.ucar.edu.
+
+Redistribution and use of the Software in source and binary forms, with or
+without modification, is permitted provided that the following conditions are
+met:
+
+- Neither the names of NCAR's Computational and Information Systems Laboratory,
+  the University Corporation for Atmospheric Research, nor the names of its
+  sponsors or contributors may be used to endorse or promote products derived
+  from this Software without specific prior written permission.
+- Redistributions of source code must retain the above copyright notices, this
+  list of conditions, and the disclaimer below.
+- Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions, and the disclaimer below in the documentation and/or other
+  materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING, BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE SOFTWARE.

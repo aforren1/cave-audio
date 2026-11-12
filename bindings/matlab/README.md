@@ -108,10 +108,15 @@ e = bwa.Engine('profile', bwa.Const.PROFILE_BINAURAL, 'sink', bwa.Const.SINK_MAN
 snd = e.loadSound('click.wav');
 src = e.createSource();
 src.setPos(1.0, 1.5, 0.0);        % committed for you
+e.start();
 src.play(snd);
 block = e.render_block();
 e.close();
 ```
+
+The package also has functions that do not need an engine: `bwa.listDevices(backend)`
+(a struct array with `name` and `id`), `bwa.sourcePreset(kind)`, `bwa.tuningPreset(setup)`,
+`bwa.constants()` and `bwa.abiVersion()`.
 
 Mix the layers freely. `e.raw('set_spcap_focus', 12.7, 2.0)` is `bwa_mex('set_spcap_focus', h,
 12.7, 2.0)`, and `e.handle()` gives you the raw handle for a call you would rather write out.

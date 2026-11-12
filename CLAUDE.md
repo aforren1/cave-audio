@@ -467,8 +467,9 @@ tools/ci/              build-engine-manylinux.sh: the LINUX engine, built, ctest
                        is an ordinary ABI client. [engine sdk]
 tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 build. TWO toolchains and they
                        are not interchangeable: wasi-sdk (wasm32-wasip1-threads, plain clang, a STATIC
-                       libbw_audio.a plus the offline test binaries, 33/33 under wasmtime) is the CI and
-                       offline leg; Emscripten with -pthread is the browser leg (Web Audio + Workers;
+                       libbw_audio.a plus the offline test binaries, 33/33 under wasmtime) is the
+                       offline leg (meant for CI, but NO CI job runs it yet: ci.yml and pages.yml are
+                       Emscripten only); Emscripten with -pthread is the browser leg (Web Audio + Workers;
                        35/38 under node with the wasm phonon staged, the three reds being `os` and
                        `idle`, control-on-main-thread blocking waits, and `fuzz_api`, a phonon throw
                        aborting the module because the wasm phonon has exceptions off). The

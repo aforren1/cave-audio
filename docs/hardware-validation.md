@@ -64,11 +64,11 @@ point where the box's acoustic center will be, not on its front baffle or its mo
 
 - [ ] **Place the speakers** in `bwa_layout_tool plan.json`, with a `constraints.json` beside it
       for the room's bounds, keep-out boxes and obstacles
-      ([layout-schema.md: Constraints](./layout-authoring.md#constraints-constraintsjson)).
+      ([layout-authoring.md: Constraints](./layout-authoring.md#constraints-constraintsjson)).
 - [ ] **Optimize** if you want to: `bwa_layout_tool --optimize plan.json dbap` (or `spcap`,
       `vbap`). It hill-climbs inside the constraints and saves in place. Keep the default
       `moving` observer: one array serves every use, so do not optimize it for one seat
-      ([layout-schema.md: The optimizer](./layout-authoring.md#the-optimizer)).
+      ([layout-authoring.md: The optimizer](./layout-authoring.md#the-optimizer)).
 - [ ] **Declare the listening point**: `bwa_layout_tool --export plan.json ears=1.448 listen`.
 - [ ] **Add the speaker model**: `uv run tools/directivity/clf_to_json.py Genelec_Oy-4410A.CF2
       --into plan.json`. Live aiming, the aiming sheet and the trims read it.
@@ -282,7 +282,7 @@ with the reason, or `OK`.
   When poses return, the stand reads `moving` for up to 0.5 s while the window refills, then the
   1 s hold starts again. During a run, a capture with no fresh pose within 0.5 s is counted as
   unchecked in the report line.
-- **A key** takes the current reading anyway, with a warning (CLI only; a Session step has no
+- **F** takes the current reading anyway, with a warning (CLI only; a Session step has no
   console). `--place-timeout` (300 s) ends a wait that never opens: `bwa_calibrate` exits 1, and
   `bwa_validate` skips that placement.
 

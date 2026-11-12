@@ -567,7 +567,7 @@ namespace BwAudio
 
         /// <summary>Load a legacy FuMa B-format soundfield (.amb-style: WXYZ order, MaxN, W -3 dB) for a
         /// world-locked bed (cached). Converted to AmbiX at load — past this call it IS an AmbiX asset.
-        /// Full 3D sets only (4/9/16 channels). Returns 0 on failure.</summary>
+        /// Full 3D sets (4/9/16 channels) and the .amb mixed-order sets (3/5/6/7/8/11). Returns 0 on failure.</summary>
         public uint LoadFuma(string clip) => Acquire(clip, BwaLoadFlags.Fuma);
 
         /// <summary>The handle for a clip that is ALREADY resident, or 0. Pure probe: it never loads,
@@ -1063,7 +1063,8 @@ namespace BwAudio
         }
 
         // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
-        // seeds the ISM early-reflection room — valid only before start, so it stays on this path. Any
+        // seeds the ISM early-reflection room. The ABI takes it live too, but Engine only calls it here
+        // and on scene loads, so it stays on this path. Any
         // acoustic geometry goes through RebuildSceneMesh, which is runtime-safe and shared with the
         // per-scene re-bake below.
         void SetupScene()

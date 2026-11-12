@@ -20,7 +20,7 @@ macro(bwa_add_bindings)
   # at the ROOT CMakeLists with the option on, rather than making bindings/python its own project,
   # because the ASIO and phonon lookups there resolve against ${CMAKE_SOURCE_DIR} and would miss
   # from anywhere else. See bindings/python/CMakeLists.txt and bindings/python/README.md.
-  option(BWA_BUILD_PYTHON "Build the Python binding (nanobind; needs Python 3.9+ with nanobind)" OFF)
+  option(BWA_BUILD_PYTHON "Build the Python binding (nanobind; needs Python 3.10+ with nanobind)" OFF)
   if(BWA_BUILD_PYTHON)
     enable_language(CXX)
     add_subdirectory(bindings/python)

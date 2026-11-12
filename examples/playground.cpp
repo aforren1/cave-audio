@@ -1031,7 +1031,7 @@ static int           g_render_pick = 0;             /* the panel's render picker
                                                      * 0 = cave_sim (array audition on headphones, the
                                                      * default - the meters/gizmos read the bus),
                                                      * 1 = binaural (direct per-source render),
-                                                     * 2 = cave (the ARRAY ITSELF: 26-ch ASIO to the
+                                                     * 2 = cave (the ARRAY ITSELF: multichannel ASIO to the
                                                      * rig; on a desk with no such device the null
                                                      * sink renders visual-only). */
 static char          g_hpeq_path[260];              /* headphone EQ (AutoEq ParametricEQ.txt); the
@@ -1450,7 +1450,7 @@ static void draw_panel(void) {
               "the speaker bus, so quiet meters there are CORRECT - only the FDN/reflection tails "
               "still ride the bus). Both headphone renders go out whatever the device combo above "
               "says, which under (auto) is the Windows default output. cave = the ARRAY ITSELF: "
-              "26-ch ASIO to the rig - the by-ear harness pointed at real speakers (pick the "
+              "multichannel ASIO to the rig - the by-ear harness pointed at real speakers (pick the "
               "Digiface ASIO entry above; with no >=layout-count device the null sink runs "
               "visual-only). The audio line above names the live decode for the headphone renders. "
               "Create-time: switching REBUILDS the engine (brief gap).");

@@ -160,7 +160,7 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                                          * name (Web Audio enumerates no output devices) */
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 
-/* bwa_desc.sink_flags bits. All three are opt-in, and all three trade something a shared,
+/* bwa_desc.sink_flags bits. All four are opt-in, and all four trade something a shared,
  * resampling, comfortably-buffered device gives you for free. None of them reaches the CAVE_BOTH
  * monitor: like `device`, they describe the PRIMARY device only (the monitor opens the platform
  * default shared, with no flags, which is the whole reason cave_both can hold an ASIO array and a
@@ -345,7 +345,8 @@ BWA_API void    bwa_unload_sound(bwa_engine* e, bwa_sound snd);    /* safe: reti
 BWA_API bwa_sound bwa_load_ambix(bwa_engine* e, const char* path);
 /* Like bwa_load_ambix for legacy FuMa B-format recordings (.amb and friends: WXYZ|RSTUV|KLMNOPQ
  * channel order, MaxN + the W -3 dB). The load converts it to AmbiX, so past this call the asset is
- * indistinguishable from an AmbiX load of the same field. Full 3D sets only (4/9/16 channels). */
+ * indistinguishable from an AmbiX load of the same field. Full 3D sets (4/9/16 channels) and the .amb
+ * mixed-order sets (3/5/6/7/8/11 channels), stored in their highest order's ACN slots. */
 BWA_API bwa_sound bwa_load_fuma(bwa_engine* e, const char* path);
 /* Asset metadata (control thread; any time after a successful load). Frames are at the ENGINE
  * rate (in-memory assets were resampled at load; streams must already match), so

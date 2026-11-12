@@ -200,7 +200,7 @@ why, for the choices the API left open.
 - **The adapter never sees a device position.** JACK hands out exactly `nframes` every cycle, so
   `written` telescopes to follow the server's frame counter and the queued-depth rule can never
   fire. On a real xrun the server's counter jumps and that rule would report the same fault the
-  xrun callback already reported, so `quant_pull` is called with `device_pos_valid` clear and
+  xrun callback already reported, so `sink_quant_pull` is called with `device_pos_valid` clear and
   `measured` is set from the xrun route instead.
 - **The buffer-size callback resizes nothing.** The adapter takes the count per pull, and its FIFO
   is allocated for 8192 frames at open, so the callback only records the new size. A cycle larger

@@ -12,7 +12,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "bw_audio"
 dynamic = ["version"]
-description = "Python binding for the bw_audio spatial audio engine (26-speaker CAVE array, binaural headphone render)"
+description = "Python binding for the bw_audio spatial audio engine (CAVE speaker array, binaural headphone render)"
 readme = "README.md"
 # 3.10 is the floor twice over: the pinned nanobind needs it, and it is the oldest Python a
 # release wheel is built for. A source build on 3.9 is not supported.

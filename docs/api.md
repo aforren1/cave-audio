@@ -749,7 +749,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `block_size`     | render quantum, frames; 0 = 256. Also the device *period hint* - a driver or an OS mixer may run its own size, and the sinks adapt, but the quantum handed to the DSP is exactly this regardless; `bwa_get_block_size` reads it back |
 | `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)). A named device backend is a demand, and an open failure fails `bwa_start` loudly: `BWA_SINK_ASIO` and `BWA_SINK_WASAPI` (Windows), `BWA_SINK_JACK` and `BWA_SINK_ALSA` (Linux), `BWA_SINK_AAUDIO` (Android, stereo only), `BWA_SINK_WORKLET` (browser, stereo only), `BWA_SINK_COREAUDIO` (macOS, not in this build yet). `BWA_SINK_NULL` forces the offline sink (CI, profiling, tracking-only). `BWA_SINK_MANUAL` creates no device and no thread: you pump blocks with `bwa_render_block` (deterministic, for golden tests) |
 | `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). Three backends read it differently: JACK takes a port regular expression, AAudio a decimal Android device id, and the worklet sink a decimal AudioContext handle (see [Sink policy](#sink-policy)). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
-| `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
+| `embree`         | ray-trace the acoustics sims on Intel Embree; falls back to the default tracer (one stderr notice) if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1), EPAD (2), or LAYOUT (3, the layout file's imported `bed_decode`) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
 | `sink_flags`     | `BWA_SINK_FLAG_*` backend options for the PRIMARY device (they do not reach the `cave_both` monitor); 0 is the default, every bit opt-in. The flags and what each backend does: [Latency classes](#latency-classes) |
@@ -767,6 +767,8 @@ The API reports failure three ways, all read on the **control thread**:
 - **`bwa_last_error`.** A human-readable string for the most recent failure on that engine, or
   `NULL` if none. Lifetime: the engine clears it at **entry** to the lifecycle/load-class calls (create,
   start, the loads, the source creates, tracker_connect), so a successful one leaves it `NULL`.
+  The exception is a call that succeeds with a degradation: it reports the degradation here (see
+  below).
   A per-frame call sets it only when it REJECTS the call. Read it right after the call you are checking; a later
   successful lifecycle call wipes it. The string itself stays valid until the next `bwa_*` call
   on the same engine.
@@ -776,7 +778,7 @@ The API reports failure three ways, all read on the **control thread**:
 | `BWA_OK`         | 0     | success |
 | `BWA_ERR_CONFIG` | 1     | bad call arguments (a NULL engine or desc), a static-`room_eq` layout in a moving-listener session, or an unparseable headphone EQ file |
 | `BWA_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked enough output channels for the layout, or failed to start |
-| `BWA_ERR_LAYOUT` | 3     | `bwa_start`: an explicitly-passed `layout_path` failed to load at create (missing/unparseable/failed validation - see [`layout-schema.md`](./layout-schema.md)) |
+| `BWA_ERR_LAYOUT` | 3     | `bwa_start`: an explicitly-passed `layout_path` failed to load at create (missing/unparseable/failed validation - see [`layout-schema.md`](./layout-schema.md)), or `bed_decoder = BWA_DECODE_LAYOUT` with a layout that carries no `bed_decode` block |
 | `BWA_ERR_HRTF`   | 4     | reserved; not currently returned. HRTF (SOFA) load failures are non-fatal - the monitor degrades and the reason lands in `bwa_last_error` |
 | `BWA_ERR_STATE`  | 5     | reserved; not currently returned. Wrong-state calls report through `bwa_last_error` instead |
 | `BWA_ERR_INTERNAL` | 6   | reserved; not currently returned |
@@ -805,7 +807,10 @@ What actually comes back today:
 
 Per-frame calls that **reject** the call do set `bwa_last_error` (`bwa_source_push` on a plain
 source, `bwa_source_queue`, `bwa_play_oneshot` on a dead handle, `bwa_fdn_set_decay`,
-`bwa_material_release`, `bwa_apply_tuning`); a per-frame call that merely enqueues never does.
+`bwa_material_release`, `bwa_apply_tuning`). A per-frame call that only enqueues never sets it,
+with one exception: `bwa_commit` reports a held async play that it had to drop (see
+[Async loading](#async-loading-bwa_sound_acquire_async)). The message is about that earlier play
+call, not about the commit. Check for it after you commit.
 
 Per-frame `void` calls that only enqueue (`bwa_source_set_pos`, `bwa_commit`, …) report nothing. They
 enqueue onto the command ring and return. A full ring drops the command silently, but the ring is sized
@@ -991,9 +996,11 @@ Nothing is loaded or opened, and the list is read fresh on every call, so a driv
 that appeared since the last call shows up and the query is safe alongside a running engine. A
 listed device is not necessarily *openable* (hardware unplugged, exclusive-mode busy); the truth
 test is still `bwa_start` + `bwa_get_audio_backend`. The tools ride the same query: `--list-devices`
-on `bwa_playground` and `bwa_minimal` lists every backend, with `--list-drivers` kept there as a
-deprecated ASIO-only alias; `bwa_calibrate`, `bwa_validate` and `bwa_zylia_probe` are ASIO-only by
-nature and keep `--list-drivers`. The GUIs use picker dropdowns.
+on `bwa_playground` and `bwa_minimal` lists every backend, and `bwa_playground` keeps
+`--list-drivers` as a deprecated ASIO-only alias. `bwa_calibrate`, `bwa_validate` and
+`bwa_zylia_probe` are ASIO-only. `bwa_calibrate` lists drivers with `--list-drivers` and
+`bwa_zylia_probe` with `--list`. `bwa_validate` has no list flag; it takes `--driver`. The GUIs
+use picker dropdowns.
 
 The buffer you pass is yours to size. A name longer than `cap` is truncated to `cap - 1` bytes on a
 UTF-8 character boundary and still returns true, so a picker that sized for the common case gets a

@@ -1311,7 +1311,7 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 		w.push_back("The Steam reflection bed already contains early reflections. Do not also "
 					"enable early_reflections on sources - they render twice.");
 	}
-	/* The desk case, and the one that costs the most time: profile Cave renders the 26-channel
+	/* The desk case, and the one that costs the most time: profile Cave renders the speaker
 	 * array and nothing else, so on a machine with no rig it is silent by design. get_audio_backend()
 	 * reports it after the fact — this says it before the run. CaveSim is the profile that
 	 * auditions the array on headphones; Binaural is the direct headphone render. */
@@ -1320,7 +1320,7 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 	 * the one path whose transport is fixed to ASIO. */
 	if (profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
 			&& BwaEngine::get_asio_driver_count() == 0) {
-		w.push_back("Profile is Cave (the 26-channel rig) but no ASIO driver is installed, so "
+		w.push_back("Profile is Cave (the speaker-array rig) but no ASIO driver is installed, so "
 					"this machine will render the array to nothing and you will hear silence. "
 					"Use CaveSim to audition the array on headphones, or Binaural for the "
 					"direct headphone render - both open an ordinary Windows output device.");
@@ -1511,10 +1511,10 @@ void BwaEngine::_bind_methods() {
 	/* The hint labels carry the DECISION, not just the enum spelling. This is the highest-stakes
 	 * property on the node — it decides whether someone at a desk hears anything at all — and the
 	 * inspector is where the choice is made, so the answer has to be legible there rather than in
-	 * docs/api.md. Cave renders 26 channels to the rig and is inaudible on headphones; CaveSim is
+	 * docs/api.md. Cave renders the speaker array to the rig and is inaudible on headphones; CaveSim is
 	 * the one that auditions the ARRAY at a desk; Binaural is the direct headphone render. */
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "profile", PROPERTY_HINT_ENUM,
-						 "Cave - 26-ch rig only:0,"
+						 "Cave - speaker-array rig only:0,"
 						 "Binaural - headphones, direct render:1,"
 						 "CaveSim - headphones, auditions the array:2,"
 						 "CaveBoth - rig + the sim tap:3"),

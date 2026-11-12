@@ -5,6 +5,7 @@ classdef Engine < handle
 %   snd = e.loadSound('click.wav');
 %   src = e.createSource();
 %   src.setPos(1.0, 1.5, 0.0);        % committed for you
+%   e.start();                        % render_block needs a started engine
 %   src.play(snd);
 %   block = e.render_block();
 %   e.close();
