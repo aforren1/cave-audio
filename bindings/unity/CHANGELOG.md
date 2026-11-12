@@ -4,6 +4,22 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: device output on macOS (CoreAudio)
+
+The macOS library opens a real output device. Under `BwaSinkType.Auto` the headphone profiles
+(`Binaural`, `CaveSim`) play on the macOS default output device, in the editor and in a
+`StandaloneOSX` player. `BwaSinkType.CoreAudio` names the backend, and `Engine.Devices
+(BwaSinkType.CoreAudio)` lists the output devices, default first. The `device` field takes a
+device name or its UID.
+
+- The device runs at the engine's sample rate or the start fails. CoreAudio has no per-client
+  resampler on this path, so the open **sets the device's sample rate** to the engine's when the
+  two differ. Other applications keep playing through their own converters.
+- The array profiles open too, when the device has enough output channels. A Mac whose device has
+  fewer falls back to the silent offline sink under `Auto`, and `Engine` logs the channel counts.
+- The sink flags (`Exclusive`, `ExactRate`, `TightBuffer`) change nothing on this backend.
+- The inspector's Sink popup offers `CoreAudio` for a macOS build target and in the macOS editor.
+
 ## [0.19.2]
 
 More NatNet QOL.

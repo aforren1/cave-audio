@@ -20,14 +20,16 @@ costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON
 - **A Tracy "frame" = one audio block.** That's the budget unit. At 256 samples / 48 kHz the block
   period is **5.33 ms**. The block zone must stay well under it, with headroom for jitter.
 - **The block zone depends on the sink.** `asio block`, `null block`, `alsa block` and
-  `manual block` time one block directly. WASAPI, JACK, AAudio and the worklet go through the
-  fixed-quantum adapter, so each rendered block is a `quant block` zone inside the device callback
-  (`wasapi block`, `jack cycle`, `aaudio callback`, `worklet quantum`).
+  `manual block` time one block directly. WASAPI, CoreAudio, JACK, AAudio and the worklet go
+  through the fixed-quantum adapter, so each rendered block is a `quant block` zone inside the
+  device callback (`wasapi block`, `coreaudio cycle`, `jack cycle`, `aaudio callback`,
+  `worklet quantum`).
 - **Threads.** The audio thread shows up as `bw-audio (ASIO)` (the driver's `bufferSwitch`
   thread), `bw-audio (WASAPI)`, `bw-audio (ALSA)`, or `bw-audio (null)` (the no-hardware render
-  thread; same `render()`, so you can profile without a device). JACK, AAudio and the worklet
-  render on a thread the server, the OS or the browser owns; their named threads
-  (`bw-audio (JACK lost)` and so on) are the host-paced fallbacks after a device is lost.
+  thread; same `render()`, so you can profile without a device). JACK, CoreAudio, AAudio and the
+  worklet render on a thread the server, the OS or the browser owns; their named threads
+  (`bw-audio (JACK lost)`, `bw-audio (CoreAudio lost)` and so on) are the host-paced fallbacks
+  after a device is lost.
 - **Zones** under the block: `rt_render` → `mix voices`, `decorrelate`, `reflect tap`,
   `path tap`, `align`; plus `array-sim room` (with `array-sim eq` inside it), `binaural decode`
   and `convert_out`. The sim threads show

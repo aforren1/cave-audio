@@ -4,7 +4,8 @@
  * The whole file is one loop and its accounting. It is pure (no device, no OS beyond the
  * monotonic clock, which goes through os.h), which is the point: the backends it serves cannot be
  * tested on CI, so the arithmetic they all share is tested on its own (test/sink_quant_test.c).
- * CoreAudio and AAudio will render through this same file, so it stays platform-free.
+ * WASAPI, CoreAudio, JACK, AAudio and the worklet all render through this same file, so it stays
+ * platform-free.
  */
 #include "sink/sink_quant.h"
 #include "os/os.h"

@@ -5,17 +5,17 @@ the ABI, the AUTO order, what each backend does, and how they build and test. Wh
 exist, the design decisions behind them, the phase plan, the next-backend checklist and the open
 verify list are in [backend-development.md](./backend-development.md).
 
-Status: **phases 0 to 3, 5 and 6 are implemented**; phase 4 (CoreAudio) is still specification.
-The engine has eight sinks: ASIO (`src/sink/asio_sink.cpp`), WASAPI (`src/sink/wasapi_sink.cpp`),
-JACK (`src/sink/jack_sink.c`), ALSA (`src/sink/alsa_sink.c`), AAudio (`src/sink/aaudio_sink.c`),
-Wasm Audio Worklet (`src/sink/worklet_sink.c`), null (`src/sink/null_sink.c`), and manual
+Status: **phases 0 to 6 are implemented.**
+The engine has nine sinks: ASIO (`src/sink/asio_sink.cpp`), WASAPI (`src/sink/wasapi_sink.cpp`),
+CoreAudio (`src/sink/coreaudio_sink.c`), JACK (`src/sink/jack_sink.c`), ALSA
+(`src/sink/alsa_sink.c`), AAudio (`src/sink/aaudio_sink.c`), Wasm Audio Worklet
+(`src/sink/worklet_sink.c`), null (`src/sink/null_sink.c`), and manual
 (`src/sink/manual_sink.c`), over the two shared pieces (`src/sink/sink_convert.h`,
 `src/sink/sink_quant.c`).
 The ABI those need is in place: the appended `bwa_sink_type` values, `bwa_desc.device` and
 `sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`. The OS shim
 (`src/os/os.h`, `src/os/os_win.c`, `src/os/os_posix.c`) lets the library, the tests and the
-console examples build and pass with gcc and clang on Linux, macOS and Android. What remains is
-the CoreAudio backend.
+console examples build and pass with gcc and clang on Linux, macOS and Android.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
 [concurrency.md](./concurrency.md) for the audio-thread rules every backend inherits.
@@ -102,7 +102,7 @@ Where each backend gets the pair:
 |-----------|-----------------------------------------------------------------------------------------|
 | ASIO      | `ASIOTime.timeInfo`: `samplePosition` when `kSamplePositionValid`, and for the time, the driver's `systemTime` ONLY when its stamps show it is on QPC, else QPC read at callback entry. See "ASIO's `systemTime`" below |
 | WASAPI    | `IAudioClock::GetPosition(&pos, &qpc)`, normalized by `GetFrequency()` to frames. Do not assume the units: `frames = pos * rate / freq`. `qpc` is in 100 ns units |
-| CoreAudio | the IOProc's `inOutputTime`: `mSampleTime` and `mHostTime` when both valid flags are set; `mach_timebase_info` converts host ticks to ns |
+| CoreAudio | Position: the IOProc's `inOutputTime->mSampleTime` when its valid flag is set, moved onto the adapter's stream. Time: `inNow->mHostTime`, the IO cycle's own time, converted from host ticks to ns through `mach_timebase_info`; the host clock when the flag is clear. Not `inOutputTime->mHostTime`: that leads the cycle by the buffer plus the safety offset, which rule 5's latency already counts |
 | JACK      | Position: the adapter's own stream count. Time: `current_usecs` from `jack_get_cycle_times` at the top of the process callback, the server's DLL-filtered time in microseconds on `CLOCK_MONOTONIC` (the sink ignores `current_frames`). Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
 | AAudio    | Position: the adapter's own stream count. Time: `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. It fails until the stream has run a little. Until then the host clock at the callback stands in, and `measured` sets only after the first success |
@@ -157,7 +157,7 @@ ALSA.
 | `dropouts`       | **exclusive:** the queued depth `written - device_pos` went negative, the device consumed frames never written. **shared:** the interval between two `ReleaseBuffer` calls exceeded the buffer depth. Every event refills the buffer to full, so the device is holding `bufferFrameCount` after each release and runs dry that many frames later; a later release proves it had nothing in between. The depth rule cannot serve shared mode: the request size is exactly what the engine consumed since the last callback, so `written` telescopes to follow the device position and the depth never goes negative | `sink_position_gap` on `mSampleTime`, as ASIO | the xrun callback (`jack_set_xrun_callback`) | `-EPIPE` from the write (an underrun)          | `AAudioStream_getXRunCount` delta   |
 | `dropped_frames` | **exclusive:** the size of that deficit. **shared:** the release interval minus the buffer depth, at the nominal rate. Not an estimate: it is the measured excess | the gap                                    | `jack_get_xrun_delayed_usecs` at the nominal rate | the elapsed monotonic time since the last good write minus the buffer depth, at the nominal rate | unknown: 0                          |
 | `driver_resyncs` | event-wait timeouts: the device stopped handing out buffers | the `kAudioDeviceProcessorOverload` listener | 0                                         | `-ESTRPIPE` (a suspend), after recovery         | 0                                   |
-| `measured`       | **exclusive:** once `GetPosition` has succeeded. **shared:** `bufferFrameCount > period`, and nothing to do with `IAudioClock`. The release-interval rule needs headroom between a normal cycle and the dry deadline; with a one-period buffer a normal cycle sits on it and ordinary jitter would read as a fault, so the honest answer is that the configuration cannot judge | once a timestamp with both flags arrived   | always (the server reports xruns directly)  | always (the write reports underruns directly)     | once `getTimestamp` has succeeded   |
+| `measured`       | **exclusive:** once `GetPosition` has succeeded. **shared:** `bufferFrameCount > period`, and nothing to do with `IAudioClock`. The release-interval rule needs headroom between a normal cycle and the dry deadline; with a one-period buffer a normal cycle sits on it and ordinary jitter would read as a fault, so the honest answer is that the configuration cannot judge | once an output sample time arrived (`kAudioTimeStampSampleTimeValid`), which the first cycle carries | always (the server reports xruns directly)  | always (the write reports underruns directly)     | once `getTimestamp` has succeeded   |
 
 The **Wasm Audio Worklet** has no column because every cell would say the same thing: Web Audio
 reports no device position, no xrun count and no underrun signal of any kind. `currentFrame`
@@ -188,20 +188,30 @@ nothing). Nothing reopens on its own.
 | backend   | frames                                                                                                   |
 |-----------|----------------------------------------------------------------------------------------------------------|
 | WASAPI    | `IAudioClient::GetStreamLatency` (converted from 100 ns units) plus the buffer size in exclusive mode, or plus one period in shared mode |
-| CoreAudio | `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` + `kAudioStreamPropertyLatency` + the buffer frame size |
+| CoreAudio | `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` + the largest `kAudioStreamPropertyLatency` over the output streams, read once at open, + the IO cycle the device is running now. On an HDMI display at a 256 block: 88 + 320 + 0 + 256 = 664 frames. Nothing is added for the adapter (see below) |
 | JACK      | the max over the sink's ports of `jack_port_get_latency_range(port, JackPlaybackLatency)`, read after the connections are made (the server recomputes on connect) |
 | ALSA      | `snd_pcm_status_get_delay` from the `snd_pcm_status` read after the first good write, which is the buffer fill; the open's buffer size until then |
 | AAudio    | `getFramesWritten - pos` from the timestamp pair, extrapolated to now at the nominal rate; `getBufferSizeInFrames` when the timestamp is not yet available |
 | Wasm Audio Worklet | `AudioContext.baseLatency + outputLatency`, in seconds, read once at open. `webaudio.h` has no accessor for either, so the sink reads the two properties off the context object itself. 0 when the browser reports neither, which is "unknown" and not "none". `BWA_SINK_FLAG_DEEP_BUFFER` moves it: a context the sink creates gets latencyHint `"playback"` (baseLatency 20 ms on the Windows desktop, 1216 frames in all at block 256, against 736 with `"interactive"`); a page that hands the sink its own context sets the hint itself (0.05 on the XR page: 50 ms, 2656 frames) |
 
-The adapter adds the frames it holds in its FIFO. The value stays constant for the life of the
-sink, as the header promises.
+The adapter adds the frames it holds in its FIFO, on every backend but CoreAudio. There it was
+measured: a block's first frame reached the device within 5 frames of the block's own stamp at
+every block and buffer pairing tried, bridged or not. The adapter stamps a block with the
+callback time plus the frames queued ahead of it, so the held frames are already in the stamp,
+and the CoreAudio sink adds nothing for them. Nobody has repeated that measurement on the other
+adapter backends, so they keep the term
+([verify list](./backend-development.md#verify-before-relying-on-it)).
+
+The value stays constant for the life of the sink, as the header promises, with one exception.
+CoreAudio's follows the device's IO cycle, because that buffer belongs to the device and the
+process and something else in the process can resize it.
 
 `BWA_SINK_FLAG_TIGHT_BUFFER` in `bwa_desc.sink_flags` asks the backend for the smallest device
 buffer it can take, which moves this number and nothing else about the contract. ALSA asks for 2
 periods instead of 3, AAudio for 1 burst instead of 2. WASAPI ignores it: exclusive mode already
 runs a one-period buffer, and a shared-mode buffer belongs to the OS mixer. So do ASIO and JACK,
-where the driver or the server owns the buffer. The device can always refuse, so read the result
+where the driver or the server owns the buffer, and CoreAudio, whose IO buffer is already the
+engine block. The device can always refuse, so read the result
 back through `output_latency()` rather than assuming the request was granted.
 
 ### 6. Sample rate
@@ -229,7 +239,8 @@ measurement rather than a preference. The default without the flag is unchanged:
 sink accepts the OS resampler and reports the degradation.
 
 CoreAudio and JACK have no per-client resampler, so a headphone open fails on a mismatch there
-too. JACK's rate is the server's (`jack_get_sample_rate`); a PipeWire desktop that runs its
+too. CoreAudio first sets the device's nominal rate to the engine rate, so the mismatch that
+fails is a device with no such rate. JACK's rate is the server's (`jack_get_sample_rate`); a PipeWire desktop that runs its
 graph at 44.1 kHz needs `default.clock.rate = 48000` in its config, or an engine created at the
 graph's rate.
 
@@ -540,8 +551,11 @@ Per platform, and on Windows per requested channel count:
 | Android  | AAudio, null                   | null                        |
 | Browser  | Wasm Audio Worklet, null       | null                        |
 
-The macOS entry is in `sink.c` already, but no CoreAudio sink is compiled until phase 4, so a Mac
-opens the null sink today. Each backend is in the order only when the build carries it.
+Each backend is in the order only when the build carries it. macOS does not split the order by
+width, because a HAL device shows its raw channel count: the same backend serves the headphones
+and, where the device has the outputs, the array. A desk Mac asked for an array wider than its
+device fails that open, lands on the null sink, and reports both channel counts through
+`bwa_last_error`.
 
 A headphone profile on Windows under AUTO opens the Windows default output, not the first
 registered ASIO driver. That is the device the headphones are on, which an ASIO pick cannot know
@@ -680,8 +694,75 @@ CI: GitHub's Windows runners have no audio endpoint, so `GetDefaultAudioEndpoint
 
 ### CoreAudio
 
-Not implemented yet (phase 4). The planned design is in
-[backend-development.md: CoreAudio](./backend-development.md#coreaudio).
+**Implemented (phase 4).** Files: `src/sink/coreaudio_sink.c`. The HAL is a C API, so the sink is
+C with blocks and no Objective-C. Link the `CoreAudio` and `CoreFoundation` frameworks. Define
+`BWA_HAVE_COREAUDIO`.
+
+The HAL (`AudioDevice*`), not AUHAL: the array needs the device's raw channel count and no
+converter in the path. The price is that nothing resamples.
+
+Open sequence:
+
+1. Resolve the device: `kAudioHardwarePropertyDefaultOutputDevice` when `device` is NULL, else
+   the exact name across every output device, then the exact UID (rule 10).
+2. Rate. When `kAudioDevicePropertyNominalSampleRate` is not the engine rate, check
+   `kAudioDevicePropertyAvailableNominalSampleRates`, set the rate, and poll the read-back for at
+   most 2 s, because the set is asynchronous. A device that has no such rate, or stays at another
+   one, fails the open, and the message names both rates (rule 6).
+3. Read `kAudioDevicePropertyStreamConfiguration` for the output scope, **after** the rate set,
+   because an interface can halve its channel count at a higher rate. It is an
+   `AudioBufferList` with one buffer per **stream**, each with its own channel count, and it is
+   the list the IOProc is handed. A device with fewer output channels than the open needs fails
+   here, and the message names both counts. When step 2 moved the rate for an open that fails
+   here, the open puts the rate back.
+4. Format. Each output stream's `kAudioStreamPropertyVirtualFormat` must be native-endian
+   float32, interleaved within the stream. The HAL virtualizes every device it knows to that.
+   Anything else fails the open, so the IOProc never meets another format.
+5. Set `kAudioDevicePropertyBufferFrameSize` to the block size, clamped to
+   `kAudioDevicePropertyBufferFrameSizeRange`, and read it back. Equal is pass-through. Anything
+   else the adapter bridges.
+6. Build the channel map: bus channels across the streams in order. A stereo open takes
+   `kAudioDevicePropertyPreferredChannelsForStereo` instead, which is where Audio MIDI Setup puts
+   the headphones on a multichannel interface.
+7. `AudioDeviceCreateIOProcID`. Then mark every INPUT stream unused for that IOProc through
+   `kAudioDevicePropertyIOProcStreamUsage`, so starting it on a duplex device does not start the
+   microphone.
+8. Add the property listeners, then read the nominal rate once more. A rate that another
+   application moved during the open fails it. `AudioDeviceStart` runs on `start()`.
+
+The IOProc zeroes every buffer first, because the HAL plays what the sink does not write. Then
+it pulls the adapter with the cycle's frame count and writes each bus channel into its stream
+buffer and interleave slot. Every index is checked against the list the HAL handed that callback,
+so a stream configuration that changed after the open cannot write out of bounds.
+
+Behavior worth knowing. The reasons are in
+[backend-development.md](./backend-development.md#coreaudio-what-the-implementation-settled).
+
+- **The open changes the device's sample rate**, for every application on the machine, and
+  `close()` does not put it back.
+- The rule 3 host time is `inNow`, the cycle's own time, not `inOutputTime`.
+- A dropout is a jump in the output sample time, through the adapter's queued-depth rule. The
+  HAL's `kAudioDeviceProcessorOverload` notification ticks `driver_resyncs`. A stalled render
+  shows in both.
+- Two things set `device_lost`: `kAudioDevicePropertyDeviceIsAlive` going false, and the device's
+  nominal rate leaving the engine rate. The sink then stops its IOProc and a host-paced thread
+  keeps the engine's clocks advancing (rule 4). A change of the default output device is ignored.
+- No listener block holds a pointer to the sink. Each holds an index into a static table, and
+  `close()` clears the entry on the listener queue, so a notification that arrives late finds
+  nothing.
+- `BWA_SINK_FLAG_EXCLUSIVE`, `BWA_SINK_FLAG_EXACT_RATE` and `BWA_SINK_FLAG_TIGHT_BUFFER` change
+  nothing. The sink never takes hog mode, the rate is always exact, and the IO buffer already is
+  the engine block.
+- At most 8 CoreAudio sinks are open in one process.
+- **The IO buffer size belongs to the device and the process, not to the sink.** A second open
+  of the same device in one process, at another block size, changes the first sink's IO cycle.
+  So does a host (Unity, Godot) that sets its own buffer after the open. The first sink keeps
+  its render quantum through the adapter, and `output_latency()` follows the new cycle.
+  Measured: a sink at 256 that reported 812 frames reported 1580 after a second open at 1024.
+  Read `bwa_get_output_latency_frames` again after you start a second engine on the device.
+
+What a desk Mac verified is in
+[backend-development.md](./backend-development.md#coreaudio-on-a-desk-mac).
 
 ### JACK
 
@@ -937,7 +1018,7 @@ all and would otherwise hang the close forever.
 | option               | default                         | effect                                                          |
 |----------------------|---------------------------------|-----------------------------------------------------------------|
 | `BWA_WITH_WASAPI`    | ON on `WIN32`                   | compiles `wasapi_sink.cpp`, links `ole32 avrt`, defines `BWA_HAVE_WASAPI` |
-| `BWA_WITH_COREAUDIO` | planned (phase 4); the option does not exist yet | will compile `coreaudio_sink.c`, link the frameworks, and define `BWA_HAVE_COREAUDIO`, ON on `APPLE` |
+| `BWA_WITH_COREAUDIO` | ON on macOS (`CMAKE_SYSTEM_NAME` is `Darwin`) | compiles `coreaudio_sink.c`, links the `CoreAudio` and `CoreFoundation` frameworks, defines `BWA_HAVE_COREAUDIO`. `Darwin` and not `APPLE`, because `APPLE` is also true for iOS and the HAL's `AudioDevice` API is macOS only |
 | `BWA_WITH_JACK`      | ON on Linux when `pkg-config jack` succeeds | compiles `jack_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libjack.so.0`), defines `BWA_HAVE_JACK` |
 | `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libasound.so.2`), defines `BWA_HAVE_ALSA` |
 | `BWA_WITH_AAUDIO`    | ON on `ANDROID`                 | compiles `aaudio_sink.c`, links `aaudio`, defines `BWA_HAVE_AAUDIO` |
@@ -1014,11 +1095,14 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   "skipped" and not "passed". The null and manual sections keep running everywhere.
 
   Only the *specific* "there is no device" message skips ("no active render
-  endpoint", "no jack server", "no PCM named", "no usable AAudio output device"); any other open
+  endpoint", "no jack server", "no PCM named", "no usable AAudio output device", "no default
+  output device"); any other open
   failure is a failure, because a machine WITH audio that cannot open it is exactly what the
   section exists to catch. The JACK section additionally skips on two
   CONFIGURATIONS it cannot run against, a server at another rate and a server with fewer playback
-  ports than the run asked for, and prints the reason either way.
+  ports than the run asked for, and prints the reason either way. The CoreAudio section skips on
+  the same two: a device with no 48 kHz mode, and a device narrower than the run, which is a
+  width the environment asked for or a mono default output.
 
   The two Linux backends add one more skip phrase, "could not be loaded", because they load their
   libraries at run time: a box with no libjack has no JACK device, which is a skip and not a
@@ -1045,7 +1129,8 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   to find out there is no server.
 
   Each section takes its device string from the environment (`BWA_TEST_ALSA_DEVICE`,
-  `BWA_TEST_AAUDIO_DEVICE`, `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so
+  `BWA_TEST_AAUDIO_DEVICE`, `BWA_TEST_COREAUDIO_DEVICE`, `BWA_TEST_JACK_PORTS`, plus
+  `BWA_TEST_JACK_CHANNELS` and `BWA_TEST_COREAUDIO_CHANNELS` for the width), so
   one binary reaches an array-width rig, a dummy server, a PulseAudio route, or a headset's Bluetooth
   output without editing code. Do not point the ALSA
   one at the hardware-free `null` PCM: it accepts writes as fast as they arrive and never paces, so
@@ -1103,6 +1188,52 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   thread belongs to AAudio, and a virtualized HAL or a busy headset can run dry through no fault of
   the sink. It prints the count instead.
 
+  CoreAudio can demand all of it. The stall overruns four IO cycles, the HAL skips cycles, and
+  the section requires the late block, a dropout whose frame count is between half and twice the
+  stall, and at least one overload notification. Measured: a 61 ms stall (2928 frames) reported
+  2936 dropped. What it does not demand is a clean healthy run, for AAudio's reason: the IO
+  thread is the HAL's. It prints the count.
+
+  **The CoreAudio device tap.** The render probe sees the bus, and the channel map and the
+  interleave sit between the bus and the HAL's buffers, so a sink that got either wrong would
+  pass every timing assertion. The CoreAudio section therefore renders a pattern, not silence:
+  each sample encodes its bus channel and its stream frame, under -84 dBFS, exact in a float. An
+  internal hook (`sink_coreaudio_tap` in `sink.h`, not public ABI) hands the test each stream
+  buffer the IOProc wrote, and the test requires every bus channel on its own device channel in
+  order, a continuous sequence but for the reported dropouts, and silence everywhere else.
+  Swapping left and right, mapping a channel off the end, ignoring the frame offset on a bridged
+  block, and writing with the wrong stride each turned it red before it was trusted green.
+  `BWA_TEST_COREAUDIO_BLOCK` sets the engine block: one outside the device's buffer range (8, or
+  8192) makes the adapter bridge, which a 256 block never does on a device that takes 256.
+
+  **The CoreAudio section owns a device it can destroy.** It is the one device section that
+  calls its OS API directly, and only to inject: it creates a private aggregate device over the
+  output under test. Private means only the test process sees it, so nothing else on the machine
+  is disturbed and no rate moves. Two checks run on it by default:
+
+  - The loss path. The section destroys the aggregate under a running sink, which fires the
+    real `kAudioDevicePropertyDeviceIsAlive` notification. It requires `device_lost`, about the
+    nominal block count from the host-paced thread, no block after `stop()`, a lost sink that
+    starts again and keeps pacing, and a close that returns.
+  - The map across streams. A stereo device has one stream, so the in-order map never crosses a
+    stream boundary on a desk Mac. An aggregate of two outputs has one stream for each, so the
+    section opens it three channels wide and the device tap requires bus channel 2 in the second
+    stream's first slot and silence past it. It runs when the machine has two outputs at 48 kHz.
+
+  The sink's second cause of a loss, a rate change, is opt-in:
+  `BWA_TEST_COREAUDIO_ALT_RATE=44100`. A second open at another rate moves the device off the
+  first sink's rate. It is opt-in because it changes the system device's rate twice, which every
+  other application playing audio hears. The section restores the rate it found.
+
+  The section also holds each block's `system_time_ns` to within about a second of the host
+  clock. That catches a stamp on the wrong base or in the wrong unit (raw mach ticks are off by a
+  factor of 41 on Apple silicon). It cannot catch a stamp that is a few milliseconds off, or a
+  wrong latency sum. Both need a loopback.
+
+  A second open at another block runs under the first sink. The section requires the first
+  sink's render quantum to stay fixed and its reported latency to move by exactly the change in
+  the IO cycle.
+
   The AAudio section runs through `tools/android/run-tests.ps1`, not through ctest: the test
   binaries are ELF executables for the device and the host has nothing to run them with. The script
   reads the test list out of the build directory's `CTestTestfile.cmake` (so it and ctest cannot
@@ -1122,7 +1253,9 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   `-DBWA_BUILD_PLAYGROUND=ON` and the `playground` and `layout_tool` suites come back too. They need
   a display, so run ctest inside an X or Wayland session, or under `xvfb-run` (software GL
   passes). A cold run pays for the phonon build, a warm one restores it from the cache. The macOS
-  job is unverified locally, both its shim paths and its phonon build.
+  job compiles the CoreAudio sink, and its sink section skips on a runner with no output device.
+  The shim's Apple paths and the CoreAudio sink are verified on a physical Mac. The macOS phonon
+  build is not: it has run in CI only.
 - **On hardware**, a "desk day" section for hardware-validation.md, one pass per backend on a
   real machine: the laterality tone left and right (never DC, per the trap); a ten-minute soak
   with a busy scene at a 256 block and zero `xruns` with `measured` true; and the reported

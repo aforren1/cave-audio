@@ -21,6 +21,16 @@
 
 #include <stdatomic.h>
 
+#ifdef BWA_HAVE_COREAUDIO
+/* The one device section that calls its OS API directly, and only to INJECT: a private aggregate
+ * device is the one output device a test can create and destroy, which is how the loss path and
+ * the multi-stream map get a device to run against. The sink under test is still reached through
+ * sink.h alone. */
+#include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <unistd.h>      /* getpid: the aggregate's UID must not collide across test processes */
+#endif
+
 #define SKIP_EXIT 77   /* ctest SKIP_RETURN_CODE; see CMakeLists.txt */
 
 typedef struct {
@@ -627,11 +637,12 @@ static int names_both_rates(const char* msg, uint32_t engine_rate, uint32_t othe
 }
 #endif
 
-#if defined(BWA_HAVE_ALSA) || defined(BWA_HAVE_AAUDIO)
+#if defined(BWA_HAVE_ALSA) || defined(BWA_HAVE_AAUDIO) || defined(BWA_HAVE_COREAUDIO)
 /* The same rule where only ONE of the two rates is known to the test: the requested rate must be
  * named, and so must a device rate, whatever the device chose to report. So: the message names the
  * request, and "runs at <n> Hz" names an n that is a real rate and not the request. Shared by the
- * ALSA and AAudio sections, which both meet a device whose own rate the test cannot predict. */
+ * ALSA, AAudio and CoreAudio sections, which all meet a device whose own rate the test cannot
+ * predict. */
 static int rejects_naming_both(const char* msg, uint32_t requested) {
     char want[32];
     snprintf(want, sizeof want, "%u", requested);
@@ -1306,6 +1317,809 @@ static int test_aaudio(void) {
 }
 #endif /* BWA_HAVE_AAUDIO */
 
+#ifdef BWA_HAVE_COREAUDIO
+/* WHAT REACHES THE DEVICE. The render probe sees the bus; the channel map and the interleave sit
+ * between the bus and the HAL's buffers, and a sink that got either wrong would pass every
+ * timing assertion while playing garbage. So the main run renders a pattern instead of silence:
+ * bus channel c, stream frame f carries (c + 1) / 2^20 + (f mod 1024) / 2^30. Both terms are
+ * exact in a float, so the device side decodes WHICH bus channel a sample came from and WHERE in
+ * the stream it was rendered. It peaks under -84 dBFS at the full 64 channels (-114 dBFS in
+ * stereo), so it is safe on real speakers, and it is not DC. */
+#define CA_PAT_TAG  (1.0f / 1048576.0f)
+#define CA_PAT_STEP (1.0f / 1073741824.0f)
+
+static _Atomic uint64_t g_ca_stamp_skew_ns;   /* the worst |stamp - host clock| a block saw */
+
+static void on_render_pattern(void* user, float* bus, uint32_t nframes, const bwa_timestamp* ts) {
+    /* Rule 3: the stamp is on the host clock. Read the clock BEFORE the probe, which may stall. */
+    {
+        const uint64_t now  = os_monotonic_ns();
+        const uint64_t skew = ts->system_time_ns > now ? ts->system_time_ns - now
+                                                       : now - ts->system_time_ns;
+        if (skew > atomic_load_explicit(&g_ca_stamp_skew_ns, memory_order_relaxed))
+            atomic_store_explicit(&g_ca_stamp_skew_ns, skew, memory_order_relaxed);
+    }
+    on_render(user, bus, nframes, ts);
+    const Probe* p = (const Probe*)user;
+    for (uint32_t c = 0; c < p->channels; ++c) {
+        float* row = bus + (size_t)c * nframes;
+        const float tag = (float)(c + 1) * CA_PAT_TAG;
+        for (uint32_t i = 0; i < nframes; ++i)
+            row[i] = tag + (float)((ts->sample_pos + i) & 1023u) * CA_PAT_STEP;
+    }
+}
+
+typedef struct {
+    uint32_t device_channels;            /* the widest first_channel + stream_channels seen     */
+    uint32_t tag[BWA_CHANNELS];          /* the bus channel + 1 this device channel carries; 0 = none yet */
+    uint32_t next[BWA_CHANNELS];         /* the stream frame (mod 1024) expected next           */
+    uint64_t zeros[BWA_CHANNELS];        /* exactly-silent samples                              */
+    uint64_t breaks[BWA_CHANNELS];       /* the pattern skipped: a dropout, or a broken interleave */
+    uint64_t mixed;                      /* a device channel that changed which bus channel it carries */
+    uint64_t frames;                     /* frames tapped on the first stream                   */
+} CaTap;
+static CaTap g_ca_tap;
+
+static void ca_tap(uint32_t first, const float* il, uint32_t nch, uint32_t nframes) {
+    CaTap* t = &g_ca_tap;
+    if (first + nch > t->device_channels) t->device_channels = first + nch;
+    if (first == 0) t->frames += nframes;
+    for (uint32_t k = 0; k < nch; ++k) {
+        const uint32_t d = first + k;
+        if (d >= BWA_CHANNELS) break;
+        for (uint32_t i = 0; i < nframes; ++i) {
+            const float v = il[(size_t)i * nch + k];
+            if (v == 0.0f) { t->zeros[d]++; continue; }
+            const float x = v * 1048576.0f;                      /* (c + 1) + idx / 1024, exact */
+            const uint32_t tag = (uint32_t)x;
+            const uint32_t idx = (uint32_t)((x - (float)tag) * 1024.0f + 0.5f);
+            if (t->tag[d] == 0) t->tag[d] = tag;
+            else {
+                if (t->tag[d] != tag) t->mixed++;
+                if (idx != t->next[d]) t->breaks[d]++;
+            }
+            t->next[d] = (idx + 1u) & 1023u;
+        }
+    }
+}
+
+/* Hold the tap's record against the open: every bus channel on the device channel it belongs on,
+ * continuous but for the dropouts the device itself reported, and silence everywhere else. */
+static int ca_tap_verify(uint32_t CH, uint32_t BS, const bwa_sink_health* h) {
+    const CaTap* t = &g_ca_tap;
+    int ok = 1;
+    if (t->frames == 0) { fprintf(stderr, "FAIL: the device tap saw no frames\n"); return 0; }
+    if (t->mixed) {
+        fprintf(stderr, "FAIL: %llu samples landed on a device channel that carries another bus "
+                        "channel\n", (unsigned long long)t->mixed); ok = 0;
+    }
+    /* A stereo open on a wider device goes to its preferred stereo pair, which the test cannot
+     * know, so there it demands two distinct channels in left-right order. Everything else is
+     * the in-order map: bus channel c on device channel c. */
+    const int in_order = !(CH == 2 && t->device_channels > 2);
+    uint32_t where[BWA_CHANNELS];
+    for (uint32_t c = 0; c < CH; ++c) {
+        uint32_t hits = 0;
+        where[c] = 0;
+        for (uint32_t d = 0; d < t->device_channels && d < BWA_CHANNELS; ++d)
+            if (t->tag[d] == c + 1) { where[c] = d; ++hits; }
+        if (hits != 1) {
+            fprintf(stderr, "FAIL: bus channel %u reached %u device channels, want exactly 1\n", c, hits); ok = 0;
+        } else if (in_order && where[c] != c) {
+            fprintf(stderr, "FAIL: bus channel %u reached device channel %u, want %u\n", c, where[c], c); ok = 0;
+        }
+    }
+    if (!in_order && ok && where[0] == where[1]) {
+        fprintf(stderr, "FAIL: left and right both reached device channel %u\n", where[0]); ok = 0;
+    }
+    for (uint32_t d = 0; d < t->device_channels && d < BWA_CHANNELS; ++d) {
+        if (t->tag[d] > CH) {
+            fprintf(stderr, "FAIL: device channel %u carries a value no bus channel wrote\n", d); ok = 0;
+        }
+        if (t->tag[d] != 0 && t->zeros[d] != 0) {
+            fprintf(stderr, "FAIL: device channel %u carries bus channel %u with %llu silent samples "
+                            "in it\n", d, t->tag[d] - 1, (unsigned long long)t->zeros[d]); ok = 0;
+        }
+        /* The stream position jumps by the lost frames at a dropout, and the pattern with it, so
+         * each reported dropout may break the pattern once. Anything past that is the sink. */
+        if (t->breaks[d] > h->dropouts) {
+            fprintf(stderr, "FAIL: device channel %u broke the rendered sequence %llu times and the "
+                            "device reported %llu dropouts\n", d, (unsigned long long)t->breaks[d],
+                    (unsigned long long)h->dropouts); ok = 0;
+        }
+    }
+    /* Every rendered frame reached the device, but for what the adapter still held at the stop. */
+    const uint64_t rendered = h->blocks * BS;
+    if (t->frames > rendered || rendered - t->frames >= BS) {
+        fprintf(stderr, "FAIL: %llu frames were rendered and %llu reached the device\n",
+                (unsigned long long)rendered, (unsigned long long)t->frames); ok = 0;
+    }
+    if (ok) printf("  device tap OK: %llu frames on %u device channels, %u bus channels each on its "
+                   "own, %llu sequence breaks against %llu dropouts\n", (unsigned long long)t->frames,
+                   t->device_channels, CH, (unsigned long long)t->breaks[where[0]],
+                   (unsigned long long)h->dropouts);
+    return ok;
+}
+
+/* Poll a running sink's health until `device_lost` sets, for at most a second. The loss arrives on
+ * a HAL notification, so it is asynchronous by nature. */
+static int coreaudio_wait_lost(bwa_sink* s) {
+    for (int i = 0; i < 100; ++i) {
+        bwa_sink_health h;
+        bwa_sink_get_health(s, &h);
+        if (h.device_lost) return 1;
+        os_sleep_ms(10);
+    }
+    return 0;
+}
+
+/* ---- a device the test owns: a PRIVATE aggregate over one or two real outputs ----
+ * Private means this process alone sees it, so creating and destroying one disturbs nothing else
+ * on the machine and changes no rate. Returns the device, or 0 with the reason printed. `uid`
+ * receives the UID to open it by. */
+static CFStringRef ca_cfstr(const char* s) {
+    return CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
+}
+
+static AudioObjectID ca_test_aggregate(const char* sub_a, const char* sub_b, char* uid, size_t uidcap) {
+    static int serial = 0;
+    snprintf(uid, uidcap, "bw_audio.test.aggregate.%d.%d", (int)getpid(), serial++);
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                         &kCFTypeDictionaryValueCallBacks);
+    CFMutableArrayRef subs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    CFStringRef cuid = ca_cfstr(uid), ca = ca_cfstr(sub_a);
+    const int one = 1;
+    CFNumberRef yes = CFNumberCreate(NULL, kCFNumberIntType, &one);
+    CFDictionarySetValue(d, CFSTR(kAudioAggregateDeviceUIDKey), cuid);
+    CFDictionarySetValue(d, CFSTR(kAudioAggregateDeviceNameKey), CFSTR("bw_audio test aggregate"));
+    CFDictionarySetValue(d, CFSTR(kAudioAggregateDeviceIsPrivateKey), yes);
+    const char* u[2] = { sub_a, sub_b };
+    for (int i = 0; i < 2 && u[i]; ++i) {
+        CFMutableDictionaryRef sd = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                              &kCFTypeDictionaryValueCallBacks);
+        CFStringRef su = ca_cfstr(u[i]);
+        CFDictionarySetValue(sd, CFSTR(kAudioSubDeviceUIDKey), su);
+        CFArrayAppendValue(subs, sd);
+        CFRelease(su); CFRelease(sd);
+    }
+    CFDictionarySetValue(d, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subs);
+    CFDictionarySetValue(d, CFSTR(kAudioAggregateDeviceMainSubDeviceKey), ca);
+    AudioObjectID agg = 0;
+    const OSStatus rc = AudioHardwareCreateAggregateDevice(d, &agg);
+    CFRelease(subs); CFRelease(d); CFRelease(cuid); CFRelease(ca); CFRelease(yes);
+    if (rc != noErr || !agg) {
+        printf("  NOTE: no private aggregate device (OSStatus %d)\n", (int)rc);
+        return 0;
+    }
+    /* It joins the device list asynchronously. Wait for the sink's own query to list it. */
+    for (int i = 0; i < 200; ++i) {
+        const uint32_t n = sink_device_count(BWA_SINK_COREAUDIO);
+        for (uint32_t k = 0; k < n; ++k) {
+            char id[256];
+            if (sink_device_id(BWA_SINK_COREAUDIO, k, id, sizeof id) && strcmp(id, uid) == 0) return agg;
+        }
+        os_sleep_ms(10);
+    }
+    printf("  NOTE: the private aggregate never appeared in the device list\n");
+    AudioHardwareDestroyAggregateDevice(agg);
+    return 0;
+}
+
+/* THE LOSS PATH, by default: destroy the aggregate under a running sink. That is a device that
+ * really goes away, so kAudioDevicePropertyDeviceIsAlive fires, which is the notification an
+ * unplugged interface sends. Then the two things rule 4 promises afterward: the clocks keep
+ * advancing, and a stopped lost sink that is started again keeps pacing.
+ * Returns 1 (ok, or no aggregate to be had) or 0 (failed). */
+static int coreaudio_aggregate_loss(const char* sub_uid, uint32_t SR, uint32_t BS) {
+    char uid[96];
+    const AudioObjectID agg = ca_test_aggregate(sub_uid, NULL, uid, sizeof uid);
+    if (!agg) return 1;
+    Probe p;
+    probe_init(&p, 2);
+    char e[256] = {0};
+    bwa_sink* s = bwa_coreaudio_sink_open(SR, BS, 2, uid, 0, false, on_render, &p, e, sizeof e);
+    if (!s) {
+        AudioHardwareDestroyAggregateDevice(agg);
+        fprintf(stderr, "FAIL: a private aggregate over a device that just opened refused: %s\n", e);
+        return 0;
+    }
+    int ok = 1;
+    /* Every wait is at least six blocks long, so the counts below mean the same thing at an
+     * 8192-frame block as at 256. */
+    const unsigned six_blocks_ms = 6u * BS * 1000u / SR;
+    const unsigned run_ms  = six_blocks_ms > 150u ? six_blocks_ms : 150u;
+    const unsigned pace_ms = 2u * six_blocks_ms > 300u ? 2u * six_blocks_ms : 300u;
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: aggregate loss: start\n"); ok = 0; }
+    os_sleep_ms(run_ms);
+    bwa_sink_health h0, h1, h2;
+    bwa_sink_get_health(s, &h0);
+    if (h0.blocks < 2 || h0.device_lost) {
+        fprintf(stderr, "FAIL: the aggregate ran %llu blocks in %u ms (lost=%u) before the loss\n",
+                (unsigned long long)h0.blocks, run_ms, h0.device_lost); ok = 0;
+    }
+
+    AudioHardwareDestroyAggregateDevice(agg);          /* the unplug */
+    if (!coreaudio_wait_lost(s)) {
+        fprintf(stderr, "FAIL: the device was destroyed under a running sink and device_lost never set\n");
+        ok = 0;
+    }
+    bwa_sink_get_health(s, &h1);
+    os_sleep_ms(pace_ms);
+    bwa_sink_get_health(s, &h2);
+    const uint64_t want = (uint64_t)SR * pace_ms / 1000u / BS;
+    const uint64_t got  = h2.blocks - h1.blocks;
+    if (got < want / 2 || got > want * 2) {
+        fprintf(stderr, "FAIL: a lost sink rendered %llu blocks in %u ms, want about %llu (host-paced)\n",
+                (unsigned long long)got, pace_ms, (unsigned long long)want); ok = 0;
+    }
+
+    bwa_sink_stop(s);
+    const unsigned long at_stop = p.blocks;
+    if (!p.time_monotonic || !p.pos_monotonic) {
+        fprintf(stderr, "FAIL: the stamps stepped backward across the handoff to host pacing\n"); ok = 0;
+    }
+    os_sleep_ms(50);
+    if (p.blocks != at_stop) {
+        fprintf(stderr, "FAIL: %lu blocks rendered after stop() returned on a lost sink\n",
+                p.blocks - at_stop); ok = 0;
+    }
+    /* A lost sink that is started again has no device to start. It must still run. */
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: a lost sink refused to start again\n"); ok = 0; }
+    os_sleep_ms(run_ms);
+    bwa_sink_stop(s);
+    if (p.blocks < at_stop + 2) {
+        fprintf(stderr, "FAIL: a restarted lost sink rendered %lu blocks in %u ms\n",
+                p.blocks - at_stop, run_ms);
+        ok = 0;
+    }
+    bwa_sink_close(s);                                 /* joins the host-paced thread; must return */
+    if (ok) printf("  loss path OK: the device was destroyed, device_lost set, %llu host-paced blocks "
+                   "in %u ms (nominal %llu), and the lost sink stopped and restarted\n",
+                   (unsigned long long)got, pace_ms, (unsigned long long)want);
+    return ok;
+}
+
+static uint32_t ca_test_rate_of(const char* device_uid) {
+    CFStringRef cu = ca_cfstr(device_uid);
+    AudioObjectID dev = kAudioObjectUnknown;
+    UInt32 sz = sizeof dev;
+    const AudioObjectPropertyAddress tr = { kAudioHardwarePropertyTranslateUIDToDevice,
+                                            kAudioObjectPropertyScopeGlobal, 0 };
+    Float64 r = 0.0;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &tr, sizeof cu, &cu, &sz, &dev) == noErr
+        && dev != kAudioObjectUnknown) {
+        const AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate,
+                                                kAudioObjectPropertyScopeGlobal, 0 };
+        sz = sizeof r;
+        if (AudioObjectGetPropertyData(dev, &ra, 0, NULL, &sz, &r) != noErr) r = 0.0;
+    }
+    CFRelease(cu);
+    return (uint32_t)(r + 0.5);
+}
+
+/* THE MAP ACROSS STREAMS. A stereo device has one stream, so the in-order map never crosses a
+ * stream boundary on a desk Mac, and that crossing is the whole of the array path. An aggregate
+ * of two outputs presents one stream per sub-device. Opened THREE wide, bus channel 2 has to
+ * land in the second stream's first slot, and everything past it has to stay silent. Runs only
+ * when the machine has two outputs already at the same rate, so it moves no rate.
+ * Returns 1 (ok or not runnable here) or 0 (failed). */
+static int coreaudio_aggregate_map(const char* uid_a, const char* uid_b, uint32_t SR, uint32_t BS) {
+    if (ca_test_rate_of(uid_a) != SR || ca_test_rate_of(uid_b) != SR) {
+        printf("  multi-stream map not run: the two outputs are not both at %u Hz\n", SR);
+        return 1;
+    }
+    char uid[96];
+    const AudioObjectID agg = ca_test_aggregate(uid_a, uid_b, uid, sizeof uid);
+    if (!agg) return 1;
+    const uint32_t CH = 3;
+    Probe p;
+    probe_init(&p, CH);
+    char e[256] = {0};
+    memset(&g_ca_tap, 0, sizeof g_ca_tap);
+    sink_coreaudio_tap = ca_tap;
+    bwa_sink* s = bwa_coreaudio_sink_open(SR, BS, CH, uid, 0, false, on_render_pattern, &p, e, sizeof e);
+    int ok = 1;
+    if (!s) {
+        sink_coreaudio_tap = NULL;
+        AudioHardwareDestroyAggregateDevice(agg);
+        if (strstr(e, "output channels")) { printf("  multi-stream map not run: %s\n", e); return 1; }
+        fprintf(stderr, "FAIL: the two-device aggregate refused a %u-channel open: %s\n", CH, e);
+        return 0;
+    }
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: aggregate map: start\n"); ok = 0; }
+    os_sleep_ms(200);
+    bwa_sink_stop(s);
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    bwa_sink_close(s);
+    sink_coreaudio_tap = NULL;
+    AudioHardwareDestroyAggregateDevice(agg);
+    if (g_ca_tap.device_channels <= CH) {
+        printf("  NOTE: the aggregate presented %u channels, so nothing past the bus was checked\n",
+               g_ca_tap.device_channels);
+    }
+    if (ok && !ca_tap_verify(CH, BS, &h)) ok = 0;
+    if (ok) printf("  multi-stream map OK: %u bus channels in order across an aggregate of %u "
+                   "device channels\n", CH, g_ca_tap.device_channels);
+    return ok;
+}
+
+/* THE LOSS PATH BY A RATE CHANGE, opt-in (BWA_TEST_COREAUDIO_ALT_RATE=<Hz>). The sink's other
+ * cause of a loss: a second open at another rate moves the device off the first sink's rate, and
+ * the sink treats that like a device that died, through the same handler. Opt-in because it
+ * changes the system device's rate twice, which
+ * every other application playing audio on the machine hears.
+ * Returns 1 (ok or not runnable on this device) or 0 (failed). */
+static int coreaudio_loss(const char* dev, uint32_t CH, uint32_t SR, uint32_t BS, uint32_t alt) {
+    Probe pa, pb;
+    probe_init(&pa, CH);
+    probe_init(&pb, CH);
+    char ea[256] = {0}, eb[256] = {0};
+    bwa_sink* a = bwa_coreaudio_sink_open(SR, BS, CH, dev, 0, false, on_render, &pa, ea, sizeof ea);
+    if (!a) { fprintf(stderr, "FAIL: coreaudio loss: the first open failed: %s\n", ea); return 0; }
+    if (bwa_sink_start(a) != 0) { fprintf(stderr, "FAIL: coreaudio loss: start\n"); bwa_sink_close(a); return 0; }
+    os_sleep_ms(100);
+
+    int ok = 1;
+    bwa_sink* b = bwa_coreaudio_sink_open(alt, BS, CH, dev, 0, false, on_render, &pb, eb, sizeof eb);
+    if (!b) {
+        printf("  NOTE: loss path not run, the device refused %u Hz: %s\n", alt, eb);
+        bwa_sink_close(a);
+        return 1;
+    }
+    if (!coreaudio_wait_lost(a)) {
+        fprintf(stderr, "FAIL: the device left %u Hz for %u Hz under a running sink and device_lost "
+                        "never set\n", SR, alt); ok = 0;
+    }
+    /* Rule 4: the clocks keep advancing. 300 ms of host pacing is about 56 blocks at 256/48000. */
+    bwa_sink_health h0, h1;
+    bwa_sink_get_health(a, &h0);
+    os_sleep_ms(300);
+    bwa_sink_get_health(a, &h1);
+    const uint64_t want = (uint64_t)SR * 300u / 1000u / BS;
+    const uint64_t got  = h1.blocks - h0.blocks;
+    if (got < want / 2 || got > want * 2) {
+        fprintf(stderr, "FAIL: a lost sink rendered %llu blocks in 300 ms, want about %llu (host-paced)\n",
+                (unsigned long long)got, (unsigned long long)want); ok = 0;
+    }
+    /* And the sink that took the device runs on it at the new rate. */
+    if (bwa_sink_start(b) != 0) { fprintf(stderr, "FAIL: coreaudio loss: second start\n"); ok = 0; }
+    os_sleep_ms(150);
+    bwa_sink_health hb;
+    bwa_sink_get_health(b, &hb);
+    if (hb.blocks < 5) { fprintf(stderr, "FAIL: %llu blocks at %u Hz in 150 ms\n", (unsigned long long)hb.blocks, alt); ok = 0; }
+    if (hb.device_lost) { fprintf(stderr, "FAIL: the sink that set the rate reports itself lost\n"); ok = 0; }
+    bwa_sink_close(b);
+    bwa_sink_stop(a);
+    if (!pa.time_monotonic || !pa.pos_monotonic) {
+        fprintf(stderr, "FAIL: the stamps stepped backward across the handoff to host pacing\n"); ok = 0;
+    }
+    bwa_sink_close(a);                            /* joins the host-paced thread; must return */
+    if (ok) printf("  rate-change loss OK: %u -> %u Hz set device_lost, %llu host-paced blocks in 300 ms "
+                   "(nominal %llu), %llu blocks on the device at %u Hz\n", SR, alt,
+                   (unsigned long long)got, (unsigned long long)want, (unsigned long long)hb.blocks, alt);
+    return ok;
+}
+
+/* The CoreAudio section. Same contract as the null sink above, against a live HAL device: a
+ * stable callback at a CONSTANT nframes equal to block_size, monotonic position and time, health
+ * that says what it can observe, a deliberate stall that the device's own sample time AND its
+ * overload notification must both report, rule 6 and rule 10, and a stop and close that return.
+ *
+ * BWA_TEST_COREAUDIO_DEVICE names the device (a name or a UID; the default is the default output)
+ * and BWA_TEST_COREAUDIO_CHANNELS the width, so one binary reaches a multichannel interface.
+ * BWA_TEST_COREAUDIO_BLOCK sets the engine block: one outside the device's buffer-size range (8,
+ * or 8192) is how to make the adapter bridge instead of pass through, which a 256 block never
+ * does on a device that takes 256. BWA_TEST_COREAUDIO_ALT_RATE turns the loss path on (see
+ * coreaudio_loss).
+ *
+ * The section leaves the device's sample rate the way it found it. The sink itself does not.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no output device to open. */
+static int test_coreaudio(void) {
+    const uint32_t SR = 48000;
+    uint32_t BS = 256;
+    {
+        const char* bs = getenv("BWA_TEST_COREAUDIO_BLOCK");
+        const long v = (bs && *bs) ? strtol(bs, NULL, 10) : 0;
+        if (v >= 1 && v <= 8192) BS = (uint32_t)v;
+    }
+    const char* dev = getenv("BWA_TEST_COREAUDIO_DEVICE");
+    if (dev && !*dev) dev = NULL;
+    const char* chs = getenv("BWA_TEST_COREAUDIO_CHANNELS");
+    uint32_t CH = 2;
+    if (chs && *chs) {
+        const long v = strtol(chs, NULL, 10);
+        if (v >= 1 && v <= BWA_CHANNELS) CH = (uint32_t)v;
+    }
+
+    Probe p;
+    probe_init(&p, CH);
+    char err[256] = {0};
+
+    memset(&g_ca_tap, 0, sizeof g_ca_tap);
+    atomic_store_explicit(&g_ca_stamp_skew_ns, 0, memory_order_relaxed);
+    sink_coreaudio_tap = ca_tap;          /* this run only; cleared before any other open below */
+    bwa_sink* s = bwa_coreaudio_sink_open(SR, BS, CH, dev, 0, false, on_render_pattern, &p, err, sizeof err);
+    if (!s) {
+        sink_coreaudio_tap = NULL;
+        if (!err[0]) { fprintf(stderr, "FAIL: coreaudio open failed with no message\n"); return 1; }
+        /* "no default output device" is a CI runner. The other two are CONFIGURATIONS the section
+         * cannot run against, like a JACK server at another rate: a device that has no 48 kHz
+         * mode (a Bluetooth headset in call mode), and a device narrower than the run: a width
+         * the environment asked for, or a mono default output under the stock stereo run.
+         * Anything else is a real failure. */
+        if (strstr(err, "no default output device")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        if (strstr(err, "cannot run at")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        if ((chs || strstr(err, "has 1 output channels") || strstr(err, "has 0 output channels"))
+            && strstr(err, "output channels")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        fprintf(stderr, "FAIL: coreaudio open: %s\n", err);
+        return 1;
+    }
+    const uint32_t restore_rate = sink_coreaudio_prior_rate(s);
+    int ok = 1;
+    /* This backend opens exact or not at all, so a message beside a sink is a defect. */
+    if (err[0]) { fprintf(stderr, "FAIL: coreaudio reported a degradation it does not have: %s\n", err); ok = 0; }
+
+    char backend[320];
+    snprintf(backend, sizeof backend, "%s", bwa_sink_backend(s));
+    const uint32_t block  = bwa_sink_block_size(s);
+    const uint32_t buffer = sink_coreaudio_buffer_frames(s);
+    if (bwa_sink_type_of(s) != BWA_SINK_COREAUDIO) {
+        fprintf(stderr, "FAIL: coreaudio sink reports the wrong backend type\n");
+        bwa_sink_close(s); sink_coreaudio_tap = NULL; return 1;
+    }
+    if (strncmp(backend, "coreaudio:", 10) != 0 || !backend[10]) {
+        fprintf(stderr, "FAIL: backend string is '%s', want \"coreaudio:<device>\"\n", backend);
+        bwa_sink_close(s); sink_coreaudio_tap = NULL; return 1;
+    }
+
+    /* --- the device query: at least the device that just opened, each entry with a name and an
+     *     id, and index 0 is the default output (which is what a NULL device opened) --- */
+    char name0[256] = {0}, id0[256] = {0};
+    {
+        const uint32_t ndev = sink_device_count(BWA_SINK_COREAUDIO);
+        if (ndev < 1) { fprintf(stderr, "FAIL: a device opened and the device query lists none\n"); ok = 0; }
+        for (uint32_t i = 0; i < ndev; ++i) {
+            char nm[256] = {0}, id[256] = {0};
+            if (!sink_device_name(BWA_SINK_COREAUDIO, i, nm, sizeof nm) || !nm[0]
+                || !sink_device_id(BWA_SINK_COREAUDIO, i, id, sizeof id) || !id[0]) {
+                fprintf(stderr, "FAIL: device %u has no name or no id ('%s' / '%s')\n", i, nm, id); ok = 0;
+            }
+            if (i == 0) { snprintf(name0, sizeof name0, "%s", nm); snprintf(id0, sizeof id0, "%s", id); }
+            printf("  device %u: '%s' (%s)%s\n", i, nm, id, i == 0 ? " [default]" : "");
+        }
+        if (!dev && strcmp(backend + 10, name0) != 0) {
+            fprintf(stderr, "FAIL: a NULL device opened '%s' and the query lists '%s' first\n",
+                    backend + 10, name0); ok = 0;
+        }
+    }
+
+    if (bwa_sink_start(s) != 0) {
+        fprintf(stderr, "FAIL: coreaudio start\n");
+        bwa_sink_close(s); sink_coreaudio_tap = NULL; return 1;
+    }
+
+    /* --- phase 1: a healthy run. The dropout count is REPORTED, not asserted to be zero: the IO
+     *     thread is the HAL's, and a loaded machine (ctest runs suites side by side) can overrun
+     *     a cycle through no fault of the sink. What is demanded is that phase 2's stall is seen. */
+    os_sleep_ms(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
+    bwa_sink_health h1;
+    bwa_sink_get_health(s, &h1);
+    if (h1.dropouts != 0)
+        printf("  NOTE: %llu dropouts on the healthy 200 ms run; not asserted on this backend.\n",
+               (unsigned long long)h1.dropouts);
+    {
+        const uint64_t nominal = (uint64_t)SR * 200u / 1000u / BS;      /* blocks in 200 ms */
+        const uint64_t floor   = nominal >= 20 ? 10 : nominal / 2;
+        if (h1.blocks < floor) {
+            fprintf(stderr, "FAIL: %llu blocks in 200 ms, want at least %llu\n",
+                    (unsigned long long)h1.blocks, (unsigned long long)floor); ok = 0;
+        }
+    }
+
+    /* --- phase 2: overrun the IO cycle on purpose. Four cycles plus slack, so the HAL certainly
+     *     skips cycles: its output sample time jumps (the dropout, with a frame count that is a
+     *     measurement) and it posts kAudioDeviceProcessorOverload (the driver_resyncs tick). --- */
+    const unsigned stall_ms = (4u * buffer * 1000u / SR) + 40u;
+    const uint64_t stall_frames = (uint64_t)stall_ms * SR / 1000u;
+    atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+    /* Long enough for blocks to render AFTER the stall: the gap is seen by the cycle that follows
+     * it, and the sample_pos check below needs a block stamped after that. */
+    {
+        const unsigned three_blocks_ms = 3u * BS * 1000u / SR;
+        os_sleep_ms((three_blocks_ms > 200u ? three_blocks_ms : 200u) + stall_ms);
+    }
+
+    bwa_sink_stop(s);            /* the IOProc has returned and none follows: the probe is ours */
+
+    const unsigned long blocks = p.blocks;
+    const uint32_t latency = bwa_sink_output_latency(s);
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+
+    if (block != BS) { fprintf(stderr, "FAIL: block_size() is %u, want the engine's %u\n", block, BS); ok = 0; }
+    if (!p.nframes_stable || p.nframes_first != BS) {
+        fprintf(stderr, "FAIL: nframes varied or was not the block size (first=%u, stable=%d)\n",
+                p.nframes_first, p.nframes_stable); ok = 0;
+    }
+    if (!p.time_monotonic) { fprintf(stderr, "FAIL: system_time_ns not monotonic\n"); ok = 0; }
+    if (!p.pos_monotonic)  { fprintf(stderr, "FAIL: sample_pos not monotonic\n");     ok = 0; }
+    /* The stream position follows the DEVICE across a dropout (the adapter re-anchors), so the
+     * last block sits past the rendered count by exactly the frames the device ran on without us.
+     * A sample_pos that ignored the gap would schedule every later play_at early by that much. */
+    if (blocks && p.last_sample_pos != (uint64_t)BS * (blocks - 1) + h.dropped_frames) {
+        fprintf(stderr, "FAIL: sample_pos (last=%llu) is not the rendered frames (%llu) plus the "
+                        "dropped ones (%llu)\n", (unsigned long long)p.last_sample_pos,
+                (unsigned long long)((uint64_t)BS * (blocks - 1)), (unsigned long long)h.dropped_frames);
+        ok = 0;
+    }
+    /* Rule 3: the stamp is on bwa_host_time_ns's clock. It may lead the clock by the frames the
+     * adapter queued and trail it by the stall, so the bound is loose. What it catches is a
+     * stamp on another base or in another unit: raw mach ticks are off by a factor of 41 on Apple
+     * silicon. It cannot catch a stamp a few milliseconds off, which needs a loopback. */
+    {
+        const uint64_t skew  = atomic_load_explicit(&g_ca_stamp_skew_ns, memory_order_relaxed);
+        const uint64_t bound = 1000000000ull + (uint64_t)stall_ms * 1000000ull
+                             + 2ull * BS * 1000000000ull / SR;
+        if (skew > bound) {
+            fprintf(stderr, "FAIL: a block's system_time_ns was %.1f ms from the host clock\n",
+                    (double)skew / 1.0e6); ok = 0;
+        }
+    }
+    /* Rule 5: never less than the cycle it is rendered into. */
+    if (latency < buffer) {
+        fprintf(stderr, "FAIL: output latency %u frames is under the %u-frame IO buffer\n", latency, buffer); ok = 0;
+    }
+
+    if (!h.measured) {
+        fprintf(stderr, "FAIL: %lu blocks ran and no output sample time ever arrived, so health "
+                        "reports unmeasured\n", blocks); ok = 0;
+    }
+    if (h.blocks != blocks) {
+        fprintf(stderr, "FAIL: health counted %llu blocks, the probe saw %lu\n",
+                (unsigned long long)h.blocks, blocks); ok = 0;
+    }
+    if (h.device_lost) { fprintf(stderr, "FAIL: the device was reported lost during a clean run\n"); ok = 0; }
+    if (h.period_ns == 0) { fprintf(stderr, "FAIL: no block period to measure the budget against\n"); ok = 0; }
+    if (h.late_blocks < 1) {
+        fprintf(stderr, "FAIL: a %u ms stall inside render() was not counted as a late block\n", stall_ms); ok = 0;
+    }
+    if (h.dropouts <= h1.dropouts) {
+        fprintf(stderr, "FAIL: the IOProc was stalled %u ms past a %u-frame cycle and the output "
+                        "sample time showed no gap (%llu dropouts before, %llu after)\n", stall_ms, buffer,
+                (unsigned long long)h1.dropouts, (unsigned long long)h.dropouts); ok = 0;
+    }
+    /* The gap is a measurement, so hold it to the stall: no less than half of it, no more than
+     * twice it plus the healthy run's own. */
+    {
+        const uint64_t gap = h.dropped_frames - h1.dropped_frames;
+        if (gap < stall_frames / 2 || gap > stall_frames * 2 + buffer) {
+            fprintf(stderr, "FAIL: a %u ms stall is %llu frames and the device reported %llu dropped\n",
+                    stall_ms, (unsigned long long)stall_frames, (unsigned long long)gap); ok = 0;
+        }
+    }
+    if (h.driver_resyncs < 1) {
+        fprintf(stderr, "FAIL: the IOProc overran its cycle by %u ms and no "
+                        "kAudioDeviceProcessorOverload notification was counted\n", stall_ms); ok = 0;
+    }
+
+    printf("coreaudio OK: backend=%s blocks=%lu block=%u buffer=%u latency=%u frames%s\n",
+           backend, blocks, block, buffer, latency, (buffer == block) ? " (adapter in pass-through)" : "");
+    printf("  measured=%d xruns=%llu dropped=%llu late=%llu resyncs=%llu (stall %u ms = %llu frames "
+           "injected, %llu xruns before it)\n", h.measured ? 1 : 0, (unsigned long long)h.dropouts,
+           (unsigned long long)h.dropped_frames, (unsigned long long)h.late_blocks,
+           (unsigned long long)h.driver_resyncs, stall_ms, (unsigned long long)stall_frames,
+           (unsigned long long)h1.dropouts);
+    bwa_sink_close(s);                            /* must return, not hang */
+    sink_coreaudio_tap = NULL;
+    if (!ca_tap_verify(CH, BS, &h)) ok = 0;
+
+    /* --- rule 6: a rate the device cannot run. Nothing in this path resamples, so the open must
+     *     fail, and name both the rate that was asked for and the device's. Then the same through
+     *     bwa_sink_open with BWA_SINK_FLAG_EXACT_RATE, the path a caller's flags take: the flag
+     *     adds nothing on this backend, and it must not subtract anything either. --- */
+    {
+        const uint32_t absurd = 999999;
+        Probe q;
+        probe_init(&q, CH);
+        char e2[256] = {0};
+        bwa_sink* bad = bwa_coreaudio_sink_open(absurd, BS, CH, dev, 0, false, on_render, &q, e2, sizeof e2);
+        if (bad) {
+            fprintf(stderr, "FAIL: a %u Hz open succeeded; the device cannot be running at that rate\n", absurd);
+            bwa_sink_close(bad); ok = 0;
+        } else if (!rejects_naming_both(e2, absurd)) {
+            fprintf(stderr, "FAIL: the rate-mismatch message must name both the requested rate and "
+                            "the device's; got: %s\n", e2[0] ? e2 : "(no message)"); ok = 0;
+        } else {
+            printf("  rate mismatch rejected: %s\n", e2);
+        }
+        char e3[256] = {0};
+        bwa_sink* strict = bwa_sink_open(absurd, BS, CH, BWA_SINK_COREAUDIO, dev,
+                                         BWA_SINK_FLAG_EXACT_RATE, false, on_render, &q, e3, sizeof e3);
+        if (strict) {
+            fprintf(stderr, "FAIL: BWA_SINK_FLAG_EXACT_RATE opened a %u Hz sink\n", absurd);
+            bwa_sink_close(strict); ok = 0;
+        } else if (!rejects_naming_both(e3, absurd)) {
+            fprintf(stderr, "FAIL: the flag's rejection must name both rates; got: %s\n",
+                    e3[0] ? e3 : "(no message)"); ok = 0;
+        }
+    }
+
+    /* --- the other three flags are documented no-ops here. Hold them to it: the same buffer and
+     *     the same latency as the plain open, through bwa_sink_open. --- */
+    {
+        Probe q;
+        probe_init(&q, CH);
+        char e4[256] = {0};
+        bwa_sink* f = bwa_sink_open(SR, BS, CH, BWA_SINK_COREAUDIO, dev,
+                                    BWA_SINK_FLAG_EXCLUSIVE | BWA_SINK_FLAG_TIGHT_BUFFER | BWA_SINK_FLAG_DEEP_BUFFER,
+                                    false, on_render, &q, e4, sizeof e4);
+        if (!f) {
+            fprintf(stderr, "FAIL: the same device refused an open with the no-op flags: %s\n",
+                    e4[0] ? e4 : "(no message)"); ok = 0;
+        } else {
+            if (sink_coreaudio_buffer_frames(f) != buffer || bwa_sink_output_latency(f) != latency) {
+                fprintf(stderr, "FAIL: EXCLUSIVE/TIGHT_BUFFER/DEEP_BUFFER moved the buffer (%u -> %u) or "
+                                "the latency (%u -> %u); they are no-ops on this backend\n", buffer,
+                        sink_coreaudio_buffer_frames(f), latency, bwa_sink_output_latency(f)); ok = 0;
+            }
+            bwa_sink_close(f);
+        }
+    }
+
+    /* --- rule 5 under a second open. The IO buffer belongs to the device and the PROCESS, so a
+     *     second sink at another block changes the first sink's cycle. The first must keep its
+     *     fixed render quantum (the adapter bridges), and its reported latency must move by
+     *     exactly the change in the cycle: a figure latched at open would now be wrong. --- */
+    {
+        const uint32_t BS2 = (BS == 1024) ? 512 : 1024;
+        Probe pa, pb;
+        probe_init(&pa, CH);
+        probe_init(&pb, CH);
+        char ea[256] = {0}, eb[256] = {0};
+        bwa_sink* a = bwa_coreaudio_sink_open(SR, BS, CH, dev, 0, false, on_render, &pa, ea, sizeof ea);
+        if (!a || bwa_sink_start(a) != 0) {
+            fprintf(stderr, "FAIL: second-open check: the first sink did not open and start: %s\n", ea);
+            ok = 0;
+            if (a) bwa_sink_close(a);
+        } else {
+            os_sleep_ms(100);
+            const uint32_t buf0 = sink_coreaudio_buffer_frames(a), lat0 = bwa_sink_output_latency(a);
+            bwa_sink* b = bwa_coreaudio_sink_open(SR, BS2, CH, dev, 0, false, on_render, &pb, eb, sizeof eb);
+            if (!b) {
+                fprintf(stderr, "FAIL: second-open check: the second open failed: %s\n", eb); ok = 0;
+            } else {
+                const uint32_t bufb = sink_coreaudio_buffer_frames(b);
+                uint32_t buf1 = buf0;
+                for (int i = 0; i < 100 && buf1 != bufb; ++i) {     /* the HAL applies it within a cycle or two */
+                    os_sleep_ms(10);
+                    buf1 = sink_coreaudio_buffer_frames(a);
+                }
+                const uint32_t lat1 = bwa_sink_output_latency(a);
+                os_sleep_ms(100);
+                if (bufb == buf0) {
+                    printf("  NOTE: the device kept a %u-frame cycle for a %u block, so the second open "
+                           "moved nothing\n", buf0, BS2);
+                } else if (buf1 != bufb) {
+                    fprintf(stderr, "FAIL: a second open set a %u-frame cycle and the first sink still "
+                                    "reports %u\n", bufb, buf1); ok = 0;
+                } else if ((int64_t)lat1 - (int64_t)lat0 != (int64_t)buf1 - (int64_t)buf0) {
+                    fprintf(stderr, "FAIL: the cycle moved %u -> %u frames and the first sink's latency "
+                                    "moved %u -> %u\n", buf0, buf1, lat0, lat1); ok = 0;
+                } else {
+                    printf("  second open: the first sink's cycle moved %u -> %u frames and its latency "
+                           "%u -> %u\n", buf0, buf1, lat0, lat1);
+                }
+                bwa_sink_close(b);
+            }
+            bwa_sink_stop(a);
+            if (!pa.nframes_stable || pa.nframes_first != BS) {
+                fprintf(stderr, "FAIL: the first sink's render quantum changed with the device cycle "
+                                "(first=%u, stable=%d)\n", pa.nframes_first, pa.nframes_stable); ok = 0;
+            }
+            if (!pa.time_monotonic || !pa.pos_monotonic) {
+                fprintf(stderr, "FAIL: the stamps stepped backward when the cycle changed\n"); ok = 0;
+            }
+            bwa_sink_close(a);
+        }
+    }
+
+    /* --- rule 10: the exact name, then the exact id, each reach the device the query listed; a
+     *     name nothing has fails naming it; and AUTO resolves to this backend, since a device is
+     *     plainly there. The AUTO check is what pins sink.c's order entry. --- */
+    if (!dev && name0[0] && id0[0]) {
+        const char* keys[2] = { name0, id0 };
+        for (int k = 0; k < 2; ++k) {
+            Probe q;
+            probe_init(&q, CH);
+            char e5[256] = {0};
+            bwa_sink* n = bwa_coreaudio_sink_open(SR, BS, CH, keys[k], 0, false, on_render, &q, e5, sizeof e5);
+            if (!n) {
+                fprintf(stderr, "FAIL: the device query listed '%s' and an open by that %s failed: %s\n",
+                        keys[k], k ? "id" : "name", e5); ok = 0;
+            } else {
+                if (strcmp(bwa_sink_backend(n), backend) != 0) {
+                    fprintf(stderr, "FAIL: an open by %s reached '%s', not '%s'\n", k ? "id" : "name",
+                            bwa_sink_backend(n), backend); ok = 0;
+                }
+                bwa_sink_close(n);
+            }
+        }
+    }
+    {
+        Probe q;
+        probe_init(&q, CH);
+        char e6[256] = {0};
+        const char* bogus = "bw_audio no such device";
+        bwa_sink* n = bwa_coreaudio_sink_open(SR, BS, CH, bogus, 0, false, on_render, &q, e6, sizeof e6);
+        if (n) {
+            fprintf(stderr, "FAIL: a device name nothing has opened '%s'\n", bwa_sink_backend(n));
+            bwa_sink_close(n); ok = 0;
+        } else if (!strstr(e6, bogus)) {
+            fprintf(stderr, "FAIL: the unknown-device message must name the device; got: %s\n", e6); ok = 0;
+        }
+        char e7[256] = {0};
+        bwa_sink* a = bwa_sink_open(SR, BS, CH, BWA_SINK_AUTO, dev, 0, false, on_render, &q, e7, sizeof e7);
+        if (!a || bwa_sink_type_of(a) != BWA_SINK_COREAUDIO) {
+            fprintf(stderr, "FAIL: AUTO did not resolve to coreaudio on a machine whose device just "
+                            "opened (got %s%s%s)\n", a ? bwa_sink_backend(a) : "no sink",
+                    e7[0] ? ": " : "", e7); ok = 0;
+        }
+        if (a) bwa_sink_close(a);
+    }
+
+    /* --- the loss path and the multi-stream map, on private aggregate devices --- */
+    if (id0[0]) {
+        char id_dev[256];
+        snprintf(id_dev, sizeof id_dev, "%s", id0);
+        if (dev) {           /* the run named a device: aggregate over THAT one, not the default */
+            const uint32_t ndev = sink_device_count(BWA_SINK_COREAUDIO);
+            for (uint32_t i = 0; i < ndev; ++i) {
+                char nm[256] = {0}, id[256] = {0};
+                sink_device_name(BWA_SINK_COREAUDIO, i, nm, sizeof nm);
+                sink_device_id(BWA_SINK_COREAUDIO, i, id, sizeof id);
+                if (strcmp(nm, dev) == 0 || strcmp(id, dev) == 0) { snprintf(id_dev, sizeof id_dev, "%s", id); break; }
+            }
+        }
+        if (!coreaudio_aggregate_loss(id_dev, SR, BS)) ok = 0;
+        char id1[256] = {0};
+        if (sink_device_count(BWA_SINK_COREAUDIO) >= 2 && sink_device_id(BWA_SINK_COREAUDIO, 1, id1, sizeof id1)
+            && id1[0]) {
+            if (!coreaudio_aggregate_map(id0, id1, SR, BS)) ok = 0;
+        } else {
+            printf("  multi-stream map not run: it needs two output devices\n");
+        }
+    }
+
+    /* --- the loss path by a rate change, opt-in --- */
+    int rate_moved = (restore_rate != 0 && restore_rate != SR);
+    {
+        const char* alt = getenv("BWA_TEST_COREAUDIO_ALT_RATE");
+        const long v = (alt && *alt) ? strtol(alt, NULL, 10) : 0;
+        if (v > 0 && (uint32_t)v != SR) {
+            if (!coreaudio_loss(dev, CH, SR, BS, (uint32_t)v)) ok = 0;
+            rate_moved = (restore_rate != 0);
+        } else {
+            printf("  rate-change loss not run (set BWA_TEST_COREAUDIO_ALT_RATE=44100 to run it; it "
+                   "changes the device's sample rate)\n");
+        }
+    }
+
+    /* Leave the machine as it was found. An open sets the rate, so opening at the old rate IS the
+     * restore. */
+    if (rate_moved) {
+        Probe q;
+        probe_init(&q, CH);
+        char e8[256] = {0};
+        bwa_sink* r = bwa_coreaudio_sink_open(restore_rate, BS, CH, dev, 0, false, on_render, &q, e8, sizeof e8);
+        if (r) { bwa_sink_close(r); printf("  device rate restored to %u Hz\n", restore_rate); }
+        else   printf("  NOTE: could not restore the device to %u Hz: %s\n", restore_rate, e8);
+    }
+    return ok ? 0 : 1;
+}
+#endif /* BWA_HAVE_COREAUDIO */
+
 #if defined(BWA_HAVE_JACK) || defined(BWA_HAVE_ALSA)
 /* ---- the UNAVAILABLE path: a Linux backend whose library will not load ----------------------
  *
@@ -1528,6 +2342,13 @@ int main(void) {
 #ifdef BWA_HAVE_AAUDIO
     {
         const int rc = test_aaudio();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+#endif
+#ifdef BWA_HAVE_COREAUDIO
+    {
+        const int rc = test_coreaudio();
         if (rc == 1) return 1;
         if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
     }

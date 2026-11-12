@@ -117,16 +117,16 @@ src/
                          down, strdup/strcasecmp, os_fopen + the UTF-8 path family, os_dl_open/_sym/
                          _close (the run-time library load the two Linux sinks use; the Windows half
                          is LoadLibraryW and has no caller yet), natnet's UDP
-                         sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux and Android
-                         have device backends; macOS runs the null and manual sinks until phase 4
-                         lands. Android takes the POSIX half unchanged (bionic has pthreads,
+                         sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux, macOS and
+                         Android have device backends. Android takes the POSIX half unchanged (bionic has pthreads,
                          clock_nanosleep, pthread_condattr_setclock); what it refuses is SCHED_FIFO
                          for an app thread, which is the same reported degradation WSL produces.
                          [backends p2]
   sink/
     sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (Windows: 2-ch
                          requests try WASAPI then ASIO, wider ones ASIO only. Linux: JACK then ALSA at
-                         every width) and the exact-match device rule. [M1/backends]
+                         every width. macOS: CoreAudio at every width) and the exact-match device
+                         rule. [M1/backends]
     sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
                          interleaved. Moved out of asio_sink.cpp so every backend shares one set of
                          clamp + NaN rules. [backends]
@@ -180,6 +180,34 @@ src/
                          it is __INTRODUCED_IN(28) and this targets API 26. AAUDIO_ERROR_DISCONNECTED
                          sets device_lost and starts the host-paced thread; nothing reopens.
                          [backends p3]
+    coreaudio_sink.c     CoreAudio host (macOS): the HAL (AudioDevice*, not AUHAL), C with blocks, no
+                         Objective-C. The desk path on a Mac (the system output device by default) and
+                         ANY WIDTH the device has output channels for, so AUTO offers it at every
+                         width. One interleaved float32 buffer per output STREAM; bus channels map
+                         across the streams in order, and a stereo open takes the device's preferred
+                         stereo pair. NOTHING RESAMPLES: the open SETS the device's nominal rate
+                         (system-wide, never restored) and fails naming both rates when the device has
+                         none such, whatever exact_rate says. The HAL owns the IO thread and its
+                         buffer size is a request, so the fixed-quantum adapter is in the path
+                         (pass-through when the device takes the block, which it normally does).
+                         Dropouts are the adapter's queued-depth rule on inOutputTime's SAMPLE time;
+                         the host stamp is inNow, NOT inOutputTime (see Traps); driver_resyncs is
+                         the kAudioDeviceProcessorOverload listener. device_lost has TWO causes,
+                         IsAlive going false and the nominal rate leaving the engine's (another app
+                         changed it), and both stop the IOProc and start the host-paced thread.
+                         No listener block holds a sink pointer: each holds a slot index into a
+                         static table and close() clears the slot on the listener queue, because
+                         the HAL does not say its Remove call waits for an invocation in flight.
+                         The sink_flags are all no-ops here (no hog mode). sink_coreaudio_tap is the
+                         internal test hook that shows what reaches the device, and the test makes
+                         its own PRIVATE AGGREGATE device to destroy (the IsAlive loss path) and
+                         to get two streams from (the map across streams). The IO buffer size is
+                         per device per PROCESS, so a second open at another block moves the first
+                         sink's cycle; output_latency() FOLLOWS the cycle (the one backend whose
+                         latency is not constant) and adds NO adapter block, because a block's
+                         first frame measured within 5 frames of its own stamp. VERIFIED on a Mac
+                         mini (2026-11-12, stereo devices and a 4-channel aggregate of them);
+                         nobody has LISTENED to it. [backends p4]
     worklet_sink.c       Wasm Audio Worklet host (the browser): the headphone path on a PAGE, and
                          STEREO ONLY - a browser carries no array transport, so AUTO sends anything
                          wider to the offline sink the way Android does. The worklet's process()
@@ -663,7 +691,8 @@ the arm64-v8a library, and the `package` job takes it from that job rather than 
 its own. It carries phonon too now, built per ABI by the same composite action; nothing in either
 binding's packaging changed for that, because phonon is linked STATICALLY and lands inside the
 engine library (which costs 0.4 MB -> 7.0 MB stripped on arm64).
-macOS builds on the null/manual sinks until phase 4 lands. Do not bake any backend's assumptions outside its own `*_sink` file.
+**macOS** is a fourth: CoreAudio is a device backend there (phase 4), at any width the device has
+outputs for. It links two system frameworks and needs no SDK. Do not bake any backend's assumptions outside its own `*_sink` file.
 
 The `linux` and `macos` jobs SHIP the same way since 2026-09-15: each builds its own Godot
 GDExtension (both flavours) and uploads a standalone engine artifact (`bw_audio-linux-x64-<ver>`,
@@ -742,9 +771,13 @@ too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
 **40** on Android: the defaults plus the SDK-gated five. Linux was verified locally at 38/38 (before
 the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
-sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
-`test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
-than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
+sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is
+verified locally WITHOUT phonon (2026-11-12, a Mac mini: 47 registered at the defaults, 46 pass, and
+the red is `ambdec_convert`, because the system Python there is 3.9 and the converter calls
+`Path.write_text(newline=...)`, which is 3.10) and with phonon in CI only. Phases 4 and 5 added no
+target - the CoreAudio, JACK and ALSA sections live inside
+`test_audio_sink`, and on a box with no device, no server and no card that one test reports SKIPPED
+rather than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
 `python_example_live_onset`), so the full-options Windows tree is 86 and the default Windows tree
@@ -779,7 +812,8 @@ GUI suites need a display). MATLAB's four never run under ctest in CI - the lice
 inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
 UNVERIFIED LOCALLY - no runner MATLAB is
 reachable from here, so they follow mathworks/ci-configuration-examples. The Windows Octave build
-IS verified locally (Octave 10.1.0, the four tests green); the macOS one is not. CI also
+IS verified locally (Octave 10.1.0, the four tests green), and so is the macOS one (Octave 11.3.0
+from Homebrew, Apple silicon, the five tests green, 2026-11-12). CI also
 builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
 that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
 `bw_audio-python-<platform>-<ver>`. Those three are the FAST GATE and are tagged for the runner
@@ -896,8 +930,8 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `test/rt_feature_test.c`. Miss one and the error is a confusing `<stdatomic.h> is not yet
   supported`, pointing at the header rather than at the missing flag. The list is deliberately
   MSVC-only, so a platform sink MSVC never compiles stays off it however many atomics it carries:
-  `jack_sink.c`, `alsa_sink.c`, `aaudio_sink.c` and `worklet_sink.c` all use `stdatomic.h` and
-  none belongs there.
+  `jack_sink.c`, `alsa_sink.c`, `aaudio_sink.c`, `coreaudio_sink.c` and `worklet_sink.c` all use
+  `stdatomic.h` and none belongs there.
 - **`pose.h` is the one HEADER that carries `stdatomic.h`, so nothing else may include it
   casually.** Its seqlock moved off the Interlocked intrinsics onto C11 atomics (Boehm 2012: the
   payload fields are relaxed atomics, and fences carry the ordering), which means every translation
@@ -943,6 +977,28 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   the handshake ignored them for years: a Motive on unicast or a moved port connects fine and then sends
   nothing here. A multicast session now follows them. `test_natnet` drives the real socket path on loopback against a fake Motive;
   only multicast delivery itself still needs a rig. Unverified against live Motive 3.3.4.1.
+- **A device API's OUTPUT time is not its callback time.** CoreAudio's IOProc gets `inNow` and
+  `inOutputTime`, and the plan stamped blocks with the second while summing the buffer and the
+  safety offset into the reported latency. Measured, `inOutputTime` leads the cycle by exactly
+  those two (12.00 ms at 256 + 320 frames), so every `bwa_get_clock` pair plus
+  `bwa_get_output_latency_frames` would have landed 576 frames late, and no test could see it:
+  the pair stays consistent, only the sum is wrong. The sink stamps `inNow`. Rule for the next
+  backend: before pairing a stamp with a latency figure, measure what the stamp leads or lags the
+  callback by, and check that the latency sum does not already hold it.
+- **A queue-bound HAL listener can be a SYNCHRONOUS call from the IO thread.**
+  `AudioObjectAddPropertyListenerBlock` dispatches asynchronously, except for the two properties
+  sent from the IO context (`kAudioDeviceProcessorOverload` is one), which it dispatches
+  synchronously onto the queue. Put that listener on the queue whose handler calls
+  `AudioDeviceStop`, and the IO thread waits for the queue while the queue waits for the IO
+  thread. The overload listener takes a NULL queue and does one atomic add. `AudioHardware.h` is
+  the source, in the parameter comment, not in the property's own entry.
+- **A probe on the bus cannot see the channel map.** `test_audio_sink`'s render probe passed with
+  the CoreAudio stereo map pointed off the end of the buffer list: every timing, position and
+  health assertion looks only at what the sink ASKED the engine for. What reaches the device is a
+  separate fact, and for a sink that interleaves or maps channels it is the one that matters.
+  `sink_coreaudio_tap` hands the test the buffers the IOProc wrote, and the render writes a
+  pattern that encodes its bus channel and stream frame, so a wrong map, stride or frame offset
+  corrupts something the test reads. The other device sinks still have no such check.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
 - **Proprietary VR-toolkit integrations (MiddleVR, Igloo) live OUTSIDE this repo**, in their own
@@ -964,7 +1020,8 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   to prevent. Both existing asmdefs also carried `noBwAudioReferences`, a mangled `noEngineReferences`
   that Unity silently ignores.
 - **Do not bake a backend's assumptions outside its own `*_sink` file.** ASIO is just the Windows
-  ARRAY sink, WASAPI the Windows monitor sink, JACK and ALSA the Linux pair; the cross-platform
+  ARRAY sink, WASAPI the Windows monitor sink, JACK and ALSA the Linux pair, CoreAudio the macOS
+  one; the cross-platform
   move added files behind the same seam and changed nothing else. The two shared pieces are
   deliberate exceptions and carry no backend types: `sink_convert.h` and `sink_quant.c`. The one
   thing that is NOT an exception is `alsa_sink.c`'s `S24_LE` interleave: the shared header's int24
@@ -1335,12 +1392,13 @@ freely. It still follows the US English rule above.
 - `docs/backends.md` — the backend REFERENCE: the 10-rule sink contract (fixed quantum, timestamp pair,
   health, exact-rate policy), the shared pieces (sink_convert, the fixed-quantum adapter, the OS shim
   inventory), the ABI (enum, `bwa_desc.device`, device query, AUTO order), per-backend notes, CMake, tests.
-  ASIO, WASAPI, JACK, ALSA, AAudio and the Worklet sink are IMPLEMENTED; CoreAudio (phase 4) is still spec.
+  ASIO, WASAPI, CoreAudio, JACK, ALSA, AAudio and the Worklet sink are all IMPLEMENTED.
 - `docs/backend-development.md` — the backend EXPLANATION + contributor how-to: why (goals per platform:
   Windows + Android = dev ease + reach for head-mounted VR games; Mac = dev ease; Linux = future rig
   alternative + seated headphone experiments from Psychtoolbox/PsychoPy), scope (Linux reaches the array
   via AES67 into the Dante net, JACK the production Linux backend, ALSA the no-server path), what stays
-  fixed, design decisions per backend, the planned CoreAudio sink, phases, the next-backend checklist,
+  fixed, design decisions per backend (CoreAudio's included, with what a desk Mac verified), phases,
+  the next-backend checklist,
   deferred follow-ups, and the verify-on-hardware list.
 - `docs/profiling.md` — Tracy instrumentation (`BWA_TRACY`), the headless benches (`profile_bench`/`bench_situations`), real-time scheduling + memory notes.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.

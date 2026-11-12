@@ -879,6 +879,36 @@ Things the tools cannot catch. Know them before you trust a green run.
   the baffle depth then reads it as measured, and reads about 0. Read the depth from `as_built.json`,
   never from a file this tool wrote positions into.
 
+## A desk Mac (CoreAudio)
+
+This pass is not part of rig day. It is the hardware check for the macOS backend, on any Mac with
+headphones. The automated half is `ctest -R audio_sink`, which opens the default output device.
+
+- [ ] `bwa_minimal --list-devices` lists the output devices, the default first.
+- [ ] `bwa_minimal` prints `backend: coreaudio:<device name>` and a `device clock:` line within
+      about ±100 ppm of 48000 Hz. Thousands of ppm means the device did not take the engine's
+      rate.
+- [ ] **Laterality, by ear.** The click in `bwa_minimal` starts in front, passes the LEFT ear
+      first, and circles the head once in 6 s. Listen on headphones. A click that passes the
+      right ear first is a swapped channel map. Use the click or a tone, never DC.
+- [ ] **A ten-minute soak**: `bwa_playground` (configure with `-DBWA_BUILD_PLAYGROUND=ON`) with a
+      busy scene at a 256 block. The health readout must show `measured` true and no dropouts.
+- [ ] **Latency against a loopback**: the delay from a scheduled click to a microphone at the
+      headphone, against `bwa_get_output_latency_frames`. Within one block passes.
+- [ ] On a multichannel interface: `BWA_TEST_COREAUDIO_DEVICE=<name>
+      BWA_TEST_COREAUDIO_CHANNELS=<n> ctest -R audio_sink`. The device tap checks that each bus
+      channel reaches its own device channel.
+- [ ] Unplug the device under a running `bwa_playground`. Its health readout must show the
+      device as lost, the scene must keep animating, and the program must close cleanly.
+      `bwa_minimal` does not print the health readback, so it cannot show this.
+- [ ] With a USB headset or another device that has a microphone as the output: start
+      `bwa_minimal` and confirm macOS shows no microphone indicator and asks for no microphone
+      permission. The sink turns its IOProc off for the input streams, and no device with an
+      input has been tried.
+
+The open sets the device's sample rate to the engine's and leaves it there. Check Audio MIDI
+Setup afterward if another application needs the old rate.
+
 ## The first day, with the speakers anywhere
 
 Nothing in the engine cares where the speakers stand, only that the layout says where they are.

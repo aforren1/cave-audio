@@ -1317,7 +1317,10 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 	 * auditions the array on headphones; Binaural is the direct headphone render. */
 	/* Cave is the ONLY profile this warning still applies to. The headphone profiles reach a
 	 * WASAPI endpoint now, so "no ASIO driver" stopped meaning "silence" for them; the array is
-	 * the one path whose transport is fixed to ASIO. */
+	 * the one path whose transport is fixed to ASIO.
+	 * WINDOWS ONLY: elsewhere the array has no ASIO to miss. It opens through JACK, ALSA or
+	 * CoreAudio on any device with enough outputs, and the binding cannot count those from here. */
+#ifdef _WIN32
 	if (profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
 			&& BwaEngine::get_asio_driver_count() == 0) {
 		w.push_back("Profile is Cave (the speaker-array rig) but no ASIO driver is installed, so "
@@ -1325,6 +1328,7 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 					"Use CaveSim to audition the array on headphones, or Binaural for the "
 					"direct headphone render - both open an ordinary Windows output device.");
 	}
+#endif
 	if (feed_listener && listener_path.is_empty()) {
 		w.push_back("Feed Listener is on but no listener node is set, so the listener never "
 					"moves from the origin. Point it at the head/camera, or turn it off to let "
@@ -1519,9 +1523,14 @@ void BwaEngine::_bind_methods() {
 						 "CaveSim - headphones, auditions the array:2,"
 						 "CaveBoth - rig + the sim tap:3"),
 			"set_profile", "get_profile");
+	/* Every backend an export of this addon can open, on every platform: the list is one string
+	 * and a scene travels between platforms, so it cannot follow the editor's own. Naming one the
+	 * running platform lacks fails the start with a message that says so. WORKLET is left out:
+	 * it is the browser build, which this extension never links. */
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink", PROPERTY_HINT_ENUM,
 						 "Auto:0,ASIO - the rig:1,Null - silent/offline:2,Manual - render_block:3,"
-						 "WASAPI - Windows endpoint:4"),
+						 "WASAPI - Windows endpoint:4,CoreAudio - macOS device:5,"
+						 "ALSA - Linux PCM:6,AAudio - Android stereo:7,JACK - Linux ports:8"),
 			"set_sink", "get_sink");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "device"), "set_device", "get_device");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink_flags", PROPERTY_HINT_FLAGS,

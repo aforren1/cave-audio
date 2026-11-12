@@ -640,9 +640,11 @@ What differs is the device, and only the device:
 
 - **Linux** outputs through JACK (a PipeWire desktop answers the same ABI) or ALSA. The array is
   reachable over AES67 into the Dante network, so this is a real rig path and not only a desk one.
-- **macOS** has **no device backend yet** (CoreAudio is `docs/backends.md` phase 4). The engine
-  runs on the null and manual sinks there: offline rendering, and everything that does not make
-  sound.
+- **macOS** outputs through CoreAudio, on the system output device by default, in the editor and
+  in a `StandaloneOSX` player. The device runs at the engine's sample rate or the start fails,
+  so the open sets the device's rate when the two differ
+  ([api.md: Sink policy](./api.md#sink-policy)). The inspector's Sink popup offers `CoreAudio`
+  for a macOS build target.
 
 The macOS library is **universal** (x86_64 and arm64) and **unsigned**. Unity itself does not care,
 but Gatekeeper does: a `.dylib` downloaded inside a tarball carries a quarantine flag, and the
@@ -764,8 +766,11 @@ Two things to know about those paths:
   one place a key and a file name deliberately differ.
 
 The device story is the engine's, not the binding's: Linux outputs through JACK or ALSA, and macOS
-has no device backend yet, so it runs the null and manual sinks. Everything the binding exposes
-behaves the same on all four platforms.
+through CoreAudio, on the system output device by default. Everything the binding exposes
+behaves the same on all four platforms. The `sink` property's inspector list names every
+backend on every platform, because a scene travels between them. A backend the running platform
+lacks fails the start with a message that says so, so leave the property on Auto in a project
+that ships to more than one.
 
 The macOS libraries are **unsigned and un-notarized**. An addon unzipped from a download carries a
 quarantine flag and the editor refuses to load it, so clear it once:

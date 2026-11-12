@@ -17,8 +17,14 @@
  *
  * WHAT IT COSTS. Nothing when the device size already equals the block size and the FIFO is
  * empty: that pull renders one block into one slot and the backend converts straight out of it,
- * in a single out call. Otherwise the adapter holds up to one block of latency, which
- * output_latency() must add (sink_quant_queued).
+ * in a single out call. Otherwise the adapter holds up to one block of audio.
+ *
+ * WHETHER THAT IS LATENCY depends on what the backend's stamp means. A block is stamped with the
+ * callback's host time plus the frames queued ahead of it, so against that stamp the held frames
+ * are already counted. Measured on CoreAudio at six block and buffer pairings: a block's first
+ * frame reached the device within 5 frames of its own stamp, bridged or not, so that sink adds
+ * nothing for the adapter. The older backends add a block (or sink_quant_queued) when the sizes
+ * differ. Nobody has repeated the measurement on them: docs/backend-development.md, verify list.
  *
  * AUDIO THREAD. Everything but sink_quant_init/free runs in the render path. The slots are
  * allocated once at open, sized for the worst case (see sink_quant_init), and the pull loop

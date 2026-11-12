@@ -748,8 +748,8 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; the headphone profiles             |
 | `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
 | `block_size`     | render quantum, frames; 0 = 256. Also the device *period hint* - a driver or an OS mixer may run its own size, and the sinks adapt, but the quantum handed to the DSP is exactly this regardless; `bwa_get_block_size` reads it back |
-| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)). A named device backend is a demand, and an open failure fails `bwa_start` loudly: `BWA_SINK_ASIO` and `BWA_SINK_WASAPI` (Windows), `BWA_SINK_JACK` and `BWA_SINK_ALSA` (Linux), `BWA_SINK_AAUDIO` (Android, stereo only), `BWA_SINK_WORKLET` (browser, stereo only), `BWA_SINK_COREAUDIO` (macOS, not in this build yet). `BWA_SINK_NULL` forces the offline sink (CI, profiling, tracking-only). `BWA_SINK_MANUAL` creates no device and no thread: you pump blocks with `bwa_render_block` (deterministic, for golden tests) |
-| `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). Three backends read it differently: JACK takes a port regular expression, AAudio a decimal Android device id, and the worklet sink a decimal AudioContext handle (see [Sink policy](#sink-policy)). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
+| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)). A named device backend is a demand, and an open failure fails `bwa_start` loudly: `BWA_SINK_ASIO` and `BWA_SINK_WASAPI` (Windows), `BWA_SINK_JACK` and `BWA_SINK_ALSA` (Linux), `BWA_SINK_AAUDIO` (Android, stereo only), `BWA_SINK_WORKLET` (browser, stereo only), `BWA_SINK_COREAUDIO` (macOS). `BWA_SINK_NULL` forces the offline sink (CI, profiling, tracking-only). `BWA_SINK_MANUAL` creates no device and no thread: you pump blocks with `bwa_render_block` (deterministic, for golden tests) |
+| `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint; CoreAudio: the macOS default output device). Three backends read it differently: JACK takes a port regular expression, AAudio a decimal Android device id, and the worklet sink a decimal AudioContext handle (see [Sink policy](#sink-policy)). Names the PRIMARY device only: under `cave_both` that is the array, and the monitor opens the platform default on its own. `asio_driver` is the legacy spelling of the same field |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; falls back to the default tracer (one stderr notice) if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1), EPAD (2), or LAYOUT (3, the layout file's imported `bed_decode`) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
@@ -847,18 +847,20 @@ to come, are in [backends.md](./backends.md).
 `BWA_SINK_AUTO` (the default) picks per platform, and on Windows also by channel count, because
 there the two output paths want different hardware:
 
-| request                        | Windows order          | Linux order        | Android order | browser order |
-|--------------------------------|------------------------|--------------------|---------------|---------------|
-| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null | JACK, ALSA, null | AAudio, null | worklet, null |
-| more than 2 channels (the array) | ASIO, null           | JACK, ALSA, null   | null          | null          |
+| request                        | Windows order          | Linux order        | macOS order     | Android order | browser order |
+|--------------------------------|------------------------|--------------------|-----------------|---------------|---------------|
+| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null | JACK, ALSA, null | CoreAudio, null | AAudio, null | worklet, null |
+| more than 2 channels (the array) | ASIO, null           | JACK, ALSA, null   | CoreAudio, null | null          | null          |
 
 The width does not split the Linux order, because nothing on Linux carries the "this transport is
 the array's" decision that ASIO carries on Windows: the same backend serves two channels and
 twenty-six. JACK goes first because it is the Linux production path, and `jack_client_open` carries
 `JackNoStartServer`, so a box with neither a JACK server nor PipeWire falls through to ALSA in
 about 4 ms instead of spawning a `jackd`. Android and the browser carry no array transport, so a
-request wider than two channels goes straight to the offline sink there. macOS runs the null sink
-until the CoreAudio backend lands.
+request wider than two channels goes straight to the offline sink there. macOS does not split
+the order either: CoreAudio serves any width the device has output channels for. A desk Mac asked
+for an array wider than its device fails that open and falls to the offline sink, and
+`bwa_last_error` then names both channel counts.
 
 A headphone profile on Windows therefore opens the **Windows default output**, which is the device
 the headphones are on, and never lands on the first registered ASIO driver (on a rig machine, the
@@ -872,10 +874,10 @@ cannot be a second ASIO device. The monitor asks for `BWA_SINK_AUTO` with no dev
 above, and the monitor would fall to silence. `bwa_get_audio_backend` names both devices under
 this profile, array first.
 
-Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_JACK`,
-`BWA_SINK_ALSA`, `BWA_SINK_AAUDIO` and `BWA_SINK_WORKLET` fail `bwa_start` loudly when the device
-does not open, instead of falling back to silence. A backend this build does not carry
-(`BWA_SINK_COREAUDIO` anywhere, the Linux pair off Linux, the Windows pair off Windows,
+Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_COREAUDIO`,
+`BWA_SINK_JACK`, `BWA_SINK_ALSA`, `BWA_SINK_AAUDIO` and `BWA_SINK_WORKLET` fail `bwa_start` loudly
+when the device does not open, instead of falling back to silence. A backend this build does not
+carry (the Linux pair off Linux, the Windows pair off Windows, `BWA_SINK_COREAUDIO` off macOS,
 `BWA_SINK_AAUDIO` off Android, `BWA_SINK_WORKLET` outside an Emscripten build with the worklet
 sink) fails with a message that says so.
 
@@ -884,6 +886,15 @@ channels fails the open with a message naming the width, and AUTO on Android sen
 the silent offline sink. Its `bwa_desc.device` is a decimal Android device id from Java's
 `AudioManager`, not a name: AAudio exposes no device list to native code, so the device query
 reports one entry, `default`, with id `0`.
+
+`BWA_SINK_COREAUDIO` opens the macOS default output device, or the one `bwa_desc.device` names
+by its name or its UID. It has no resampler, so the device runs at `bwa_desc.sample_rate` or the
+open fails, for a headphone profile too. To make that true, **the open sets the device's sample
+rate** when the two differ. That is a change every application on the Mac sees, and `bwa_stop`
+does not undo it. The open fails, naming both rates, when the device has no such rate. A stereo
+open plays on the device's preferred stereo pair, which is the pair Audio MIDI Setup shows. If
+another application moves the device off the engine's rate while the engine runs, the engine
+keeps rendering silence and reports `device_lost`, the same as for a device that was unplugged.
 
 `BWA_SINK_JACK` reads `bwa_desc.device` differently from every other backend, because JACK has
 ports rather than devices: there it is a `jack_get_ports` regular expression, such as
@@ -907,7 +918,8 @@ reaches the backend that owns it.
 **Sample rate.** The array demands its rate: the device runs at `bwa_desc.sample_rate` or the open
 fails, since a resampled array shifts every per-speaker delay. A headphone sink may let the OS
 resample, and then reports the degradation through `bwa_last_error` after a **successful**
-`bwa_start`. Check it there.
+`bwa_start`. Check it there. CoreAudio and JACK are the exceptions: neither has a resampler, so a
+headphone open is exact there too.
 
 `bwa_last_error` carries the other AUTO degradations too, for the same reason. A start that fell
 through to the silent offline sink says why the real device did not open, and a `device` name no
@@ -921,9 +933,9 @@ resampling, comfortably buffered device gives you for free; the fourth trades la
 
 | flag | what the backend does |
 |------|-----------------------|
-| `BWA_SINK_FLAG_EXCLUSIVE` (0x1) | WASAPI opens the endpoint in exclusive mode, AAudio asks for the MMAP path. ASIO, JACK and a `hw:` ALSA PCM are already exclusive, so it is a no-op there |
-| `BWA_SINK_FLAG_EXACT_RATE` (0x2) | the open fails, naming both rates, when the device cannot run at `sample_rate`. WASAPI shared mode drops its auto-convert flag, ALSA turns the library resampler off, AAudio checks its device-rate probe. The array sinks behave this way already |
-| `BWA_SINK_FLAG_TIGHT_BUFFER` (0x4) | the smallest device buffer the backend can take: ALSA asks for 2 periods instead of 3, AAudio for 1 burst instead of 2. WASAPI exclusive mode already runs one period and shared mode's buffer belongs to the OS mixer, so it is a no-op there, and so are ASIO and JACK |
+| `BWA_SINK_FLAG_EXCLUSIVE` (0x1) | WASAPI opens the endpoint in exclusive mode, AAudio asks for the MMAP path. ASIO, JACK and a `hw:` ALSA PCM are already exclusive, so it is a no-op there. A no-op on CoreAudio too: the sink never takes hog mode, which buys no latency on a Mac |
+| `BWA_SINK_FLAG_EXACT_RATE` (0x2) | the open fails, naming both rates, when the device cannot run at `sample_rate`. WASAPI shared mode drops its auto-convert flag, ALSA turns the library resampler off, AAudio checks its device-rate probe. The array sinks behave this way already, and so does every CoreAudio open |
+| `BWA_SINK_FLAG_TIGHT_BUFFER` (0x4) | the smallest device buffer the backend can take: ALSA asks for 2 periods instead of 3, AAudio for 1 burst instead of 2. WASAPI exclusive mode already runs one period and shared mode's buffer belongs to the OS mixer, so it is a no-op there, and so are ASIO, JACK and CoreAudio |
 | `BWA_SINK_FLAG_DEEP_BUFFER` (0x8) | a DEEPER OUTPUT BUFFER: more latency, more slack for a render that overruns its callback. The browser sink only: a context it creates gets latencyHint `"playback"` instead of `"interactive"` (on a Windows desktop 20 ms of browser buffer instead of 10, 1216 frames of output latency instead of 736 at block 256). A context the PAGE hands over keeps the hint the page gave it, so a page that wants this creates its AudioContext with the hint itself; the web XR page uses 0.05 s. A no-op on every other backend |
 
 None of them reaches the `cave_both` monitor. Like `device`, they describe the primary device, and
@@ -946,6 +958,9 @@ Classes 0 and 1 are shared mode with the OS free to convert, which is what Psych
 `paMacCoreFailIfConversionRequired` on macOS and `eStreamOptionMatchFormat` on Windows: fail rather
 than convert.
 
+On macOS only the `block_size` column does anything. The CoreAudio sink shares the device at
+every class, and it never converts, so every class already has class 4's strictness.
+
 The block size is a hint. Read the result back rather than assuming it:
 `bwa_get_output_latency_frames` reports the real render-to-DAC delay.
 
@@ -962,6 +977,17 @@ Measured on one desk machine, a Realtek onboard endpoint at 48 kHz, with
 Two seconds of each ran with no dropout. Your endpoint will differ: this driver forces a 144-frame
 exclusive period whatever the engine block is, so most of what the smaller blocks buy is the
 adapter holding less.
+
+Measured on one Mac mini at 48 kHz, through CoreAudio:
+
+| device | open | latency |
+|--------|------|---------|
+| an HDMI display | 256-frame blocks | 664 frames, 13.8 ms |
+| an HDMI display | 100-frame blocks | 508 frames, 10.6 ms |
+| the built-in speakers | 256-frame blocks | 812 frames, 16.9 ms |
+
+The device takes the engine block as its IO buffer, so a smaller block is the whole saving. The
+rest is the device's own latency and safety offset, which no flag moves.
 
 **Exclusive mode takes the device.** While the engine holds it, no other application on the
 machine can open that endpoint: not the VR runtime, not the browser, not the OS sounds. On a

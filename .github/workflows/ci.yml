@@ -1138,9 +1138,9 @@ jobs:
           array is reached over AES67 into the Dante network.
 
           ``bw_audio-macos-universal-$tag.zip`` - one universal ``libbw_audio.dylib`` (x86_64 and
-          arm64) plus ``bw_audio.h``. macOS has **no device backend yet**, so this is the offline
-          path: rendering through the manual sink and the test suite. It is **not signed or
-          notarized**, so clear the quarantine flag after unzipping:
+          arm64) plus ``bw_audio.h``. Output goes through **CoreAudio**, on the system output
+          device by default; the open sets the device's sample rate to the engine's. It is
+          **not signed or notarized**, so clear the quarantine flag after unzipping:
           ``xattr -dr com.apple.quarantine <folder>``.
 
           Both link Steam Audio statically, like every other build here. The Unity package and the
@@ -1259,9 +1259,10 @@ jobs:
             done
 
   # ---- portability gate, and two more shipping jobs (docs/backend-development.md phases 2 and 5) ----------
-  # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
-  # runner has an audio device, so both build the library, the console examples and the whole test
-  # suite and run them on the null and manual sinks.
+  # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio. A
+  # runner with no audio device builds the library, the console examples and the whole test suite
+  # and runs them on the null and manual sinks. Whether the macOS runner presents an output device
+  # is unknown: with one, the CoreAudio section of test_audio_sink runs against it.
   #
   # They SHIP as well, since 2026-09-15: each builds its own Godot GDExtension in both flavours,
   # uploads a standalone engine artifact, and hands the package job a fixed-name pack input, exactly
@@ -1278,10 +1279,10 @@ jobs:
   # warm one restores the archives and costs a few minutes. No ASIO: it is Windows-only by
   # definition, and nothing here fetches it.
   #
-  # The macOS job is UNVERIFIED locally in BOTH halves: the shim's Apple paths (mach_absolute_time,
-  # mach_wait_until, the SCHED_OTHER priority drop) were written from the documentation, and its
-  # phonon build was written from the pinned scripts. Nobody here has a Mac. This job is the first
-  # thing that will execute either.
+  # The macOS job's PHONON build is unverified locally: it was written from the pinned scripts and
+  # this job is the first thing that executes it. The shim's Apple paths (mach_absolute_time,
+  # mach_wait_until, the SCHED_OTHER priority drop) and the CoreAudio sink have run on a physical
+  # Mac (2026-11-12), in a tree without phonon.
   #
   # ANDROID IS CROSS-BUILT, in the job below, and deliberately WITHOUT an emulator. An emulator job is
   # possible here: ubuntu-latest runners expose /dev/kvm, so reactivecircus/android-emulator-runner can
@@ -1935,8 +1936,8 @@ jobs:
           retention-days: 1      # an intra-run handoff, not a download
           if-no-files-found: error
 
-  # UNVERIFIED LOCALLY, all of it: nobody here has a Mac, so this job is the first thing that
-  # executes either the shim's Apple paths or a macOS phonon build. Both decisions below came out
+  # The PHONON half is UNVERIFIED LOCALLY: this job is the first thing that executes a macOS
+  # phonon build. (The engine and the shim's Apple paths have run on a Mac.) Both decisions below came out
   # of the pinned scripts rather than a run. build.py -p osx generates ONE tree named "osx" with
   # the Xcode generator, and core/CMakeLists.txt sets CMAKE_OSX_ARCHITECTURES "x86_64;arm64" for
   # every macOS build (get_dependencies.py passes the same pair to the three companions), so the
@@ -2040,7 +2041,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON \
                 -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
                 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 | tee configure.log
-          grep -q "null and manual sinks only" configure.log
+          grep -q "CoreAudio backend ENABLED" configure.log
           grep -q "Steam Audio ENABLED" configure.log
 
       - name: Build
@@ -2238,8 +2239,8 @@ jobs:
           commit   ${{ github.sha }} (${{ github.ref_name }})
           built    $(date -u +%Y-%m-%dT%H:%M:%S)Z  (GitHub Actions run ${{ github.run_id }})
           arches   one UNIVERSAL library, x86_64 + arm64 ($(lipo -info dist-macos/lib/libbw_audio.dylib))
-          backends none. macOS has no device backend yet (CoreAudio is docs/backend-development.md phase 4),
-                   so this runs the null and manual sinks: offline rendering and the test suite.
+          backends CoreAudio (the system output device by default; the open sets the device's
+                   sample rate to the engine's). No ASIO.
                    SteamAudio=yes (STATIC), so the binaural path is the real HRTF decode.
           unsigned NOT code-signed and NOT notarized. Gatekeeper blocks a downloaded unsigned
                    library, so clear the quarantine flag after unzipping:
@@ -2396,9 +2397,9 @@ jobs:
   # desktop jobs. What it gives back is a whole phonon build and a whole engine build per platform,
   # and the wheel step that is left is minutes per interpreter.
   #
-  # macOS side: UNVERIFIED LOCALLY, like the macos job. Nobody here has a Mac, so the universal2
-  # build, delocate's repair and the deployment target below came out of cibuildwheel's
-  # documentation. The failure modes are all loud (the tag assertion, lipo, otool). The Windows
+  # macOS side: UNVERIFIED LOCALLY. A plain `uv build --wheel` has run on a Mac; cibuildwheel has
+  # not, so the universal2 build, delocate's repair and the deployment target below came out of
+  # cibuildwheel's documentation. The failure modes are all loud (the tag assertion, lipo, otool). The Windows
   # side IS verified locally: the same cibuildwheel version, the same config setting, three wheels.
   wheels:
     name: wheels (${{ matrix.platform }})

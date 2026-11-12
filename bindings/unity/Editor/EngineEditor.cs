@@ -46,9 +46,8 @@ namespace BwAudio.EditorTools
 
         // The device backends each player platform's engine library carries. BwaSinkType mirrors the
         // ABI, so it names every backend on every platform, and naming one a target lacks is a DEMAND
-        // that fails startup there. Left out everywhere: CoreAudio (not built yet), Worklet (the
-        // browser build, which Unity never links) and Manual (it needs bwa_render_block pumped, and
-        // Unity binds no pump).
+        // that fails startup there. Left out everywhere: Worklet (the browser build, which Unity
+        // never links) and Manual (it needs bwa_render_block pumped, and Unity binds no pump).
         static BwaSinkType[] BackendsFor(BuildTarget t)
         {
             switch (t)
@@ -56,19 +55,22 @@ namespace BwAudio.EditorTools
                 case BuildTarget.StandaloneWindows:
                 case BuildTarget.StandaloneWindows64: return new[] { BwaSinkType.Asio, BwaSinkType.Wasapi };
                 case BuildTarget.StandaloneLinux64:   return new[] { BwaSinkType.Jack, BwaSinkType.Alsa };
+                case BuildTarget.StandaloneOSX:       return new[] { BwaSinkType.CoreAudio };
                 case BuildTarget.Android:             return new[] { BwaSinkType.AAudio };
                 default:                              return new BwaSinkType[0];
             }
         }
 
         // Play mode runs the EDITOR's library, not the build target's, so a Quest project played on a
-        // Windows desk opens WASAPI. Those entries stay pickable, marked, for desk testing.
+        // Windows desk opens WASAPI, and on a Mac it opens CoreAudio. Those entries stay pickable,
+        // marked, for desk testing.
         static BwaSinkType[] EditorBackends()
         {
             switch (Application.platform)
             {
                 case RuntimePlatform.WindowsEditor: return BackendsFor(BuildTarget.StandaloneWindows64);
                 case RuntimePlatform.LinuxEditor:   return BackendsFor(BuildTarget.StandaloneLinux64);
+                case RuntimePlatform.OSXEditor:     return BackendsFor(BuildTarget.StandaloneOSX);
                 default:                            return new BwaSinkType[0];
             }
         }

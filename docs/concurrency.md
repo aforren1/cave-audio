@@ -19,7 +19,7 @@ Two threads carry the core:
   memory. Does all file decode, malloc/free, file I/O, and logging.
 - **Audio thread**: whichever thread the sink renders on *is* this thread: the
   ASIO driver's `bufferSwitch` callback, the WASAPI, JACK, ALSA or AAudio render
-  thread, the browser's AudioWorklet `process()`, or the null sink's pacing
+  thread, the CoreAudio IOProc, the browser's AudioWorklet `process()`, or the null sink's pacing
   thread. It calls `rt_render`, which owns all DSP state: the voice table, the
   speaker bus, per-voice gains, the listener active fields. It never allocates,
   locks, blocks, or does I/O.

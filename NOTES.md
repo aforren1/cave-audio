@@ -8,6 +8,24 @@ agent session while remaining findable.
 
 ---
 
+**CoreAudio sink, backends phase 4 (2026-11-12).** `src/sink/coreaudio_sink.c`: the HAL with one
+IOProc, through the fixed-quantum adapter, on a Mac mini with two stereo devices. The enum value,
+the AUTO entry and every binding's constant were already in place, so the change was the sink, a
+CMake block, three dispatch cases, a test section and the docs. Three things came out of measuring
+before writing. `inOutputTime` leads the IO cycle by the buffer plus the safety offset, so the
+planned stamp and the planned latency sum counted 576 frames twice; the sink stamps `inNow`. The
+HAL dispatches the overload notification synchronously from the IO thread when the listener has a
+queue, so that one listener has none. And a deliberately broken channel map passed the first
+version of the test, because the render probe never sees the device side; the device tap and the
+encoded pattern came from that. A review pass then found the stream layout read before the rate set, an
+IOProc left on the input streams, and an anchor that survived a restart, and showed that a
+private aggregate device gives the test something it can destroy: the loss path and the map
+across streams both run on one by default. Open items are on the verify list in
+docs/backend-development.md: array width, a multi-stream device, a real unplug, the
+CI runner, and anyone listening to it.
+
+---
+
 **Engine SDK: one engine per platform (2026-09-16).** Every binding used to link the in-tree
 `bw_audio` target, so a desktop CI job compiled the engine FOUR times - once for its ctest run,
 once per Godot extension flavour, and once more inside the wheel build's isolated scikit-build-core

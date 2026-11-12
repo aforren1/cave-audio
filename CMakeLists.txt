@@ -38,15 +38,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "WASI" OR EMSCRIPTEN)
   set(BWA_WASM TRUE)
 endif()
 
-# Platform: Windows is the production target (ASIO -> Digiface -> Dante) and the only one with
-# device backends so far. Everything else builds the library, the tests and the console examples on
-# the null and manual sinks, which is what the Linux and macOS CI jobs run. See docs/backends.md.
+# Platform: Windows is the production target (ASIO -> Digiface -> Dante). Linux, Android and macOS
+# carry device backends of their own; anything else builds the library, the tests and the console
+# examples on the null and manual sinks. See docs/backends.md.
 if(WIN32)
   message(STATUS "bw_audio: Windows - ASIO and WASAPI backends available")
 elseif(ANDROID)
   message(STATUS "bw_audio: Android (API ${ANDROID_PLATFORM_LEVEL}, ${ANDROID_ABI}) - AAudio backend available")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(STATUS "bw_audio: Linux - JACK and ALSA backends available")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  message(STATUS "bw_audio: macOS - CoreAudio backend available")
 elseif(BWA_WASM)
   message(STATUS "bw_audio: ${CMAKE_SYSTEM_NAME} (wasm32) - null and manual sinks only; "
                  "the AudioWorklet sink is the HOST's job (docs/web.md)")
@@ -579,6 +581,22 @@ else()
   message(STATUS "bw_audio: AAudio backend disabled (Android only)")
 endif()
 
+# ---- CoreAudio backend (macOS: headphones at the desk, and the array where a device has the outputs) ----
+# No SDK to vendor and no license line to add: both frameworks are part of macOS, so this is ON
+# wherever it can build and cannot be forced on elsewhere. "Darwin" rather than APPLE, because APPLE
+# is also true for iOS and the HAL's AudioDevice API is macOS only. The sink is C with blocks
+# (the HAL's queue-bound property listeners take one), which Apple clang compiles by default.
+option(BWA_WITH_COREAUDIO "Build the CoreAudio backend (macOS only)" ON)
+if(BWA_WITH_COREAUDIO AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  target_sources(bw_audio PRIVATE src/sink/coreaudio_sink.c)
+  target_compile_definitions(bw_audio PRIVATE BWA_HAVE_COREAUDIO)
+  target_link_libraries(bw_audio PRIVATE "-framework CoreAudio" "-framework CoreFoundation")
+  message(STATUS "bw_audio: CoreAudio backend ENABLED")
+else()
+  set(BWA_WITH_COREAUDIO OFF)
+  message(STATUS "bw_audio: CoreAudio backend disabled (macOS only)")
+endif()
+
 # ---- Wasm Audio Worklet backend (the browser: headphones on a page) ----
 # Emscripten only, and OFF by default even there. -sAUDIO_WORKLET pulls in -sWASM_WORKERS and
 # changes emscripten_get_now into a per-scope runtime probe for every target that links the
@@ -906,7 +924,7 @@ if(BWA_BUILD_TESTS)
 
   # audio-loop check: drives the null sink directly (no core needed), plus one section per
   # compiled device backend. Those sections open a live device (a WASAPI endpoint, a JACK server, an
-  # ALSA PCM), so they are the tests here that can legitimately be unrunnable; each exits 77 (see
+  # ALSA PCM, a CoreAudio device), so they are the tests here that can legitimately be unrunnable; each exits 77 (see
   # SKIP_RETURN_CODE below) rather than pass.
   add_executable(test_audio_sink test/audio_sink_test.c src/sink/sink.c src/sink/sink_quant.c
                  src/sink/null_sink.c src/sink/manual_sink.c ${BWA_OS_SRC})
@@ -935,6 +953,11 @@ if(BWA_BUILD_TESTS)
     target_sources(test_audio_sink PRIVATE src/sink/aaudio_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_AAUDIO)
     target_link_libraries(test_audio_sink PRIVATE aaudio)
+  endif()
+  if(BWA_WITH_COREAUDIO)
+    target_sources(test_audio_sink PRIVATE src/sink/coreaudio_sink.c)
+    target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_COREAUDIO)
+    target_link_libraries(test_audio_sink PRIVATE "-framework CoreAudio" "-framework CoreFoundation")
   endif()
   if(MSVC)   # the stall hook is a C11 atomic
     set_source_files_properties(test/audio_sink_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)

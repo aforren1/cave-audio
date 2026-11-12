@@ -56,6 +56,9 @@ uint32_t sink_device_count(bwa_sink_type backend) {
 #ifdef BWA_HAVE_WORKLET
     case BWA_SINK_WORKLET: return sink_worklet_device_count();
 #endif
+#ifdef BWA_HAVE_COREAUDIO
+    case BWA_SINK_COREAUDIO: return sink_coreaudio_device_count();
+#endif
     default: return 0;   /* AUTO/NULL/MANUAL have no devices; so does a backend not built in */
     }
 }
@@ -80,6 +83,9 @@ bool sink_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t
 #endif
 #ifdef BWA_HAVE_WORKLET
     case BWA_SINK_WORKLET: return sink_worklet_device_name(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_COREAUDIO
+    case BWA_SINK_COREAUDIO: return sink_coreaudio_device_name(index, buf, cap);
 #endif
     default: (void)index; return false;
     }
@@ -109,6 +115,9 @@ bool sink_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t c
 #ifdef BWA_HAVE_WORKLET
     case BWA_SINK_WORKLET: return sink_worklet_device_id(index, buf, cap);
 #endif
+#ifdef BWA_HAVE_COREAUDIO
+    case BWA_SINK_COREAUDIO: return sink_coreaudio_device_id(index, buf, cap);
+#endif
     default: (void)index; return false;
     }
 }
@@ -135,6 +144,9 @@ static bool backend_compiled(bwa_sink_type t) {
 #endif
 #ifdef BWA_HAVE_WORKLET
     case BWA_SINK_WORKLET: return true;
+#endif
+#ifdef BWA_HAVE_COREAUDIO
+    case BWA_SINK_COREAUDIO: return true;
 #endif
     default: return false;
     }
@@ -193,6 +205,11 @@ static bwa_sink* try_backend(bwa_sink_type backend, uint32_t sample_rate, uint32
         return bwa_worklet_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
                                      render, user, msg, msgcap);
 #endif
+#ifdef BWA_HAVE_COREAUDIO
+    case BWA_SINK_COREAUDIO:
+        return bwa_coreaudio_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
+                                       render, user, msg, msgcap);
+#endif
     default:
         break;
     }
@@ -249,15 +266,18 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
      *
      * Off Windows the width does not split the order, because nothing on those platforms carries
      * the "this transport is the array's" decision: the same backend serves two channels and
-     * twenty-six. The entries for backends a phase has not built yet are here on purpose - they
-     * are skipped by backend_compiled, and having the order already correct is what keeps landing
-     * one of those phases to a single file plus a CMake block. */
+     * twenty-six. An entry whose backend this build does not carry (an option turned off) is
+     * skipped by backend_compiled. */
     bwa_sink_type order[4];
     uint32_t norder = 0;
 #if defined(_WIN32)
     if (channels <= 2) order[norder++] = BWA_SINK_WASAPI;
     order[norder++] = BWA_SINK_ASIO;
 #elif defined(__APPLE__)
+    /* CoreAudio at every width. A HAL device shows its raw channel count, so the same backend
+     * serves the headphones and, where the device has the outputs, the array. A desk Mac asked
+     * for an array it has no outputs for fails this open and lands on the offline sink below,
+     * with the channel counts on the degradation channel. */
     order[norder++] = BWA_SINK_COREAUDIO;
 #elif defined(__EMSCRIPTEN__)
     /* Before __linux__ and __APPLE__: Emscripten defines neither, but it DOES define __unix__ via

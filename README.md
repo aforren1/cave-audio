@@ -123,7 +123,8 @@ the game engine's own mixer.
 - **One *tracked* listener.** The multi-listener mode is a panning compromise for
   extra occupants, not per-head rendering.
 - **The array is a Windows path.** ASIO is Windows-only and the Digiface is a Windows
-  and macOS device. Everything else builds and runs everywhere (see
+  and macOS device. The macOS CoreAudio sink can open a device that wide, and nobody has
+  run the array through it. Everything else builds and runs everywhere (see
   [Platforms](#platforms-and-licensing)).
 - **Room EQ is opt-in.** Static-listener correction at one point
   (`bwa_calibrate --room-eq`, fixed-seat installs), or **tracked room EQ** from a
@@ -300,11 +301,11 @@ so the library, the tests, the console examples, and the two raylib tools
 | Windows | ASIO into the Digiface | WASAPI, shared mode by default |
 | Linux | JACK or ALSA, through a multichannel card or AES67 into the Dante net. Neither route is tested. | JACK or ALSA |
 | Android | none. Android carries no array transport. | AAudio, stereo only |
-| macOS | none yet | none yet. CoreAudio is specified, not written. |
+| macOS | CoreAudio, on a device with enough output channels. Not tested at array width. | CoreAudio, on the system output device by default |
 | Web | none | a Wasm Audio Worklet, stereo. Emscripten with threads, so the page must be cross-origin isolated |
 
-macOS runs the null and manual sinks, so the offline render path works there and nothing
-reaches a speaker. The web build keeps the engine's two-thread model over
+CoreAudio has no resampler on this path, so the open sets the device's sample rate to the
+engine's. The web build keeps the engine's two-thread model over
 `SharedArrayBuffer`, which is why it needs the isolation headers; on GitHub Pages a service
 worker supplies them. A wasi-sdk build of the same core runs the offline suite under
 wasmtime. No CI job runs it yet. [`docs/backends.md`](./docs/backends.md) has the sink contract

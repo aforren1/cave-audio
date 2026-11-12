@@ -24,12 +24,13 @@ a standalone VR headset. It is stereo only: Android carries no array transport, 
 than two channels falls to the offline sink. The library cross-builds with the NDK against API 26
 or later. See [Android](#android) below.
 
-**macOS builds the library, the tests and the console examples** with clang, on the **null and
-manual sinks**. That is the whole platform surface there for now: there is no device backend, so
-nothing reaches a speaker. What it buys is the offline path (`bwa_render_block` renders
-bit-identically anywhere), a place to run ThreadSanitizer, and a CI gate that catches a Win32 call
-sneaking back into the core. CoreAudio is specified, not implemented, in
-[backend-development.md](./backend-development.md#coreaudio). Keep each backend's assumptions confined to its own `*_sink` file.
+**macOS has one device backend**, CoreAudio (`src/sink/coreaudio_sink.c`), built wherever the
+library builds with clang. It opens the system output device by default, which is the headphone
+path at a desk, and any width the device has output channels for. Nothing in that path
+resamples: the open sets the device's sample rate to the engine's, and fails when the device has
+no such rate. It needs no SDK, because the `CoreAudio` and `CoreFoundation` frameworks are part
+of macOS. See [backends.md](./backends.md#coreaudio). Keep each backend's assumptions confined to
+its own `*_sink` file.
 
 Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os/os.h`, with
 `src/os/os_win.c` and `src/os/os_posix.c` behind it: threads, sleep, the monotonic clock, an
@@ -97,6 +98,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_WITH_JACK` | ON | the JACK backend. Linux only, and forced OFF elsewhere. Needs `pkg-config jack` to succeed for the HEADERS (`libjack-jackd2-dev`, or pipewire-jack's development package); it turns itself off with a status line when that fails. The library itself is loaded at run time, never linked |
 | `BWA_WITH_ALSA` | ON | the ALSA backend. Linux only, and forced OFF elsewhere. Needs `find_package(ALSA)` to succeed for the HEADERS (`libasound2-dev`); same self-disabling behavior, and the same run-time load |
 | `BWA_WITH_AAUDIO` | ON | the AAudio backend. Android only, and forced OFF elsewhere. Needs no SDK: the header ships with the NDK and it links `aaudio`. Fails the configure when `ANDROID_PLATFORM` is under `android-26`, which is AAudio's own floor |
+| `BWA_WITH_COREAUDIO` | ON | the CoreAudio backend. macOS only, and forced OFF elsewhere. Needs no SDK: it links the `CoreAudio` and `CoreFoundation` system frameworks |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate`, `bwa_validate` and `bwa_zylia_probe` (Windows only: they link the ASIO capture host) |
@@ -123,8 +125,9 @@ each job into its own
 `lib/<platform>/` and under its own cache key. A checkout can carry several sets at once, and the
 detection picks the one for the platform you are configuring. The Android recipe is in
 `third_party/README.md`, including the two android-only patches it applies. The Linux recipe is there too, including
-the one flag it takes (`-DSTEAMAUDIO_ENABLE_AVX=OFF` on gcc 13 and older). The macOS build runs
-**only in CI**, because nobody here has a Mac to verify it on.
+the one flag it takes (`-DSTEAMAUDIO_ENABLE_AVX=OFF` on gcc 13 and older). The macOS phonon build runs
+**only in CI**. The engine has run on a Mac without phonon, and nobody has built phonon on one
+outside CI.
 
 ### The engine SDK
 
@@ -229,6 +232,7 @@ What the SDK adds, and what you lose without it:
 | libjack        | the Linux JACK backend                       | LGPL-2.1. Headers at build time, `libjack.so.0` loaded at run time (never linked); pipewire-jack's drop-in (MIT) answers the same ABI |
 | alsa-lib       | the Linux ALSA backend                       | LGPL-2.1. Headers at build time, `libasound.so.2` loaded at run time (never linked) |
 | libaaudio      | the Android AAudio backend                   | part of the Android system image; the NDK ships the stub to link against. No license line to add |
+| CoreAudio, CoreFoundation | the macOS CoreAudio backend       | system frameworks, part of macOS and linked from the SDK. Nothing is redistributed. No license line to add |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
 
 Two dependencies live under `third_party/`: `asiosdk/`, and the Steam Audio pair
@@ -295,8 +299,9 @@ Everything above, sorted by what it actually ends up in:
   those two is redistributed, so neither adds a file to ship, but both add a notice line. Neither
   is required to be present: the library loads and runs the offline sink without them. No ASIO.
 - **The macOS artifact** (`bw_audio-macos-universal-<ver>`, and the copies inside both bindings) is
-  one universal `libbw_audio.dylib` carrying dr_libs, cJSON and a statically linked Steam Audio. No
-  system audio library at all yet, because macOS has no device backend, and no ASIO. It is **not
+  one universal `libbw_audio.dylib` carrying dr_libs, cJSON and a statically linked Steam Audio. Its
+  device backend links the `CoreAudio` and `CoreFoundation` system frameworks, which are part of
+  macOS and add no notice. No ASIO. It is **not
   code-signed and not notarized**, which is a distribution question rather than a license one:
   internal use clears the quarantine flag, and shipping outside the lab needs a Developer ID
   signature and notarization.
@@ -503,15 +508,16 @@ for `arm64-v8a` and `x86_64` at `android-26`, and builds the library, the exampl
 ### `linux` and `macos`
 
 `linux` on `ubuntu-latest` and `macos` on `macos-latest` build phonon, configure, build
-RelWithDebInfo, and run the whole engine ctest suite on the null and manual sinks, the SDK-gated
-tests included. The binding tests run separately, in each job's own bindings tree against the SDK.
+RelWithDebInfo, and run the whole engine ctest suite, the SDK-gated tests included. A runner
+with no audio device runs it on the null and manual sinks, and the device section of
+`test_audio_sink` skips. The binding tests run separately, in each job's own bindings tree against the SDK.
 Neither job fetches ASIO, which is Windows-only. A cold run pays for the phonon build the way the
 Windows job does; a warm one restores the archives and costs a few minutes.
 
 - **They guard the port.** Both jobs exist to catch a Win32 call sneaking back into the core, so
   they assert on the configure log rather than trusting the build to fail on its own: `linux`
   wants `JACK backend ENABLED` and `ALSA backend ENABLED`, `macos` wants
-  `null and manual sinks only`, and both want `Steam Audio ENABLED`. That last assertion is the
+  `CoreAudio backend ENABLED`, and both want `Steam Audio ENABLED`. That last assertion is the
   one that matters after a cache round trip, because a build that quietly lost its phonon staging
   still passes every test.
 - **The Linux engine is built inside the manylinux container.** A `manylinux_2_28` wheel needs an
@@ -538,8 +544,13 @@ Windows job does; a warm one restores the archives and costs a few minutes.
   action passes the same pair to phonon's own configure, because phonon's CMake does not make
   itself universal despite appearing to (see `third_party/README.md`). Both the action and the job
   fail on a `lipo -info` that does not show both architectures.
-- **The macOS job is UNVERIFIED locally** in both halves, since no Mac was at hand: it is the
-  first thing that will ever execute either the shim's Apple paths or a macOS phonon build.
+- **The macOS job's phonon build is UNVERIFIED locally.** The shim's Apple paths and the
+  CoreAudio sink have run on a physical Mac, in a no-SDK build. A macOS phonon build has run in
+  CI only. Whether the runner presents an output device is unknown, so the CoreAudio section of
+  `test_audio_sink` either skips there or meets a virtual device for the first time.
+- **A ctest run on a Mac moves the output device to 48 kHz.** Every test that starts an engine
+  under AUTO opens the real device, and the CoreAudio open sets the device's sample rate. Only
+  the `audio_sink` section puts back the rate it found.
 
 ### Python wheels in the desktop jobs (the fast gate)
 
@@ -592,8 +603,8 @@ because only MATLAB needs an action to install it and a licensed `run-command` s
 **Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so every MATLAB step was
 written from
 [mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
-rather than from a run. The macOS Octave steps are unverified for the same reason the rest of that
-job is: nobody here has a Mac. The Windows and Linux Octave halves are verified locally.
+rather than from a run. The Octave half is verified locally on all three desktops. On macOS that was Octave
+11.3 from Homebrew on Apple silicon, in a tree without phonon.
 
 The `package` job assembles the six MEX files into one toolbox; see [`package`](#package).
 
@@ -715,7 +726,7 @@ doesn't:
 - `bw_audio-linux-x64-<tag>.zip`: the Linux engine, `libbw_audio.so` plus `bw_audio.h`. JACK and
   ALSA, no ASIO.
 - `bw_audio-macos-universal-<tag>.zip`: the macOS engine, one universal `libbw_audio.dylib`
-  (x86_64 and arm64) plus `bw_audio.h`. No device backend yet, so it is the offline path. It is
+  (x86_64 and arm64) plus `bw_audio.h`. CoreAudio, no ASIO. It is
   **not code-signed and not notarized**: Gatekeeper blocks a downloaded unsigned library, so clear
   the quarantine flag (`xattr -dr com.apple.quarantine <folder>`) after unzipping. Distribution
   outside the lab would need a Developer ID signature and notarization.

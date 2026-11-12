@@ -52,9 +52,10 @@ public:
 	/* Mirrors bwa_profile: BINAURAL is the direct per-source headphone render, CAVE_SIM the
 	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
 	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
-	/* AUTO picks by channel count and platform: a headphone profile tries WASAPI then ASIO, the
-	 * array tries ASIO, and either falls back to the silent offline sink. COREAUDIO, ALSA, AAUDIO,
-	 * JACK and WORKLET are reserved values - the Windows build carries none of them. */
+	/* AUTO picks by channel count and platform. Windows: a headphone profile tries WASAPI then
+	 * ASIO, the array tries ASIO. Linux: JACK then ALSA. macOS: COREAUDIO, at any width the device
+	 * has outputs for. Android: AAUDIO, stereo only. Each falls back to the silent offline sink.
+	 * A build carries its own platform's backends and no others; WORKLET is the browser's. */
 	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3,
 		SINK_WASAPI = 4, SINK_COREAUDIO = 5, SINK_ALSA = 6, SINK_AAUDIO = 7, SINK_JACK = 8,
 		SINK_WORKLET = 9 };

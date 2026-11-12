@@ -136,7 +136,8 @@ typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current defau
  * to the silent offline sink - the engine keeps rendering with no device (the tools' visual-only
  * mode). On Windows a 2-channel request (the headphone profiles) tries WASAPI first, then ASIO;
  * a request wider than 2 channels (the array) tries ASIO only, because the array's transport is a
- * settled decision. On Linux it is JACK then ALSA at every width. Naming a backend is an explicit demand: an open failure fails bwa_start
+ * settled decision. On Linux it is JACK then ALSA at every width, and on macOS CoreAudio at every
+ * width. Naming a backend is an explicit demand: an open failure fails bwa_start
  * loudly instead of hiding behind silence (production, or a speaker audition that must reach real
  * speakers), and a backend this build does not carry fails with a message saying so. NULL forces
  * the offline sink (CI, profiling, tracking-only tools). MANUAL creates no device and no thread.
@@ -146,7 +147,11 @@ typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current defau
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_MANUAL = 3, /* no device/thread - pump blocks yourself with bwa_render_block */
                BWA_SINK_WASAPI = 4, /* Windows shared-mode (or exclusive, see BWA_SINK_FLAG_EXCLUSIVE) */
-               BWA_SINK_COREAUDIO = 5,  /* macOS   - not in this build yet */
+               BWA_SINK_COREAUDIO = 5,  /* macOS   - the HAL, on the default output device or a
+                                         * named one, at any width the device has outputs for.
+                                         * The device runs at the engine rate or the open fails:
+                                         * the open SETS the device's sample rate, because this
+                                         * path has no resampler */
                BWA_SINK_ALSA      = 6,  /* Linux   - the no-server path: a raw hw: card, or a
                                          * plug/server PCM for a desk monitor */
                BWA_SINK_AAUDIO    = 7,  /* Android - the headphone path on a standalone VR
@@ -173,6 +178,7 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
  * also the only way past 2 channels.
  *   WASAPI: AUDCLNT_SHAREMODE_EXCLUSIVE, one-period buffer, the device's own format walk.
  *   AAudio: AAUDIO_SHARING_MODE_EXCLUSIVE (the MMAP path) when the device grants it.
+ *   CoreAudio: no-op. The sink never takes hog mode, which buys no latency on a Mac.
  *   ASIO/JACK/ALSA(hw:): no-op, those paths are already exclusive by construction.
  *
  * EXACT_RATE refuses a device that cannot run at bwa_desc.sample_rate: the open FAILS naming both
@@ -186,6 +192,8 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
  *           silently resample.
  *   AAudio: the probed device rate must equal the engine rate.
  *   JACK:   the server owns the rate; a mismatch already fails the open.
+ *   CoreAudio: no-op, it is always exact. The open sets the device's nominal rate to the engine
+ *           rate, and fails naming both when the device has no such rate.
  *
  * TIGHT_BUFFER asks the backend for the SMALLEST device buffer it can take, trading dropout
  * margin for latency. Expect underruns on a loaded machine; it is for a quiet rig, not a default.
@@ -194,6 +202,7 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
  *   WASAPI: no-op. Exclusive mode already runs a one-period buffer, and shared mode's buffer
  *           belongs to the OS mixer.
  *   ASIO/JACK: no-op, the driver or the server owns the buffer.
+ *   CoreAudio: no-op. The device's IO buffer is already set to the engine block.
  * DEEP_BUFFER asks for a DEEPER OUTPUT BUFFER: more latency, more slack for a render that
  * overruns its callback. Only the browser uses it:
  *   WORKLET: a context the sink creates (device NULL) gets latencyHint "playback" instead of
@@ -223,7 +232,8 @@ typedef struct {
     /* Device to open, for whichever backend opens it: the friendly name or the stable id from the
      * device query below, matched EXACTLY (never by substring - two endpoints called "Speakers"
      * are common). NULL = the backend's default device (ASIO: the first registered driver with
-     * enough output channels; WASAPI: the Windows default render endpoint). Under AUTO a backend
+     * enough output channels; WASAPI: the Windows default render endpoint; CoreAudio: the macOS
+     * default output device, and the id there is the device UID). Under AUTO a backend
      * that has no device by this name is skipped, so the name reaches the backend that owns it.
      *
      * It names the PRIMARY device only. Under CAVE_BOTH that is the array; the monitor opens the
@@ -289,7 +299,8 @@ BWA_API void      bwa_destroy(bwa_engine* e);
 BWA_API const char* bwa_last_error(bwa_engine* e);
 BWA_API uint32_t    bwa_get_version(void);   /* the DLL's BWA_VERSION - check against the header's */
 /* Backend actually in use after bwa_start, as "<backend>:<device>" - "asio:Digiface Dante",
- * "wasapi:Headphones (Realtek Audio)" - or "null" (offline/SILENT), "manual", or "none" (not
+ * "wasapi:Headphones (Realtek Audio)", "coreaudio:MacBook Pro Speakers" - or "null"
+ * (offline/SILENT), "manual", or "none" (not
  * started). The device part is the OS's own name, UTF-8. The headphone profiles also name the
  * decode in use - "(steam HRTF direct)" / "(simple-pan direct)" for BINAURAL, "(steam HRTF sim)" /
  * "(simple-pan sim)" for CAVE_SIM/CAVE_BOTH. CAVE_BOTH has TWO devices and names both, array
@@ -316,8 +327,8 @@ BWA_API bwa_sink_type bwa_get_sink_type(bwa_engine* e);
  *
  * `backend` must be CONCRETE: AUTO, NULL, and MANUAL report 0 devices. A backend this build does
  * not carry also reports 0. Index 0 is the platform default device where the backend has one
- * (WASAPI's default render endpoint); ASIO has no default, so index 0 is just the first
- * registered driver. ---- */
+ * (WASAPI's default render endpoint, CoreAudio's default output device); ASIO has no default, so
+ * index 0 is just the first registered driver. ---- */
 BWA_API uint32_t bwa_get_device_count(bwa_sink_type backend);
 /* Copy device `index`'s friendly name into buf (always NUL-terminated, truncated to cap-1) - one
  * of the two exact strings bwa_desc.device accepts. False = index out of range or no buffer. */
@@ -651,7 +662,8 @@ BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* ho
  * JACK's jack_get_cycle_times reports CLOCK_MONOTONIC microseconds through the server's DLL, so
  * the stamp is FILTERED (smoothed against the device clock) but on the same base. WASAPI (IAudioClock
  * reports its position paired with the QPC value at that instant), ALSA (CLOCK_MONOTONIC htstamp),
- * AAudio (getTimestamp asked for CLOCK_MONOTONIC) and the null sink are all on this clock too.
+ * AAudio (getTimestamp asked for CLOCK_MONOTONIC), CoreAudio (the IO cycle's own mHostTime, which is
+ * mach_absolute_time) and the null sink are all on this clock too.
  * The manual sink is the one exception: its stamps are SYNTHESIZED from the sample position, so
  * they are exact for arithmetic and unrelated to any wall clock - an offset measured against it
  * means nothing. */
@@ -684,10 +696,13 @@ typedef struct bwa_clock_model {
  * Lock-free. Same seqlock as bwa_get_clock, so the pair and the model agree on a block. */
 BWA_API bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out);
 /* The primary device's self-reported render->DAC latency in FRAMES at the engine rate
- * (ASIOGetLatencies - the Digiface includes its Dante buffering): audio scheduled for dsp time T
+ * (ASIOGetLatencies - the Digiface includes its Dante buffering; on CoreAudio the device latency,
+ * its safety offset, the stream latency and the IO buffer): audio scheduled for dsp time T
  * is HEARD at T + latency. The audio half of AV alignment (the video half - display delay - you
  * measure once; docs/api.md). 0 = unknown or no physical output (null sink, or before
- * bwa_start). Constant while the device is open. */
+ * bwa_start). Constant while the device is open, with one exception: on CoreAudio it follows the
+ * device's IO buffer, which belongs to the whole process, so a second engine or a host engine
+ * that resizes that buffer moves this number to match. */
 BWA_API uint32_t bwa_get_output_latency_frames(bwa_engine* e);
 
 /* ---- procedural (push) sources: engine-generated audio, no file (full story: docs/api.md,

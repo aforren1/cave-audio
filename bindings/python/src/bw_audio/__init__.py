@@ -146,6 +146,10 @@ class SinkFlags(enum.IntFlag):
       on a loaded machine: it is for a quiet rig, not a default.
     * ``DEEP_BUFFER`` asks for a deeper output buffer. Only the browser sink uses it, so it does
       nothing on a desktop backend. It is here so the flags mirror the ABI.
+
+    CoreAudio (macOS) reads none of them. It shares the device, its buffer already is the engine
+    block, and it has no resampler to refuse: the open sets the device's sample rate to the
+    engine's, or fails naming both rates.
     """
 
     NONE = 0

@@ -312,7 +312,7 @@ to silent visual-only mode without an ASIO device).
 Requires Godot 4.7 or newer: compatibility_minimum in the manifest now matches the 4.7
 extension API the binary is compiled against (earlier packs understated it as 4.4). The
 extension ships for Windows x64 (the desktop, where the engine's device path is ASIO),
-Linux x86_64 (JACK or ALSA), macOS universal (headphones only, no device backend yet)
+Linux x86_64 (JACK or ALSA), macOS universal (CoreAudio, the system output device)
 and Android arm64-v8a (a standalone headset, stereo out through AAudio). Every one of
 them carries Steam Audio linked statically inside the engine library, so binaural is the
 real HRTF decode everywhere.

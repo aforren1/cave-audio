@@ -46,9 +46,9 @@ released package **ships the native engine** for every one of them, with import 
 configured. Nothing to build, and one file per platform: Steam Audio is linked into the engine
 rather than shipped beside it.
 
-The array itself is Windows only, because ASIO is. Linux reaches it over AES67 through JACK or
-ALSA; macOS has no device backend yet, so it renders offline; Android is the headphone path on a
-standalone headset. The macOS library is unsigned, so clear its quarantine flag once after
+The array's production path is Windows, because ASIO is. Linux reaches it over AES67 through
+JACK or ALSA; macOS outputs through CoreAudio, on the system output device by default; Android is
+the headphone path on a standalone headset. The macOS library is unsigned, so clear its quarantine flag once after
 installing a downloaded package: `xattr -dr com.apple.quarantine <the imported package folder>`.
 
 ### From a git URL

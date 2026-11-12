@@ -35,8 +35,8 @@ Three concrete problems the backends fix:
   `bwa_asio_sink_open`). So the monitor takes a second backend: ASIO for the array, WASAPI for
   the headphones. See [AUTO order](./backends.md#auto-order) for how `bwa_start` opens it. Only the rig can
   confirm the pair on hardware (see the verify list).
-- **Unity and Godot projects run on macOS, Linux, Android and the browser.** JACK, ALSA, AAudio
-  and the Wasm Audio Worklet cover those hosts today, and CoreAudio will cover macOS. Two of them can
+- **Unity and Godot projects run on macOS, Linux, Android and the browser.** CoreAudio, JACK,
+  ALSA, AAudio and the Wasm Audio Worklet cover those hosts. Two of them can
   also drive the array, a bonus rather than the goal: CoreAudio, because the RME Digiface
   Dante has a macOS driver; Linux, because a JACK or ALSA client can drive a multichannel card
   directly, or reach the existing Dante network as an AES67 sender. See
@@ -270,41 +270,112 @@ which is the timestamp pair checked through the whole engine rather than at the 
 emulator's audio HAL is virtual, so its block counts wander (54 to 96 across identical runs) and
 say nothing; what it exercises is the code path.
 
-## Planned: the CoreAudio sink
+### CoreAudio: what the implementation settled
 
-Phase 4. Nothing below is implemented yet.
+- **The host stamp is `inNow`, not `inOutputTime`.** The plan paired `inOutputTime`'s sample time
+  with its host time, and summed the device latency, the safety offset, the stream latency and
+  the buffer for rule 5. Measured on a Mac, `inOutputTime->mHostTime` leads the IO cycle by the
+  buffer plus the safety offset: 12.00 ms at 256 + 320 frames on an HDMI display, steady to about
+  0.01 ms after the first cycle. So
+  the two halves of the plan counted those 576 frames twice. The sink stamps `inNow->mHostTime`,
+  the cycle's own time, which is also what every other backend's stamp means, and the latency
+  keeps the full sum. `bwa_get_output_latency_frames` then stays the render-to-DAC delay its
+  header promises. The position still comes from `inOutputTime->mSampleTime`.
+- **The latency has no term for the adapter, and it follows the IO cycle.** The other adapter
+  backends add a block when the device size differs from the block size. Measured here with the
+  device tap, at 256 on 256, 8192 on 4096, 6000 on 4096, 256 on 1024, 1024 on 256 and 8 on 15: a
+  block's first frame reached the device 0.3 to 5 frames after the block's own stamp. The
+  adapter stamps a block with the callback time plus the frames queued ahead of it, so the
+  stamp already holds what the adapter holds. With the term, an 8192 block reported 12696
+  frames where 4504 is right. The IO buffer is read from the cycle the IOProc is handed, not
+  latched at open, because the buffer size is per device per process: a second open at 1024
+  moved a 256 sink from 812 frames to 1580, and a latched figure stayed at 812.
+- **A dropout goes through the adapter's queued-depth rule.** The output sample time advances by
+  exactly one buffer per cycle, and a cycle the HAL skips after an overload shows as a jump. The
+  sink moves the sample time onto the adapter's stream with one anchor and passes it as the
+  device position. A sample time that steps backward, or jumps past the sane window, is a new
+  timeline, so it re-anchors and reports nothing.
+- **The overload listener gets no dispatch queue.** With a queue, the HAL dispatches
+  `kAudioDeviceProcessorOverload` synchronously from the IO thread (`AudioHardware.h` says so).
+  The device-change handler runs on the sink's queue and calls `AudioDeviceStop`, which waits for
+  the IO thread. Sharing the queue would let each wait on the other. The overload block is
+  invoked directly and does one atomic add.
+- **No listener block holds a pointer to the sink.** `AudioObjectRemovePropertyListenerBlock`
+  does not say whether it waits for an invocation already under way. Each block captures a slot
+  index into a static table. The device-change handler runs on one serial queue and looks the
+  sink up in its slot, and `close()` clears the slot on that queue, so a notification that
+  arrives late finds nothing. The overload count lives in the table and is never freed. The
+  handler reads the device and does not trust the notification, so a stray call on a slot another
+  sink reused does nothing. The table has 8 slots, which is the limit on open sinks per process.
+- **A rate change under a running sink is a loss.** Another application, or Audio MIDI Setup,
+  can move the device off the engine rate. Nothing in this path resamples, so playing on would be
+  a pitched render that reports itself healthy. The sink treats it like a device that died: it
+  sets `device_lost`, stops its IOProc, and starts the host-paced thread.
+- **`AudioDeviceStop` is treated as synchronous, with one guard.** Across 60 stops, some with
+  the IOProc overrunning, no callback was in flight when it returned and none followed. The
+  header does not promise that. The IOProc and the host-paced thread raise a counter around
+  each pull, and read the `running` and `lost` flags after raising it. `stop()` and the loss
+  handler set a flag and then wait for the counter to reach 0. Both sides are sequentially
+  consistent, so either the puller sees the flag or the stopper sees the pull. That covers a
+  pull in flight. It does not cover a callback that begins after the wait, and nothing can.
+- **The width check runs at the engine rate.** An interface can halve its outputs at a higher
+  rate, so the stream layout is read again after the rate set, and the map is built from that
+  one. A device that is too narrow and already at the engine rate fails before anything
+  changes. A device that is too narrow after a rate move gets its old rate back.
+- **The IOProc is turned off for the input streams.** By default an IOProc is on every stream
+  of a device. On a duplex device that would start the microphone for a sink that never reads
+  it. Both devices measured are output only, so this call has never met an input stream.
+- **`start()` forgets the anchor.** A restart is a new sample timeline when the device stopped,
+  and the old one when another IOProc in the process kept it running. The second case read as
+  one dropout the length of the pause. The engine closes a sink on `bwa_stop`, so only a caller
+  of the vtable could reach it.
+- **The open sets the device's rate and `close()` leaves it.** Every other client of the device
+  resamples through its own converter, so the change costs them one glitch. Restoring it would
+  cost a second one on every editor play session.
+- **No hog mode.** `BWA_SINK_FLAG_EXCLUSIVE` does nothing here. On WASAPI, exclusive mode buys
+  latency. On a Mac a shared open already runs the IOProc on the device's own IO cycle, at the
+  buffer size the sink set, so hog mode would buy only the exclusion.
+- **A stereo open takes the device's preferred stereo pair.**
+  `kAudioDevicePropertyPreferredChannelsForStereo` is where Audio MIDI Setup routes stereo on a
+  multichannel interface. A wider open maps bus channels across the streams in order.
+- **The IOProc zeroes every buffer, then writes through checked indices.** The channel map is
+  built at open from the stream configuration. A configuration that changes later (an aggregate
+  device edited while the engine runs) then costs channels, not memory safety.
 
-### CoreAudio
+### CoreAudio on a desk Mac
 
-Files: `src/sink/coreaudio_sink.c`. The HAL is a C API; no Objective-C. Link the `CoreAudio` and
-`CoreFoundation` frameworks. Define `BWA_HAVE_COREAUDIO`.
+Verified on a Mac mini (Apple silicon, macOS 27.0) against two devices, an HDMI display and the
+built-in speakers, both stereo, one stream each, at 48 kHz:
 
-The HAL, not AUHAL, because the array needs the device's raw channel count and no converter
-in the path. Open sequence:
+- The IO buffer took the 256-frame block, so the adapter ran in pass-through. Blocks of 8 and
+  8192 fall outside the device's 15 to 4096 range and ran bridged.
+- The IO buffer size is per process: one process held 1024 frames while a second read the
+  device's 512. So the engine's block does not reach other applications, and it does reach
+  every other IOProc in its own process.
+- Reported latency: 664 frames on the display (88 device + 320 safety + 256 buffer), 812 on the
+  built-in speakers (72 + 76 + 408 stream + 256).
+- An injected 61 ms stall (2928 frames) produced one dropout of 2936 frames, one late block and
+  one overload notification.
+- The device tap saw every rendered frame on the right device channel, in order, at each block
+  size. See [backends.md: Tests](./backends.md#tests).
+- The loss path, both causes. A private aggregate device destroyed under a running sink set
+  `device_lost` in 5 to 10 ms, and so did a second open at 44.1 kHz. The host-paced thread
+  rendered 56 to 59 blocks in 300 ms against a nominal 56. Twelve races between the destroy and
+  `close()`, 0 to 33 ms apart, all closed.
+- The map across streams, on a private aggregate of the two devices: 2 streams, 4 channels.
+  Widths 1 to 4 each put bus channel c on device channel c, and width 5 was refused.
+- `bwa_minimal` under AUTO opened `coreaudio:M27Q` and its clock model measured 48000.27 Hz over
+  a 6 second run, +5.6 ppm.
+- The Python wheel's 87 tests, the Octave suite, and both `live_onset` examples ran against the
+  same build. The Godot extension compiled. No Godot or Unity editor loaded it.
+- ThreadSanitizer reported nothing in the sink. Its warnings were the adapter's plain health
+  counters, as on Linux. AddressSanitizer reported nothing.
 
-1. Resolve the device: `kAudioHardwarePropertyDefaultOutputDevice`, or match the UID or name.
-2. Read `kAudioDevicePropertyStreamConfiguration` for the output scope: an `AudioBufferList`
-   with one buffer per **stream**, each with its own channel count. A device can present 24
-   outputs as one 24-channel stream or as several streams; the sink maps bus channels across
-   streams in order. Read each stream's `kAudioStreamPropertyVirtualFormat`; it is float32,
-   interleaved within the stream, on every device the HAL virtualizes. Reject anything else.
-3. Set `kAudioDevicePropertyNominalSampleRate` to the engine rate. The property set is
-   asynchronous: listen for the change or poll with a bounded wait, then read it back. A
-   device that stays at another rate fails the open (rule 6, and the headphone case does not
-   relax this one: the HAL has no per-client resampler without AUHAL).
-4. Set `kAudioDevicePropertyBufferFrameSize` to the block size, clamped to
-   `kAudioDevicePropertyBufferFrameSizeRange`. Read it back; the adapter handles a mismatch.
-5. `AudioDeviceCreateIOProcID`, then `AudioDeviceStart` on `start()`.
-6. Add property listeners for `kAudioDeviceProcessorOverload` (a `driver_resyncs` tick) and
-   `kAudioDevicePropertyDeviceIsAlive` (`device_lost`).
+The first start of the built-in speakers once produced one overload and a dropout of about 400
+frames in the first 200 ms, and four later runs did not. The count is the HAL's own report, so the section
+prints it and does not fail on it.
 
-The IOProc gets `inOutputTime` with `mSampleTime` and `mHostTime`. Both feed rule 3; the
-host time converts through `mach_timebase_info`. The IOProc's `outOutputData` is the ABL
-from step 2, already sized; the sink writes every buffer or the HAL plays stale data.
-
-The goal on a Mac is the desk, and the HAL design permits the array as a bonus. If that is
-ever wanted, verify first that the RME macOS driver presents the Digiface Dante's outputs as
-one device, and that the count at 48 kHz covers the layout (24, up to 36).
+What that run did not reach is on the [verify list](#verify-before-relying-on-it).
 
 ## Phases
 
@@ -314,23 +385,24 @@ one device, and that the count at 48 kHz covers the layout (24, up to 36).
 | 1 **(done)** | WASAPI sink; the ABI bump (enum, desc union and flags, device query, `device_lost`); `sink.c` AUTO order; both bindings mirror; docs | phase 0 | a Windows desk machine; the rig for the `cave_both` check | ~600 lines of sink, ~200 of ABI and bindings |
 | 2 **(done)** | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
 | 3 **(done)** | AAudio sink; NDK toolchain wiring; `tools/android/run-tests.ps1`; the CI cross-build of both ABIs, phonon for both ABIs, and both bindings' Android packaging | phases 0 and 2 | a standalone headset (an emulator covered the code paths) | ~400 lines of sink and test, plus the toolchain and the packaging |
-| 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional array check | ~450 lines |
+| 4 **(done)** | CoreAudio sink; `sink.c`'s dispatch; the device tap in `test_audio_sink`; the Unity inspector's macOS entry | phases 0 and 2                   | a Mac; the Digiface only for the optional array check | ~650 lines of sink, ~400 of test |
 | 5 **(done)** | JACK sink, then ALSA sink                                        | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
 | 6 **(done)** | Wasm Audio Worklet sink; the `BWA_SINK_WORKLET` enum value; `sink.c`'s browser AUTO entry; `bindings/web` and `tools/wasm/build-web.sh` | phase 2, and the wasm spike in [web.md](./web.md) | a browser, and a headless Chromium is enough: `ctest -R web_browser` drives the sink end to end and skips where there is none. Nobody has LISTENED to it yet | ~450 lines of sink, ~900 of binding |
 
-Phases 3 to 6 depend only on phase 2 and not on each other. CoreAudio is the one that remains,
-and it can slot in whenever a Mac is available.
+Phases 3 to 6 depend only on phase 2 and not on each other.
 
 ## What to update when implementing
 
-The next backend is CoreAudio (phase 4). Adding one touches these places, and nothing in the core:
+No backend is planned after CoreAudio. Adding one touches these places, and nothing in the core:
 
 - `src/sink/<name>_sink.c` (the backend), one `BWA_WITH_*` option and CMake block, and the
-  dispatch cases in `src/sink/sink.c`. The AUTO entry for macOS is already there.
-- `include/bw_audio.h`: the comment on the enum value (CoreAudio's says "not in this build yet").
+  dispatch cases and the AUTO order in `src/sink/sink.c`.
+- `include/bw_audio.h`: the enum value, and the per-backend lines under the sink flags.
 - `test/audio_sink_test.c`: a section for the backend, with its own "no device" skip phrase.
 - `docs/build.md`: the Platform section, the options table, and the license inventory.
 - `docs/api.md`, `docs/integration.md` and `docs/hardware-validation.md` (the desk-day pass).
+- The bindings: the Unity inspector's per-platform sink list (`EngineEditor.cs`), the Godot
+  `sink` property hint, and each binding's README.
 - `docs/backends.md`: the status line, the contract tables and a per-backend notes section.
 - This document: [Phases](#phases), the design decisions, and the verify list.
 
@@ -351,11 +423,44 @@ Known, deliberately not done yet. Each names its trigger.
 
 ## Verify before relying on it
 
-- [ ] `test_os` on a PHYSICAL Mac, so the Apple deadline bound can be tightened from the gross one
-      the coalescing evidence justifies. Everything Apple in the shim is CI-verified only: nobody
-      here has a Mac, and the `THREAD_TIME_CONSTRAINT_POLICY` call was written from the macOS CI
-      log plus the documentation.
+- [x] `test_os` on a PHYSICAL Mac. A Mac mini (Apple silicon, macOS 27.0) measured the
+      deadline sleep at p50 0.004 ms and p99 0.006 to 0.011 ms over three runs, on a thread with
+      the `THREAD_TIME_CONSTRAINT_POLICY` the shim sets. The whole suite passes there. The Apple
+      bound in the test is still the gross one, because the virtualized CI runner measured p50
+      2.7 ms and p99 9.8 ms and has to pass it too.
 - [ ] The RME Digiface Dante's macOS driver: one CoreAudio device, enough outputs for the layout (24, up to 36) at 48 kHz.
+- [ ] The CoreAudio sink at array width, on a real multichannel interface. The map across
+      streams has run only on a 4-channel aggregate of two stereo devices. A preferred stereo
+      pair other than channels 1 and 2 has never been met, and neither has a device whose
+      channel count changes with its rate, which the Digiface Dante may be. Run `test_audio_sink` with
+      `BWA_TEST_COREAUDIO_DEVICE` and `BWA_TEST_COREAUDIO_CHANNELS` on such a device: the device
+      tap checks the map.
+- [ ] The CoreAudio sink on a device with an input (a USB headset). The IOProc is marked off
+      for the input streams so that macOS shows no microphone indicator and asks for no
+      permission. No such device has been tried.
+- [ ] The adapter's share of the reported latency on WASAPI, JACK, AAudio and the worklet.
+      Each adds a block, or what the adapter holds, when the device size differs from the block
+      size. On CoreAudio that term measured as an overcount and was removed (see the CoreAudio
+      decisions above). The stamp rule is shared, so the same is likely true of the others, but
+      each has its own host-time source and nobody has measured them. A device-side tap like
+      `sink_coreaudio_tap` is enough: no loopback is needed for this question.
+- [ ] The CoreAudio sink BY EAR. The device tap proves the right samples reach the HAL. Nobody
+      has listened to it, so the laterality tone in hardware-validation.md is still open.
+- [ ] A PHYSICAL CoreAudio device that goes away: unplug a USB interface, or take a Bluetooth
+      headset out of range, under a running engine. `device_lost` must set, the dsp clock must
+      keep advancing, and `bwa_stop` then `bwa_start` must recover on the new default. The
+      `kAudioDevicePropertyDeviceIsAlive` path has run only on an aggregate device the test
+      destroyed.
+- [ ] The CoreAudio rate set on a device that takes time over it. The two devices measured
+      switched between 48 and 44.1 kHz inside the 2 s bound, and nobody timed how long they took.
+      A USB interface relocks its clock, so the bound is a guess until one has been timed.
+- [ ] The CoreAudio sink on a macOS older than 27, on an aggregate device and on a Bluetooth
+      output. Intel Macs are not a target: the x86_64 slice of the universal build compiles and
+      nobody plans to run it.
+- [ ] `test_audio_sink` on the macOS CI runner. Nothing here knows whether that runner presents
+      an output device. With none, the CoreAudio section skips. With a virtual one, the section
+      runs against a device nobody has characterized, and a red there is a finding about the
+      runner before it is one about the sink.
 - [ ] Whether the Digiface is USB Audio Class compliant, which decides if ALSA's `snd-usb-audio`
       sees it at all. RME's product page is the source; do not assume. (Even then it is a
       Dante *transmitter* only through RME's driver; on Linux the AES67 route below is the way
@@ -449,7 +554,9 @@ Known, deliberately not done yet. Each names its trigger.
       without them.
 - [ ] A MAC COLLABORATOR loading both packages for the first time: the Unity package imported into
       a project on macOS (the Editor picks the `.dylib` up, `DllImport("bw_audio")` resolves, Play
-      runs the offline sink) and the Godot addon unzipped into a project (the editor loads
+      opens CoreAudio on the default output; Unity's own audio is a second client of that device
+      in the same process, and the HAL's buffer size is per process, so the engine's block
+      becomes Unity's callback size too) and the Godot addon unzipped into a project (the editor loads
       `macos.editor` and the extension finds `libbw_audio.dylib` through `@loader_path`). Both are
       built and name-checked in CI and neither has ever been opened on a Mac. Expect Gatekeeper
       first: the libraries are unsigned, so the quarantine flag on a downloaded archive has to be

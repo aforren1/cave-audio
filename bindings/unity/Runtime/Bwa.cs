@@ -62,8 +62,10 @@ namespace BwAudio
     /// Asio, and anything wider tries Asio only, because the array's transport is settled. Naming
     /// a backend is a demand — an open failure fails bwa_start loudly, and a backend this build
     /// does not carry says so. Null forces the offline sink; Manual is the deterministic
-    /// caller-pumped sink (bwa_render_block — offline/golden tests, not Unity). CoreAudio, Alsa,
-    /// AAudio and Jack are reserved values; the Windows DLL carries none of them yet.</summary>
+    /// caller-pumped sink (bwa_render_block — offline/golden tests, not Unity). Off Windows, Auto
+    /// tries Jack then Alsa on Linux, CoreAudio on macOS (any width the device has outputs for)
+    /// and AAudio on Android (stereo only). Each library carries its own platform's backends and
+    /// no others; Worklet is the browser build, which Unity never links.</summary>
     public enum BwaSinkType : int
     {
         Auto = 0, Asio = 1, Null = 2, Manual = 3,
@@ -80,6 +82,8 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
+    /// CoreAudio reads none of them: it shares the device, it has no resampler to refuse (the
+    /// open sets the device's rate or fails), and its buffer already is the engine block.
     /// DeepBuffer asks for a deeper output buffer. Only the browser sink uses it, so it is a no-op
     /// on every backend Unity reaches; it is here so the enum mirrors the ABI.
     /// docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
@@ -749,7 +753,7 @@ namespace BwAudio
         }
 
         /// <summary>Backend in use after bwa_start: "&lt;backend&gt;:&lt;device&gt;" ("asio:Digiface Dante",
-        /// "wasapi:Headphones"), or "null", "manual", "none".</summary>
+        /// "wasapi:Headphones", "coreaudio:MacBook Pro Speakers"), or "null", "manual", "none".</summary>
         public static string Backend(IntPtr e)
         {
             var p = bwa_get_audio_backend(e);

@@ -65,7 +65,7 @@ install-from-file entry point. So unlike the Unity binding, you cannot install *
 repo archive.
 
 Four platforms: **Windows x64** for the desktop, where the engine's device path is ASIO,
-**Linux x86_64** (JACK or ALSA), **macOS universal** and **Android arm64-v8a** for a standalone
+**Linux x86_64** (JACK or ALSA), **macOS universal** (CoreAudio) and **Android arm64-v8a** for a standalone
 headset. Each carries an editor library and an export library, except Android, which runs no
 editor.
 
@@ -97,8 +97,9 @@ editor and a template_release library for each, so the extension loads in the ed
   library sits in `bin/linux/`, one level down from the others, because Android's has the same file
   name and one addon carries both. The extension finds it through an `$ORIGIN` run path, in the
   editor and in an exported game alike.
-- **macOS** has **no device backend yet**, so the engine runs its offline sinks there: everything
-  works except making sound. Its libraries are universal (x86_64 and arm64).
+- **macOS** outputs through CoreAudio, on the system output device by default. The device runs
+  at the engine's sample rate or the start fails, so the open sets the device's rate when the two
+  differ. Its libraries are universal (x86_64 and arm64).
 - The macOS libraries are **not signed or notarized**. Gatekeeper blocks a downloaded unsigned
   library, so clear the quarantine flag once after unzipping:
   `xattr -dr com.apple.quarantine addons/bw_audio`.

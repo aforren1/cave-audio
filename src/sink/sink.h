@@ -21,6 +21,8 @@
  *                  Stereo only - Android has no array transport.
  *   - worklet_sink.c (BWA_HAVE_WORKLET): the browser, through an Emscripten Wasm Audio Worklet.
  *                  Stereo only - a page carries no array transport. See docs/web.md.
+ *   - coreaudio_sink.c (BWA_HAVE_COREAUDIO): macOS, the HAL (AudioDevice*, not AUHAL). The
+ *                  headphone profiles at the desk, and any width the device has outputs for.
  *   - manual_sink.c (always built): no thread; the caller pumps blocks (bwa_render_block).
  *
  * Two shared pieces sit under the backends rather than inside one of them: sink_convert.h (the
@@ -181,7 +183,7 @@ uint64_t sink_peak_recent(const SinkPeakWindow* w);
  * invalid string rather than a shorter one, and a picker that renders it shows a replacement
  * character it can never match back against bwa_desc.device. Steps back over continuation bytes
  * (10xxxxxx) to land on a character boundary. Returns false only for no buffer or an empty result.
- * Static inline because all four device backends need it and two of them are C++. */
+ * Static inline because every device backend needs it and two of them are C++. */
 static inline bool sink_copy_device_name(char* dst, uint32_t cap, const char* src) {
     if (!dst || cap == 0) return false;
     dst[0] = 0;
@@ -225,8 +227,8 @@ struct bwa_sink { const bwa_sink_vtbl* vt; };
 
 /* Open a sink for this format per `sink_type`. AUTO tries the platform's backends in the order
  * docs/backends.md fixes (on Windows: WASAPI then ASIO for a 2-channel request, ASIO only when
- * wider; on Linux: JACK then ALSA at every width; on Android: AAudio for a 2-channel request and
- * nothing for a wider one; then the null sink in every case); a named backend is a demand and its
+ * wider; on Linux: JACK then ALSA at every width; on macOS: CoreAudio at every width; on Android:
+ * AAudio for a 2-channel request and nothing for a wider one; then the null sink in every case); a named backend is a demand and its
  * failure returns NULL.
  * `device` names the device for whichever backend opens (NULL = that backend's default;
  * matched exactly against the name then the id, and under AUTO a backend with no such device is
@@ -368,6 +370,38 @@ bool     sink_aaudio_device_id  (uint32_t index, char* buf, uint32_t cap);
  * the stream - the same reason the WASAPI and ALSA pairs above exist. Control thread, on an open sink. */
 uint32_t sink_aaudio_burst_frames(bwa_sink* s);
 uint32_t sink_aaudio_buffer_frames(bwa_sink* s);
+#endif
+
+#ifdef BWA_HAVE_COREAUDIO
+/* macOS, through the HAL. `device` is a device name or its UID; NULL opens the default output.
+ * Any width the device has output channels for; a stereo open takes the device's preferred
+ * stereo pair. The device runs at sample_rate or the open fails, whatever `exact_rate` says: the
+ * HAL has no per-client resampler, so the open SETS the device's nominal rate. `flags` changes
+ * nothing here (see coreaudio_sink.c). */
+bwa_sink* bwa_coreaudio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = the default output device */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* Every device with an output channel (index 0 = the default output), its name and its UID.
+ * Control thread, no engine, opens nothing. */
+uint32_t sink_coreaudio_device_count(void);
+bool     sink_coreaudio_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_coreaudio_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readbacks, internal on purpose (not in bw_audio.h): the IO cycle the device
+ * is running now (equal to the block means the adapter runs in pass-through; it can change after
+ * the open, because the buffer size belongs to the device and the process), and the nominal
+ * rate the device ran at BEFORE this open, so a test that made the open change it can put it
+ * back. Control thread, on an open sink. */
+uint32_t sink_coreaudio_buffer_frames(bwa_sink* s);
+uint32_t sink_coreaudio_prior_rate(bwa_sink* s);
+/* TEST HOOK (defined in coreaudio_sink.c; not in bw_audio.h and not exported, since only a test
+ * that compiles the sink in can use it): when set, the IOProc calls it once per output stream
+ * after a cycle that rendered, with the interleaved float buffer it just handed the HAL.
+ * `first_channel` is the device channel the stream's first interleave slot is. It is the only
+ * place a test can see what REACHES THE DEVICE, which is where the channel map and the interleave
+ * live; the render probe sees only the bus. IO thread: read your accumulators after stop(). */
+extern void (*sink_coreaudio_tap)(uint32_t first_channel, const float* interleaved,
+                                  uint32_t stream_channels, uint32_t nframes);
 #endif
 
 #ifdef BWA_HAVE_WORKLET

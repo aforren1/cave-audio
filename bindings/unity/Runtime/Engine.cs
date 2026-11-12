@@ -28,13 +28,15 @@ namespace BwAudio
         public uint sampleRate = 48000;
         public uint blockSize = 256;
         [Tooltip("Output-device policy. Auto: for a headphone profile try WASAPI then ASIO, for the " +
-                 "array try ASIO, and fall back to the SILENT offline sink either way (the engine " +
+                 "array try ASIO (Linux: JACK then ALSA; macOS: CoreAudio; Android: AAudio), and fall " +
+                 "back to the SILENT offline sink either way (the engine " +
                  "keeps rendering — the inspector flags the silent fallback). Naming a backend is a " +
                  "demand, so a missing device fails startup loudly. Null: force the offline sink.")]
         public BwaSinkType sink = BwaSinkType.Auto;
         [Tooltip("Device to open, for whichever backend opens it: the exact friendly name or stable " +
                  "id from Engine.Devices. Empty = that backend's default (ASIO: the first driver with " +
-                 "enough output channels; WASAPI: the Windows default render endpoint).")]
+                 "enough output channels; WASAPI: the Windows default render endpoint; CoreAudio: " +
+                 "the macOS default output device).")]
         // FormerlySerializedAs: this field was `asioDriver` through 0.13, so a scene saved then
         // keeps its value instead of silently reverting to the backend default on load.
         [UnityEngine.Serialization.FormerlySerializedAs("asioDriver")]
