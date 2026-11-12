@@ -772,9 +772,10 @@ too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
 the survey's eight) against a static phonon built
 with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
 sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is
-verified locally WITHOUT phonon (2026-11-12, a Mac mini: 47 registered at the defaults, 46 pass, and
-the red is `ambdec_convert`, because the system Python there is 3.9 and the converter calls
-`Path.write_text(newline=...)`, which is 3.10) and with phonon in CI only. Phases 4 and 5 added no
+verified locally both ways (2026-11-12, a Mac mini: 47 registered without phonon and 57 with it and
+Octave, one red each time, `ambdec_convert`, because the system Python there is 3.9 and the
+converter calls `Path.write_text(newline=...)`, which is 3.10). That local phonon came from
+`build-phonon.sh`'s Makefiles branch, taken when there is no Xcode.app; CI builds it with Xcode. Phases 4 and 5 added no
 target - the CoreAudio, JACK and ALSA sections live inside
 `test_audio_sink`, and on a box with no device, no server and no card that one test reports SKIPPED
 rather than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
@@ -872,6 +873,18 @@ tracker path (parser + lifecycle are tested off-wire). See docs/hardware-validat
 
 Regression-preventing gotchas. Each has bitten before or guards a real invariant:
 
+- **A level check cannot see a missing interaural TIME difference.** phonon's NEON `float4::round`
+  reinterprets where it meant to convert, so it never rounded, and its one caller (`wrapPhase`) set
+  every bin of the bilinear-interpolated HRTF to a phase of plus or minus pi. On every ARM and wasm
+  build (Apple silicon, the Android headsets, the browser) the per-voice convolution kept its level
+  difference and spectrum and had an ITD of exactly 0, and every laterality test passed, because
+  they all compare ear energies. Found 2026-11-12 from a by-ear report on a Mac ("no spatial
+  percept"); x86 was never affected. `third_party/patches/phonon-neon-round.patch` fixes it (the same line as upstream PR #591, open) and
+  `test_steam_decode` section 6b measures the delay with an impulse (0.54 ms patched, 0.00 without).
+  Two things it did not change: the no-SDK decode is a level pan with no delay by construction, and
+  phonon's AMBISONIC binaural decode (cave_sim, and any spread share) is built from minimum-phase
+  HRIRs, so it measures only about 0.15 ms at 90 degrees. `bwa_minimal` now says so when it runs on
+  the simple pan.
 - **Laterality checks must never drive DC.** A DC-driven `steam_decode` laterality assertion had
   inverted polarity (the default HRTF's per-ear DC gains oppose its audible ILD), mis-diagnosed a
   correct encode, and shipped a left/right mirror that only a by-ear report caught. Drive tones,

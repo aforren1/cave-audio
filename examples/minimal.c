@@ -153,6 +153,11 @@ int main(int argc, char** argv) {
     printf("backend: %s%s\n", be,
            bwa_get_sink_type(e) == BWA_SINK_NULL ? "  (no output device opened - silent run)" : "");
     if (why[0]) printf("  reason: %s\n", why);
+    /* a build with no Steam Audio decodes with a left/right level pan: no interaural delay and no
+     * spectral cues, so the orbit reads as a pan between the ears and front equals back */
+    if (strstr(be, "simple-pan"))
+        printf("  note: this build has no Steam Audio, so there is no HRTF: expect a left/right\n"
+               "        level pan, not a position (third_party/README.md, \"Steam Audio\")\n");
     {   /* what the flags actually bought: the device's own render->DAC delay, not the block size */
         char fl[64];
         const uint32_t lat = bwa_get_output_latency_frames(e);

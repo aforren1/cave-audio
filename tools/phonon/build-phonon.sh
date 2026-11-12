@@ -150,6 +150,9 @@ SUBMODULE=third_party/steam-audio-source
 CORE="$SUBMODULE/core"
 # REQUIRED for directional reflections (upstream steam-audio#546):
 apply_once "$SUBMODULE" third_party/patches/phonon-multiplyaccumulate-align.patch
+# REQUIRED for an interaural time difference on every ARM and wasm build: without it the
+# interpolated HRTF has no phase at all. Inert on x86, where the header it patches is not compiled.
+apply_once "$SUBMODULE" third_party/patches/phonon-neon-round.patch
 
 if [ "$BWA_PLATFORM" = "android" ]; then
   # Android needs more of the pinned scripts fixed than any other platform: they were written for
@@ -193,6 +196,21 @@ if [ "$BWA_PLATFORM" = "windows" ]; then
   SHAREDCRT="--sharedcrt"     # everything /MD; see the CRT note in this file's header
 else
   SHAREDCRT=""
+fi
+
+if [ "$BWA_PLATFORM" = "osx" ] && ! xcodebuild -version >/dev/null 2>&1; then
+  # Both pinned scripts hard-code the Xcode generator for osx, and that generator needs Xcode.app:
+  # the Command Line Tools carry clang and the SDK but no xcodebuild, so on a Mac that has only
+  # those the first configure dies and the engine silently builds with no HRTF. Makefiles build
+  # the same archives. Two things the Xcode generator did for free and Makefiles do not: a
+  # configuration (the scripts pass none for osx, and no build type is -O0, so the environment
+  # default supplies Release, CMake >= 3.22), and nothing else - the universal flag is already on
+  # every configure line. CI has Xcode and never takes this branch.
+  echo "osx: no Xcode.app (Command Line Tools only); building with Unix Makefiles instead"
+  sed -i '' "s/'Xcode'/'Unix Makefiles'/g" \
+      third_party/steam-audio-source/core/build/build.py \
+      third_party/steam-audio-source/core/build/get_dependencies.py
+  export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 fi
 
 cd "$CORE/build"

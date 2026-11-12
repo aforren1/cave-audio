@@ -253,6 +253,44 @@ int main(void) {
         }
     }
 
+    /* 6b. the per-voice convolution carries an INTERAURAL TIME DIFFERENCE. Everything above
+     * measures level, and level cannot see this: phonon's NEON float4::round did not round, which
+     * set every bin of the bilinear-interpolated HRTF to a phase of +/- pi, so on every ARM and
+     * wasm build both ears peaked on the same sample while the level difference stayed correct
+     * and every check above passed (third_party/patches/phonon-neon-round.patch). An impulse on a
+     * hand-made point tap at the listener's left, then right: the far ear must peak later, by a
+     * head's worth. Measured with the patch 0.65 ms at 90 degrees, and 0.00 ms without it. */
+    {
+        SteamMonitor* mi = steam_monitor_create(&L, 48000, N, NULL, 2, 0);
+        CHECK(mi != NULL && steam_monitor_pervoice(mi), "itd: monitor with a per-voice fleet");
+        if (mi && steam_monitor_pervoice(mi)) {
+            static float imp[N];
+            const float pl[3] = { 0.f, 1.5f, 0.f };
+            const float qi[4] = { 0, 0, 0, 1 };
+            memset(bus, 0, sizeof(float) * (size_t)BWA_DEFAULT_GRID * N);
+            for (int side = 0; side < 2; ++side) {           /* 0: room +x (left), 1: room -x (right) */
+                RtDirectVoice dv; memset(&dv, 0, sizeof dv);
+                dv.active = 1; dv.gen = 1u + (uint32_t)side; dv.mono = imp;
+                dv.dir[0] = side ? -1.f : 1.f;
+                memset(imp, 0, sizeof imp); imp[0] = 1.f;
+                steam_monitor_process(mi, bus, NULL, &dv, 1, pl, qi, out, N);
+                int kl = 0, kr = 0;
+                for (uint32_t i = 0; i < N; ++i) {
+                    if (fabsf(out[i])     > fabsf(out[kl]))     kl = (int)i;
+                    if (fabsf(out[N + i]) > fabsf(out[N + kr])) kr = (int)i;
+                }
+                const double itd_ms = (side ? kl - kr : kr - kl) * 1000.0 / 48000.0;   /* far minus near */
+                printf("itd %s: L peak @%d, R peak @%d, far ear lags %.2f ms\n", side ? "right" : "left", kl, kr, itd_ms);
+                CHECK(itd_ms > 0.4 && itd_ms < 0.9,
+                      side ? "itd: a source at the right reaches the left ear 0.4 to 0.9 ms later"
+                           : "itd: a source at the left reaches the right ear 0.4 to 0.9 ms later");
+                memset(imp, 0, sizeof imp);                  /* flush the convolution tail */
+                steam_monitor_process(mi, bus, NULL, &dv, 1, pl, qi, out, N);
+            }
+        }
+        if (mi) steam_monitor_destroy(mi);
+    }
+
     /* 7. PARALLAX (the array audition: cave_sim, cave_both). A tone on the median FRONT speaker,
      * through two monitors on the same layout, one encoding every virtual speaker from the live
      * listener position (parallax, the sim profiles) and one from ref (BWA_PROFILE_BINAURAL). At ref

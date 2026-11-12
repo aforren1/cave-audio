@@ -118,7 +118,7 @@ conversion fix the v4.8.1 binaries lack. Two reasons the source is the right ven
 
 There are **local patches** in `third_party/patches/`, and they land on two different trees.
 
-One is on the submodule and every platform applies it: phonon 4.8.1's
+Two are on the submodule and every platform applies them. The first: phonon 4.8.1's
 complex `ArrayMath::multiplyAccumulate` reads its accumulator with an *aligned* SSE load on the path
 it takes when the accumulator is *misaligned* — which it always is for the odd ambisonic channels
 (the per-channel FFT stride is `8 mod 16` bytes), so any multichannel reflection effect access-violates
@@ -126,6 +126,20 @@ at channel 1. The one-line fix (`load`→`loadu`) is what lets the reflection be
 early reflections instead of omni-only. This is the open upstream issue
 [ValveSoftware/steam-audio#546](https://github.com/ValveSoftware/steam-audio/issues/546) (symptom only —
 no root cause/fix there yet); drop the patch once a fixed release lands.
+
+The second is `phonon-neon-round.patch`, and without it **no ARM or wasm build has an interaural
+time difference**. `neon_float4.h`'s `float4::round` adds half and then *reinterprets* the sum
+through `int32` and back, where it meant to *convert*, so it returns `a + 0.5` or `a - 0.5`. Its one
+caller wraps the interpolated HRTF phase as `p - 2 pi round(p / 2 pi)`, which then comes out as plus
+or minus pi for every bin: the bilinear-interpolated HRTF keeps its magnitude and loses its phase,
+and both ears' impulse responses peak on the same sample. Measured on Apple silicon at a source 90
+degrees to the left: 646 us with nearest-neighbor lookup, 0 us with bilinear, and about 550 us with
+bilinear after the patch. Level differences survive, so every level-based laterality test passed
+through it; `test_steam_decode` now measures the delay. x86 is not affected (the SSE header
+converts). The patch is one line and is inert where the NEON header is not compiled. It is the same
+change as upstream pull request
+[ValveSoftware/steam-audio#591](https://github.com/ValveSoftware/steam-audio/pull/591) (issue #590),
+which was open and unmerged on 2026-11-12. Drop the patch when the pin includes that merge.
 
 The other lands on a **downloaded dependency** rather than on phonon, and it is the only one that
 does: `deps-flatbuffers-tablekeycomparator.patch`. flatbuffers 1.12 defines a private
@@ -152,6 +166,7 @@ git submodule update --init third_party/steam-audio-source   # fetch the pinned 
 
 # 0. Apply our local fixes (see third_party/patches/). REQUIRED for directional reflections.
 git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
+git -C third_party/steam-audio-source apply ../patches/phonon-neon-round.patch   # ITD on ARM and wasm
 
 # 0.5. CMake >= 4 only: the pinned deps (flatbuffers 1.12, zlib, ...) declare pre-3.5
 #      cmake_minimum_required, which CMake 4 refuses. This env var is the escape hatch.
@@ -283,7 +298,10 @@ CI the same way Windows is, by the same composite action. Traps found so far.
   `libbw_audio.so` a C++ link (`LINKER_LANGUAGE CXX`), so it gains a `libstdc++.so.6` dependency it
   did not have. Build phonon with the same compiler family as the engine.
 - **macOS.** `build.py -p osx` generates ONE tree named `osx` with the Xcode generator (no config
-  suffix, because Xcode is multi-config). `core/CMakeLists.txt` looks as if it makes every macOS
+  suffix, because Xcode is multi-config). That generator needs Xcode.app. On a Mac that has only
+  the Command Line Tools, `tools/phonon/build-phonon.sh` rewrites both pinned scripts to Unix
+  Makefiles and sets `CMAKE_BUILD_TYPE=Release` in the environment, and the same archives come
+  out (verified 2026-11-12, CMake 4.4, Apple silicon). `core/CMakeLists.txt` looks as if it makes every macOS
   build universal, but its `set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64")` comes after `project()`,
   which CMake ignores for languages already enabled, so the core archive comes out host-arch only
   (arm64 on a current Mac) while `get_dependencies.py`, which passes the pair on the command line,

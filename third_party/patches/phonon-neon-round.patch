@@ -1,0 +1,50 @@
+# phonon: make the NEON float4::round round
+#
+# Steam Audio 4.8.1 (ValveSoftware/steam-audio), still present on upstream master on 2026-11-12
+# (the fix is upstream pull request #591, not merged).
+# Apply to the third_party/steam-audio-source submodule before building phonon (build-phonon.sh
+# does it on every platform; it is inert where neon_float4.h is not compiled).
+#
+# THE BUG
+# neon_float4.h's float4::round adds copysign(0.5, a) and then REINTERPRETS the sum float -> s32 ->
+# float, which is the identity. The two casts were meant to be CONVERSIONS (the truncate that turns
+# "add a half" into "round half away from zero"). So on every ARM build round(a) returns a +/- 0.5.
+#
+# WHAT IT BREAKS
+# One caller: HRTFDatabase::wrapPhase, which wraps the interpolated HRTF phase as
+# p - 2pi * round(p / 2pi). With round(x) = x +/- 0.5 that is -/+ pi for EVERY bin the SIMD loop
+# covers, whatever p was. The bilinear-interpolated HRTF (IPL_HRTFINTERPOLATION_BILINEAR, the one
+# steam_decode.c's per-voice convolution asks for) therefore keeps its magnitude and loses its whole
+# phase: both ears' impulse responses peak on the same sample with inverted polarity, so the
+# interaural time difference is ZERO at every bearing. Level differences and the magnitude spectrum
+# survive, which is why every laterality test stayed green.
+#
+# Measured on a Mac mini (arm64), phonon alone, an impulse through iplBinauralEffectApply at 48 kHz:
+#   nearest,  source at left 90:  L peak @ 90, R peak @ 121   ITD 646 us   (correct)
+#   bilinear, source at left 90:  L peak @ 64, R peak @ 64    ITD   0 us   (this bug)
+# x86 is unaffected: sse_float4.h converts (_mm_cvtps_epi32). Every target that compiles
+# neon_float4.h is affected, which here means macOS on Apple silicon, Android (the standalone
+# headsets) and wasm (platform.h files IPL_OS_WASM under IPL_CPU_ARMV7, so the browser build takes
+# the NEON header through Emscripten's NEON-on-SIMD translation). Only the Mac was measured.
+#
+# THE FIX
+# Convert instead of reinterpret (vcvtq_s32_f32 truncates, vcvtq_f32_s32 converts back). One line,
+# and it works on ARMv7 as well as AArch64.
+#
+# Upstream: issue ValveSoftware/steam-audio#590, fixed by pull request #591, which was OPEN and
+# unmerged on 2026-11-12. This is the same one-line change (the patched blob is identical), found
+# here independently. #591 measured it on a Quest 3. Drop the patch when the pin includes the merge.
+# https://github.com/ValveSoftware/steam-audio/pull/591
+diff --git a/core/src/core/neon_float4.h b/core/src/core/neon_float4.h
+index 442b1b5..25cbf86 100644
+--- a/core/src/core/neon_float4.h
++++ b/core/src/core/neon_float4.h
+@@ -167,7 +167,7 @@ namespace float4
+         int32x4_t a_05 = vreinterpretq_s32_f32(vdupq_n_f32(0.5f));
+         int32x4_t a_addition = vorrq_s32(a_05, vandq_s32(a_sign, vreinterpretq_s32_f32(a)));
+ 
+-        return vreinterpretq_f32_s32(vreinterpretq_s32_f32(vaddq_f32(a, vreinterpretq_f32_s32(a_addition))));
++        return vcvtq_f32_s32(vcvtq_s32_f32(vaddq_f32(a, vreinterpretq_f32_s32(a_addition))));
+     }
+ 
+     // Aligned load.

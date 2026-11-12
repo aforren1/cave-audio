@@ -815,9 +815,10 @@ jobs:
           bw_audio links this statically into bw_audio.dll. It is built with the recipe in
           third_party/README.md ("Steam Audio"), BUILD_SHARED_LIBS=OFF and --minimal, after
           applying the patches in patches/ below. The tree here is the unpatched upstream
-          commit, so apply the patch to reproduce the build:
+          commit, so apply the two patches to reproduce the build:
 
             git apply patches/phonon-multiplyaccumulate-align.patch
+            git apply patches/phonon-neon-round.patch
 
           The other files in patches/ are not patches to this tree. The phonon-android-* ones
           apply to it too but only for an Android build, and deps-flatbuffers-* applies to a
@@ -1279,10 +1280,11 @@ jobs:
   # warm one restores the archives and costs a few minutes. No ASIO: it is Windows-only by
   # definition, and nothing here fetches it.
   #
-  # The macOS job's PHONON build is unverified locally: it was written from the pinned scripts and
-  # this job is the first thing that executes it. The shim's Apple paths (mach_absolute_time,
-  # mach_wait_until, the SCHED_OTHER priority drop) and the CoreAudio sink have run on a physical
-  # Mac (2026-11-12), in a tree without phonon.
+  # The macOS job's PHONON build through the Xcode generator is unverified locally: the one local
+  # build (2026-11-12, a Mac with the Command Line Tools only) went through build-phonon.sh's
+  # Makefiles branch, which this job never takes. The shim's Apple paths (mach_absolute_time,
+  # mach_wait_until, the SCHED_OTHER priority drop), the CoreAudio sink and the SDK-gated five
+  # have run on that Mac.
   #
   # ANDROID IS CROSS-BUILT, in the job below, and deliberately WITHOUT an emulator. An emulator job is
   # possible here: ubuntu-latest runners expose /dev/kvm, so reactivecircus/android-emulator-runner can
@@ -1936,8 +1938,9 @@ jobs:
           retention-days: 1      # an intra-run handoff, not a download
           if-no-files-found: error
 
-  # The PHONON half is UNVERIFIED LOCALLY: this job is the first thing that executes a macOS
-  # phonon build. (The engine and the shim's Apple paths have run on a Mac.) Both decisions below came out
+  # The PHONON half is UNVERIFIED LOCALLY through the Xcode generator: this job is the first thing
+  # that executes that build. (A Mac with no Xcode.app built it with Makefiles; the engine and the
+  # shim's Apple paths have run there.) Both decisions below came out
   # of the pinned scripts rather than a run. build.py -p osx generates ONE tree named "osx" with
   # the Xcode generator, and core/CMakeLists.txt sets CMAKE_OSX_ARCHITECTURES "x86_64;arm64" for
   # every macOS build (get_dependencies.py passes the same pair to the three companions), so the
