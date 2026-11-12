@@ -206,10 +206,28 @@ int measure_response_win(const float* capture, int ncap, const float* ref, int n
     return measure_response_ex(capture, ncap, ref, nref, f1, f2, fs, band_hz, 0, 0, out, win, win_len, pre, win_start);
 }
 
+/* The earliest tap within MEASURE_FIRST_DB of the strongest (p), walking back no further than lo. */
+static int first_arrival(const float* ir, int p, int lo, double fs) {
+    const double thr = (double)ir[p] * ir[p] * pow(10.0, MEASURE_FIRST_DB / 10.0);
+    const int back = (int)(MEASURE_FIRST_BACK_S * fs), lead = (int)(MEASURE_FIRST_MIN_S * fs);
+    const int a = p - back > lo ? p - back : lo;
+    for (int i = a; i < p - lead; ++i)
+        if ((double)ir[i] * ir[i] >= thr) return ir_peak(ir, i, i + lead < p - lead ? i + lead : p - lead);
+    return p;
+}
+
 int measure_response_ex(const float* capture, int ncap, const float* ref, int nref,
                         double f1, double f2, double fs, const double band_hz[2],
                         int exp_lo, int exp_hi, MeasureResult* out,
                         float* win, int win_len, int pre, int* win_start) {
+    return measure_response_pick(capture, ncap, ref, nref, f1, f2, fs, band_hz, exp_lo, exp_hi, 0, 0,
+                                 out, win, win_len, pre, win_start);
+}
+
+int measure_response_pick(const float* capture, int ncap, const float* ref, int nref,
+                          double f1, double f2, double fs, const double band_hz[2],
+                          int exp_lo, int exp_hi, int pick_lo, int pick_hi, MeasureResult* out,
+                          float* win, int win_len, int pre, int* win_start) {
     if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
     if (win && (win_len <= 0 || pre < 0 || !win_start)) return 0;
     /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
@@ -227,6 +245,9 @@ int measure_response_ex(const float* capture, int ncap, const float* ref, int nr
     /* physical arrival = the strongest tap where this speaker's sound can arrive. A window that the
      * clamp emptied (it lies past the capture) falls back to the whole IR and flags it. */
     int p = windowed ? ir_peak(ir, lo, hi) : pany;
+    const int pl = pick_lo < 0 ? 0 : pick_lo, ph = pick_hi > npos ? npos : pick_hi;
+    if (pick_hi > pick_lo && ph > pl) p = ir_peak(ir, pl, ph);
+    else if (windowed)                p = first_arrival(ir, p, lo, fs);
     out->delay_samples = p;
     out->peak_any = pany;
     if (exp_hi > exp_lo) {
@@ -511,6 +532,23 @@ int measure_room_cuts(const float* ir, int nir, int direct, double fs,
     }
     free(re); free(im); free(mdb); free(exc);
     return count;
+}
+
+int measure_ir_around(const float* capture, int ncap, const float* ref, int nref,
+                      double f1, double f2, double fs, int pre, float* out, int cap) {
+    if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0) || pre < 0 || cap <= pre) return 0;
+    if ((int64_t)ncap + nref > (1 << 30)) return 0;
+    const double band_hz[2] = { 300.0, 3000.0 };
+    float* ir = NULL;
+    const int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, NULL, NULL, NULL, &ir);
+    if (!L) return 0;
+    const int direct = ir_peak(ir, 0, ncap < L ? ncap : L);
+    for (int k = 0; k < cap; ++k) {
+        const int j = direct - pre + k;
+        out[k] = (j >= 0 && j < L) ? ir[j] : 0.f;
+    }
+    free(ir);
+    return 1;
 }
 
 int measure_room(const float* capture, int ncap, const float* ref, int nref,

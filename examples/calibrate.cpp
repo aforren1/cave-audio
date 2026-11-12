@@ -2233,6 +2233,13 @@ int main(int argc, char** argv) {
         if (asio_up) calib_asio_close();
 #endif
         sweep_report("localize");
+        /* what the solve is given: a bad fit cannot be argued about without these */
+        printf("localize: raw ranges, meters at c including the latency (one line per speaker, one column per mic row):\n");
+        for (int s = 0; s < n; ++s) {
+            printf("  raw %2d:", s);
+            for (int k = 0; k < K; ++k) printf(" %.4f", range[(size_t)s * K + k]);
+            printf("\n");
+        }
         if (g_tracked) {
             printf("localize: the MEASURED mic positions the trilateration uses (planned in brackets):\n");
             for (int k = 0; k < K; ++k)
@@ -3058,7 +3065,15 @@ int main(int argc, char** argv) {
                 printf("%s\n", rr.er_count ? "" : " (none)");
                 if (rr.rt60 > 0.f) { rt60_sum += rr.rt60; ++rt60_n; }
             }
-            if (ir_prefix) { char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); calib_write_wav_f32(p, irbuf, IR_LEN, (int)FS); }
+            if (ir_prefix) {
+                char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); calib_write_wav_f32(p, irbuf, IR_LEN, (int)FS);
+                enum { PRE = 1920, PRE_LEN = PRE + 4800 };              /* 40 ms ahead of the picked peak, 100 ms after */
+                static float prebuf[PRE_LEN];
+                if (measure_ir_around(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, PRE, prebuf, PRE_LEN)) {
+                    snprintf(p, sizeof p, "%s_%02d_pre.wav", ir_prefix, i);
+                    calib_write_wav_f32(p, prebuf, PRE_LEN, (int)FS);
+                }
+            }
             if (room_eq) {   /* room correction at the mic point: FD-window FIR + LF modal cuts */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
                 int nc = calib_room_eq(irbuf, IR_LEN, first_refl, FS, NTAPS,

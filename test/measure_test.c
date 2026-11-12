@@ -175,6 +175,25 @@ int main(void) {
             CHECK(a.delay_samples == Dw + 600 && !a.outside, "no window: the louder impostor is taken, unflagged");
             CHECK(b.delay_samples == Dw && b.outside && b.peak_any == Dw + 600 && fabsf(b.outside_db - 6.02f) < 0.3f,
                   "window: the speaker's own arrival, flagged: a stronger tap 6 dB up outside the window");
+            /* the first strong arrival, not the strongest: a reflection 150 samples after a direct sound
+             * 2.5 dB under it (the rig's speakers 6, 12 and 15) */
+            {
+                float* ca = (float*)calloc((size_t)ncw, sizeof(float));
+                CHECK(ca != NULL, "alloc (first arrival)");
+                if (ca) {
+                    const int Dr = Dw + 150, lo = Dw - 400, hi = Dw + 800;
+                    MeasureResult fa, fb, fc;
+                    for (int i = 0; i < nref; ++i) { ca[i + Dw] += 0.3f * sweep[i]; ca[i + Dr] += 0.4f * sweep[i]; }
+                    measure_response_ex(ca, ncw, sweep, nref, f1, f2, fs, band_hz, lo, hi, &fa, NULL, 0, 0, NULL);
+                    CHECK(fa.delay_samples == Dw && !fa.outside, "first arrival: the direct sound, not the louder reflection after it");
+                    measure_response_pick(ca, ncw, sweep, nref, f1, f2, fs, band_hz, lo, hi, Dr - 20, Dr + 21, &fc, NULL, 0, 0, NULL);
+                    CHECK(fc.delay_samples == Dr, "first arrival: a pick window names the arrival, with no walk back");
+                    for (int i = 0; i < nref; ++i) ca[i + Dw] -= 0.26f * sweep[i];
+                    measure_response_ex(ca, ncw, sweep, nref, f1, f2, fs, band_hz, lo, hi, &fb, NULL, 0, 0, NULL);
+                    CHECK(fb.delay_samples == Dr, "first arrival: a tap 20 dB under the peak is not an arrival");
+                    free(ca);
+                }
+            }
             /* a steady noise floor: the SNR falls with it, about 20 dB per decade of noise */
             for (int i = 0; i < nref; ++i) cw[i + Dw + 600] -= 0.8f * sweep[i];
             uint32_t sd = 12345u;

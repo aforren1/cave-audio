@@ -582,14 +582,32 @@ int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const floa
     enum { XW = 256, XPRE = 64 };
     static float win[ZYLIA_MICS][XW];                 /* control thread, one caller at a time */
     int start[ZYLIA_MICS] = { 0 };
+    /* One decision for the whole array, from the capsule mean: which physical arrival this is. Each capsule
+     * then takes its own peak within the array's aperture of it (+/- 0.06 m at a slow c, plus the mean's
+     * smear). */
+    static float mean[CAL_CAPLEN];
+    int pick_lo = 0, pick_hi = 0;
+    if (ncap <= CAL_CAPLEN) {
+        for (int i = 0; i < ncap; ++i) {
+            double acc = 0.0;
+            for (int j = 0; j < ZYLIA_MICS; ++j) acc += rows[(size_t)j * (size_t)stride + i];
+            mean[i] = (float)(acc / ZYLIA_MICS);
+        }
+        MeasureResult m;
+        if (measure_response_ex(mean, ncap, sweep, nsweep, CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, &m, NULL, 0, 0, NULL)) {
+            const int w = (int)ceil(0.06 / 300.0 * CAL_FS) + 8;
+            pick_lo = m.delay_samples - w;
+            pick_hi = m.delay_samples + w + 1;
+        }
+    }
     unsigned hw = std::thread::hardware_concurrency();
     const int nw = hw < 2 ? 1 : (hw > 8 ? 8 : (int)hw);
     std::atomic<int> next(0);
     auto work = [&]() {
         for (int j; (j = next.fetch_add(1)) < ZYLIA_MICS; )
-            ok[j] = measure_response_ex(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
-                                        CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, &res[j],
-                                        win[j], XW, XPRE, &start[j]);
+            ok[j] = measure_response_pick(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
+                                          CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, pick_lo, pick_hi, &res[j],
+                                          win[j], XW, XPRE, &start[j]);
     };
     std::vector<std::thread> pool;
     for (int w = 1; w < nw; ++w) pool.emplace_back(work);

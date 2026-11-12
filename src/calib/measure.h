@@ -46,8 +46,9 @@ typedef struct {
     float energy;          /* whole-response ENERGY over the level band (sum of |H|^2): what direct_frac is
                             * a share of, so several captures' shares can be pooled energy-weighted
                             * (zylia_pressure_proxy) */
-    /* The capture's own quality (measure_response_ex). The arrival above is the strongest tap INSIDE
-     * the expected-arrival window when one was given, else over the whole positive-lag IR. */
+    /* The capture's own quality (measure_response_ex). The arrival above is the FIRST strong arrival
+     * inside the expected-arrival window when one was given (MEASURE_FIRST_*), else the strongest tap
+     * over the whole positive-lag IR. */
     int   win_lo, win_hi;  /* the window searched, capture samples [win_lo, win_hi); 0, 0 = none */
     int   peak_any;        /* the strongest tap over the whole positive-lag IR [0, ncap) */
     int   outside;         /* 1 = peak_any lies outside the window: something other than this speaker
@@ -57,6 +58,16 @@ typedef struct {
     float floor_rms;       /* that floor: the RMS of the loudest MEASURE_NOISE_BLOCK_S block, linear */
     int   noise_n;         /* samples the floor was read from (0 = the regions were empty: snr unknown) */
 } MeasureResult;
+
+/* In a room the strongest tap is not always the direct sound: on the rig, three of 26 speakers carried a
+ * reflection within 4 dB of an arrival 2.5 to 7 ms ahead of it, and noise flipped which one won. So a
+ * windowed search walks back from the strongest tap and takes the earliest one within MEASURE_FIRST_DB of
+ * it. The rig's clean speakers had nothing above -35 dB there, and the real early arrivals sat above
+ * -5 dB, so the limit has room on both sides. The minimum lead keeps the peak's own rising edge and a
+ * two-way speaker's crossover smear (under 0.6 ms, -25 dB on the rig) from reading as an arrival. */
+#define MEASURE_FIRST_DB      (-12.0)
+#define MEASURE_FIRST_BACK_S  0.020
+#define MEASURE_FIRST_MIN_S   0.001
 
 /* The noise-floor regions (measure_response_ex). Both sit on the IR's positive lags, where the
  * linear deconvolution (FFT length >= ncap + nref, so nothing wraps) puts the speaker's response:
@@ -120,6 +131,15 @@ int measure_response_win(const float* capture, int ncap, const float* ref, int n
  * floor and snr_db are filled either way. A peak search inside a window returns the same tap the
  * whole-IR search would whenever the strongest tap is inside it, so the window costs nothing on a
  * clean capture; it changes the answer only for a capture it also flags. */
+/* measure_response_ex with the arrival search narrowed to [pick_lo, pick_hi) and no walk back: the strongest
+ * tap there. exp_lo/exp_hi still set the quality fields. The ZM-1 uses it so all 19 capsules read the same
+ * physical arrival: decided per capsule, a capsule in the sphere's shadow picks a reflection its neighbors
+ * do not, and the windows the cross-correlation compares no longer overlap. */
+int measure_response_pick(const float* capture, int ncap, const float* ref, int nref,
+                          double f1, double f2, double fs, const double band_hz[2],
+                          int exp_lo, int exp_hi, int pick_lo, int pick_hi, MeasureResult* out,
+                          float* win, int win_len, int pre, int* win_start);
+
 int measure_response_ex(const float* capture, int ncap, const float* ref, int nref,
                         double f1, double f2, double fs, const double band_hz[2],
                         int exp_lo, int exp_hi, MeasureResult* out,
@@ -133,6 +153,13 @@ double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs,
  * + early reflections). If `ir_out` is non-NULL, the deconvolved impulse response from the direct
  * arrival onward is copied into it (up to `ir_cap` samples) — the room-preview convolution kernel, so
  * one capture serves trims, this report, AND a future headphone room simulator. Returns 1 / 0. */
+/* The deconvolved IR around its strongest tap, with `pre` samples ahead of it (zero-padded at the start), so
+ * out[pre] is that tap. measure_room's kernel starts AT the tap, which hides the question a survey needs
+ * answered in a room: is an earlier, weaker arrival sitting ahead of the peak the tool picked? Returns 0 on
+ * bad input. */
+int measure_ir_around(const float* capture, int ncap, const float* ref, int nref,
+                      double f1, double f2, double fs, int pre, float* out, int cap);
+
 int measure_room(const float* capture, int ncap, const float* ref, int nref,
                  double f1, double f2, double fs, RoomResult* out, float* ir_out, int ir_cap);
 

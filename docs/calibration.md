@@ -196,6 +196,13 @@ The thresholds below are **provisional**: nothing here has met the rig. They are
 
 ### The expected-arrival window
 
+The arrival is the first strong tap in the window, not the strongest. On the rig, three of 26
+speakers had a reflection within 4 dB of an arrival 2.5 to 7 ms ahead of it, and the strongest-tap rule flipped
+between them from sweep to sweep. From the strongest tap the search walks back up to 20 ms and takes the
+earliest tap within 12 dB of it. With the ZM-1, the capsule mean makes this one decision for all 19 capsules.
+A speaker with no line of sight to the mic has no direct sound to find, so its arrival is a longer path
+and its surveyed position is wrong. Clear the path first.
+
 The arrival is searched only between
 
 ```
@@ -529,7 +536,9 @@ it. Do not expect it to be audible.
   interpolation puts the reading at well under 1 mm. With `--zylia` it is live aiming instead:
   one speaker's position against the layout and its off-axis angle, once per sweep. See "Live
   aiming" below.
-- **`--save-irs prefix`**: dump the per-speaker impulse responses (the deconvolved kernels). One
+- **`--save-irs prefix`**: dump the per-speaker impulse responses (the deconvolved kernels). Each
+  `<prefix>_NN.wav` starts at the picked peak. `<prefix>_NN_pre.wav` also holds the 40 ms ahead of it
+  (the peak is sample 1920), so you can see an earlier arrival the peak search passed over. One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:
   convolving these IRs into the binaural monitor previews the installed sound while you work
   off-site. For the *spatial* version, do a second capture pass with in-ear/dummy-head mics: those
