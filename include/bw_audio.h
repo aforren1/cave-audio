@@ -55,8 +55,8 @@ extern "C" {
  * CMake package and bwa_get_version() all answer the same number a GitHub release carries. Do not
  * edit them by hand; a release moves them, and a patch release moves them too. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 19
-#define BWA_VERSION_PATCH 2
+#define BWA_VERSION_MINOR 20
+#define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
 #ifdef _WIN32

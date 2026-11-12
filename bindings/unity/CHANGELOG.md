@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.20.0]
+
 ### Added: device output on macOS (CoreAudio)
 
 The macOS library opens a real output device. Under `BwaSinkType.Auto` the headphone profiles
