@@ -98,7 +98,7 @@ typedef struct {
  * splitter (rt.c: lp = two one-pole stages, ap = a first-order allpass, hp = ap - lp) and computes
  * HF*hp + LF*lp = HF*ap + (LF - HF)*lp, so `dlf` = LF - HF is derived at load and is zero for a
  * single-band decoder. One decoder per channel set, at least one full one when ndec > 0. Selected
- * with BWA_DECODE_LAYOUT; every other decoder ignores the block. ~8 KB per decoder at 64 speakers
+ * with BWA_DECODE_LAYOUT; every other decoder ignores the block. ~8 KiB per decoder at 64 speakers
  * (two 64 x 16 matrices); the cap is one per distinct set (3 full orders + 6 mixed), so it can
  * never refuse a file the duplicate-set rule accepts. */
 #define BWA_BED_DEC_MAX 9
@@ -143,9 +143,10 @@ static inline const BedDecoder* layout_bed_decoder_for(const BedImport* b, int s
     return above ? above : below;
 }
 
-/* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~252 KB, most
- * of it the 512-tap FIR each Speaker embeds (and 72 KB the imported bed decoders), and a binding may call in from a 512 KB thread. Keep it
- * a plain value type, but give it heap or static residency: a member of a heap struct (RtCore,
+/* NEVER A STACK LOCAL (see CLAUDE.md, Traps). At BWA_CHANNELS = 64 a Layout is ~252 KiB, most
+ * of it the 512-tap FIR each Speaker embeds (and 72 KiB the imported bed decoders), and a binding
+ * may call in from a 512 KiB thread. Keep it a plain value type, but give it heap or static
+ * residency: a member of a heap struct (RtCore,
  * bwa_engine), a calloc, or a static in non-reentrant code. That is also why layout_default fills
  * in place rather than returning by value: a by-value return is a hidden stack temporary. */
 typedef struct {

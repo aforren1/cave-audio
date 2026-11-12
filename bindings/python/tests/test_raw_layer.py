@@ -193,6 +193,7 @@ def test_sink_flags_mirror_the_abi_bits():
     assert int(bwa.SinkFlags.EXCLUSIVE) == 0x1
     assert int(bwa.SinkFlags.EXACT_RATE) == 0x2
     assert int(bwa.SinkFlags.TIGHT_BUFFER) == 0x4
+    assert int(bwa.SinkFlags.DEEP_BUFFER) == 0x8
     assert int(bwa.SinkFlags.EXCLUSIVE | bwa.SinkFlags.EXACT_RATE) == 0x3
 
     d = _bwa.desc()

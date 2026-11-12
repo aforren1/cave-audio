@@ -133,7 +133,7 @@ LoadFlags = _bwa.load_flags
 class SinkFlags(enum.IntFlag):
     """``Engine(sink_flags=...)`` bits, for the PRIMARY device only.
 
-    All three are opt-in and all three trade something a shared, resampling, comfortably buffered
+    All four are opt-in and all four trade something a shared, resampling, comfortably buffered
     device gives you for free. None of them reaches the ``CAVE_BOTH`` monitor, which opens the
     platform default shared and unflagged. ``docs/api.md`` maps them onto PsychPortAudio's latency
     classes if you are porting a psychophysics rig.
@@ -144,12 +144,15 @@ class SinkFlags(enum.IntFlag):
       accepting the OS resampler. Use it when a measured rate is part of the experiment.
     * ``TIGHT_BUFFER`` asks for the smallest device buffer the backend can take. Expect underruns
       on a loaded machine: it is for a quiet rig, not a default.
+    * ``DEEP_BUFFER`` asks for a deeper output buffer. Only the browser sink uses it, so it does
+      nothing on a desktop backend. It is here so the flags mirror the ABI.
     """
 
     NONE = 0
     EXCLUSIVE = _bwa.SINK_FLAG_EXCLUSIVE
     EXACT_RATE = getattr(_bwa, "SINK_FLAG_EXACT_RATE", 0x2)
     TIGHT_BUFFER = getattr(_bwa, "SINK_FLAG_TIGHT_BUFFER", 0x4)
+    DEEP_BUFFER = getattr(_bwa, "SINK_FLAG_DEEP_BUFFER", 0x8)
 
 
 CHANNEL_AUTO = _bwa.CHANNEL_AUTO

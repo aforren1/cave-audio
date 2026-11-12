@@ -270,7 +270,9 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
 #elif defined(__linux__)
     /* JACK first on Linux, at EVERY width. It is the production path (a rig box runs a server, and
      * a desktop's PipeWire answers the same libjack), and jack_client_open carries JackNoStartServer
-     * so a box with neither falls through to ALSA in microseconds instead of forking a jackd. */
+     * so a box with neither falls through to ALSA in about 4 ms (JACK2's own retry sleeps; tens of
+     * microseconds when libjack is not installed at all) instead of forking a jackd. Measured
+     * 2026-11-12 under WSL, JACK2 with no server. */
     order[norder++] = BWA_SINK_JACK;
     order[norder++] = BWA_SINK_ALSA;
 #endif

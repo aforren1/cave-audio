@@ -26,8 +26,9 @@ you can hear gaps/smoothness and walk the room to judge off-center coverage. The
 rebuilds the engine with the edited positions, since the layout is load-time.
 
 The tool exports the [layout schema](./layout-schema.md) with `delay_ms` auto-derived from
-the positions (max-distance alignment). A `directivity` block and any per-speaker `aim` in the loaded
-file survive the export verbatim; the tool never edits them.
+the positions (max-distance alignment). The tool never edits a `directivity` block or a per-speaker
+`aim`. The `directivity` block survives the export verbatim. An `aim` keeps its direction, but the
+export writes it normalized to unit length and rounded to 4 decimals.
 
 The tool is the **plan editor**. Open a file that a survey has already written (one that
 carries `plan_position`) and it edits the plan instead, and saves the plan only. See
@@ -375,7 +376,7 @@ use case picks its renderer on top (tracked DBAP for a roaming session, SPCAP or
 VBAP fixed-solve for a seated one, the bed renderer for ambisonic content).
 The shared layout costs a seated user little against a dedicated seated-only
 array, while a seated-only array is unusable for everyone else. Verify any use case's slice of the same file with
-`--score L.json [condition] [fixed|moving] [epad|layout] [maxre]`.
+`--score L.json [condition] [fixed|moving] [allrad|epad|layout] [maxre]`.
 
 ### Leash and ear height
 

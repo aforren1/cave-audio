@@ -8,6 +8,7 @@
 //
 // Fields are drawn by ITERATING the serialized object rather than listing them by name, so a new field
 // on Engine shows up here automatically; only the ones with a rule get hidden.
+using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
@@ -34,12 +35,69 @@ namespace BwAudio.EditorTools
                     continue;
                 }
                 if (IsHidden(it.propertyPath, a)) continue;
+                if (it.propertyPath == "sink") { DrawSinkField(it); continue; }
                 EditorGUILayout.PropertyField(it, true);
             }
 
             serializedObject.ApplyModifiedProperties();   // fires Engine.OnValidate -> live re-push
             DrawProblems(a);
             DrawLiveStatus(a);
+        }
+
+        // The device backends each player platform's engine library carries. BwaSinkType mirrors the
+        // ABI, so it names every backend on every platform, and naming one a target lacks is a DEMAND
+        // that fails startup there. Left out everywhere: CoreAudio (not built yet), Worklet (the
+        // browser build, which Unity never links) and Manual (it needs bwa_render_block pumped, and
+        // Unity binds no pump).
+        static BwaSinkType[] BackendsFor(BuildTarget t)
+        {
+            switch (t)
+            {
+                case BuildTarget.StandaloneWindows:
+                case BuildTarget.StandaloneWindows64: return new[] { BwaSinkType.Asio, BwaSinkType.Wasapi };
+                case BuildTarget.StandaloneLinux64:   return new[] { BwaSinkType.Jack, BwaSinkType.Alsa };
+                case BuildTarget.Android:             return new[] { BwaSinkType.AAudio };
+                default:                              return new BwaSinkType[0];
+            }
+        }
+
+        // Play mode runs the EDITOR's library, not the build target's, so a Quest project played on a
+        // Windows desk opens WASAPI. Those entries stay pickable, marked, for desk testing.
+        static BwaSinkType[] EditorBackends()
+        {
+            switch (Application.platform)
+            {
+                case RuntimePlatform.WindowsEditor: return BackendsFor(BuildTarget.StandaloneWindows64);
+                case RuntimePlatform.LinuxEditor:   return BackendsFor(BuildTarget.StandaloneLinux64);
+                default:                            return new BwaSinkType[0];
+            }
+        }
+
+        static bool SinkFitsTarget(BwaSinkType s) =>
+            s == BwaSinkType.Auto || s == BwaSinkType.Null ||
+            System.Array.IndexOf(BackendsFor(EditorUserBuildSettings.activeBuildTarget), s) >= 0;
+
+        // A popup instead of the enum's own: only what the active build target (and the editor, for
+        // Play mode) can open. A saved value outside that set stays selected and labeled rather than
+        // being rewritten, because switching the build target must not edit the scene.
+        static void DrawSinkField(SerializedProperty p)
+        {
+            var target = EditorUserBuildSettings.activeBuildTarget;
+            var cur = (BwaSinkType)p.intValue;
+            var opts = new List<BwaSinkType> { BwaSinkType.Auto };
+            var labels = new List<GUIContent> { new GUIContent("Auto") };
+            foreach (var b in BackendsFor(target)) { opts.Add(b); labels.Add(new GUIContent(b.ToString())); }
+            foreach (var b in EditorBackends())
+                if (!opts.Contains(b)) { opts.Add(b); labels.Add(new GUIContent(b + " (editor only)")); }
+            opts.Add(BwaSinkType.Null); labels.Add(new GUIContent("Null (silent)"));
+            if (!opts.Contains(cur)) { opts.Add(cur); labels.Add(new GUIContent(cur + " (not on " + target + ")")); }
+
+            var rect = EditorGUILayout.GetControlRect();
+            var label = EditorGUI.BeginProperty(rect, new GUIContent(p.displayName, p.tooltip), p);
+            EditorGUI.BeginChangeCheck();
+            int pick = EditorGUI.Popup(rect, label, opts.IndexOf(cur), labels.ToArray());
+            if (EditorGUI.EndChangeCheck()) p.intValue = (int)opts[pick];
+            EditorGUI.EndProperty();
         }
 
         // The engine ignores these in the given state, so showing them just invites you to tune a knob
@@ -78,7 +136,12 @@ namespace BwAudio.EditorTools
             if (!string.IsNullOrEmpty(a.layoutFile))
             {
                 string full = Path.Combine(Application.streamingAssetsPath, a.layoutFile).Replace('\\', '/');
-                if (!File.Exists(full))
+                if (!File.Exists(full) && a.profile == BwaProfile.Binaural)
+                    EditorGUILayout.HelpBox(
+                        "No speaker layout at:\n\n" + full + "\n\nBinaural drives no speakers, so the " +
+                        "engine runs its built-in default grid for the diffuse bed. Cave, CaveSim and " +
+                        "CaveBoth need the file, and refuse to start without it.", MessageType.Info);
+                else if (!File.Exists(full))
                     EditorGUILayout.HelpBox(
                         "Speaker layout not found. The engine will look for it here:\n\n" + full +
                         "\n\nAn explicit layout MUST load: bwa_start refuses a failed load with " +
@@ -87,6 +150,12 @@ namespace BwAudio.EditorTools
                         "relative to it) — or clear the field to run the engine's built-in default " +
                         "26-speaker grid deliberately.", MessageType.Error);
             }
+
+            if (!SinkFitsTarget(a.sink))
+                EditorGUILayout.HelpBox(
+                    "Sink " + a.sink + " is not available on " + EditorUserBuildSettings.activeBuildTarget +
+                    ". A named backend is a demand, so a build for that target fails to start. Use Auto " +
+                    "for a project that ships to more than one platform.", MessageType.Warning);
 
             if (a.enableReflections && a.enableFdnReverb)
                 EditorGUILayout.HelpBox(

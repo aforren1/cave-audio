@@ -1527,7 +1527,8 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink_flags", PROPERTY_HINT_FLAGS,
 						 "Exclusive - take the device:1,"
 						 "ExactRate - fail rather than resample:2,"
-						 "TightBuffer - smallest device buffer:4"),
+						 "TightBuffer - smallest device buffer:4,"
+						 "DeepBuffer - browser sink only:8"),
 			"set_sink_flags", "get_sink_flags");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sample_rate"), "set_sample_rate", "get_sample_rate");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "block_size"), "set_block_size", "get_block_size");
@@ -1648,6 +1649,7 @@ void BwaEngine::_bind_methods() {
 	BIND_ENUM_CONSTANT(SINK_WORKLET);
 	BIND_ENUM_CONSTANT(SINK_FLAG_NONE); BIND_ENUM_CONSTANT(SINK_FLAG_EXCLUSIVE);
 	BIND_ENUM_CONSTANT(SINK_FLAG_EXACT_RATE); BIND_ENUM_CONSTANT(SINK_FLAG_TIGHT_BUFFER);
+	BIND_ENUM_CONSTANT(SINK_FLAG_DEEP_BUFFER);
 	BIND_ENUM_CONSTANT(DECODE_DEFAULT); BIND_ENUM_CONSTANT(DECODE_ALLRAD); BIND_ENUM_CONSTANT(DECODE_EPAD); BIND_ENUM_CONSTANT(DECODE_LAYOUT);
 	BIND_ENUM_CONSTANT(SETUP_DEFAULT); BIND_ENUM_CONSTANT(SETUP_SEATED); BIND_ENUM_CONSTANT(SETUP_ROAMING);
 	BIND_ENUM_CONSTANT(PAN_DBAP); BIND_ENUM_CONSTANT(PAN_SPCAP); BIND_ENUM_CONSTANT(PAN_VBAP);

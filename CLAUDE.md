@@ -1093,13 +1093,13 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `-lwasi-emulated-process-clocks`) each have a comment in `tools/wasm/wasi-sdk.toolchain.cmake`.
   Also: `os` under wasmtime is the same sleep-lateness flake the Android emulator shows (32/33 then
   33/33 on back-to-back runs); it passes in isolation.
-- **A `Layout` is never a stack local.** (It is about 258 KB since the imported bed decoders, 2026-10-15:
-  nine decoders of two 64 x 16 bands each.) Raising the capacity to 64 grew it from 72 KB to 176 KB,
-  almost all of it the 512-tap FIR each `Speaker` embeds. Four tests (`rt_feature`, `dsp`, `xval`,
-  `valid`) then overflowed the 1 MB main-thread stack with exit `0xC00000FD` BEFORE PRINTING
-  ANYTHING, so the log shows a bare SegFault and no failing check. The fix is residency, not a
-  bigger stack: a binding can call in from a 512 KB thread (a macOS secondary thread), and wasm's
-  shadow stack is 1 MB total. So a `Layout` lives in a heap struct (`RtCore`, `bwa_engine`), a
+- **A `Layout` is never a stack local.** (It is about 252 KiB since the imported bed decoders, 2026-10-15:
+  nine decoders of two 64 x 16 bands each, 72 KiB together.) Raising the capacity to 64 grew it from
+  72 KiB to 176 KiB, almost all of it the 512-tap FIR each `Speaker` embeds. Four tests (`rt_feature`,
+  `dsp`, `xval`, `valid`) then overflowed the 1 MiB main-thread stack with exit `0xC00000FD` BEFORE
+  PRINTING ANYTHING, so the log shows a bare SegFault and no failing check. The fix is residency, not
+  a bigger stack: a binding can call in from a 512 KiB thread (a macOS secondary thread), and wasm's
+  shadow stack is 1 MiB total. So a `Layout` lives in a heap struct (`RtCore`, `bwa_engine`), a
   calloc (the pure `bwa_*_batch` helpers), or a static in non-reentrant code (tests, tool mains).
   `layout_default(Layout*)` fills in place because a by-value return is a hidden stack temporary;
   do not bring the by-value form back. The note above the struct in `layout.h` says the same.

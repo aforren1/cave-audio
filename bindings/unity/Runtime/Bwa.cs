@@ -80,9 +80,11 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
+    /// DeepBuffer asks for a deeper output buffer. Only the browser sink uses it, so it is a no-op
+    /// on every backend Unity reaches; it is here so the enum mirrors the ABI.
     /// docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
-    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
+    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4, DeepBuffer = 0x8 }
 
     /// <summary>Mirrors bwa_tracker_state: liveness of a connected tracker's stream (Engine.TrackerStatus).
     /// Disconnected = no tracker on this engine; NoData = connected but no frames arriving (check the

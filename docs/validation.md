@@ -55,13 +55,19 @@ renormalize the low band, the spread modes and decorrelation reshape the gain ve
 hole-aware floor widens, tracked alignment re-references the delays. A harness that multiplied a
 stimulus by panner gains could sweep every one of those flags and measure nothing.
 
-The harness forces three things for measurement. They are not part of what it measures:
+The harness forces four things for measurement. They are not part of what it measures:
 
 - **The limiter is off.** It is on by default at -1 dBFS and would quietly compress the very gains
   being read.
 - **Master gain is exactly 1.**
 - **The tracked-alignment slew guards are opened wide.** They exist to manage the transient of a
   walking head. This measurement is steady-state.
+- **Tracked directivity compensation is off.** The engine turns it on by default. The simulated
+  propagation and the physical reference model every speaker as omni, so in simulate the comp would
+  correct a loss the capsules never see. Only tracked cells away from the listening point change,
+  because the comp does nothing there. On the rig the real speakers lose level off axis, so a
+  hardware session measures the array without the comp it ships with. `bwa_validate` has no flag
+  to turn it on.
 
 The harness renders and discards blocks until the gain ramps, the alignment delay lines, and the
 tracked-alignment glide have settled. Then it takes the capture window. Gains ramp rather than

@@ -1501,7 +1501,8 @@ static void drain_commands(RtCore* c) {
 
 /* Dispatch the bed decode: AllRAD or EPAD if selected (and the build succeeds), else the shared
  * sampling decode (ambi_sad_decode — assumes a roughly uniform array, fine for a diffuse bed).
- * World-locked: directions are from the array centroid, not the moving listener. Room convention
+ * World-locked: directions are from Layout.ref (listening_point_m, else the array centroid), not
+ * the moving listener. Room convention
  * (post +z-forward flip): identity listener faces +z, right ear at -x, +y up; AmbiX axes are
  * x=front/y=left/z=up, so ambi front = room +z (where the listener faces / the main content sits),
  * ambi left = room +x, ambi up = room +y.

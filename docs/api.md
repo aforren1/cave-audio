@@ -288,7 +288,8 @@ conversions, and the handedness rationale. OptiTrack poses pass through unchange
 an identity orientation faces +z with the right ear at −x; derive basis vectors
 from `BWA_ROOM_AHEAD` / `BWA_ROOM_UP` / `BWA_ROOM_RIGHT` in the header rather than
 re-hardcoding them. The engine's world-locked decodes and its default listener
-position use the **array centroid** (the nominal listening point), not the origin.
+position use the layout's **listening point** (`listening_point_m`, or the array centroid when
+the layout declares none), not the origin.
 Gains are linear (1 = unity); sound offsets are engine-rate sample frames.
 
 **Coordinates have a range, not just a finiteness rule.** Every call that takes a room position
@@ -2757,10 +2758,12 @@ void bwa_set_tracked_align(bwa_engine* e, bool on);
 void bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m, float slew_frames_per_s);
 ```
 
-The layout's per-speaker trims align the array's arrival times at **one** point, the array
-centroid. Turn this on and the output stage re-references those trims onto the **tracked**
-listener, so time coherence follows the head: per speaker, the extra propagation delay and 1/r
-level for `|speaker - listener|` against `|speaker - centroid|`.
+The layout's per-speaker trims align the array's arrival times at **one** point, the layout's
+listening point (`listening_point_m`, or the array centroid when the layout declares none).
+`bwa_calibrate` aligns delays at the mic, so put the mic there. Turn this on and the output stage
+re-references those trims onto the **tracked** listener, so time coherence follows the head: per
+speaker, the extra propagation delay and 1/r level for `|speaker - listener|` against
+`|speaker - listening point|`.
 
 It is off by default because a moving delay line is a resampling event: a walking listener glides
 every speaker's delay at once, a Doppler shift on everything the array plays. Two guards make it

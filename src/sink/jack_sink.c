@@ -299,6 +299,10 @@ static void jack_host_thread(void* arg) {
     JackSink* s = (JackSink*)arg;
     BWA_THREAD_NAME("bw-audio (JACK lost)");
     const uint64_t block_ns = (uint64_t)s->block * 1000000000ull / (uint64_t)s->sample_rate;
+    /* Asked for, and its refusal tolerated, like the other fallbacks: the server's own thread held
+     * the realtime grant, and this one may sit under an RLIMIT_RTPRIO of 0. Without it, a loaded box
+     * stalls the engine clocks that rule 4 promises keep advancing. */
+    const bool rt = (os_thread_set_realtime(block_ns) == 0);
     uint64_t next_ns = 0;
     while (!atomic_load_explicit(&s->host_stop, memory_order_relaxed)) {
         const uint64_t now = sink_quant_now_ns();
@@ -308,6 +312,7 @@ static void jack_host_thread(void* arg) {
         next_ns += block_ns;
         os_sleep_until_ns(next_ns);          /* absolute deadline: a relative sleep drifts */
     }
+    if (rt) os_thread_clear_realtime();
 }
 
 /* The server went away. Rule 4: report it, never reopen. The engine's dsp clock, playheads and
@@ -487,7 +492,8 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     jack_client_t* client = jk.jack_client_open("bw_audio", JackNoStartServer, &st);
     if (!client) {
         /* JackNoStartServer is what makes this the FAST path to ALSA under AUTO: a box with
-         * neither a JACK server nor PipeWire fails here in microseconds instead of forking a
+         * neither a JACK server nor PipeWire fails here in about 4 ms (JACK2 sleeps ~3 ms of that
+         * before giving up, so a faster CPU does not shrink it) instead of forking a
          * jackd and waiting for it. The message names the flag so the failure is not mistaken
          * for "libjack is missing". */
         char m[224];

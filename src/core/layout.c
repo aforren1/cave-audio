@@ -21,8 +21,10 @@ static void set_err(char* err, size_t cap, const char* msg) {
 
 static float db_to_lin(double db) { return (float)pow(10.0, db / 20.0); }
 
-/* ref = the array centroid: the nominal listening point the world-locked decodes reference.
- * Computed from the positions, so it holds for any origin convention (floor or center). */
+/* ref's DEFAULT = the array centroid, the nominal listening point the world-locked decodes reference.
+ * Computed from the positions, so it holds for any origin convention (floor or center). A declared
+ * listening_point_m overwrites it after this runs, because a top-heavy array's centroid sits above
+ * the ears. */
 void layout_compute_ref(Layout* L) {
     double s[3] = { 0, 0, 0 };
     for (uint32_t k = 0; k < L->count; ++k)

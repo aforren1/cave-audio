@@ -67,7 +67,27 @@ The wheel carries the engine library above, plus the `_bwa` extension module:
 `bwa_calibrate` and `bwa_zylia_probe` are console tools; they add nothing beyond
 the `bw_audio.dll` list.
 
+## In the web build (`bw_audio.mjs`, `bw_audio.wasm`)
+
+The web module carries the engine library list above (phonon included), plus the Emscripten
+runtime that `tools/wasm/build-web.sh` links. The Pages build uses Emscripten 6.0.10, the
+version `.github/workflows/pages.yml` pins.
+
+- **Emscripten**: the JavaScript glue in `bw_audio.mjs` and the runtime code in `bw_audio.wasm`.
+  Your choice of the MIT License (text below) or the University of Illinois/NCSA Open Source
+  License. Copyright (c) 2010-2014 Emscripten authors (see the AUTHORS file in the Emscripten
+  repository). https://github.com/emscripten-core/emscripten/blob/6.0.10/LICENSE
+- **musl libc**, as Emscripten ships it: MIT (text below). Copyright (c) 2005-2020 Rich Felker,
+  et al. https://github.com/emscripten-core/emscripten/blob/6.0.10/system/lib/libc/musl/COPYRIGHT
+- **LLVM libc++, libc++abi and compiler-rt**, as Emscripten ships them: Apache License 2.0 with
+  LLVM Exceptions, and older code also under the legacy University of Illinois/NCSA or MIT dual
+  license that the same files state. phonon is C++, so the module links libc++ and libc++abi.
+  https://github.com/emscripten-core/emscripten/blob/6.0.10/system/lib/libcxx/LICENSE.TXT
+  (libc++abi and compiler-rt carry the same terms in their own `LICENSE.TXT`).
+
 ## In the web demo (GitHub Pages artifact)
+
+The demo carries the web build above, plus:
 
 - **coi-serviceworker** — MIT (text below). Copyright (c) 2021 Guido Zuidhof. Vendored at
   `bindings/web/deploy/coi-serviceworker.js`; it adds the COOP/COEP headers GitHub Pages cannot.
@@ -81,7 +101,7 @@ the `bw_audio.dll` list.
   imports it from there because the site is served under COEP require-corp, where a CDN script is
   blocked. https://github.com/mrdoob/three.js
 
-## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js, robin_map)
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js, robin_map, Emscripten, musl)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in

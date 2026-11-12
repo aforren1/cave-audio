@@ -12,6 +12,8 @@ grouped by topic. Each entry says what the term means for a decision.
 **Hear it now.** The engine runs in a browser: [aforren1.github.io/cave-audio](https://aforren1.github.io/cave-audio/)
 is the minimal orbit and the six-scene playground, the same WebAssembly build of the same
 code, on headphones. The playground runs a generated 24-speaker dome by default. Chromium is what it is tested in. Every push to main redeploys it.
+On a WebXR headset, open the [XR page](https://aforren1.github.io/cave-audio/xr/index.html). It
+runs the playground with your tracked head as the listener.
 
 ## Status
 

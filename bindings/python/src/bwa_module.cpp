@@ -127,13 +127,16 @@ NB_MODULE(_bwa, m) {
     m.attr("CHANNEL_AUTO")  = (int32_t)BWA_CHANNEL_AUTO;
     /* bwa_desc.sink_flags bits. They are #defines rather than an enum in the ABI, so they stay
      * plain module constants here; the Pythonic layer wraps them in an IntFlag. The #ifdefs let
-     * this file compile against a 0.14.0 header that predates the last two. */
+     * this file compile against an older header that predates the later bits. */
     m.attr("SINK_FLAG_EXCLUSIVE") = (uint32_t)BWA_SINK_FLAG_EXCLUSIVE;
 #ifdef BWA_SINK_FLAG_EXACT_RATE
     m.attr("SINK_FLAG_EXACT_RATE") = (uint32_t)BWA_SINK_FLAG_EXACT_RATE;
 #endif
 #ifdef BWA_SINK_FLAG_TIGHT_BUFFER
     m.attr("SINK_FLAG_TIGHT_BUFFER") = (uint32_t)BWA_SINK_FLAG_TIGHT_BUFFER;
+#endif
+#ifdef BWA_SINK_FLAG_DEEP_BUFFER
+    m.attr("SINK_FLAG_DEEP_BUFFER") = (uint32_t)BWA_SINK_FLAG_DEEP_BUFFER;
 #endif
     /* The identity-listener basis, as data. Derive "forward"/"right" from these rather than
      * re-hardcoding the convention (bw_audio.h, BWA_ROOM_*). */

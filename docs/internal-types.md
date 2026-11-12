@@ -24,6 +24,11 @@ and generation are each 16-bit, so the voice and sound tables are each ≤ 65536
 slots and generations wrap at 2¹⁶. The wrap is safe: a stale handle only has to
 differ from the *current* occupant of the slot.
 
+The real ceiling is lower. `rt_create` refuses a voice table plus a sound table larger
+than `EVT_CAP` (1024 slots, `rt.c`). The voice table counts the fade reserve below, so the
+requested pool plus 8 plus the sound cap must fit in 1024. The bound keeps the ownership acks
+from overflowing the event ring.
+
 `rt_create` adds `BWA_FADE_RESERVE` (8) physical voice slots beyond the requested
 pool, kept free so a stolen voice can fade out on its own slot (see
 concurrency.md).
@@ -179,8 +184,8 @@ orders and six mixed sets) `BedDecoder`s, each a channel set, the order it was d
 `hf[speaker][16]` matrix and a derived `dlf = LF - HF` (zero for a single-band one). Pick one
 through `layout_bed_decoder_for(&L->bed, set, order, &exact)`: a bed's own set and order, else
 the lowest full order above, else the highest below, with `exact` saying whether the pick was a
-match. At 64 speakers a `Layout` is about 252 KB, 72 KB of it the decoders (8.2 KB each): it is
-never a stack local.
+match. At 64 speakers a `Layout` is about 252 KiB (257,988 bytes), 72 KiB of it the decoders
+(8.0 KiB each): it is never a stack local.
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */

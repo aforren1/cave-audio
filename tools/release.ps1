@@ -14,7 +14,9 @@
 # whose major.minor differs from it, and a pin left at 0.13.0 shipped three packages that could never
 # start. So this script rewrites the three defines AND BoundVersion to the version being cut, rolls
 # the CHANGELOG's [Unreleased] section, commits all three files, and creates the matching annotated
-# v-tag. CI refuses a tag whose header disagrees, and any push whose BoundVersion does. It does
+# v-tag. It also reruns tools/wasm/gen-abi.mjs, because the web binding's committed abi.js carries
+# ABI_VERSION from the header: build-web.sh regenerates it, but the checked-in copy stayed a release
+# behind (0.18.1 under a 0.19.2 header) until this step existed. That needs node on PATH. CI refuses a tag whose header disagrees, and any push whose BoundVersion does. It does
 # NOT push by default: review the commit and tag, then `git push --follow-tags` (or pass -Push) to
 # trigger the CI release.
 #
@@ -65,6 +67,11 @@ try {
         if ($dirty) { throw "working tree is dirty; commit or stash first so the release commit is only the CHANGELOG roll:`n$dirty" }
     }
 
+    # Checked before any file changes, so a box without node fails clean instead of half-released.
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw "node not on PATH; the release regenerates bindings/web/src/abi.js with tools/wasm/gen-abi.mjs"
+    }
+
     # ---- roll the CHANGELOG ------------------------------------------------------------------------
     # Read/write as UTF-8 (the file has non-ASCII): .NET ReadAllText/WriteAllText default to UTF-8 and
     # WriteAllText emits no BOM, so the round-trip is byte-stable apart from the edit.
@@ -106,7 +113,7 @@ try {
     $pinChanges = ($cnew -ne $craw)
 
     if ($DryRun) {
-        Write-Host "DRY RUN - would roll [Unreleased] -> [$ver], set BWA_VERSION $old -> $ver, set Bwa.BoundVersion to $ver, and tag $tag`n"
+        Write-Host "DRY RUN - would roll [Unreleased] -> [$ver], set BWA_VERSION $old -> $ver, set Bwa.BoundVersion to $ver, regenerate the web ABI table, and tag $tag`n"
         $preview = ($rolled -split "\r?\n" | Select-Object -First 16) -join [Environment]::NewLine
         Write-Host $preview
         Write-Host "`n(no files changed, no commit, no tag)"
@@ -117,8 +124,13 @@ try {
     if ($headerChanges) { [System.IO.File]::WriteAllText($header, $hnew) }
     if ($pinChanges)    { [System.IO.File]::WriteAllText($bwacs, $cnew) }
 
+    # ---- regenerate the web binding's ABI table from the header just written ------------------------
+    node tools/wasm/gen-abi.mjs
+    if ($LASTEXITCODE -ne 0) { throw "tools/wasm/gen-abi.mjs failed" }
+
     # ---- commit + tag ------------------------------------------------------------------------------
-    git add -- 'bindings/unity/CHANGELOG.md' 'include/bw_audio.h' 'bindings/unity/Runtime/Bwa.cs'
+    git add -- 'bindings/unity/CHANGELOG.md' 'include/bw_audio.h' 'bindings/unity/Runtime/Bwa.cs' `
+               'bindings/web/src/abi.js' 'bindings/web/src/exported_functions.json'
     if ($LASTEXITCODE -ne 0) { throw "git add failed" }
     git commit -m "Release $tag"
     if ($LASTEXITCODE -ne 0) { throw "git commit failed" }

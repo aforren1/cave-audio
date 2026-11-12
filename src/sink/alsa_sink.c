@@ -316,9 +316,15 @@ static void alsa_thread(void* arg) {
             if (w == -ESTRPIPE) {
                 /* Suspended (a laptop lid, a power event). Resume until the kernel stops saying
                  * "not yet", then prepare. This is the driver reporting a discontinuity to us
-                 * rather than us inferring one, which is what driver_resyncs means. */
+                 * rather than us inferring one, which is what driver_resyncs means. The sleep is
+                 * alsa-lib's own recovery idiom and costs nothing (a suspended device takes no
+                 * audio), but the wait can last as long as the suspend, so it must still see stop. */
                 int r;
-                while ((r = al.snd_pcm_resume(s->pcm)) == -EAGAIN) os_sleep_ms(10);
+                while ((r = al.snd_pcm_resume(s->pcm)) == -EAGAIN) {
+                    if (atomic_load_explicit(&s->stop_flag, memory_order_relaxed)) break;
+                    os_sleep_ms(10);
+                }
+                if (r == -EAGAIN) break;            /* stopped mid-suspend: the outer loop exits */
                 if (r < 0 && al.snd_pcm_prepare(s->pcm) < 0) {
                     atomic_store_explicit(&s->lost, 1u, memory_order_relaxed);
                     break;

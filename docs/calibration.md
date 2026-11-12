@@ -538,8 +538,9 @@ it. Do not expect it to be audible.
   one speaker's position against the layout and its off-axis angle, once per sweep. See "Live
   aiming" below.
 - **`--save-irs prefix`**: dump the per-speaker impulse responses (the deconvolved kernels). Each
-  `<prefix>_NN.wav` starts at the picked peak. `<prefix>_NN_pre.wav` also holds the 40 ms ahead of it
-  (the peak is sample 1920), so you can see an earlier arrival the peak search passed over. One
+  `<prefix>_NN.wav` starts at the strongest tap over the whole IR. That is not the windowed
+  first-arrival pick the trims use. `<prefix>_NN_pre.wav` also holds the 40 ms ahead of that tap
+  (the tap is sample 1920). Use it to find a weaker arrival that comes before the strongest one. One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:
   convolving these IRs into the binaural monitor previews the installed sound while you work
   off-site. For the *spatial* version, do a second capture pass with in-ear/dummy-head mics: those
@@ -2180,12 +2181,18 @@ the session's own outputs. Load `grid.json` (or `trims.json`) into the engine wh
 | --- | --- | --- | --- | --- | --- |
 | 1 | frame | `bwa_speaker_survey <plan> --require-frame --baffle-offset-m <baffle offset> --csv frame_check.csv` | the plan, the baffle offset | `frame_check.csv` | exit 0: Motive's frame agrees within 0.5° and 10 mm |
 | 2 | localize | `bwa_calibrate --layout <plan> --out as_built.json --zylia --localize <rows>` | the plan, the localize rows | `as_built.json` | exit 0 |
-| 3 | capsules | `bwa_calibrate --layout as_built.json --zylia --capsule-survey capsules.json --mic <listening point>` | `as_built.json` | `capsules.json` | exit 0 |
+| 3 | capsules | `bwa_calibrate --layout as_built.json --zylia --capsule-survey capsules.json --mic <listening point> [--speakers <list>] [--latency <m>]` | `as_built.json` | `capsules.json` | exit 0 |
 | 4 | aim | the Aim tab, in this window | `as_built.json`, `capsules.json` | the readings you accept | every listed speaker has an accepted reading |
 | 5 | trims | `bwa_calibrate --layout as_built.json --out trims.json --zylia --trims --room --survey capsules.json` | `as_built.json`, `capsules.json` | `trims.json` | exit 0 |
 | 6 | verify | `bwa_calibrate --layout trims.json --zylia --verify --survey capsules.json` | `trims.json` | a status | exit 0; exit 3 means flagged speakers |
-| 7 | grid | `bwa_calibrate --layout trims.json --out grid.json --zylia --room-eq-grid <rows>` | `trims.json`, the grid rows | `grid.json` | exit 0 |
-| 8 | validate | `bwa_validate --layout grid.json --survey capsules.json --out validate.csv --azimuths <n> [--positions <file>]` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
+| 7 | grid | `bwa_calibrate --layout trims.json --out grid.json --zylia --room-eq-grid <rows> [--survey capsules.json]` | `trims.json`, the grid rows, `capsules.json` | `grid.json` | exit 0 |
+| 8 | validate | `bwa_validate --layout grid.json --out validate.csv --azimuths <n> [--positions <file>] [--no-reference] [--survey capsules.json]` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
+
+The flags in brackets depend on the session. The capsule step gets `--latency` only when localize
+printed `the latency held` (see below). The trims, verify, grid and validate steps get
+`--survey capsules.json` only when the capsule step passed. Without it, a tracked run gets
+`--mount-offset`, and an untracked trims or verify run gets `--mic` at the listening point.
+Validate gets `--no-reference` when you clear the **validate reference arm** box.
 
 Every `bwa_calibrate` step also gets the device (`--driver`, `--input`) or `--simulate`, the
 tracker (`--track`, `--natnet-server`, `--natnet-multicast`, `--natnet-local`, `--place-timeout`) or `--track-sim`,
@@ -2260,9 +2267,11 @@ accepted. The step passes when every listed speaker has one.
 The latency the tab hands the capsule survey and live aiming is the localize run's: the median of
 its per-row latencies. The tab hands it over only when the run printed `the latency held`. When the
 latency MOVED between rows, or the run never checked it (one latency for the run, or each speaker's
-own solve), the tab hands over nothing, and the step summary says which: the later steps then solve
-their own. The capsule survey's own
-latency is weak on a dome around the listening point (see "The speaker-sweep capsule survey").
+own solve), the tab hands over nothing from localize, and the step summary says which. The capsule
+survey then solves its own latency. Live aiming takes the capsule survey's latency when that
+run printed one. With neither, the Aim tab keeps the value in its latency field. The capsule
+survey's own latency is weak on a dome around the listening point (see "The speaker-sweep capsule
+survey").
 
 ### The audio device
 

@@ -35,7 +35,7 @@ because there is no window system.
 
 | leg | result |
 |-----|--------|
-| wasi-sdk 25, `wasm32-wasip1-threads` | builds the library and all 35 test and example binaries. **33 of 33 ctests pass** under wasmtime 27. |
+| wasi-sdk 25, `wasm32-wasip1-threads` | builds the library and all 35 test and example binaries. **33 of 33 ctests pass** under wasmtime 27. Measured on 2026-09-22; nobody has counted again since. |
 | Emscripten 6.0.10, `-pthread` | builds the same tree. **31 of 33 pass** under node: `os` times out and `idle` fails. Both are the main thread blocking, see below. Needs `-sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=1048576`, which `tools/wasm/build-wasm.sh` passes; without them the same tree gives 13 of 33. |
 | Emscripten 6.0.10, `-pthread`, phonon staged | **35 of 38 pass** through `tools/wasm/build-wasm.sh` verbatim in the emsdk container. All five SDK-gated tests pass, the four simulator ones included (`reflect`, `bake`, `path`, `dynmesh`, `steam_decode`). The three failures are the same `os` and `idle`, plus `fuzz_api`: see [Steam Audio under wasm](#steam-audio-phonon-under-wasm). |
 | Emscripten 6.0.10, `-pthread`, phonon staged, **`-sPROXY_TO_PTHREAD`** | **36 of 38**, through `BWA_WASM_PROXY=1 tools/wasm/build-wasm.sh`. `idle` goes GREEN (1.63 s), which is the finding: main() on a pthread leaves the main thread's event loop running, and the asset loader's wake arrives. `os` still times out and `fuzz_api` still fails. |
@@ -47,10 +47,11 @@ Rows that do not say "phonon staged" are **no-SDK** builds. The one with-SDK red
 that is phonon's is the exception model: see
 [Steam Audio (phonon) under wasm](#steam-audio-phonon-under-wasm).
 
-The wasi run is the useful number, because it is the same suite the Linux and macOS jobs run at
-default options, driven by the same `ctest`. It includes the threaded tests: `idle` (the loader and
-stream wakeup counters), `cave_both` (two sinks), `golden` (a deterministic manual-sink render), and
-`natnet` on the socket stubs. Build it with:
+The wasi run is the useful number, because the same `ctest` drives it. It is a smaller suite than
+the Linux and macOS jobs run. A cross build drops the tests that need a host CMake or Python, the
+raylib tools refuse wasm, and this build has no phonon. It includes the threaded tests: `idle`
+(the loader and stream wakeup counters), `cave_both` (two sinks), `golden` (a deterministic
+manual-sink render), and `natnet` on the socket stubs. Build it with:
 
 ```
 tools/wasm/build-wasm.sh          # BWA_WASM_TOOLCHAIN=wasi, WASI_SDK_PATH=<root>
@@ -326,10 +327,10 @@ the headset.
 
 Built: `src/sink/worklet_sink.c`, `BWA_SINK_WORKLET`, behind the `BWA_WITH_WORKLET` CMake option.
 The option is OFF by default even on Emscripten, because `-sAUDIO_WORKLET` pulls in
-`-sWASM_WORKERS` and changes `emscripten_get_now` for every target that links the library, and the
-CI leg must not pay for that. In `src/sink/sink.c` the `__EMSCRIPTEN__` branch sits BEFORE the
-`__linux__` and `__APPLE__` ones, because Emscripten's sysroot defines `__unix__` and a plain chain
-would offer a backend no browser carries.
+`-sWASM_WORKERS` and changes `emscripten_get_now` for every target that links the library. The
+plain engine build and its tests must not pay for that. In `src/sink/sink.c` the `__EMSCRIPTEN__`
+branch sits BEFORE the `__linux__` and `__APPLE__` ones, because Emscripten's sysroot defines
+`__unix__` and a plain chain would offer a backend no browser carries.
 [backends.md](./backends.md) carries it in the contract's tables like every other backend; this
 section is the part that is specific to a browser.
 
@@ -457,7 +458,7 @@ fetch that feeds a push source, which moves the refill cadence out of the engine
 
 Worth stating plainly, because the sink is the part a reader will most want to trust.
 
-**Verified** in the `emscripten/emsdk:latest` container (emcc 6.0.10) with the
+**Verified** in the `emscripten/emsdk:6.0.10` container, the version `pages.yml` pins, with the
 wasm32 phonon staged:
 
 - `worklet_sink.c` compiles clean at `-Wall -Wextra` and links into `bw_audio.mjs`.
@@ -588,9 +589,10 @@ Taken 2026-09-21. Everything else in this note is written against it, not around
 - **Cross-origin isolation is an accepted hosting requirement.** COOP plus COEP, or no
   `SharedArrayBuffer`. There is no fallback build, and a page that is not isolated must fail loudly
   instead of degrading.
-- **Emscripten is the shipping toolchain for the browser. wasi-sdk is the CI and offline leg.**
-  Both stay. Emscripten is the only one that reaches Web Audio, and wasi-sdk is the one that runs
-  the suite the desktop jobs run.
+- **Emscripten is the shipping toolchain for the browser. wasi-sdk is the offline leg and the
+  intended CI leg.** No workflow runs it yet: `ci.yml` has no wasm job, and `pages.yml` builds with
+  Emscripten. Both stay. Emscripten is the only one that reaches Web Audio, and wasi-sdk runs the
+  engine's ctest suite under wasmtime.
 
 The design-record sections around it record what was measured, and what each of those three
 costs.
@@ -599,15 +601,17 @@ costs.
 
 The spike went looking for a way to avoid Emscripten, because Emscripten has been a fragile target
 before. The short answer: **wasi-sdk carries the engine core and cannot carry the browser**, and
-Emscripten carries both. That is why the decision keeps both rather than picking one: wasi-sdk is
-the CI and offline leg, Emscripten is what ships a page.
+Emscripten carries both. That is why the decision keeps both rather than picking one. wasi-sdk is
+the offline leg and the intended CI leg (not wired into a workflow yet). Emscripten is what ships a
+page.
 
 ### wasi-sdk (clang, wasi-libc)
 
-Verdict: **the CI and offline leg.** It is a plain clang cross-compiler, the sysroot is
-ordinary POSIX, and there is no framework between you and the module. `wasm32-wasip1-threads` has
-real pthreads: a probe confirmed `pthread_create`, `pthread_join`, C11 atomics across threads,
-`pthread_rwlock`, `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` and
+Verdict: **the offline leg, and the intended CI leg.** No workflow runs it yet. It is a plain
+clang cross-compiler, the sysroot is ordinary POSIX, and there is no framework between you and
+the module. `wasm32-wasip1-threads` has real pthreads: a probe confirmed `pthread_create`,
+`pthread_join`, C11 atomics across threads, `pthread_rwlock`,
+`clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` and
 `pthread_condattr_setclock(CLOCK_MONOTONIC)` all work. Those five are exactly what
 `src/os/os_posix.c` is built on, which is why the shim needed almost nothing (see
 [The OS shim](#the-os-shim-under-wasm)).
@@ -751,7 +755,7 @@ decision and not a recommendation inside it.
 on a pthread and leaves the browser (or node) main thread free to run its event loop, which is
 exactly the shape the decision asks for. `tools/wasm/build-wasm.sh` takes `BWA_WASM_PROXY=1` for it.
 Numbers from one machine, same tree, same commit, both through the script verbatim in the
-`emscripten/emsdk:latest` container:
+`emscripten/emsdk:6.0.10` container (the version `pages.yml` pins):
 
 | link | result |
 |------|--------|
@@ -823,7 +827,7 @@ clean checkout, run from the repo root:
 ```sh
 docker run --rm -v "$PWD:/ph" -w /ph \
     -e BWA_PLATFORM=wasm -e BWA_STAGE_DIR=wasm32 \
-    emscripten/emsdk:latest tools/phonon/build-phonon.sh
+    emscripten/emsdk:6.0.10 tools/phonon/build-phonon.sh
 ```
 
 It stages all four archives into `third_party/steam-audio-artifacts/lib/wasm32/`, which is the

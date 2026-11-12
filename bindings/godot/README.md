@@ -53,16 +53,16 @@ the one that platform's ctest run tested.
 
 ## Install
 
-**From the Asset Store** (in the editor: AssetLib tab, search "bw_audio"), or by hand:
-download `bw_audio-godot-<version>.zip` from a GitHub Release and unzip it into your project
-so you end up with `addons/bw_audio/`. Either way, restart the editor afterwards. A
-GDExtension loads on project open, so there is no plugin to enable.
+The addon has no store listing yet. Install it by hand: download `bw_audio-godot-<version>.zip`
+from a GitHub Release and unzip it into your project, so you end up with `addons/bw_audio/`. You
+can also copy `addons/bw_audio/` out of an archive of the `godot` branch. Then restart the editor.
+A GDExtension loads on project open, so there is no plugin to enable.
 
 Godot has **no equivalent of Unity's "add package from git URL"**. The documented routes are
-the store's own listing and a manual zip extract. The editor has no install-from-URL or
+a store listing and a manual zip extract. The editor has no install-from-URL or
 install-from-file entry point. So unlike the Unity binding, you cannot install *from* the
-`godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
-archive.
+`godot` distribution branch directly. The branch exists for a future store listing that pulls a
+repo archive.
 
 Four platforms: **Windows x64** for the desktop, where the engine's device path is ASIO,
 **Linux x86_64** (JACK or ALSA), **macOS universal** and **Android arm64-v8a** for a standalone
@@ -150,8 +150,9 @@ hash, and rewriting history would eventually orphan a published one. The standin
 that the branch grows by roughly the addon's size per release; that is inherent to in-repo
 distribution.
 
-A release also attaches the zip beside its other assets, for anyone who would rather not use the
-AssetLib. [docs/build.md](../../docs/build.md#continuous-integration) lists them.
+A release also attaches the zip beside its other assets, which
+[docs/build.md](../../docs/build.md#continuous-integration) lists. Until a store listing exists,
+that zip is the install route.
 
 ### Submitting a store listing
 

@@ -190,7 +190,7 @@ nothing). Nothing reopens on its own.
 | WASAPI    | `IAudioClient::GetStreamLatency` (converted from 100 ns units) plus the buffer size in exclusive mode, or plus one period in shared mode |
 | CoreAudio | `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` + `kAudioStreamPropertyLatency` + the buffer frame size |
 | JACK      | the max over the sink's ports of `jack_port_get_latency_range(port, JackPlaybackLatency)`, read after the connections are made (the server recomputes on connect) |
-| ALSA      | `snd_pcm_delay` right after a write, which is the buffer fill                                            |
+| ALSA      | `snd_pcm_status_get_delay` from the `snd_pcm_status` read after the first good write, which is the buffer fill; the open's buffer size until then |
 | AAudio    | `getFramesWritten - pos` from the timestamp pair, extrapolated to now at the nominal rate; `getBufferSizeInFrames` when the timestamp is not yet available |
 | Wasm Audio Worklet | `AudioContext.baseLatency + outputLatency`, in seconds, read once at open. `webaudio.h` has no accessor for either, so the sink reads the two properties off the context object itself. 0 when the browser reports neither, which is "unknown" and not "none". `BWA_SINK_FLAG_DEEP_BUFFER` moves it: a context the sink creates gets latencyHint `"playback"` (baseLatency 20 ms on the Windows desktop, 1216 frames in all at block 256, against 736 with `"interactive"`); a page that hands the sink its own context sets the hint itself (0.05 on the XR page: 50 ms, 2656 frames) |
 

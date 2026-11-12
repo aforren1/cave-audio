@@ -225,8 +225,8 @@ why, for the choices the API left open.
   the same limit the kernel checks, and the render thread makes the actual
   `os_thread_set_realtime()` attempt.
 - **`output_latency()` reports the buffer size until the first block.** The header promises a
-  constant, and `snd_pcm_delay` can only be read after a write, so the open's buffer-size figure
-  stands until the first successful write latches the measured delay in its place.
+  constant, and the delay (`snd_pcm_status_get_delay`) can only be read after a write, so the
+  open's buffer-size figure stands until the first successful write latches the measured delay in its place.
 - **`stop()` joins before it touches the PCM.** An `snd_pcm_t` is not thread-safe, so calling
   `snd_pcm_drop` to cut short an in-flight `snd_pcm_writei` from the control thread is a race. The
   wait costs one blocking write, which is one period.

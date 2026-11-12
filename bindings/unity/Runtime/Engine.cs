@@ -21,7 +21,9 @@ namespace BwAudio
                  "(create that folder and put cave_layout.json in it). EMPTY runs the engine's built-in " +
                  "default 26-speaker grid — the only way to opt into it. A non-empty path MUST load: on " +
                  "a failed load the engine logs the reason and REFUSES to start (BWA_ERR_LAYOUT), so a " +
-                 "session can never silently pan over geometry that isn't the one in the room.")]
+                 "session can never silently pan over geometry that isn't the one in the room. " +
+                 "Binaural is the exception: it drives no speakers, so a MISSING file there runs the " +
+                 "default grid with a log line instead.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
@@ -40,7 +42,8 @@ namespace BwAudio
         [Tooltip("Backend options. Exclusive takes a WASAPI endpoint from every other application on " +
                  "the machine; leave it off for a monitor that shares the device with a VR runtime. " +
                  "ExactRate fails the open rather than letting the OS resample. TightBuffer takes " +
-                 "the smallest device buffer the backend can, trading dropout margin for latency.")]
+                 "the smallest device buffer the backend can, trading dropout margin for latency. " +
+                 "DeepBuffer affects only the browser sink, so it does nothing here.")]
         public BwaSinkFlags sinkFlags = BwaSinkFlags.None;
 
         /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>
@@ -263,13 +266,26 @@ namespace BwAudio
                 return;                                              // Instance NOT claimed
             }
 
+            // Empty maps to layout_path = NULL, the ABI's only way to run the default grid, exactly
+            // like asioDriver below. Path.Combine of an empty string would yield the StreamingAssets
+            // DIRECTORY: still an explicit path, which fails to load and then fails bwa_start
+            // (BWA_ERR_LAYOUT), leaving the default grid unreachable.
+            string layoutFull = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null;
+            // Binaural drives no speakers: the layout only places the virtual speakers the diffuse
+            // bed decodes through, and the default grid serves that fine. The refusal exists so the
+            // ARRAY never pans over the wrong room, so a desk scene on the default profile must not
+            // go silent for want of a file it does not need. A file that exists still has to load.
+            // (On Android StreamingAssets sits inside the APK, which the engine cannot fopen either.)
+            if (layoutFull != null && profile == BwaProfile.Binaural && !File.Exists(layoutFull))
+            {
+                Debug.Log($"[bw_audio] Binaural: no layout at '{layoutFull}', so the diffuse bed decodes " +
+                          "through the built-in default grid. The array profiles need the file.");
+                layoutFull = null;
+            }
+
             var cfg = new BwaDesc {
                 profile = profile,
-                // Empty maps to layout_path = NULL — the ABI's only way to run the default grid —
-                // exactly like asioDriver below. Path.Combine of an empty string would yield the
-                // StreamingAssets DIRECTORY: still an explicit path, which fails to load and then
-                // fails bwa_start (BWA_ERR_LAYOUT), leaving the default grid unreachable.
-                layoutPath = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null,
+                layoutPath = layoutFull,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
                 sink = sink,
                 device = device.Length > 0 ? device : null,

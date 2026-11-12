@@ -627,9 +627,12 @@ or directly:
 node --test bindings/web/tests/*.test.mjs
 ```
 
-They run against the module that was just built, under node, with the null and manual sinks: the
-generated table against the module's real exports, engine lifecycle and the commit model on the null
-sink, and a manual-sink render that pins laterality and the frame slab against real samples.
+Under ctest they run against the module that the build tree linked last. ctest sets
+`BWA_WEB_MODULE` and `BWA_WEB_SRC` for that. Run by hand without those variables,
+`tests/helper.mjs` falls back to `dist/`, so the tests check the last staged build. They run under
+node, with the null and manual sinks: the generated table against the module's real exports, engine
+lifecycle and the commit model on the null sink, and a manual-sink render that pins laterality and
+the frame slab against real samples.
 `constants.test.mjs` needs no module: it pins `MAX_CHANNELS` and `DEFAULT_GRID` in the generated
 table, so a header edit the generator cannot parse fails a test instead of handing a page
 `undefined`.

@@ -275,7 +275,8 @@ if any of:
 - the file cannot be opened or is not valid JSON;
 - `speakers` is missing or not an array, or an entry is not an object;
 - `speakers.length` is outside `4..64` (`4..BWA_MAX_CHANNELS`);
-- an `index` is missing or non-numeric, or the indices are not a permutation of `0..N-1`;
+- an `index` is missing or non-numeric, or the indices are not a permutation of `0..N-1`
+  (the loader truncates a fractional speaker `index` toward zero, so `2.7` reads as 2);
 - a `position` is missing or not three entries, or a component is non-numeric, non-finite,
   or beyond ±1000 m;
 - `dbap.rolloff_r` is a number ≤ 0, `dbap.distance_attenuation.reference_distance_m` or
@@ -305,7 +306,8 @@ if any of:
   that is not full1, full2, full3 or one of 1H, 2H, 2H1V, 3H, 3H1V, 3H2V (a bare "full" is
   refused with its own message), two decoders for one set, no full-order decoder, an `hf` (or
   `lf`) that does not have exactly one row per speaker, a row without a numeric `index` and 16
-  `gains`, an index out of range or repeated, a gain that is non-numeric, non-finite or beyond
+  `gains`, a row index that is fractional, out of range or repeated (unlike a speaker
+  `index`, which the loader truncates), a gain that is non-numeric, non-finite or beyond
   ±1e4, a nonzero gain in a column outside the decoder's set (above its order for a full
   decoder), an `lf` without an `xover_hz` in `[100, 4000]`, or an `xover_hz` without an `lf`.
 

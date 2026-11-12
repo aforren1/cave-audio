@@ -617,7 +617,8 @@ BWA_API uint64_t bwa_get_dsp_time_frames(bwa_engine* e);
  * your own monotonic clock and refresh the offset per frame (clocks drift ~ppm). Returns false
  * (outputs untouched) until a host-stamped block renders; the manual sink stamps a nominal,
  * wall-free time (exact for arithmetic, not real wall time). Lock-free.
- * Full recipe (epochs, graphics-side events, Unity helpers): docs/api.md, "Syncing with graphics". */
+ * Full recipe (epochs, graphics-side events, Unity helpers): docs/api.md,
+ * "Land a sound on a visual event". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
 /* A direct read of the clock bwa_get_clock's host_time_ns is stamped with: nanoseconds, the same
  * BACKEND-DEFINED epoch, monotonic, only DIFFERENCES mean anything. Engine-free - no handle, so it
@@ -633,7 +634,7 @@ BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* ho
  * one sandwich is enough, and you can repeat it whenever you want a tighter bound or a fresh
  * anchor. The alternative, a decaying max over the per-block bwa_get_clock stamps, stays valid and
  * is the fallback for a caller who cannot reach this call (an older DLL, or a host whose clock is
- * only readable from another process). See docs/api.md, "Syncing with graphics".
+ * only readable from another process). See docs/api.md, "Land a sound on a visual event".
  *
  * Whether your own clock IS this clock: on Windows and macOS most "high-resolution" clocks are,
  * because there is only one such counter (Python time.perf_counter is QPC on Windows and mach on
@@ -1498,10 +1499,11 @@ BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
 BWA_API void     bwa_set_tracked_directivity(bwa_engine* e, bool on);
 
 /* Tracked listener alignment (OFF by default). The layout's per-speaker delay and gain trims align
- * the array's arrival times at ONE point, the array centroid, so the array is time-coherent there and
- * progressively less so as the listener walks away. Turn this on and the output stage re-references
- * that alignment onto the TRACKED listener instead: per speaker it adds the propagation delay and the
- * 1/r level for |speaker - listener| against |speaker - centroid|, so coherence follows the head.
+ * the array's arrival times at ONE point, the layout's listening point (listening_point_m, else the
+ * array centroid), so the array is time-coherent there and progressively less so as the listener
+ * walks away. Turn this on and the output stage re-references that alignment onto the TRACKED
+ * listener instead: per speaker it adds the propagation delay and the 1/r level for
+ * |speaker - listener| against |speaker - listening point|, so coherence follows the head.
  * Purely geometric, downstream of every panner, and works with any of them.
  *
  * It is opt-in because a moving delay line is a resampling event. A walking listener means every
@@ -1520,8 +1522,8 @@ BWA_API void     bwa_set_tracked_directivity(bwa_engine* e, bool on);
  *                       trade the default takes deliberately. Raise it for tighter tracking of a fast
  *                       listener, and expect to hear it.
  *
- * Corrections saturate about 4 m from the centroid (the reserved delay headroom) and the per-speaker
- * level trim is clamped to +/-6 dB. Off is exact: the trims revert to the layout's own values, and
+ * Corrections saturate about 4 m from the listening point (the reserved delay headroom) and the
+ * per-speaker level trim is clamped to +/-6 dB. Off is exact: the trims revert to the layout's own values, and
  * toggling either way glides rather than steps. Control thread, per-frame-safe, live A/B.
  *
  * The enable and its guards are SEPARATE calls, the same split as bwa_set_limiter /
@@ -1702,9 +1704,9 @@ BWA_API uint32_t bwa_bed_decode_matrix(const char* layout_path, bwa_bed_decoder 
  * right ear is at -x). The origin sits ON THE FLOOR at the working-area center
  * (x/z) - Motive's ground-plane calibration - so OptiTrack rigid-body poses pass
  * through unchanged and y is height above the floor. The engine's world-locked
- * decodes reference the ARRAY CENTROID (the nominal listening point, also the
- * default listener position), not the origin, so nothing breaks if a survey
- * places the origin elsewhere. */
+ * decodes reference the layout's LISTENING POINT (listening_point_m, else the
+ * array centroid; also the default listener position), not the origin, so
+ * nothing breaks if a survey places the origin elsewhere. */
 /* The identity-listener basis, as data - derive "forward"/"right" from these
  * (the engine's own orientation seams do) rather than re-hardcoding the
  * convention. An identity quaternion's ahead is BWA_ROOM_AHEAD, etc.

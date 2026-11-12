@@ -42,6 +42,7 @@ classdef Const
         SINK_FLAG_EXCLUSIVE    = 1
         SINK_FLAG_EXACT_RATE   = 2
         SINK_FLAG_TIGHT_BUFFER = 4
+        SINK_FLAG_DEEP_BUFFER  = 8      % browser sink only; a no-op on desktop backends
 
         % Result codes (bwa_result).
         OK           = 0

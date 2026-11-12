@@ -120,6 +120,8 @@ Four core pieces:
 
 The rest of the Runtime folder:
 
+- `SourceBase`: the abstract base of `Emitter` and `PushEmitter`. It holds the source lifecycle,
+  the per-frame transform push and every `bwa_source_*` setting that applies to any voice.
 - `AmbisonicBed`: a world-locked AmbiX soundfield component over `bwa_bed_*`.
 - `PushEmitter`: a positional source you feed PCM (see "Procedural (push) sources" below).
 - `AcousticGeometry` and `DynamicAcousticGeometry`: mark a mesh as occluding and reflecting
@@ -128,7 +130,11 @@ The rest of the Runtime folder:
   coefficients.
 - `RoomConstraints`: draws the surveyed room (truss, screen cube, projectors) in the scene view,
   from the same `constraints.json` the C++ tools read. Scene view only, no audio.
+- `RoomView`: draws the `RoomConstraints` boxes as wireframes in a build, for use inside the CAVE.
+  It still draws when the engine fails to start.
 - `SpeakerView`: one unlit marker per speaker, lit by its live output, for use inside the CAVE.
+- `UnlitMaterial`: an internal helper that makes one unlit material for the active render
+  pipeline. `RoomView` and `SpeakerView` use it.
 - `ClipAttribute`: marks a string field as a StreamingAssets path.
 
 Editor side:
