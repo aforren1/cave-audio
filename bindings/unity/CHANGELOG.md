@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.20.2]
+
 Bump for MacOS fixes for calibration.
 
 ## [0.20.1]
