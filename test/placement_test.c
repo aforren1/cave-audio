@@ -497,6 +497,14 @@ static void test_keys(void) {
     CHECK(place_key_action('f', PLACE_MOVING) == PLACE_KEY_FORCE, "key: f overrides a shut gate");
     CHECK(place_key_action('F', PLACE_MOVING) == PLACE_KEY_FORCE, "key: F overrides a shut gate");
     CHECK(place_key_action('f', PLACE_OK) == PLACE_KEY_GO, "key: f on an open gate is a clean start, not a forced one");
+    /* one pass's keys: an Enter starts only when the gate was ALREADY open the pass before */
+    CHECK(place_keys_action(1, 0, PLACE_OK, 1) == PLACE_KEY_GO, "keys: Enter on a gate that was open starts");
+    CHECK(place_keys_action(1, 0, PLACE_OK, 0) == PLACE_KEY_NONE, "keys: an Enter read on the pass the gate opens was sent before it: spent");
+    CHECK(place_keys_action(1, 0, PLACE_MOVING, 1) == PLACE_KEY_NONE, "keys: Enter on a gate that just shut does nothing");
+    CHECK(place_keys_action(0, 0, PLACE_OK, 1) == PLACE_KEY_NONE, "keys: no key");
+    CHECK(place_keys_action(0, 1, PLACE_MOVING, 0) == PLACE_KEY_FORCE, "keys: F overrides a shut gate at once");
+    CHECK(place_keys_action(1, 1, PLACE_MOVING, 0) == PLACE_KEY_FORCE, "keys: F beside an Enter is still the override");
+    CHECK(place_keys_action(0, 1, PLACE_NO_POSE, 0) == PLACE_KEY_ABORT, "keys: F with no pose aborts");
     CHECK(place_key_action('f', PLACE_NO_POSE) == PLACE_KEY_ABORT, "key: f with no pose aborts");
     CHECK(place_key_action('\r', PLACE_NO_POSE) == PLACE_KEY_NONE, "key: Enter with no pose does nothing");
 }

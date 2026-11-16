@@ -156,6 +156,12 @@ PlaceKey place_key_action(int key, PlaceState st) {
     return PLACE_KEY_NONE;
 }
 
+PlaceKey place_keys_action(int saw_enter, int saw_f, PlaceState st, int was_open) {
+    if (saw_f) return place_key_action('f', st);
+    if (saw_enter && st == PLACE_OK && was_open) return PLACE_KEY_GO;
+    return PLACE_KEY_NONE;
+}
+
 PlaceState place_gate_update_q(PlaceGate* g, double t, const float center[3], const float q[4], const float target[3]) {
     if (!g) return PLACE_NO_POSE;
     double uq[4];

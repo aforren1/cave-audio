@@ -234,6 +234,51 @@ int os_remove(const char* utf8_path) {
     return DeleteFileW(w) ? 0 : 1;
 }
 
+int os_replace(const char* utf8_from, const char* utf8_to) {
+    wchar_t a[OS_PATH_WIDE_MAX], b[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_from, a, OS_PATH_WIDE_MAX) != 0 || os_utf8_to_wide(utf8_to, b, OS_PATH_WIDE_MAX) != 0) return 1;
+    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING) ? 0 : 1;
+}
+
+int os_path_kind(const char* utf8_path) {
+    wchar_t w[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_path, w, OS_PATH_WIDE_MAX) != 0) return OS_PATH_OTHER;
+    const DWORD a = GetFileAttributesW(w);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        const DWORD e = GetLastError();
+        /* Only these two say "nothing there". A sharing violation or a denied access is something there, and
+         * so is everything that means "could not look": an unreachable share (ERROR_BAD_NETPATH,
+         * ERROR_BAD_NET_NAME, ERROR_NETNAME_DELETED) must refuse a run, not read as a free path, and a
+         * name the OS rejects (ERROR_INVALID_NAME) is not a place to write either. */
+        return (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? OS_PATH_NONE : OS_PATH_OTHER;
+    }
+    return (a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) ? OS_PATH_OTHER : OS_PATH_FILE;
+}
+
+int os_move_new(const char* utf8_from, const char* utf8_to) {
+    wchar_t a[OS_PATH_WIDE_MAX], b[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_from, a, OS_PATH_WIDE_MAX) != 0 || os_utf8_to_wide(utf8_to, b, OS_PATH_WIDE_MAX) != 0) return 1;
+    /* no MOVEFILE_REPLACE_EXISTING: it fails on an existing file (or directory) */
+    return MoveFileExW(a, b, 0) ? 0 : 1;
+}
+
+int os_same_file(const char* utf8_a, const char* utf8_b) {
+    wchar_t w[2][OS_PATH_WIDE_MAX];
+    BY_HANDLE_FILE_INFORMATION fi[2];
+    if (os_utf8_to_wide(utf8_a, w[0], OS_PATH_WIDE_MAX) != 0 || os_utf8_to_wide(utf8_b, w[1], OS_PATH_WIDE_MAX) != 0) return 0;
+    for (int i = 0; i < 2; ++i) {
+        /* no access asked for, every sharing allowed: this must not get in the way of anyone's rename */
+        HANDLE h = CreateFileW(w[i], 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        const BOOL ok = GetFileInformationByHandle(h, &fi[i]);
+        CloseHandle(h);
+        if (!ok) return 0;
+    }
+    return fi[0].dwVolumeSerialNumber == fi[1].dwVolumeSerialNumber &&
+           fi[0].nFileIndexHigh == fi[1].nFileIndexHigh && fi[0].nFileIndexLow == fi[1].nFileIndexLow;
+}
+
 int os_rmdir(const char* utf8_path) {
     wchar_t w[OS_PATH_WIDE_MAX];
     if (os_utf8_to_wide(utf8_path, w, OS_PATH_WIDE_MAX) != 0) return 1;

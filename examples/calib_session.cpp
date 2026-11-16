@@ -486,6 +486,9 @@ static std::string track_flags(const Session& S) {
         if (!I.nn_server.empty()) c += " --natnet-server " + I.nn_server;
         if (!I.nn_multicast.empty()) c += " --natnet-multicast " + I.nn_multicast;
         if (!I.nn_local.empty()) c += " --natnet-local " + I.nn_local;
+        /* the tool's stdin is this runner's pipe, and Send Enter writes down it: without the flag the tool
+         * cannot know an Enter is coming and counts 5 s instead of waiting for the operator to leave */
+        c += " --place-wait-enter";
     } else return c;
     c += " --place-timeout " + std::to_string(I.place_timeout_s > 0 ? I.place_timeout_s : 300);
     return c;
@@ -533,6 +536,37 @@ static std::string survey_flags(const Session& S, bool mic_ok, const float ref[3
     return c;
 }
 
+SesResume ses_localize_resume(const Session& S, int* done, int* rows, std::string* why) {
+    if (done) *done = 0;
+    if (rows) *rows = 0;
+    if (why) why->clear();
+    if (S.folder.empty()) return SES_RESUME_NONE;
+    const std::string path = ses_join(S.folder, SES_LOCALIZE_RANGES);
+    /* the file's header, parsed again only when the file changed (its size and write time) */
+    struct Peek { std::string path; unsigned long long size = 0, mtime = 0; bool ok = false; int ver = 0, rows = 0, done = 0, sim = -1; };
+    static Peek P;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(wide(path).c_str(), GetFileExInfoStandard, &a)) return SES_RESUME_NONE;
+    const unsigned long long size = ((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    const unsigned long long mt = ((unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+    if (P.path != path || P.size != size || P.mtime != mt) {
+        P.path = path; P.size = size; P.mtime = mt;
+        P.ok = calib_ranges_peek(path.c_str(), &P.ver, NULL, &P.rows, &P.done, &P.sim) != 0;
+    }
+    if (!P.ok) return SES_RESUME_NONE;       /* not a file the tool can read: a fresh run sets it aside */
+    if (done) *done = P.done;
+    if (rows) *rows = P.rows;
+    if (!(P.done > 0 && P.done < P.rows)) return SES_RESUME_NONE;
+    /* the one thing the tab checks for the user: a rehearsal's rows are not resumed by a rig run, nor the
+     * reverse (the tool would refuse it). Whether the plan, the rows or the mount changed is theirs to know:
+     * Start over is one click. */
+    if (P.ver == CALIB_RANGES_VERSION && (P.sim < 0 || !P.sim == !S.simulate)) return SES_RESUME_OK;
+    if (why) *why = P.ver != CALIB_RANGES_VERSION ? "it is version " + std::to_string(P.ver) + " of the ranges file"
+                  : P.sim ? "its captures are simulated and this session is on the rig"
+                          : "its captures are the rig's and this session is simulated";
+    return SES_RESUME_MISMATCH;
+}
+
 bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, std::vector<SesFile>* consumed,
                  std::string* why) {
     consumed->clear();
@@ -569,6 +603,11 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         c = quote(T.calibrate) + " --layout " + quote(plan) + " --out as_built.json --zylia --localize " + quote(rows);
         c += device_flags(S, consumed) + track_flags(S);
         if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + I.mount_offset;
+        /* A run that stopped partway is resumed, not repeated, when its file has this command's simulate
+         * flag and the current version (ses_localize_resume). The ranges file is NOT a consumed input. The step rewrites it itself, so its hash
+         * recorded at the start would read the step stale against its own output the moment it passed;
+         * and what a later step consumes is as_built.json, which carries the result. */
+        if (!S.localize_start_over && ses_localize_resume(S, NULL, NULL, NULL) == SES_RESUME_OK) c += " --ranges-in " SES_LOCALIZE_RANGES;
         use_input("plan", plan, consumed);
         use_input("localize_rows", rows, consumed);
         break;
@@ -650,6 +689,7 @@ void ses_begin(Session* S, int k, const std::string& cmd, const std::vector<SesF
     P.started = ses_now();
     P.command = cmd;
     P.consumed = consumed;
+    if (k == SES_LOCALIZE) S->localize_start_over = false;   /* it was a choice about this run */
 }
 
 void ses_skip(Session* S, int k, const std::string& note) {

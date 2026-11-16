@@ -8,7 +8,11 @@
 #                 delay_ms +0.5 ms and another's gain_db -3 dB: exactly those two flagged, exit 3.
 #   verify_zylia  the same pair with the ZM-1 as the mic for both the trims and the verify pass.
 #   zylia_trims   --zylia --trims end to end; its written trims must match the omni run's.
-#   aim_sheet     --aim-sheet on the layout plus a listening point and one mis-aimed speaker.
+#   aim_sheet     --aim-sheet on the layout plus a listening point and one mis-aimed speaker. Also the
+#                 --localize ranges file (untracked, six rows): the per-row checks, --solve-only, a refused
+#                 fit, --retake at a moved target, a resume and its refusals, --exclude, a stopped retake,
+#                 one measured bad capture, a file in the way set aside, simulated rows kept from a rig
+#                 run's, the ranges file named as another of the run's files, and a write that fails.
 #   live_zylia    --live N --zylia --simulate: a speaker moved 10 cm reads back as moved, and the move it
 #                 is told is the opposite one in room words (room-right is -x), on all three axes; a
 #                 layout with a plan_position is read against the PLAN, not the position; a speaker
@@ -24,7 +28,11 @@
 #   track_settle  --zylia --trims --track-sim --mount-offset x,y,z: waits (HOLD, then OK), takes the measured
 #                 center, which is the simulated stand's TRUE center and not the target, and solves there.
 #   track_ring    the same with --mount-offset ring (the simulated MODELDEF's uneven marker ring).
-#   track_bump    the stand knocked 15 mm mid-run: exit 4, the bump message, nothing written.
+#   track_bump    the stand knocked 15 mm mid-run: exit 4, the bump message, nothing written. A --localize
+#                 run knocked in row 3 keeps rows 1 and 2 in its ranges file. And --place-wait-enter down a
+#                 real pipe (--track-sim-rig-wait, a parent process as the first of a pipeline): an Enter
+#                 sent before the gate opens is spent and one after it starts the sweeps, none ends in the
+#                 timeout, a closed pipe aborts, no flag counts 5 s.
 #   track_refuse  the refusals: the tracked --zylia survey without a body-frame survey (and with a room-axes
 #                 one), the live position readout without one (the tilt meter still runs), stray flags.
 #   track_survey  a body-frame survey (offset + table): the tracked position survey lands every speaker.
@@ -448,32 +456,349 @@ elseif(MODE STREQUAL "aim_sheet")
     message(FATAL_ERROR "calibrate_cli_test: speaker 5's row is wrong: ${r5}")
   endif()
 
-  # A failed trilateration leaves the speaker where the file had it. Five COLLINEAR mic rows make
-  # every solve degenerate; the tool used to write (0,0,0), a confident position the engine would
-  # then render from.
+  # Five COLLINEAR mic rows make every solve degenerate. The tool first wrote (0,0,0), then exited 0 with the
+  # layout it was given written out as if measured. With no speaker solved there is nothing to write: exit 1,
+  # no file.
   file(WRITE "${WORK}/line.txt" "0 1.5 0\n0.3 1.5 0\n0.6 1.5 0\n0.9 1.5 0\n1.2 1.5 0\n")
-  run(degen 0 --layout "${LAYOUT}" --out degen.json --simulate --localize line.txt)
-  if(NOT "${degen_OUT}" MATCHES "failed ones left as they were")
-    message(FATAL_ERROR "calibrate_cli_test: degen: the solves did not fail as planned (log: ${WORK}/degen.log)")
+  run(degen 1 --layout "${LAYOUT}" --out degen.json --simulate --localize line.txt)
+  file(READ "${WORK}/degen.log" dl)
+  if(NOT dl MATCHES "spk  0: trilateration failed" OR
+     NOT dl MATCHES "localize: REFUSED: no speaker could be solved, so nothing is written to degen\\.json")
+    message(FATAL_ERROR "calibrate_cli_test: degen: the solves did not fail and refuse as planned (log: ${WORK}/degen.log)")
   endif()
-  file(READ "${WORK}/degen.json" dj)
-  string(JSON n LENGTH "${js}" speakers)
-  math(EXPR last "${n} - 1")
-  foreach(k RANGE ${last})
-    string(JSON want GET "${js}" speakers ${k} position)
-    string(JSON got  GET "${dj}" speakers ${k} position)
-    string(REGEX REPLACE "[ \n\t]" "" want "${want}")
-    string(REGEX REPLACE "[ \n\t]" "" got "${got}")
-    foreach(a 0 1 2)
-      string(JSON wa GET "${want}" ${a})
-      string(JSON ga GET "${got}" ${a})
-      to_milli(mw "${wa}")
-      to_milli(mg "${ga}")
-      if(NOT mw EQUAL mg)
-        message(FATAL_ERROR "calibrate_cli_test: degen: speaker ${k} was moved from ${want} to ${got} by a failed solve")
+  if(EXISTS "${WORK}/degen.json")
+    message(FATAL_ERROR "calibrate_cli_test: degen: a layout was written from rows that solved nothing")
+  endif()
+
+  # ---- the localize ranges file ----
+  # Six rows; the simulator plays from LAYOUT, so loc_positions checks against the truth. Rows 1 and 2 sit 77 mm
+  # apart: that is what gives the row-pair check a tight bound at row 2 (the bad-capture case below).
+  file(WRITE "${WORK}/rows6.txt" "0 1.45 0\n0.05 1.42 0.05\n-0.9 1.8 0.9\n-0.9 1.0 -0.9\n0.9 1.8 -0.9\n0.9 1.0 0.9\n")
+  run(rg 0 --layout "${LAYOUT}" --out rg.json --simulate --localize rows6.txt)
+  expect(rg "localize: the captures are kept in rg\\.ranges\\.json" "the ranges file is named after --out")
+  expect(rg "localize: capture row 1 speaker 0: [0-9.]+ m \\([0-9.]+ s\\), snr [0-9.]+ dB, 2 sweep" "a line per capture, two sweeps")
+  expect(rg "localize: row 2 check: every speaker's range change fits" "the row-pair check runs from row 2")
+  expect(rg "localize: row 5 fit: [0-9]\\.[0-9] mm RMS over the 5 rows so far; captures past 10 mm \\(every row so far\\): none"
+         "the running fit starts at row 5, over every row so far")
+  expect(rg "localize: row 6 fit: [0-9]\\.[0-9] mm RMS over the 6 rows so far; captures past 10 mm \\(this row, and earlier ones new to the list\\): none"
+         "the running fit goes on at row 6")
+  loc_positions(rg rg.json)
+  file(READ "${WORK}/rg.ranges.json" jr0)
+
+  # --solve-only: the same solve from the file, no audio, the same positions to the digit
+  run(rgs 0 --layout "${LAYOUT}" --out rgs.json --simulate --localize rows6.txt --ranges-in rg.ranges.json --solve-only)
+  expect(rgs "localize: 6 of 6 row\\(s\\) kept from rg\\.ranges\\.json" "every row comes from the file")
+  if(rgs_OUT MATCHES "capture row" OR rgs_OUT MATCHES "captures are kept in")
+    message(FATAL_ERROR "calibrate_cli_test: rgs: --solve-only measured something, or said it keeps captures (log: ${WORK}/rgs.log)")
+  endif()
+  file(READ "${WORK}/rg.json" ja)
+  file(READ "${WORK}/rgs.json" jb)
+  foreach(k RANGE 25)
+    string(JSON pa GET "${ja}" speakers ${k} position)
+    string(JSON pb GET "${jb}" speakers ${k} position)
+    if(NOT pa STREQUAL pb)
+      message(FATAL_ERROR "calibrate_cli_test: rgs: speaker ${k} solved to ${pb} from the file, ${pa} live")
+    endif()
+  endforeach()
+
+  # A row whose captures are meters off: the fit misses by far more than the 50 mm limit, so nothing is written
+  set(jr "${jr0}")
+  foreach(sp 0 2 4 6 8 10 12 14 16 18 20 22 24)
+    string(JSON jr SET "${jr}" captures 2 arrival_s ${sp} "0.030000000")
+  endforeach()
+  file(WRITE "${WORK}/bad.ranges.json" "${jr}")
+  run(rgbad 1 --layout "${LAYOUT}" --out rgbad.json --simulate --localize rows6.txt --ranges-in bad.ranges.json --solve-only)
+  file(READ "${WORK}/rgbad.log" lb)
+  if(NOT lb MATCHES "localize: REFUSED: the fit misses the captures by [0-9]+ mm RMS" OR EXISTS "${WORK}/rgbad.json")
+    message(FATAL_ERROR "calibrate_cli_test: rgbad: a fit that misses the captures was not refused, or was written (log: ${WORK}/rgbad.log)")
+  endif()
+  # Arrivals that fit no geometry (12 ms plus ((3 s + 7 k) mod 11) x 2 ms): the joint solve does not converge
+  # and each speaker's own solve does. Those positions are for diagnosis: nothing is written.
+  set(jgarb "${jr0}")
+  foreach(k RANGE 5)
+    foreach(sp RANGE 25)
+      math(EXPR ms "12 + ((3 * ${sp} + 7 * ${k}) % 11) * 2")
+      string(JSON jgarb SET "${jgarb}" captures ${k} arrival_s ${sp} "0.0${ms}")
+    endforeach()
+  endforeach()
+  file(WRITE "${WORK}/garb.ranges.json" "${jgarb}")
+  run(rgfb 1 --layout "${LAYOUT}" --out rgfb.json --simulate --localize rows6.txt --ranges-in garb.ranges.json --solve-only)
+  file(READ "${WORK}/rgfb.log" lg)
+  if(lg MATCHES "trilateration failed" OR NOT lg MATCHES "localize: REFUSED: the joint solve did not converge, so nothing is written to rgfb\\.json" OR
+     EXISTS "${WORK}/rgfb.json")
+    message(FATAL_ERROR "calibrate_cli_test: rgfb: the per-speaker fallback must be refused and not written (log: ${WORK}/rgfb.log)")
+  endif()
+
+  # --retake 3 on the file with the bad row: only row 3 is measured, and the solve recovers.
+  # - Row 3's target is MOVED in the rows file: the retaken row is measured at the new target and records it.
+  # - Speaker 5 is excluded: its old row-3 capture belongs to the old mic position and must go.
+  # - --ranges-out names the file that was read under another spelling: it is still that file, so it is
+  #   COPIED aside (to the first free <name>.1.json) and left in place, not moved away as another run's.
+  file(WRITE "${WORK}/retake.ranges.json" "${jr}")
+  file(WRITE "${WORK}/rows6b.txt" "0 1.45 0\n0.05 1.42 0.05\n-0.8 1.7 0.8\n-0.9 1.0 -0.9\n0.9 1.8 -0.9\n0.9 1.0 0.9\n")
+  run(rgre 0 --layout "${LAYOUT}" --out rgre.json --simulate --localize rows6b.txt --ranges-in retake.ranges.json --retake 3
+      --exclude 5 --ranges-out ./RETAKE.ranges.json)
+  expect(rgre "localize: measuring row\\(s\\) 3; the rest come from retake\\.ranges\\.json" "only row 3 is measured")
+  expect(rgre "is rewritten by this run: copied as it was to" "the file the run read is copied aside, whatever the spelling")
+  if(rgre_OUT MATCHES "capture row [12456] " OR rgre_OUT MATCHES "was there from another run: moved")
+    message(FATAL_ERROR "calibrate_cli_test: rgre: a row other than 3 was measured, or the file the run read was moved away (log: ${WORK}/rgre.log)")
+  endif()
+  file(READ "${WORK}/retake.ranges.1.json" jp)
+  if(NOT jp STREQUAL jr)
+    message(FATAL_ERROR "calibrate_cli_test: rgre: retake.ranges.1.json is not the file as the retake read it")
+  endif()
+  loc_positions(rgre rgre.json)
+  file(READ "${WORK}/retake.ranges.json" jq)
+  string(JSON nq LENGTH "${jq}" captures)
+  if(NOT nq EQUAL 6)
+    message(FATAL_ERROR "calibrate_cli_test: rgre: the ranges file holds ${nq} rows, not 6")
+  endif()
+  set(wantmic -800 1700 800)
+  foreach(a 0 1 2)
+    list(GET wantmic ${a} wm)
+    foreach(key mic planned)
+      string(JSON v GET "${jq}" captures 2 ${key} ${a})
+      to_milli(vm "${v}")
+      if(NOT vm EQUAL wm)
+        message(FATAL_ERROR "calibrate_cli_test: rgre: row 3's ${key}[${a}] in the ranges file is ${v}, the retake's target is ${wm} mm")
       endif()
     endforeach()
   endforeach()
+  string(JSON told TYPE "${jq}" captures 2 arrival_s 5)
+  string(JSON tkept TYPE "${jq}" captures 0 arrival_s 5)
+  if(NOT told STREQUAL "NULL" OR NOT tkept STREQUAL "NUMBER")
+    message(FATAL_ERROR "calibrate_cli_test: rgre: row 3 speaker 5 is ${told} (want NULL: excluded from the retake, its old capture dropped), row 1 speaker 5 ${tkept} (want NUMBER)")
+  endif()
+  # the retaken file solves with no audio; the rows file still has row 3's OLD target, which is only warned about
+  run(rgre2 0 --layout "${LAYOUT}" --out rgre2.json --simulate --localize rows6.txt --ranges-in retake.ranges.json --solve-only
+      --exclude 5)
+  expect(rgre2 "WARNING: row 3's target in rows6\\.txt is 173 mm from the one in retake\\.ranges\\.json" "a kept row's moved target is warned about")
+  loc_positions(rgre2 rgre2.json)
+
+  # Resume: a run canceled before row 4 left a file without it. --ranges-in alone measures the missing row only.
+  string(JSON jres REMOVE "${jr0}" captures 3)
+  file(WRITE "${WORK}/resume.ranges.json" "${jres}")
+  run(rgres 0 --layout "${LAYOUT}" --out rgres.json --simulate --localize rows6.txt --ranges-in resume.ranges.json)
+  expect(rgres "localize: 5 of 6 row\\(s\\) kept from resume\\.ranges\\.json" "five rows come from the file")
+  expect(rgres "localize: measuring row\\(s\\) 4; the rest come from resume\\.ranges\\.json" "only the missing row is measured")
+  if(rgres_OUT MATCHES "capture row [12356] ")
+    message(FATAL_ERROR "calibrate_cli_test: rgres: a row the file already held was measured (log: ${WORK}/rgres.log)")
+  endif()
+  loc_positions(rgres rgres.json)
+  # A resume never measures a row again unasked. One capture of row 3 is missing (a null, as a failed capture
+  # leaves): measuring row 3 again would discard its other 25, in place. Refused, by row and speaker; the file
+  # is not touched. (Naming the row in --retake is the way through: the case above.)
+  string(JSON jnull SET "${jr0}" captures 2 arrival_s 9 null)
+  file(WRITE "${WORK}/null.ranges.json" "${jnull}")
+  run(rgnull 2 --layout "${LAYOUT}" --out rgnull.json --simulate --localize rows6.txt --ranges-in null.ranges.json)
+  file(READ "${WORK}/rgnull.log" ln)
+  if(NOT ln MATCHES "row 3: no capture of speaker\\(s\\) 9\n" OR NOT ln MATCHES "--exclude <speakers>.*--retake <rows>" OR rgnull_OUT MATCHES "capture row")
+    message(FATAL_ERROR "calibrate_cli_test: rgnull: the refusal does not name row 3, speaker 9 and the two ways out, or it measured (log: ${WORK}/rgnull.log)")
+  endif()
+  file(READ "${WORK}/null.ranges.json" jq)
+  if(NOT jq STREQUAL jnull OR EXISTS "${WORK}/rgnull.json")
+    message(FATAL_ERROR "calibrate_cli_test: rgnull: a refused resume changed the ranges file or wrote a layout")
+  endif()
+
+  # --exclude: never swept, never solved; the raw table says so. The layout here has speaker 3 half a meter off
+  # where the simulator plays it from (--sim-truth), so "keeps the layout's position" and "solved" differ.
+  # --ranges-out: the captures go where told, and nowhere else. --check-aim: no row for an excluded speaker.
+  file(READ "${LAYOUT}" jl)
+  string(JSON x3 GET "${jl}" speakers 3 position 0)
+  to_milli(x3m "${x3}")
+  math(EXPR x3moved "${x3m} + 500")
+  if(x3m LESS 0)
+    message(FATAL_ERROR "calibrate_cli_test: rgex: the fixture's speaker 3 sits at x ${x3}; this test writes x + 0.5 m and needs x >= 0")
+  endif()
+  math(EXPR x3i "${x3moved} / 1000")
+  math(EXPR x3f "${x3moved} % 1000 + 1000")
+  string(SUBSTRING "${x3f}" 1 3 x3f)               # three digits, leading zeros kept
+  string(JSON jx SET "${jl}" speakers 3 position 0 "${x3i}.${x3f}")
+  file(WRITE "${WORK}/plan_ex.json" "${jx}")
+  run(rgex 0 --layout plan_ex.json --sim-truth "${LAYOUT}" --out rgex.json --simulate --localize rows6.txt --exclude 3,14
+      --ranges-out told.json --check-aim)
+  expect(rgex "  raw  3:  +-  +-  +-  +-  +-  +-   \\(excluded\\)" "speaker 3's raw line says excluded")
+  expect(rgex "localize: wrote 24 positions to rgex\\.json  \\(the excluded ones left as they were\\)" "24 written, 2 kept")
+  expect(rgex "localize: the captures are kept in told\\.json" "--ranges-out names the file")
+  string(REGEX MATCH "check-aim: fitted acoustic axis.*" aimtab "${rgex_OUT}")
+  if(rgex_OUT MATCHES "capture row [0-9]+ speaker (3|14):" OR NOT aimtab MATCHES "\n +4 +[0-9.]+ +[0-9.]+ " OR aimtab MATCHES "\n +(3|14) +[0-9.]+ +[0-9.]+ ")
+    message(FATAL_ERROR "calibrate_cli_test: rgex: an excluded speaker was swept, or has a row in the aim table (log: ${WORK}/rgex.log)")
+  endif()
+  if(NOT EXISTS "${WORK}/told.json" OR EXISTS "${WORK}/rgex.ranges.json")
+    message(FATAL_ERROR "calibrate_cli_test: rgex: --ranges-out told.json: the captures must be there and not in rgex.ranges.json")
+  endif()
+  file(READ "${WORK}/told.json" jtold)
+  string(JSON t3 TYPE "${jtold}" captures 5 arrival_s 3)
+  if(NOT t3 STREQUAL "NULL")
+    message(FATAL_ERROR "calibrate_cli_test: rgex: told.json holds a capture of excluded speaker 3 (${t3})")
+  endif()
+  file(READ "${WORK}/rgex.json" jo)
+  foreach(k RANGE 25)
+    set(d2 0)
+    foreach(a 0 1 2)
+      string(JSON pa GET "${jl}" speakers ${k} position ${a})
+      string(JSON pb GET "${jo}" speakers ${k} position ${a})
+      to_milli(ma "${pa}")
+      to_milli(mb "${pb}")
+      if(k EQUAL 3 AND a EQUAL 0)
+        set(ma ${x3moved})                       # speaker 3 must stay where plan_ex.json put it
+      endif()
+      math(EXPR d2 "${d2} + (${ma} - ${mb}) * (${ma} - ${mb})")
+    endforeach()
+    if((k EQUAL 3 AND d2 GREATER 1) OR d2 GREATER 9)
+      message(FATAL_ERROR "calibrate_cli_test: rgex: speaker ${k} is ${d2} mm^2 off (excluded speaker 3 must stay at the layout's moved position, the others land on the truth within 9)")
+    endif()
+  endforeach()
+  # --exclude on a resume: forgetting it reads every row as short of speakers 3 and 14. Refused, file untouched.
+  run(rgexno 2 --layout plan_ex.json --sim-truth "${LAYOUT}" --out rgexno.json --simulate --localize rows6.txt --ranges-in told.json)
+  file(READ "${WORK}/rgexno.log" ln)
+  file(READ "${WORK}/told.json" jq)
+  if(NOT ln MATCHES "row 6: no capture of speaker\\(s\\) 3 14\n" OR NOT jq STREQUAL jtold OR EXISTS "${WORK}/told.1.json")
+    message(FATAL_ERROR "calibrate_cli_test: rgexno: a resume without --exclude was not refused by row and speaker, or touched the file (log: ${WORK}/rgexno.log)")
+  endif()
+
+  # A retake of two rows that stops in the second. Rows 2 and 4 of the file are marked (a tilt no run writes),
+  # so the ORIGINAL rows are told from measured ones. A stray sweep far outside the window on every sweep of
+  # row 4's first speaker (sweeps 53 to 57: row 2 takes 52) stops the run there, exit 1. A row leaves the
+  # file only when its new captures are complete: the file holds six rows, row 2 the new one, row 4 still the
+  # original (it was once dropped the moment its retake began), and it still solves.
+  string(JSON jpart SET "${jr0}" captures 3 tilt_db 0 9.999)
+  string(JSON jpart SET "${jpart}" captures 1 tilt_db 0 8.888)
+  file(WRITE "${WORK}/part.ranges.json" "${jpart}")
+  string(JSON row4 GET "${jpart}" captures 3)
+  run(rgpart 1 --layout "${LAYOUT}" --out rgpart.json --simulate --localize rows6.txt --ranges-in part.ranges.json
+      --retake 2,4 --sim-interferer 53,54,55,56,57:0.05:6:sweep)
+  file(READ "${WORK}/rgpart.log" lp)
+  if(NOT lp MATCHES "capture row 2 speaker 25:" OR NOT lp MATCHES "localize stopped at speaker 0, position 4")
+    message(FATAL_ERROR "calibrate_cli_test: rgpart: the run did not retake row 2 and stop in row 4 (log: ${WORK}/rgpart.log)")
+  endif()
+  file(READ "${WORK}/part.ranges.json" jq)
+  string(JSON nq LENGTH "${jq}" captures)
+  string(JSON r4now GET "${jq}" captures 3)
+  string(JSON r2tilt GET "${jq}" captures 1 tilt_db 0)
+  if(NOT nq EQUAL 6 OR NOT r4now STREQUAL row4 OR r2tilt MATCHES "^8\\.888")
+    message(FATAL_ERROR "calibrate_cli_test: rgpart: after a retake stopped in row 4 the file must hold 6 rows (${nq}), row 4 the original, row 2 the new one (tilt ${r2tilt})")
+  endif()
+  run(rgpart3 0 --layout "${LAYOUT}" --out rgpart3.json --simulate --localize rows6.txt --ranges-in part.ranges.json --solve-only)
+  loc_positions(rgpart3 rgpart3.json)
+
+  # One BAD capture, measured: both checks must name it while the stand is still there. A stray sweep 12 dB over
+  # the speaker lands 0.40 m after speaker 7's true arrival at row 2, on both of its sweeps (sweeps 67 and 68:
+  # 26 speakers x 2 for row 1, then speakers 0 to 6), so the agreement rule passes it. Its time comes from the
+  # clean run's own arrival: t = arrival + (0.40 - 1.5427) / 343, the interferer playing from 1.5427 m off the
+  # mic (CALIB_SIM_INTF_OFFSET). The pair check names speaker 7 at row 2. The first fit there is, at row 5,
+  # names the capture by speaker AND row, first in its list, and row 6 does not name it again. The run then
+  # drops it and lands on the truth.
+  string(JSON a7 GET "${jr0}" captures 1 arrival_s 7)
+  if(NOT a7 MATCHES "^0\\.([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])")
+    message(FATAL_ERROR "calibrate_cli_test: rg: cannot read row 2 speaker 7's arrival '${a7}'")
+  endif()
+  math(EXPR tns "${CMAKE_MATCH_1} - 3331487 + 1000000000")   # ns; (0.40 - 1.5427) / 343 s = -3331487 ns
+  string(SUBSTRING "${tns}" 1 9 tns)                          # nine digits, leading zeros kept
+  run(rgbadcap 0 --layout "${LAYOUT}" --out rgbadcap.json --simulate --localize rows6.txt
+      --sim-interferer 67,68:0.${tns}:12:sweep)
+  expect(rgbadcap "localize: row 2 check: 1 speaker\\(s\\) changed range by more than the mic moved, against most of 1 earlier row\\(s\\): 7\n"
+         "the row-pair check names the bad capture's speaker at its row")
+  expect(rgbadcap "localize: row 3 check: every speaker's range change fits" "and no other row")
+  expect(rgbadcap "localize: row 5 fit: [0-9.]+ mm RMS over the 5 rows so far; captures past 10 mm \\(every row so far\\): speaker 7 row 2 \\(\\+[23][0-9][0-9] mm\\)"
+         "the first fit names the bad capture from an earlier row, largest first")
+  string(REGEX MATCH "localize: row 5 fit:[^\n]*" fit5 "${rgbadcap_OUT}")
+  string(REGEX MATCH "localize: row 6 fit:[^\n]*" fit6 "${rgbadcap_OUT}")
+  if(NOT fit5 MATCHES " and [0-9]+ smaller$" OR fit6 MATCHES "speaker 7 row 2" OR
+     NOT fit6 MATCHES "\\): speaker 7 row 6 \\(-[0-9]+ mm\\) speaker [0-9]+ row 2 \\(-1[0-9] mm\\)")
+    message(FATAL_ERROR "calibrate_cli_test: rgbadcap: the row 5 line must be cut at its limit, and the row 6 line name its own row's worst and the row 2 captures new to the list, but not speaker 7 row 2 again:\n${fit5}\n${fit6}")
+  endif()
+  expect(rgbadcap "localize: dropped speaker 7's capture at row 2" "the solve drops it")
+  loc_positions(rgbadcap rgbadcap.json)
+
+  # A file in the way is never overwritten. A fresh run finds six rows at its ranges path: they are moved to
+  # the next FREE <name>.N.json (.1 is taken here, so .2), byte for byte. The run then stops in row 2 (the
+  # stray sweep on sweeps 53 to 57), and its own file holds row 1: written after every row, not at the end.
+  file(WRITE "${WORK}/rot.ranges.json" "${jr0}")
+  file(WRITE "${WORK}/rot.ranges.1.json" "an older run's file\n")
+  run(rgrot 1 --layout "${LAYOUT}" --out rot.json --simulate --localize rows6.txt --sim-interferer 53,54,55,56,57:0.05:6:sweep)
+  expect(rgrot "localize: rot\\.ranges\\.json was there from another run: moved to rot\\.ranges\\.2\\.json" "the run says what it set aside")
+  file(READ "${WORK}/rot.ranges.json" jq)
+  string(JSON nq LENGTH "${jq}" captures)
+  file(READ "${WORK}/rot.ranges.1.json" g1)
+  file(READ "${WORK}/rot.ranges.2.json" g2)
+  if(NOT nq EQUAL 1 OR NOT g2 STREQUAL jr0 OR NOT g1 STREQUAL "an older run's file\n")
+    message(FATAL_ERROR "calibrate_cli_test: rgrot: the stopped run's file holds ${nq} row(s) (want 1), the six rows must be rot.ranges.2.json byte for byte, and rot.ranges.1.json untouched")
+  endif()
+
+  # Simulated captures and the rig's do not go in one file: a file that says it came from the rig is not added
+  # to by this simulated run (exit 2, untouched). --solve-only adds nothing and may read it.
+  string(JSON jrig SET "${jr0}" simulate false)
+  file(WRITE "${WORK}/rig.ranges.json" "${jrig}")
+  run(rgsim 2 --layout "${LAYOUT}" --out rgsim.json --simulate --localize rows6.txt --ranges-in rig.ranges.json --retake 3)
+  file(READ "${WORK}/rgsim.log" ls)
+  file(READ "${WORK}/rig.ranges.json" jq)
+  if(NOT ls MATCHES "rig\\.ranges\\.json holds the rig's captures and this run is simulated" OR NOT jq STREQUAL jrig OR rgsim_OUT MATCHES "capture row")
+    message(FATAL_ERROR "calibrate_cli_test: rgsim: the rig's captures under a simulated run were not refused, or the file was touched (log: ${WORK}/rgsim.log)")
+  endif()
+  run(rgsim2 0 --layout "${LAYOUT}" --out rgsim2.json --simulate --localize rows6.txt --ranges-in rig.ranges.json --solve-only)
+
+  # The ranges file must be none of the run's other files: the layout was written over the captures, or the
+  # captures replaced by a layout, with exit 0. Exit 2, nothing measured, every file as it was.
+  file(WRITE "${WORK}/coll.json" "not a ranges file yet\n")
+  run(rgcoll1 2 --layout "${LAYOUT}" --out coll.json --simulate --localize rows6.txt --ranges-out coll.json)
+  run(rgcoll2 2 --layout "${LAYOUT}" --out newout.json --simulate --localize rows6.txt --ranges-out ./NEWOUT.json)
+  file(WRITE "${WORK}/coll.ranges.json" "${jr0}")
+  run(rgcoll3 2 --layout "${LAYOUT}" --out coll.ranges.json --simulate --localize rows6.txt --ranges-in coll.ranges.json --solve-only)
+  file(WRITE "${WORK}/collayout.json" "${jl}")
+  run(rgcoll4 2 --layout collayout.json --out rgcoll4.json --simulate --localize rows6.txt --ranges-out collayout.json)
+  run(rgcoll5 2 --layout "${LAYOUT}" --out rgcoll5.json --simulate --localize rows6.txt --ranges-out rows6.txt)
+  foreach(c 1 2 3 4 5)
+    file(READ "${WORK}/rgcoll${c}.log" lc)
+    if(NOT lc MATCHES "the captures and that file would overwrite each other" OR rgcoll${c}_OUT MATCHES "capture row")
+      message(FATAL_ERROR "calibrate_cli_test: rgcoll${c}: a ranges file that is one of the run's other files was not refused in those words, unmeasured (log: ${WORK}/rgcoll${c}.log)")
+    endif()
+  endforeach()
+  file(READ "${WORK}/coll.json" c1)
+  file(READ "${WORK}/coll.ranges.json" c2)
+  file(READ "${WORK}/collayout.json" c3)
+  file(GLOB strays "${WORK}/coll*.1.json" "${WORK}/rows6.1.*" "${WORK}/newout.json" "${WORK}/rgcoll*.json")
+  if(NOT c1 STREQUAL "not a ranges file yet\n" OR NOT c2 STREQUAL jr0 OR NOT c3 STREQUAL jl OR strays)
+    message(FATAL_ERROR "calibrate_cli_test: rgcoll: a refused run changed a file, set one aside or wrote a layout (${strays})")
+  endif()
+
+  # A ranges file that cannot be written stops the run at that row, exit 1, saying so: here a folder that is not
+  # there, so row 1 is the row. And a folder AT the path is not a file to set aside: refused before measuring.
+  run(rgwfail 1 --layout "${LAYOUT}" --out rgwfail.json --simulate --localize rows6.txt --ranges-out nodir/x.json)
+  file(READ "${WORK}/rgwfail.log" lw)
+  if(NOT lw MATCHES "calibrate: row 1's captures could not be saved" OR NOT lw MATCHES "No row of this run is in the ranges file" OR
+     EXISTS "${WORK}/rgwfail.json" OR lw MATCHES "capture row 2 ")
+    message(FATAL_ERROR "calibrate_cli_test: rgwfail: a ranges file that cannot be written must stop the run after row 1, in those words, with no layout (log: ${WORK}/rgwfail.log)")
+  endif()
+  file(MAKE_DIRECTORY "${WORK}/isdir.json")
+  run(rgwdir 1 --layout "${LAYOUT}" --out rgwdir.json --simulate --localize rows6.txt --ranges-out isdir.json)
+  file(READ "${WORK}/rgwdir.log" lw)
+  if(NOT lw MATCHES "calibrate: isdir\\.json holds captures this run would overwrite, and they cannot be set aside" OR rgwdir_OUT MATCHES "capture row")
+    message(FATAL_ERROR "calibrate_cli_test: rgwdir: a folder at the ranges path was not refused before measuring (log: ${WORK}/rgwdir.log)")
+  endif()
+
+  # what the flags refuse. --retake names ROWS, counted from 1: the top row is 6, and 0 and 7 are refused in
+  # those words (it once went through the speaker-list parser, which counts from 0 and holds 64 entries).
+  run(rgnoin 2 --layout "${LAYOUT}" --simulate --localize rows6.txt --retake 3)
+  run(rgtrack 2 --layout "${LAYOUT}" --simulate --localize rows6.txt --ranges-in rg.ranges.json --solve-only --track-sim)
+  run(rgnoloc 2 --layout "${LAYOUT}" --simulate --exclude 3)
+  foreach(badrow 0 7 3,3)
+    run(rgrow 2 --layout "${LAYOUT}" --out rgrow.json --simulate --localize rows6.txt --ranges-in rg.ranges.json --retake ${badrow})
+    file(READ "${WORK}/rgrow.log" lr)
+    if(badrow STREQUAL "3,3")
+      set(wantmsg "calibrate: --retake '3,3' names row 3 twice")
+    else()
+      set(wantmsg "calibrate: --retake '${badrow}': rows are counted from 1 and run 1\\.\\.6")
+    endif()
+    if(NOT lr MATCHES "${wantmsg}")
+      message(FATAL_ERROR "calibrate_cli_test: --retake ${badrow}: no '${wantmsg}' (log: ${WORK}/rgrow.log)")
+    endif()
+  endforeach()
+  # every write goes through a .tmp that is moved onto its file, and a set-aside copy through one too: none is left
+  file(GLOB tmps "${WORK}/*.tmp")
+  if(tmps)
+    message(FATAL_ERROR "calibrate_cli_test: a ranges write left its .tmp behind: ${tmps}")
+  endif()
 
 elseif(MODE STREQUAL "live_zylia")
   # the rig's placement: the ZM-1 at the 4.75 ft listening point, which every default aim points at
@@ -836,6 +1161,89 @@ elseif(MODE STREQUAL "track_bump")
   run(clearcount 4 --layout "${LAYOUT}" ${SIM} --zylia --verify --track-sim --track-sim-bump 3 --place-clear-s 2)
   expect(clearcount "placement: clear the space: the sweeps start in 2 s" "the count is announced")
   expect(clearcount "OK +clear 1\\.[0-9]s" "the readout counts down")
+  # "Rewritten after every row" is about a run that does NOT finish. The stand is knocked after capture 60:
+  # row 3, speaker 7 (26 speakers a row). Exit 4, no layout, and the ranges file holds rows 1 and 2 whole.
+  file(WRITE "${WORK}/rows6.txt" "0 1.45 0\n0.9 1.0 0.9\n-0.9 1.8 0.9\n-0.9 1.0 -0.9\n0.9 1.8 -0.9\n0 1.2 1.1\n")
+  run(locbump 4 --layout "${LAYOUT}" --out locbump.json ${SIM} --localize rows6.txt --track-sim --track-sim-bump 60 --place-timeout 60)
+  if(EXISTS "${WORK}/locbump.json" OR NOT EXISTS "${WORK}/locbump.ranges.json")
+    message(FATAL_ERROR "calibrate_cli_test: locbump: a stopped run wrote a layout, or kept no ranges file")
+  endif()
+  file(READ "${WORK}/locbump.ranges.json" jq)
+  string(JSON nq LENGTH "${jq}" captures)
+  string(JSON r2 GET "${jq}" captures 1 row)
+  string(JSON t25 TYPE "${jq}" captures 1 arrival_s 25)
+  if(NOT nq EQUAL 2 OR NOT r2 EQUAL 2 OR NOT t25 STREQUAL "NUMBER")
+    message(FATAL_ERROR "calibrate_cli_test: locbump: stopped in row 3, the ranges file holds ${nq} rows (want rows 1 and 2, whole)")
+  endif()
+
+  # The Enter that arrives down a pipe (--place-wait-enter; calib_view's Send Enter). --track-sim-rig-wait
+  # makes the scripted stand wait as a rig stand does: wall-clock time, keys read, the rig's clear wait. The
+  # first process of each pipeline is the parent that holds stdin's pipe, and writes to it or does not.
+  # The tool's stdout is not visible to that parent, so the hook leaves marker files it can wait on:
+  # <marker>.armed when the placement starts reading keys, <marker> when the gate is open and the tool waits
+  # for Enter, <marker>.taken at the reading. No step below is timed against the wall clock except the two
+  # that test a timeout and a count.
+  set(STAND --layout "${LAYOUT}" --simulate --trims --track-sim)
+  set(ECHO "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E echo \"\")\n")
+  set(WAITFN "function(wait_for f)\n  set(n 0)\n  while(NOT EXISTS \"\${f}\" AND n LESS 900)\n    execute_process(COMMAND \"${CMAKE_COMMAND}\" -E sleep 0.2)\n    math(EXPR n \"\${n} + 1\")\n  endwhile()\nendfunction()\n")
+  # The early Enter must be spent. The hook holds the gate shut (pipego.mark.hold, there from the start) until
+  # the parent writes pipego.mark.go, and the parent writes it only after the tool has marked the first Enter
+  # .spent: so that Enter is read on a shut gate, every run, whatever the machine is doing. Then the gate
+  # opens, the tool says it waits, and the parent gives it 2 s. A reading taken in that time was started by
+  # the first Enter (pipego.early). Then the second Enter, which must start the sweeps.
+  file(WRITE "${WORK}/pipego.mark.hold" "")
+  file(WRITE "${WORK}/w_enter.cmake"
+       "${WAITFN}wait_for(\"${WORK}/pipego.mark.armed\")\n${ECHO}wait_for(\"${WORK}/pipego.mark.spent\")\nfile(WRITE \"${WORK}/pipego.mark.go\" \"\")\nwait_for(\"${WORK}/pipego.mark\")\nexecute_process(COMMAND \"${CMAKE_COMMAND}\" -E sleep 2)\nif(EXISTS \"${WORK}/pipego.mark.taken\")\n  file(WRITE \"${WORK}/pipego.early\" \"\")\nendif()\n${ECHO}")
+  # silent, and holding the pipe open past the tool's 14 s timeout (the gate opens about 4 s in)
+  file(WRITE "${WORK}/w_silent.cmake" "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E sleep 18)\n")
+  file(WRITE "${WORK}/w_gone.cmake" "")
+  file(WRITE "${WORK}/w_early.cmake" "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E sleep 1)\n${ECHO}execute_process(COMMAND \"${CMAKE_COMMAND}\" -E sleep 1)\n")
+  function(run_piped name want writer)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -P "${WORK}/${writer}.cmake"
+                    COMMAND "${EXE}" ${ARGN}
+                    WORKING_DIRECTORY "${WORK}"
+                    RESULTS_VARIABLE rvs OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    list(GET rvs -1 rv)
+    string(REPLACE "\r" "\n" out "${out}")
+    file(WRITE "${WORK}/${name}.log" "${out}\n--- stderr ---\n${err}")
+    if(NOT rv EQUAL want)
+      message(FATAL_ERROR "calibrate_cli_test: ${name}: exit ${rv}, expected ${want} (log: ${WORK}/${name}.log)\n${err}")
+    endif()
+    set(${name}_OUT "${out}" PARENT_SCOPE)
+  endfunction()
+  # Enter sent: the early one is spent, the gate opens, the tool waits, the second Enter starts the sweeps
+  run_piped(pipego 0 w_enter ${STAND} --track-sim-rig-wait pipego.mark --out pipego.json --place-wait-enter --place-timeout 240)
+  expect(pipego "placement: settled\\. Clear the space, then press Enter" "the tool waits for the Enter")
+  expect(pipego "placement: measured center" "the Enter down the pipe takes the reading")
+  if(pipego_OUT MATCHES "the sweeps start in" OR NOT EXISTS "${WORK}/pipego.json")
+    message(FATAL_ERROR "calibrate_cli_test: pipego: it counted instead of waiting, or wrote no trims (log: ${WORK}/pipego.log)")
+  endif()
+  if(NOT EXISTS "${WORK}/pipego.mark.spent")
+    message(FATAL_ERROR "calibrate_cli_test: pipego: the early Enter was never read on a shut gate, so nothing was tested (log: ${WORK}/pipego.log)")
+  endif()
+  if(EXISTS "${WORK}/pipego.early")
+    message(FATAL_ERROR "calibrate_cli_test: pipego: the reading was taken before the second Enter was sent: an Enter read while the gate was closed started the sweeps (log: ${WORK}/pipego.log)")
+  endif()
+  # no Enter: --place-timeout bounds the gate and the Enter together (it once reset while the gate was open)
+  run_piped(pipewait 1 w_silent ${STAND} --track-sim-rig-wait pipewait.mark --out pipewait.json --place-wait-enter --place-timeout 14)
+  expect(pipewait "placement: settled\\. Clear the space, then press Enter" "the gate opened")
+  expect(pipewait "placement: timed out after 14 s: the ZM-1 settled, and no Enter arrived" "the Enter wait is bounded")
+  # the parent is gone: no Enter can come, so the run stops at once, not at the timeout
+  run_piped(pipegone 1 w_gone ${STAND} --track-sim-rig-wait pipegone.mark --out pipegone.json --place-wait-enter --place-timeout 240)
+  expect(pipegone "placement: aborted: stdin's pipe is closed" "a closed pipe aborts")
+  # stdin is a file: neither a console nor a pipe, so no Enter can arrive, and the flag is refused
+  execute_process(COMMAND "${EXE}" ${STAND} --track-sim-rig-wait pipefile.mark --out pipefile.json --place-wait-enter
+                  WORKING_DIRECTORY "${WORK}" INPUT_FILE "${WORK}/rows6.txt"
+                  RESULT_VARIABLE rv OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rv EQUAL 2 OR NOT err MATCHES "--place-wait-enter: stdin is neither a console nor a pipe")
+    message(FATAL_ERROR "calibrate_cli_test: pipefile: exit ${rv}, expected 2 with the reason:\n${err}")
+  endif()
+  # no flag: a pipe is not a promise of an Enter. The 5 s count, and the Enter that does arrive is not read
+  run_piped(pipecount 0 w_early ${STAND} --track-sim-rig-wait pipecount.mark --out pipecount.json --place-timeout 240)
+  expect(pipecount "placement: clear the space: the sweeps start in 5 s" "a pipe without the flag counts")
+  if(pipecount_OUT MATCHES "press Enter \\(Send Enter" OR pipecount_OUT MATCHES "aborted")
+    message(FATAL_ERROR "calibrate_cli_test: pipecount: without --place-wait-enter the pipe was waited on or read (log: ${WORK}/pipecount.log)")
+  endif()
 
 elseif(MODE STREQUAL "track_refuse")
   # the --zylia position survey turns DOAs into room directions: tracked, it needs a BODY-FRAME survey
@@ -855,7 +1263,9 @@ elseif(MODE STREQUAL "track_refuse")
     message(FATAL_ERROR "calibrate_cli_test: roomaxes: a room-axes survey was not refused for the tracked position survey")
   endif()
   # ...but the trims only need the center: the same room-axes survey is accepted there
-  run(roomtrims 0 --layout "${LAYOUT}" --out rt.json ${SIM} --zylia --trims --track-sim --survey room_axes.json)
+  # --place-wait-enter rides along: the simulated stand has nobody to press Enter, so it changes nothing here
+  run(roomtrims 0 --layout "${LAYOUT}" --out rt.json ${SIM} --zylia --trims --track-sim --survey room_axes.json
+      --place-wait-enter)
   expect(roomtrims "track: room-axes survey: installed for its channel order and geometry, NOT re-aimed" "a room-axes survey rides along")
   # live aiming with no body-frame survey: the tilt meter runs, the position readout is refused
   file(READ "${LAYOUT}" js)
@@ -868,6 +1278,11 @@ elseif(MODE STREQUAL "track_refuse")
   run(nosim 2 --layout "${LAYOUT}" --track-sim --zylia --trims)
   run(check 2 --layout "${LAYOUT}" ${SIM} --track 3 --check)
   run(tolnotrack 2 --layout "${LAYOUT}" ${SIM} --place-tol-mm 5)
+  run(waitclear 2 --layout "${LAYOUT}" ${SIM} --zylia --trims --track-sim --place-wait-enter --place-clear-s 2)
+  file(READ "${WORK}/waitclear.log" lw)
+  if(NOT lw MATCHES "--place-wait-enter waits for Enter and --place-clear-s counts instead: pass one")
+    message(FATAL_ERROR "calibrate_cli_test: waitclear: refused for another reason (log: ${WORK}/waitclear.log)")
+  endif()
   run(gridnomic 2 --layout "${LAYOUT}" ${SIM} --track-sim --room-eq-grid)
 
 elseif(MODE STREQUAL "track_survey")
@@ -1190,14 +1605,23 @@ elseif(MODE STREQUAL "zylia_localize")
          "rows 1 and 2 read the step against the median of the five")
   expect(locstep "WARNING: the latency MOVED (199|200)\\.[0-9] us across the run" "the step is flagged, at its size")
   loc_positions(locstep locstep.json)
-  # One BAD capture: a stray sweep 12 dB over the speaker, inside the arrival window, on capture 11 (row 1,
-  # speaker 10; untracked, so the row is the mic). It plays from the interferer's spot 1.543 m off the mic
-  # (CALIB_SIM_INTF_OFFSET), timed so its center arrival lands 40 mm after speaker 10's true one:
-  # t = 512 / 48000 + (2.8320 + 0.040 - 1.5427) / 343.0 = 0.014542 s. One sweep per capture (this mode asks
-  # no agreement) takes it as the arrival. The fit shows only part of it in that capture's residual; the
-  # run drops it, solves again, and the positions land on the truth.
+  # A stray sweep 12 dB over the speaker, inside the arrival window, on row 1's speaker 10 (untracked, so the
+  # row is the mic). It plays from the interferer's spot 1.543 m off the mic (CALIB_SIM_INTF_OFFSET), timed so
+  # its center arrival lands 40 mm after speaker 10's true one:
+  # t = 512 / 48000 + (2.8320 + 0.040 - 1.5427) / 343.0 = 0.014542 s. Localize takes two agreeing sweeps a
+  # capture, so speaker 10 is sweeps 21 and 22. On ONE of them the agreement rule sees it: a re-sweep, and
+  # nothing to drop.
+  run(locagree 0 --layout plan_off.json --sim-truth "${LAYOUT}" --out locagree.json --simulate --zylia --localize rows.txt
+      --sim-interferer 21:0.014542:12:sweep)
+  expect(locagree "speaker 10: re-swept, sweep 2: " "one stray sweep is caught by the agreement rule")
+  if(locagree_OUT MATCHES "dropped speaker|FLAGGED")
+    message(FATAL_ERROR "calibrate_cli_test: locagree: the stray reached the solve (log: ${WORK}/locagree.log)")
+  endif()
+  loc_positions(locagree locagree.json)
+  # On BOTH, the two sweeps agree on the wrong arrival, so the stray reaches the solve. The fit shows only part
+  # of it in that capture's residual; the run drops it, solves again, and the positions land on the truth.
   run(locdrop 0 --layout plan_off.json --sim-truth "${LAYOUT}" --out locdrop.json --simulate --zylia --localize rows.txt
-      --sim-interferer 11:0.014542:12:sweep)
+      --sim-interferer 21,22:0.014542:12:sweep)
   expect(locdrop "localize: dropped speaker 10's capture at row 1: \\+[1-9][0-9]\\.[0-9] mm off the solve, past the 10 mm flag"
          "the stray sweep's capture is the one dropped")
   expect(locdrop "against that solve it is \\+(3[5-9]|4[0-5])\\.[0-9] mm off" "without it, its residual reads the whole 40 mm")

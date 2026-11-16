@@ -198,6 +198,12 @@ int place_clear_step(double* end_t, double t, int gate_open, double clear_s);
  * used to take a reading at the old spot. F with no pose has no reading to take, so it aborts. */
 typedef enum { PLACE_KEY_NONE, PLACE_KEY_GO, PLACE_KEY_FORCE, PLACE_KEY_ABORT } PlaceKey;
 PlaceKey place_key_action(int key, PlaceState st);
+/* The same for ONE PASS of the wait, after everything queued was read (a queued "\r\n" is one Enter, and
+ * several clicks are one). was_open: the gate already read OK on the pass before. An Enter counts only
+ * then: one that was sent while the gate was shut and is read on the very pass it opens was not an answer
+ * to "settled, press Enter", and taking it starts the sweeps with the operator still beside the array.
+ * F is the override and needs no such wait. */
+PlaceKey place_keys_action(int saw_enter, int saw_f, PlaceState st, int was_open);
 
 /* The bump check: did the center move more than half the tolerance between the center a run took
  * (`taken`) and now? Returns 1 = bumped, 0 = in place, -1 = cannot tell (a refused input or a

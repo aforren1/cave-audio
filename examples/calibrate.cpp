@@ -47,6 +47,7 @@ extern "C" {
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <string>
 #ifdef BWA_HAVE_ASIO
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>       /* Sleep */
@@ -137,7 +138,12 @@ static float loose_tol_m(void) { return g_tol_m > LOCALIZE_TOL_M ? g_tol_m : LOC
  * says why a miss costs nothing; NULL = the strict gate. turn_limit_deg > 0: a direction mode, whose
  * gate also waits for the orientation to hold still and whose bump check stops on a turn.
  * Returns 0, or 1 (timed out). */
-static double clear_seconds(void) { return g_clear_s >= 0.0 ? g_clear_s : mic_track_default_clear(g_track_sim); }
+/* --track-sim-rig-wait (a test hook): the scripted stand is waited for the way a real one is. Wall-clock
+ * time, keys read, the rig's default for the clear wait. It exists so the Enter that arrives down a pipe,
+ * its timeout and the count that replaces it can be driven with no tracker (calibrate_track_bump). */
+static int g_sim_rig_wait;
+static int sim_waits(void) { return g_track_sim && !g_sim_rig_wait; }   /* the scripted stand's own instant waits */
+static double clear_seconds(void) { return g_clear_s >= 0.0 ? g_clear_s : mic_track_default_clear(sim_waits()); }
 
 /* The untracked rows' stop. Enter pressed during the last row's sweeps would otherwise answer this prompt
  * and take the next row with the mic still at the old spot, and no check could tell. */
@@ -158,7 +164,7 @@ static int track_place(const float target[3], const char* loose_why, const char*
     place_cfg_default(&cfg, loose_why ? loose_tol_m() : g_tol_m);
     if (turn_limit_deg > 0.f) place_cfg_direction(&cfg, turn_limit_deg);
     g_turn_limit = turn_limit_deg > 0.f ? turn_limit_deg : 0.f;
-    if (mic_track_place_console(&g_mt, target, &cfg, g_place_timeout, !g_track_sim, clear_seconds(), what, &g_placed)) return 1;
+    if (mic_track_place_console(&g_mt, target, &cfg, g_place_timeout, !sim_waits(), clear_seconds(), what, &g_placed)) return 1;
     memcpy(mic_out, g_placed.center, sizeof g_placed.center);
     memcpy(g_taken, g_placed.center, sizeof g_taken);
     if (loose_why && g_placed.dist_m > g_tol_m)
@@ -1353,6 +1359,37 @@ static int parse_speakers(const char* s, int n, int* out, int cap, char* err, si
     return k;
 }
 
+/* --retake "3,7-8": mic rows counted from 1, as every printed row number is. Sets pick[row - 1] for each
+ * (pick holds K entries); 1, or 0 on a malformed list (why in err). Not parse_speakers: rows run 1..K
+ * where speakers run 0..n-1, and its error text and its 64-entry table are the speakers'. */
+static int parse_rows(const char* s, int K, unsigned char* pick, char* err, size_t errcap) {
+    std::vector<unsigned char> seen((size_t)K + 1, 0);
+    const char* q = s;
+    if (!*q) { snprintf(err, errcap, "'' is not a list of rows like 3,7-8"); return 0; }
+    while (*q) {
+        char* end = NULL;
+        const long a = strtol(q, &end, 10);
+        if (end == q) { snprintf(err, errcap, "'%s' is not a list of rows like 3,7-8", s); return 0; }
+        long b = a;
+        q = end;
+        if (*q == '-') {
+            ++q;
+            b = strtol(q, &end, 10);
+            if (end == q) { snprintf(err, errcap, "'%s' is not a list of rows like 3,7-8", s); return 0; }
+            q = end;
+        }
+        if (a < 1 || b < a || b > K) { snprintf(err, errcap, "'%s': rows are counted from 1 and run 1..%d", s, K); return 0; }
+        for (long v = a; v <= b; ++v) {
+            if (seen[(size_t)v]) { snprintf(err, errcap, "'%s' names row %ld twice", s, v); return 0; }
+            seen[(size_t)v] = 1;
+            pick[v - 1] = 1;
+        }
+        if (*q == ',') ++q;
+        else if (*q) { snprintf(err, errcap, "'%s': unexpected '%c'", s, *q); return 0; }
+    }
+    return 1;
+}
+
 /* read mic positions ("x y z" per line) for --localize; returns the count (<= maxK) */
 static int read_positions(const char* path, float (*out)[3], int maxK) {
     FILE* f = fopen(path, "r"); if (!f) return 0;
@@ -1405,6 +1442,12 @@ int main(int argc, char** argv) {
     const char* csurvey_out = NULL;                           /* --capsule-survey out.json: the table from the speakers */
     const char* sim_truth_path = NULL;                        /* --sim-truth f.json: where the simulated speakers stand */
     const char* spk_list = NULL;                              /* --speakers 0,3,5-9: its source set */
+    const char* ranges_out = NULL;                            /* --localize: where the captures are kept */
+    const char* ranges_in = NULL;                             /* --localize: captures from an earlier run */
+    const char* retake_list = NULL;                           /* --localize: rows to measure again, from 1 */
+    const char* exclude_list = NULL;                          /* --localize: speakers never swept */
+    int solve_only = 0;                                       /* --localize: solve --ranges-in, no audio */
+    int wait_enter = 0;                                       /* --place-wait-enter: Enter may come down stdin's pipe */
     int    drop_outliers = 0;                                 /* --drop-outliers: drop what leave-one-out flags */
     int    track_sim_off_set = 0;                             /* --track-sim-offset x,y,z: the stand's TRUE offset */
     float  track_sim_off[3] = { 0.f, 0.f, 0.f };
@@ -1548,6 +1591,8 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "calibrate: --place-clear-s wants seconds, 0 to 120 (got %s)\n", argv[i]); return 2; }
             g_clear_s = v;
         }
+        else if (!strcmp(argv[i],"--place-wait-enter")) wait_enter = 1;
+        else if (!strcmp(argv[i],"--track-sim-rig-wait") && i+1<argc) { g_sim_rig_wait = 1; mic_track_test_marker(argv[++i]); }
         else if (!strcmp(argv[i],"--mount-offset") && i+1<argc) {   /* "ring" or "x,y,z" (body axes, m) */
             const char* s = argv[++i];
             if (!strcmp(s, "ring")) mount_ring = 1;
@@ -1567,6 +1612,11 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i],"--capsule-survey") && i+1<argc) csurvey_out = argv[++i];
         else if (!strcmp(argv[i],"--speakers") && i+1<argc)       spk_list = argv[++i];
+        else if (!strcmp(argv[i],"--ranges-out") && i+1<argc)     ranges_out = argv[++i];
+        else if (!strcmp(argv[i],"--ranges-in") && i+1<argc)      ranges_in = argv[++i];
+        else if (!strcmp(argv[i],"--retake") && i+1<argc)         retake_list = argv[++i];
+        else if (!strcmp(argv[i],"--exclude") && i+1<argc)        exclude_list = argv[++i];
+        else if (!strcmp(argv[i],"--solve-only"))                 solve_only = 1;
         else if (!strcmp(argv[i],"--drop-outliers"))              drop_outliers = 1;
         else if (!strcmp(argv[i],"--track-sim-offset") && i+1<argc) {   /* "x,y,z", body axes, m */
             if (!parse_xyz(argv[++i], PLACE_MAX_OFFSET_M, track_sim_off)) {
@@ -1606,7 +1656,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
             fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
         }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] [--natnet-local ip] | --track-sim [--track-sim-bump N] [--track-sim-twist N]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--place-clear-s s] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--trims | --verify] [--room] [--eq | --room-eq | --room-eq-grid [rows.txt]] [--zylia] [--survey f] [--ref spk dist_m | --ref-speakers list] [--save-irs prefix] [--localize positions.txt [--ranges-out f.json] [--ranges-in f.json [--retake rows | --solve-only]] [--exclude list]] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps] [--ignore-directivity] [--check-aim] [--sim-aim-error deg] [--sim-room [absorption]] [--aim-sheet out.csv] [--sweeps N] [--aim-ref spk | --aim-ref-db dB] [--sim-move dx dy dz] [--sim-aim-steps a,b,...] [--sim-screen dB] [--track id|name [--natnet-server ip] [--natnet-multicast g] [--natnet-local ip] | --track-sim [--track-sim-bump N] [--track-sim-twist N] [--track-sim-rig-wait marker]] [--mount-offset x,y,z | ring] [--place-tol-mm mm] [--place-timeout s] [--place-clear-s s | --place-wait-enter] [--capsule-survey out.json [--speakers list] [--drop-outliers] [--sim-center x,y,z]] [--track-sim-offset x,y,z] [--sim-truth f.json] [--window-m m] [--sim-interferer captures[:t_s[:dB[:click|noise|sweep]]]] [--sim-speaker-latency spk,ms] [--sim-latency-step row,ms]\n"
                                "  --zylia: the mic is a ZM-1; --input is the FIRST of its 19 consecutive capture channels,\n"
                                "  --mic is the array center. Alone it is the single-placement position survey: distances\n"
                                "  need --latency (loopback, m at c) or --ref <spk> <m> (one tape-measured center->speaker\n"
@@ -1670,15 +1720,35 @@ int main(int argc, char** argv) {
                                "  --natnet-server is REQUIRED to track by name. --natnet-local names this machine's IP on Motive's\n"
                                "  network, when the adapter routing to --natnet-server is the wrong one to join the multicast group\n"
                                "  on. On the rig F takes the current reading anyway,\n"
-                               "  with a warning; --place-timeout s (default 300) aborts the wait. Unverified against live Motive.\n"
+                               "  with a warning; --place-timeout s (default 300) aborts the wait. Once the gate opens, a console\n"
+                               "  waits for Enter (clear the space first) and anything else counts 5 s; --place-clear-s s counts\n"
+                               "  s instead, and --place-wait-enter waits for Enter from the console or from stdin's pipe\n"
+                               "  (calib_view's Send Enter). With --place-wait-enter the timeout bounds the gate and the Enter\n"
+                               "  together, and a closed pipe aborts; without it a console waits for Enter with no limit.\n"
+                               "  Unverified against live Motive.\n"
                                "  --track-sim (simulate only): a scripted stand walks in from 8 cm off the target, settles about\n"
                                "  5 mm off it, and the captures come from its TRUE center; --track-sim-bump N knocks it 15 mm\n"
                                "  after the Nth capture; --track-sim-twist N turns it 2 deg about the array center after the\n"
-                               "  Nth capture, which moves no center. --track-sim-offset x,y,z: the stand's TRUE mount offset\n"
+                               "  Nth capture, which moves no center. --track-sim-rig-wait marker (a test hook): wait for the\n"
+                               "  scripted stand as for a real one, in wall-clock time, reading keys, with the rig's clear wait;\n"
+                               "  the file `marker` appears when the gate opens for Enter, and marker.taken at the reading.\n"
+                               "  --track-sim-offset x,y,z: the stand's TRUE mount offset\n"
                                "  (body axes) when it differs from the one the tool is given, so a wrong offset can be caught.\n"
                                "  --localize rows.txt --zylia: --localize with the ZM-1. Each range is the arrival at the array\n"
                                "  CENTER (zylia_center_arrival over the 19 capsules), which does not change when the array\n"
                                "  turns: no capsule survey and no orientation needed. --check-aim reads the pooled tilt.\n"
+                               "  --localize keeps its captures in a ranges file, rewritten after every row: --ranges-out f.json,\n"
+                               "  else the --out name with .ranges.json for .json.\n"
+                               "  --ranges-in f.json starts from an earlier run's captures and measures only the rows it lacks;\n"
+                               "  --retake 3,7-8 (rows, counted from 1) measures those again; --solve-only solves the file with\n"
+                               "  no audio. --exclude 3,14 never sweeps or solves those speakers: they keep the layout's position.\n"
+                               "  A row the file holds with a capture missing is never measured again unasked (exit 2): name it\n"
+                               "  in --retake, or --exclude the speaker.\n"
+                               "  A run never overwrites a ranges file it did not create: a file in its way is set aside first as\n"
+                               "  the next free <name>.1.json, .2.json, ... (moved, or copied when it is the file the run read).\n"
+                               "  A file of simulated captures is not added to by a rig run, nor the reverse (exit 2). The ranges\n"
+                               "  file may not be the --out, --layout or rows file (exit 2). If it cannot be written the run stops\n"
+                               "  at that row (exit 1).\n"
                                "  --capsule-survey out.json --zylia: the capsule survey from the speakers. One placement (--mic\n"
                                "  is the center, or the tracked target), every speaker in --speakers (default all) swept, their\n"
                                "  layout POSITIONS taken as the known sources: trust them (--localize --zylia first). It solves\n"
@@ -1734,6 +1804,14 @@ int main(int argc, char** argv) {
     }
     if (spk_list && !csurvey_out) {
         fprintf(stderr, "calibrate: --speakers picks the --capsule-survey's speakers\n"); return 2; }
+    if ((ranges_out || ranges_in || retake_list || exclude_list || solve_only) && !localize_file) {
+        fprintf(stderr, "calibrate: --ranges-out, --ranges-in, --retake, --exclude and --solve-only are --localize options\n"); return 2; }
+    if ((retake_list || solve_only) && !ranges_in) {
+        fprintf(stderr, "calibrate: --retake and --solve-only work on an earlier run's captures: pass --ranges-in\n"); return 2; }
+    if (retake_list && solve_only) {
+        fprintf(stderr, "calibrate: --retake measures rows and --solve-only measures nothing: pass one\n"); return 2; }
+    if (solve_only && (track_body || track_sim)) {
+        fprintf(stderr, "calibrate: --solve-only measures nothing, so it takes no --track or --track-sim\n"); return 2; }
     if (ref_spk_list && ref_spk >= 0) {
         fprintf(stderr, "calibrate: --ref and --ref-speakers both set the latency; pass one\n"); return 2; }
     if (nsim_lat && !simulate) {
@@ -1803,8 +1881,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: --track and --track-sim are alternatives: a real stand or the simulated one\n"); return 2; }
     if (track_sim && !simulate) {
         fprintf(stderr, "calibrate: --track-sim is a --simulate knob: a simulated stand in front of a real array places nothing\n"); return 2; }
+    if (g_sim_rig_wait && !track_sim) {
+        fprintf(stderr, "calibrate: --track-sim-rig-wait acts on the SIMULATED stand; pass --track-sim\n"); return 2; }
     if ((track_sim_bump || track_sim_twist) && !track_sim) {
         fprintf(stderr, "calibrate: --track-sim-bump/--track-sim-twist act on the SIMULATED stand; pass --track-sim\n"); return 2; }
+    if (wait_enter && g_clear_s >= 0.0) {
+        fprintf(stderr, "calibrate: --place-wait-enter waits for Enter and --place-clear-s counts instead: pass one\n"); return 2; }
+    mic_track_wait_enter(wait_enter);
+    /* The scripted stand never waits for a key (unless the hook says so), so the flag is inert there and any
+     * stdin will do. A real stand's run would count 5 s and say nothing about the flag it was given. */
+    if (wait_enter && (track_body || g_sim_rig_wait) && !mic_track_stdin_takes_enter()) {
+        fprintf(stderr, "calibrate: --place-wait-enter: stdin is neither a console nor a pipe, so no Enter can arrive\n"); return 2; }
     if (!g_tracked && (tol_set || timeout_set || mount_off_set || nn_server || nn_local)) {
         fprintf(stderr, "calibrate: --place-tol-mm/--place-timeout/--mount-offset/--natnet-server/--natnet-local are --track options\n"); return 2; }
     if (g_tracked && (check || (live_speaker >= 0 && !zylia) || aim_csv)) {
@@ -2026,7 +2113,7 @@ int main(int argc, char** argv) {
         mc.sim_twist_after = track_sim_twist;
         mc.sim_have_true_offset = track_sim_off_set;
         memcpy(mc.sim_true_offset_m, track_sim_off, sizeof mc.sim_true_offset_m);
-        mc.virtual_clock = 1;                                 /* simulated time: no waiting on the wall clock */
+        mc.virtual_clock = !g_sim_rig_wait;                   /* simulated time: no waiting on the wall clock */
         char e[400] = { 0 };
         const int rc = mic_track_open(&g_mt, &mc, e, sizeof e);
         if (rc) {
@@ -2105,14 +2192,14 @@ int main(int argc, char** argv) {
 
 #ifdef BWA_HAVE_ASIO
     int asio_up = 0;
-    if (!simulate) {
+    if (!simulate && !solve_only) {
         if (zylia) {
             if (calib_asio_open_multi(driver, mic_in, ZYLIA_MICS, n, sweep, cap19) != 0) return 1;
         } else if (calib_asio_open(driver, mic_in, n, sweep, cap) != 0) return 1;
         asio_up = 1;
     }
 #else
-    if (!simulate) { fprintf(stderr, "calibrate: built without ASIO; re-run with --simulate or build the ASIO backend\n"); return 1; }
+    if (!simulate && !solve_only) { fprintf(stderr, "calibrate: built without ASIO; re-run with --simulate or build the ASIO backend\n"); return 1; }
 #endif
     /* the expected-arrival window's latency prior: after the open, which is when the driver's loop is
      * known. --latency is c * tau in meters. Live aiming's --ref is measured inside the mode, which
@@ -2159,6 +2246,312 @@ int main(int argc, char** argv) {
                    "           (tools/directivity/clf_to_json.py --into %s)\n", layout_path);
         float planned[64][3];
         memcpy(planned, micpos, sizeof planned);
+#ifdef BWA_HAVE_ASIO
+#define LOC_CLOSE() do { if (asio_up) calib_asio_close(); } while (0)
+#else
+#define LOC_CLOSE() do { } while (0)
+#endif
+        /* --exclude: a box that cannot be measured (occluded, not yet hung) is never swept and never solved,
+         * and keeps the position the layout already gives it */
+        unsigned char excl[BWA_MAX_CHANNELS] = { 0 };
+        int nexcl = 0;
+        if (exclude_list) {
+            int ex[BWA_MAX_CHANNELS]; char e[200];
+            const int ne = parse_speakers(exclude_list, n, ex, BWA_MAX_CHANNELS, e, sizeof e);
+            if (ne < 0) { fprintf(stderr, "calibrate: --exclude %s\n", e); LOC_CLOSE(); return 2; }
+            printf("localize: excluded (--exclude), not swept, left where the layout has them:");
+            for (int i = 0; i < ne; ++i) { excl[ex[i]] = 1; printf(" %d", ex[i]); }
+            printf("\n");
+            nexcl = ne;
+            if (n - nexcl < 4) { fprintf(stderr, "calibrate: --exclude leaves %d speakers; the solve needs 4\n", n - nexcl); LOC_CLOSE(); return 2; }
+        }
+        /* The captures on disk: written after every row, so a canceled or refused run keeps what it measured,
+         * and --ranges-in starts from them. Arrivals in seconds (the file's rule), meters here. */
+        unsigned char* have = (unsigned char*)calloc((size_t)n * K, 1);
+        double* arr_s = (double*)calloc((size_t)n * K, sizeof(double));
+        unsigned char row_done[64] = { 0 };
+        std::string rpath;
+        if (ranges_out) rpath = ranges_out;
+        else if (ranges_in) rpath = ranges_in;                   /* a retake updates the file it read */
+        else {
+            rpath = out_path ? out_path : layout_path;
+            if (rpath.size() > 5 && rpath.compare(rpath.size() - 5, 5, ".json") == 0) rpath.resize(rpath.size() - 5);
+            rpath += ".ranges.json";
+        }
+        /* The ranges file must be none of the run's other files: --ranges-out naming --out had the layout
+         * written over the captures, and --ranges-in naming --out under --solve-only replaced the captures
+         * with a layout, both with exit 0. One file by identity when both exist, else by name with the
+         * separators and letter case folded and a leading ./ dropped. That catches a slip; it is not a
+         * defense against every spelling of a path. */
+        {
+            auto same_path = [](const char* a, const char* b) -> bool {
+                if (!a || !b) return false;
+                if (os_same_file(a, b)) return true;
+                std::string x = a, y = b;
+                for (std::string* p : { &x, &y }) {
+                    for (char& ch : *p) { if (ch == '\\') ch = '/'; ch = (char)tolower((unsigned char)ch); }
+                    while (p->compare(0, 2, "./") == 0) p->erase(0, 2);
+                }
+                return x == y;
+            };
+            struct { const char* flag; const char* path; } mine[2] = {
+                { "--ranges-in", ranges_in }, { ranges_out ? "--ranges-out" : "the ranges file", solve_only ? NULL : rpath.c_str() } };
+            struct { const char* what; const char* path; } theirs[3] = {
+                { "the layout this run writes (--out)", out_path }, { "the layout it reads (--layout)", layout_path },
+                { "the rows file (--localize)", localize_file } };
+            for (auto& m : mine)
+                for (auto& t : theirs)
+                    if (m.path && t.path && same_path(m.path, t.path)) {
+                        fprintf(stderr, "calibrate: %s %s is %s: the captures and that file would overwrite each other. Name another file\n",
+                                m.flag, m.path, t.what);
+                        LOC_CLOSE(); return 2;
+                    }
+        }
+        /* What goes to disk is its own copy, not the working arrays. A row being measured again is cleared in
+         * the working arrays at once (below), but the file must go on holding its OLD captures until the new
+         * ones are complete: a retake of rows 2 and 4 stopped in row 4 once wrote a file with no row 4 at all,
+         * and repeating the command then lost the last copy of it. A row enters the disk copy
+         * only whole (disk_put_row), so every write holds every row there has ever been. */
+        std::vector<unsigned char> d_have((size_t)n * K, 0);
+        std::vector<double> d_arr((size_t)n * K, 0.0);
+        std::vector<float> d_tilt((size_t)n * K, 0.f), d_tiltw((size_t)n * K, 0.f);
+        static float d_plan[64][3], d_mic[64][3];
+        unsigned char d_done[64] = { 0 };
+        CalibRanges RG = { n, K, d_have.data(), d_arr.data(), d_tilt.data(), d_tiltw.data(), d_plan, d_mic, d_done, simulate };
+        auto disk_put_row = [&](int k) {
+            for (int s = 0; s < n; ++s) {
+                const size_t i = (size_t)s * K + k;
+                d_have[i] = have[i]; d_arr[i] = arr_s[i]; d_tilt[i] = tilt[i]; d_tiltw[i] = tiltw[i];
+            }
+            memcpy(d_plan[k], planned[k], sizeof d_plan[k]);
+            memcpy(d_mic[k], micpos[k], sizeof d_mic[k]);
+            d_done[k] = 1;
+        };
+        auto row_complete = [&](int k) {
+            if (!row_done[k]) return false;
+            for (int s = 0; s < n; ++s) if (!excl[s] && !have[(size_t)s * K + k]) return false;
+            return true;
+        };
+        float fplan[64][3], fmic[64][3];                         /* --ranges-in: each row as the file has it */
+        if (ranges_in) {
+            CalibRanges in = { n, K, have, arr_s, tilt, tiltw, fplan, fmic, row_done, -1 };
+            char e[300];
+            if (!calib_ranges_read(ranges_in, &in, e, sizeof e)) { fprintf(stderr, "calibrate: %s\n", e); LOC_CLOSE(); return 1; }
+            /* simulated captures and the rig's do not go in one file: a rehearsal's rows under a rig run solve
+             * to a layout that is neither. --solve-only adds nothing, so it may read either. A file from
+             * before the flag was written (-1) is taken as it is. */
+            if (!solve_only && in.simulate >= 0 && !in.simulate != !simulate) {
+                fprintf(stderr, "calibrate: %s holds %s captures and this run is %s: rows from both in one file would mix two\n"
+                                "           experiments. Start a fresh run (drop --ranges-in), or move that file away.\n",
+                        ranges_in, in.simulate ? "SIMULATED" : "the rig's", simulate ? "simulated" : "on the rig");
+                LOC_CLOSE(); return 2;
+            }
+            for (int k = 0; k < K; ++k) {                        /* the disk copy starts as the file */
+                if (!row_done[k]) continue;
+                float keep_p[3], keep_m[3];
+                memcpy(keep_p, planned[k], sizeof keep_p); memcpy(keep_m, micpos[k], sizeof keep_m);
+                memcpy(planned[k], fplan[k], sizeof keep_p); memcpy(micpos[k], fmic[k], sizeof keep_m);
+                disk_put_row(k);
+                memcpy(planned[k], keep_p, sizeof keep_p); memcpy(micpos[k], keep_m, sizeof keep_m);
+            }
+        }
+        unsigned char measure[64] = { 0 }, in_file[64];
+        memcpy(in_file, row_done, sizeof in_file);               /* the rows the file holds captures of */
+        if (retake_list) {
+            char e[200];
+            if (!parse_rows(retake_list, K, measure, e, sizeof e)) { fprintf(stderr, "calibrate: --retake %s\n", e); LOC_CLOSE(); return 2; }
+        }
+        /* A row the file holds, short of a speaker this run wants: measuring it again by itself would throw
+         * away every capture the row has, and rewrite the file. That is what a resume did when --exclude was
+         * forgotten (every row short of the excluded box, so every row measured again, in place) or when one
+         * capture had failed. Only the operator knows which was meant, so it is refused and they say:
+         * --exclude, or --retake. --solve-only measures nothing and has its own message below. */
+        if (ranges_in && !solve_only) {
+            int nshort = 0;
+            for (int k = 0; k < K; ++k) nshort += in_file[k] && !measure[k] && !row_complete(k);
+            if (nshort) {
+                fprintf(stderr, "calibrate: %s holds %d row(s) with a capture missing. Measuring them again would discard the\n"
+                                "           captures they have, so nothing is measured:\n", ranges_in, nshort);
+                for (int k = 0; k < K; ++k) {
+                    if (!(in_file[k] && !measure[k] && !row_complete(k))) continue;
+                    fprintf(stderr, "             row %d: no capture of speaker(s)", k + 1);
+                    for (int s = 0; s < n; ++s) if (!excl[s] && !have[(size_t)s * K + k]) fprintf(stderr, " %d", s);
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "           Pass --exclude <speakers> if they were left out on purpose, or --retake <rows> to measure\n"
+                                "           those rows again.\n");
+                LOC_CLOSE(); return 2;
+            }
+        }
+        for (int k = 0; k < K; ++k) if (!row_complete(k)) measure[k] = 1;   /* a fresh run: every row */
+        int nmeasure = 0;
+        for (int k = 0; k < K; ++k) nmeasure += measure[k];
+        if (ranges_in) {
+            /* A kept row is the file's: its measured mic position, its target, its arrivals. A row about to be
+             * measured takes NOTHING from the file into the working arrays. Its mic position comes from the
+             * rows file or the tracker, as on a fresh run (the file's old one beside new arrivals is a row
+             * measured where the mic was not), and its old captures go for every speaker, so an excluded
+             * speaker's does not stay beside a new mic position and latency. It is not done until it is
+             * measured, which also keeps the per-row checks and the solve off it. On disk the old row stays
+             * until then (the disk copy above). */
+            int nd = 0;
+            for (int k = 0; k < K; ++k) {
+                if (measure[k]) {
+                    row_done[k] = 0;
+                    for (int s = 0; s < n; ++s) {
+                        have[(size_t)s * K + k] = 0;
+                        arr_s[(size_t)s * K + k] = 0.0;
+                        tilt[(size_t)s * K + k] = tiltw[(size_t)s * K + k] = 0.f;
+                    }
+                    continue;
+                }
+                ++nd;
+                const float dx = fplan[k][0] - planned[k][0], dy = fplan[k][1] - planned[k][1], dz = fplan[k][2] - planned[k][2];
+                if (dx*dx + dy*dy + dz*dz > 0.01f * 0.01f)
+                    printf("localize: WARNING: row %d's target in %s is %.0f mm from the one in %s; the row is not measured\n"
+                           "          again, so the measured mic position in the ranges file is what the solve uses\n",
+                           k + 1, localize_file, 1e3 * sqrtf(dx*dx + dy*dy + dz*dz), ranges_in);
+                memcpy(planned[k], fplan[k], sizeof planned[k]);
+                memcpy(micpos[k], fmic[k], sizeof micpos[k]);
+                for (int s = 0; s < n; ++s)
+                    if (have[(size_t)s * K + k]) range[(size_t)s * K + k] = arr_s[(size_t)s * K + k] * sos;
+            }
+            printf("localize: %d of %d row(s) kept from %s\n", nd, K, ranges_in);
+        }
+        if (solve_only && nmeasure) {
+            fprintf(stderr, "calibrate: --solve-only: %s does not hold every capture of row(s)", ranges_in);
+            for (int k = 0; k < K; ++k) if (measure[k]) fprintf(stderr, " %d", k + 1);
+            fprintf(stderr, "; measure them (drop --solve-only)\n");
+            LOC_CLOSE(); return 1;
+        }
+        if (ranges_in && !solve_only) {
+            printf("localize: measuring row(s)");
+            for (int k = 0; k < K; ++k) if (measure[k]) printf(" %d", k + 1);
+            printf("%s; the rest come from %s\n", nmeasure ? "" : " none", ranges_in);
+        }
+        if (nmeasure) {
+            /* This run will write rpath, and a file already there is captures this run did not create: hours
+             * of sweeps on the rig. It is set aside under the next free generation name first
+             * (calib_ranges_set_aside: nothing is ever replaced or deleted). Another run's file is MOVED. The
+             * file this run read is COPIED and stays in place, so a run that stops before its first row is
+             * written still has it; that holds for a resume too, which rewrites the file it read like a retake
+             * does. One file by identity, not by spelling: "./a.json" or another letter case is still the file
+             * that was read, and taking it for another run's would move it out from under this run. */
+            const int in_place = ranges_in && (rpath == ranges_in || os_same_file(rpath.c_str(), ranges_in));
+            char gen[1024];
+            const int sa = calib_ranges_set_aside(rpath.c_str(), in_place, gen, sizeof gen);
+            if (sa > 0 && in_place) printf("localize: %s is rewritten by this run: copied as it was to %s\n", rpath.c_str(), gen);
+            else if (sa > 0)        printf("localize: %s was there from another run: moved to %s\n", rpath.c_str(), gen);
+            else if (sa < 0) {
+                fprintf(stderr, "calibrate: %s holds captures this run would overwrite, and they cannot be set aside; pass another --ranges-out\n",
+                        rpath.c_str());
+                LOC_CLOSE(); return 1;
+            }
+            printf("localize: the captures are kept in %s, rewritten after every row\n", rpath.c_str());
+        }
+        /* After each row: is it consistent with the rows before it? Two checks, both printed so a bad capture
+         * is seen while the stand is still at that row. The row-pair check needs no solve (calib_row_pair_check);
+         * from 5 rows on, the joint solve over the rows so far gives each new capture a residual. */
+        /* A write that fails stops the run at that row: going on would measure rows there is nowhere to keep.
+         * The rows before it are in the file as last written, and a write that failed at its last step leaves
+         * the new content beside it as <name>.tmp (calib_ranges_write says so in its error). */
+        int nsaved = 0;
+        auto ranges_save = [&](int k) -> bool {
+            char e[400];
+            if (calib_ranges_write(rpath.c_str(), &RG, e, sizeof e)) { ++nsaved; return true; }
+            fprintf(stderr, "calibrate: row %d's captures could not be saved: %s.\n", k + 1, e);
+            if (nsaved) fprintf(stderr, "           The rows this run finished before it are in %s.", rpath.c_str());
+            else        fprintf(stderr, "           No row of this run is in the ranges file.");
+            fprintf(stderr, " The run stops here: free the path\n"
+                            "           (a full disk, an open file in the way) and run again with --ranges-in.\n");
+            return false;
+        };
+        std::vector<unsigned char> fit_named((size_t)n * K, 0);   /* captures a running fit has named */
+        int fit_first = 1;
+        auto row_check = [&](int k) {
+            int nbad[BWA_MAX_CHANNELS] = { 0 }, npairs = 0;
+            unsigned char fl[BWA_MAX_CHANNELS], use2[BWA_MAX_CHANNELS];
+            static double ra[BWA_MAX_CHANNELS], rb[BWA_MAX_CHANNELS];
+            for (int j = 0; j < K; ++j) {
+                if (j == k || !row_done[j]) continue;
+                for (int s = 0; s < n; ++s) {
+                    use2[s] = (unsigned char)(!excl[s] && have[(size_t)s * K + k] && have[(size_t)s * K + j]);
+                    ra[s] = range[(size_t)s * K + j]; rb[s] = range[(size_t)s * K + k];
+                }
+                const float dx = micpos[j][0] - micpos[k][0], dy = micpos[j][1] - micpos[k][1], dz = micpos[j][2] - micpos[k][2];
+                if (calib_row_pair_check(ra, rb, use2, n, sqrt((double)dx*dx + dy*dy + dz*dz), CALIB_LOC_PAIR_TOL_M, NULL, fl) <= 0) continue;
+                ++npairs;
+                for (int s = 0; s < n; ++s) if (use2[s] && fl[s]) ++nbad[s];
+            }
+            if (npairs) {
+                int nb = 0;
+                for (int s = 0; s < n; ++s) nb += nbad[s] * 2 > npairs;
+                if (!nb) printf("localize: row %d check: every speaker's range change fits the mic's move against %d earlier row(s)\n", k + 1, npairs);
+                else {
+                    printf("localize: row %d check: %d speaker(s) changed range by more than the mic moved, against most of %d earlier row(s):",
+                           k + 1, nb, npairs);
+                    for (int s = 0; s < n; ++s) if (nbad[s] * 2 > npairs) printf(" %d", s);
+                    printf("\n          a capture meters off (a reflection, a stray sweep), or the stand moved: retake this row\n");
+                }
+            }
+            int kd[64], nd = 0;
+            for (int j = 0; j < K; ++j) if (row_done[j]) kd[nd++] = j;
+            if (nd < 5) return;
+            std::vector<double> pr((size_t)n * nd), pres((size_t)n * nd);
+            std::vector<unsigned char> pcu((size_t)n * nd), puse(n);
+            std::vector<float> pmic((size_t)nd * 3), pstart((size_t)n * 3);
+            std::vector<double> plat(nd);
+            int knew = -1;
+            for (int a = 0; a < nd; ++a) {
+                if (kd[a] == k) knew = a;
+                for (int c = 0; c < 3; ++c) pmic[(size_t)a * 3 + c] = micpos[kd[a]][c];
+            }
+            for (int s = 0; s < n; ++s) {
+                puse[s] = (unsigned char)!excl[s];
+                for (int c = 0; c < 3; ++c) pstart[(size_t)s * 3 + c] = L.speakers[s].pos[c];
+                for (int a = 0; a < nd; ++a) {
+                    pr[(size_t)s * nd + a] = range[(size_t)s * K + kd[a]];
+                    pcu[(size_t)s * nd + a] = have[(size_t)s * K + kd[a]];
+                }
+            }
+            if (!calib_localize_joint(pr.data(), (const float (*)[3])pmic.data(), nd, n, puse.data(), pcu.data(), 1,
+                                      (float (*)[3])pstart.data(), plat.data(), pres.data())) {
+                printf("localize: row %d fit: the joint solve over the %d rows so far did not converge\n", k + 1, nd);
+                return;
+            }
+            double ss = 0.0; int nu = 0, nf = 0;
+            for (int s = 0; s < n; ++s)
+                for (int a = 0; a < nd; ++a)
+                    if (puse[s] && pcu[(size_t)s * nd + a]) { ss += pres[(size_t)s * nd + a] * pres[(size_t)s * nd + a]; ++nu; }
+            /* The first fit there is (row 5, or the first row measured after a resume) names every capture so
+             * far past the flag: a bad one in rows 1 to 4 has had no fit to show in, and the stand may still
+             * be near it. After that, this row's, plus an earlier capture only when it newly crosses the flag
+             * (one bad capture leans on its neighbors, and which one stands out can change as rows arrive).
+             * Largest first, and FIT_NAME_MAX bounds the line (past it, the count): one bad capture drags its
+             * whole row a little through the row's latency, and the culprit must not be the name cut off. */
+            enum { FIT_NAME_MAX = 8 };
+            printf("localize: row %d fit: %.1f mm RMS over the %d rows so far; captures past %.0f mm (%s):",
+                   k + 1, nu ? 1e3 * sqrt(ss / nu) : 0.0, nd, CALIB_LOC_RESID_FLAG_M * 1e3,
+                   fit_first ? "every row so far" : "this row, and earlier ones new to the list");
+            struct FitBad { double e; int s, row; };
+            std::vector<FitBad> bad;
+            for (int a = 0; a < nd; ++a)
+                for (int s = 0; s < n; ++s) {
+                    if (!puse[s] || !pcu[(size_t)s * nd + a]) continue;
+                    const double e = pres[(size_t)s * nd + a];
+                    if (!(fabs(e) > CALIB_LOC_RESID_FLAG_M)) continue;
+                    unsigned char* named = &fit_named[(size_t)s * K + kd[a]];
+                    if (a != knew && !fit_first && *named) continue;
+                    *named = 1;
+                    bad.push_back({ e, s, kd[a] + 1 });
+                }
+            std::sort(bad.begin(), bad.end(), [](const FitBad& p, const FitBad& q) { return fabs(p.e) > fabs(q.e); });
+            nf = (int)bad.size();
+            for (int i = 0; i < nf && i < FIT_NAME_MAX; ++i) printf(" speaker %d row %d (%+.0f mm)", bad[i].s, bad[i].row, bad[i].e * 1e3);
+            if (nf > FIT_NAME_MAX) printf(" and %d smaller", nf - FIT_NAME_MAX);
+            printf("%s\n", nf ? "" : " none");
+            fit_first = 0;
+        };
         /* --zylia: the ZM-1 is the mic. Each range is the arrival at the array CENTER from the 19 capsules
          * (calib_measure_speaker's pressure proxy: zylia_center_arrival), not one capsule's. One capsule
          * on the 49 mm sphere is early or late by up to R/c (143 us, 49 mm) depending on where the speaker
@@ -2184,6 +2577,7 @@ int main(int argc, char** argv) {
                        g_track_sim ? "the way the scripted stand turns it" : "the untracked simulation's fixed way");
         }
         for (int k = 0; k < K; ++k) {
+            if (!measure[k]) continue;
             if (g_tracked) {
                 /* the row is the PLAN; the tracker measures where the mic actually stands, and that
                  * is what the trilateration gets */
@@ -2201,13 +2595,16 @@ int main(int argc, char** argv) {
                        k + 1, sim_step_s * 1e3);
             }
             for (int s = 0; s < n; ++s) {
+                if (excl[s]) continue;
                 MeasureResult r;
                 if (zylia && simulate) {   /* the physical array as it is turned right now, at the stand's TRUE center */
                     float q[4];
                     calib_sim_zm1_room(g_track_sim && mic_track_sim_orientation(&g_mt, q) ? q : NULL, LP.c.caps);
                 }
                 LP.c.sim_at = g_track_sim ? g_sim_at : micpos[k];
-                pass_quality(LP.c, micpos[k], CALIB_WIN_PLAN_M, 0);
+                /* two agreeing sweeps, as the trims take: on the rig a single sweep now and then read meters early,
+                 * and one such capture is enough to spoil a speaker's position */
+                pass_quality(LP.c, micpos[k], CALIB_WIN_PLAN_M, 1);
                 CalibMeasInfo zmi;
                 if (!measure_speaker(LP, s, 0, &r, &zmi)) {
                     fprintf(stderr, "calibrate: localize stopped at speaker %d, position %d\n", s, k + 1);
@@ -2229,7 +2626,15 @@ int main(int argc, char** argv) {
                                         ? (float)(20.0 * log10((double)r.band_direct[2] / (double)r.band_direct[1])) : 0.f;
                 tiltw[(size_t)s * K + k] = (r.band[1] > 1e-9f && r.band[2] > 1e-9f)
                                          ? (float)(20.0 * log10((double)r.band[2] / (double)r.band[1])) : 0.f;
+                arr_s[(size_t)s * K + k] = range[(size_t)s * K + k] / sos;
+                have[(size_t)s * K + k] = 1;
+                printf("localize: capture row %d speaker %d: %.4f m (%.6f s), snr %.1f dB, %d sweep(s)\n", k + 1, s,
+                       range[(size_t)s * K + k], arr_s[(size_t)s * K + k], r.snr_db, zmi.sweeps);
             }
+            row_done[k] = 1;
+            disk_put_row(k);                                     /* whole now: it replaces the old row on disk */
+            if (!ranges_save(k)) { LOC_CLOSE(); return 1; }
+            row_check(k);
         }
 #ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
@@ -2239,8 +2644,11 @@ int main(int argc, char** argv) {
         printf("localize: raw ranges, meters at c including the latency (one line per speaker, one column per mic row):\n");
         for (int s = 0; s < n; ++s) {
             printf("  raw %2d:", s);
-            for (int k = 0; k < K; ++k) printf(" %.4f", range[(size_t)s * K + k]);
-            printf("\n");
+            for (int k = 0; k < K; ++k) {
+                if (excl[s]) printf("       -");
+                else         printf(" %.4f", range[(size_t)s * K + k]);
+            }
+            printf("%s\n", excl[s] ? "   (excluded)" : "");
         }
         if (g_tracked) {
             printf("localize: the MEASURED mic positions the trilateration uses (planned in brackets):\n");
@@ -2272,12 +2680,13 @@ int main(int argc, char** argv) {
             /* an unsolved speaker keeps what the file already says rather than get the floor origin: (0,0,0)
              * is a confident-looking position the engine would then render from */
             memcpy(pos[s], L.speakers[s].pos, sizeof pos[s]);
+            if (excl[s]) { solved[s] = 0; continue; }
             solved[s] = (unsigned char)calib_trilaterate(&range[(size_t)s * K], micpos, K, lin[s], &linlat[s]);
             nsolved += solved[s];
             if (!solved[s])
                 fprintf(stderr, "  spk %2d: trilateration failed (degenerate mic positions?); its position is left as it was\n", s);
         }
-        const int failed = n - nsolved;
+        const int failed = n - nsolved - nexcl;
         /* the joint solve over the captures in cuse, from both starts; the converged one with the smaller
          * residual (over those captures: a dropped one's residual is large on purpose) lands in pos, rowlat
          * and resid. Returns the latencies solved, 0 when neither start converged (nothing touched). */
@@ -2311,8 +2720,8 @@ int main(int argc, char** argv) {
         if (nlat == 0 && nsolved > 0) {
             /* the joint solve did not converge at all: the per-speaker answers, flagged */
             unchecked = "the joint solve did not converge, so each speaker's own solve";
-            printf("localize: WARNING: the joint solve did not converge; writing each speaker's own solve, which assumes the\n"
-                   "          latency held for the whole run\n");
+            printf("localize: WARNING: the joint solve did not converge. Each speaker's own solve follows, for diagnosis\n"
+                   "          only: it assumes the latency held for the whole run, and nothing will be written\n");
             for (int s = 0; s < n; ++s) if (solved[s]) memcpy(pos[s], lin[s], sizeof pos[s]);
         }
         /* One bad capture shows only PART of its error in its own residual: the fit spends the rest on that
@@ -2466,6 +2875,7 @@ int main(int argc, char** argv) {
              * reverberant dilution the gate removes (docs/calibration.md) */
             float err_g[BWA_MAX_CHANNELS], err_w[BWA_MAX_CHANNELS]; int nerr = 0;
             for (int s = 0; s < n; ++s) {
+                if (excl[s]) continue;
                 CalibAimResult ar;
                 calib_check_aim(&LA, s, micpos, &tilt[(size_t)s * K], K, AIM_BAND_HZ, F2, &ar);
                 if (!ar.ok) {
@@ -2518,11 +2928,48 @@ int main(int argc, char** argv) {
         }
         free(tilt);
         free(tiltw);
+        /* No writeback from a fit the captures do not support. On the rig the per-speaker fallback put boxes
+         * 2 to 13 m out, and a layout carrying that is worse than the plan it would replace. */
+        double fit_rms = 0.0;
+        {
+            double ss = 0.0; int nu = 0;
+            if (nlat > 0)
+                for (int s = 0; s < n; ++s)
+                    if (solved[s])
+                        for (int k = 0; k < K; ++k)
+                            if (cuse[(size_t)s * K + k]) { ss += resid[(size_t)s * K + k] * resid[(size_t)s * K + k]; ++nu; }
+            fit_rms = nu ? sqrt(ss / nu) : 0.0;
+        }
+        const int refuse_none = nsolved == 0;                    /* every linear solve failed: the layout would go out unchanged */
+        const int refuse_fallback = nlat == 0 && nsolved > 0;
+        const int refuse_misfit = nlat > 0 && fit_rms > CALIB_LOC_REFUSE_RMS_M;
         free(lin); free(trial); free(solved); free(cuse); free(linlat); free(resid); free(tres);
+        if (refuse_none) {
+            fprintf(stderr, "localize: REFUSED: no speaker could be solved, so nothing is written to %s.\n"
+                            "          The mic rows are degenerate (all at one height, or on one line): %s needs rows\n"
+                            "          spread in all three directions.\n", out_path, localize_file);
+            free(range); free(pos); free(res); free(cap); free(sweep); free(have); free(arr_s);
+            return 1;
+        }
+        if (refuse_fallback || refuse_misfit) {
+            if (refuse_fallback)
+                fprintf(stderr, "localize: REFUSED: the joint solve did not converge, so nothing is written to %s.\n", out_path);
+            else
+                fprintf(stderr, "localize: REFUSED: the fit misses the captures by %.0f mm RMS (the limit is %.0f mm), so nothing is\n"
+                                "          written to %s.\n", fit_rms * 1e3, CALIB_LOC_REFUSE_RMS_M * 1e3, out_path);
+            fprintf(stderr, "          The captures disagree with the mic rows. Read the raw ranges above: a speaker whose\n"
+                            "          column jumps by meters had a bad capture, and a whole row off says the mic or the latency\n"
+                            "          moved during it. Then re-take those rows\n");
+            free(range); free(pos); free(res); free(cap); free(sweep); free(have); free(arr_s);
+            return 1;
+        }
+        free(have); free(arr_s);
         int nplan = 0;
         if (!calib_write_positions(layout_path, out_path, pos, n, &nplan, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         record_sos(out_path, sos);
-        printf("localize: wrote %d positions to %s%s\n", n, out_path, failed ? "  (the failed ones left as they were)" : "");
+        printf("localize: wrote %d positions to %s%s%s (fit %.1f mm RMS)\n", n - failed - nexcl, out_path,
+               failed ? "  (the failed ones left as they were)" : "",
+               nexcl ? "  (the excluded ones left as they were)" : "", fit_rms * 1e3);
         report_plan("localize", nplan, n);
         free(range); free(pos); free(res); free(cap); free(sweep);
         return 0;

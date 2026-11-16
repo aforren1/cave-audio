@@ -3353,7 +3353,8 @@ static void tab_session(void) {
             if (SES.in.place_timeout_s < 1) SES.in.place_timeout_s = 1;
             g_ses_dirty = true;
         }
-        bwTip("how long a tracked step waits for the placement gate (--place-timeout); the gate opens by itself");
+        bwTip("how long a tracked step waits for the placement gate and then for Send Enter (--place-timeout); "
+              "the gate opens by itself");
         if (SES.simulate)
             ses_input("simulated truth##ses", "a layout: where the speakers really stand (optional)", SU.truth, sizeof SU.truth, w_long,
                       "simulate only (bwa_calibrate --sim-truth): the speakers stand here, not at the plan, so the "
@@ -3455,6 +3456,36 @@ static void tab_session(void) {
         }
         ImGui::EndTable();
     }
+    {   /* localize stopped partway: say what its next run will do with the rows it kept, and let that be changed */
+        /* Not asked while a tool runs: the answer is about the NEXT run, and the file is the tool's to
+         * rename and rewrite meanwhile. The line shows the last answer. */
+        static int ld = 0, lr = 0;
+        static SesResume lres = SES_RESUME_NONE;
+        static std::string lwhy;
+        if (!busy) lres = ses_localize_resume(SES, &ld, &lr, &lwhy);
+        if (lres == SES_RESUME_MISMATCH) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(amber, "localize: %s holds %d of %d rows, but %s. The next run STARTS OVER: it measures every row.",
+                               SES_LOCALIZE_RANGES, ld, lr, lwhy.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::SetItemTooltip("the kept rows are not lost: the file is set aside as as_built.ranges.1.json (or the next free number)");
+        } else if (lres == SES_RESUME_OK) {
+            if (!SES.localize_start_over)
+                ImGui::TextColored(amber, "localize: %s holds %d of %d rows. The next run RESUMES: it measures only the missing rows.",
+                                   SES_LOCALIZE_RANGES, ld, lr);
+            else
+                ImGui::TextColored(amber, "localize: %s holds %d of %d rows. The next run STARTS OVER: it measures every row.",
+                                   SES_LOCALIZE_RANGES, ld, lr);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(busy);
+            if (ImGui::SmallButton(SES.localize_start_over ? "Resume instead##ses_loc" : "Start over##ses_loc"))
+                SES.localize_start_over = !SES.localize_start_over;
+            bwTip("resume: the next localize run reads the kept rows (--ranges-in) and measures the rest. Start over: it "
+                  "measures every row, and the file with the kept rows is set aside as as_built.ranges.1.json (or the next "
+                  "free number: nothing is overwritten, and old ones are safe to delete by hand)");
+            ImGui::EndDisabled();
+        }
+    }
     ImGui::BeginDisabled(busy);
     ImGui::SetNextItemWidth(-uiScaled(250));
     ImGui::InputTextWithHint("##sesnote", "note for a skip (why)", g_ses_note, sizeof g_ses_note);
@@ -3520,7 +3551,8 @@ static void tab_session(void) {
         bwTip("stop the tool now (it is killed; on the rig the device closes with it). The step reads failed");
         ImGui::SameLine();
         if (ImGui::SmallButton("Send Enter##ses")) ses_run_enter(&SR);
-        bwTip("untracked runs on the rig stop at each row with 'press Enter': place the ZM-1, then send it");
+        bwTip("on the rig a run stops with 'press Enter': tracked, once the stand has settled (leave the space first); "
+              "untracked, at each row (place the ZM-1 first). Then send it");
     }
 
     /* -------- the log -------- */
@@ -5419,6 +5451,8 @@ static void register_tests(ImGuiTestEngine* e) {
         IM_CHECK(ses_used(SES_FRAME, "baffle_offset_m") && ses_used(SES_FRAME, "baffle_offset_m")->path == "0.0600");
         IM_CHECK(SES.step[SES_LOCALIZE].command.find("--layout \"" + ses_abs(SES_PLAN) + "\" --out as_built.json") != std::string::npos);
         IM_CHECK(SES.step[SES_LOCALIZE].command.find("--sim-truth") != std::string::npos);
+        IM_CHECK(SES.step[SES_LOCALIZE].command.find("--track-sim") != std::string::npos);
+        IM_CHECK(SES.step[SES_LOCALIZE].command.find("--place-wait-enter") == std::string::npos);   /* simulate never waits */
         IM_CHECK(ses_link(SES_CAPSULES, SES_LOCALIZE));
         IM_CHECK(ses_link(SES_TRIMS, SES_LOCALIZE));
         IM_CHECK(ses_link(SES_TRIMS, SES_CAPSULES));
@@ -5509,6 +5543,29 @@ static void register_tests(ImGuiTestEngine* e) {
         }
         IM_CHECK(ses_log_has("aim: speaker 4 accepted"));
         IM_CHECK(ses_log_has("verify: 0 speaker(s) flagged"));
+        /* The ranges file the REAL tool wrote in this session, cut to look stopped (its last row dropped): the
+         * tab must read it as the tool wrote it and resume. localize_resume writes its files by hand. */
+        {
+            const std::string rp = ses_join(SES.folder, SES_LOCALIZE_RANGES);
+            std::string txt;
+            FILE* rf = fopen(rp.c_str(), "rb");
+            IM_CHECK(rf != NULL);
+            char rb[4096];
+            size_t rn;
+            while (rf && (rn = fread(rb, 1, sizeof rb, rf)) > 0) txt.append(rb, rn);
+            if (rf) fclose(rf);
+            const size_t cut = txt.rfind(",\n    { \"row\": ");
+            IM_CHECK(cut != std::string::npos);
+            IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_NONE);   /* whole: nothing to resume */
+            IM_CHECK(ses_write_text(rp.c_str(), (txt.substr(0, cut) + "\n  ]\n}\n").c_str()));
+            int nd = 0, nr = 0;
+            std::string w;
+            const SesResume rr = ses_localize_resume(SES, &nd, &nr, &w);
+            printf("session test: the tool's own ranges file, its last row dropped: %d (%d of %d) %s\n", (int)rr, nd, nr, w.c_str());
+            IM_CHECK(rr == SES_RESUME_OK);
+            IM_CHECK(nd == nr - 1 && nr == 5);
+            IM_CHECK(ses_write_text(rp.c_str(), txt.c_str()));
+        }
         ctx->CaptureScreenshotWindow("//calib view");
     };
 
@@ -5673,6 +5730,117 @@ static void register_tests(ImGuiTestEngine* e) {
         printf("session test: localize command: %s%s\n", cmd.c_str(), why.c_str());
         IM_CHECK(have_cmd);
         IM_CHECK(cmd.find(" --natnet-local 10.0.0.2") != std::string::npos);
+        /* a tracked rig step waits for Send Enter: without the flag the tool cannot know its stdin pipe
+         * has a writer, and counts 5 s instead */
+        IM_CHECK(cmd.find(" --place-wait-enter") != std::string::npos);
+    };
+
+    /* A localize run that stopped partway is resumed by the next Run, and Start over is the way out. No tool
+     * runs here: the ranges file is written as an aborted run leaves it, and the command line is what is read. */
+    t = IM_REGISTER_TEST(e, "session", "localize_resume");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_locresume";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        SesTools T;
+        T.survey = "bwa_speaker_survey.exe";                      /* never run here */
+        T.calibrate = "bwa_calibrate.exe";
+        std::string cmd, why;
+        std::vector<SesFile> cons;
+        IM_CHECK(ses_command(SES, SES_FRAME, T, &cmd, &cons, &why));
+        ses_begin(&SES, SES_FRAME, cmd, cons);
+        IM_CHECK(ses_write_text(ses_join(SES.folder, "frame_check.csv").c_str(), "index\n"));
+        ses_finish(&SES, SES_FRAME, 0, "summary: matched 4\n", false);
+        const std::string rp = ses_join(SES.folder, SES_LOCALIZE_RANGES);
+        DeleteFileA(rp.c_str());
+        /* no ranges file: a fresh run */
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+        IM_CHECK(cmd.find("--ranges-in") == std::string::npos);
+        IM_CHECK(!ctx->ItemExists("**/Start over##ses_loc"));
+
+        /* a ranges file as bwa_calibrate leaves one: nrows of its 5 rows, simulated or not, or with no flag */
+        auto ranges_text = [](int nrows, const char* simulate, int version = 1) {
+            std::string t = std::string("{ \"format\": \"") + CALIB_RANGES_FORMAT + "\", \"version\": " + std::to_string(version) + ",\n";
+            if (simulate) t += std::string("\"simulate\": ") + simulate + ", ";
+            t += "\"speakers\": 1, \"rows\": 5, \"captures\": [";
+            for (int r = 1; r <= nrows; ++r)
+                t += std::string(r > 1 ? ", " : "") + "{ \"row\": " + std::to_string(r) + ", \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], \"arrival_s\": [0.1] }";
+            return t + "] }\n";
+        };
+
+        /* a run aborted after 2 of its 5 rows */
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(2, "true").c_str()));
+        ses_begin(&SES, SES_LOCALIZE, cmd, cons);
+        ses_finish(&SES, SES_LOCALIZE, 1, "placement: timed out\n", false);
+        IM_CHECK_EQ(SES.step[SES_LOCALIZE].status, SES_FAILED);
+        int nd = 0, nr = 0;
+        IM_CHECK(ses_localize_resume(SES, &nd, &nr, NULL) == SES_RESUME_OK && nd == 2 && nr == 5);
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+        printf("session test: localize command after an aborted run: %s\n", cmd.c_str());
+        IM_CHECK(cmd.find(" --ranges-in as_built.ranges.json") != std::string::npos);
+        for (const SesFile& u : cons) IM_CHECK(u.path.find("ranges") == std::string::npos);   /* never a consumed input */
+        /* Start over, through the button: the next command has no --ranges-in, and the line says so */
+        ctx->Yield(2);
+        ctx->ItemClick("**/Start over##ses_loc");
+        ctx->Yield(2);
+        IM_CHECK(SES.localize_start_over);
+        IM_CHECK(ctx->ItemExists("**/Resume instead##ses_loc"));
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+        IM_CHECK(cmd.find("--ranges-in") == std::string::npos);
+        /* the choice is about one run: beginning it clears it, and a run that stops again is resumed again */
+        ses_begin(&SES, SES_LOCALIZE, cmd, cons);
+        IM_CHECK(!SES.localize_start_over);
+        ses_finish(&SES, SES_LOCALIZE, 1, "placement: timed out\n", false);
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find(" --ranges-in ") != std::string::npos);
+        /* and back, through the button */
+        ctx->Yield(2);
+        ctx->ItemClick("**/Start over##ses_loc");
+        ctx->Yield(2);
+        ctx->ItemClick("**/Resume instead##ses_loc");
+        ctx->Yield(2);
+        IM_CHECK(!SES.localize_start_over);
+
+        /* A rehearsal's rows are not resumed on the rig, nor the rig's by a rehearsal: the next run starts
+         * over (no --ranges-in), the line says why, and no button is offered since there is no resume to
+         * turn down. The file is rewritten in each case, which is also what makes the tab read it again. */
+        auto expect_mismatch = [&](const char* label, const char* word) {
+            std::string w;
+            const SesResume r = ses_localize_resume(SES, NULL, NULL, &w);
+            printf("session test: resume with %s: %d: %s\n", label, (int)r, w.c_str());
+            IM_CHECK(r == SES_RESUME_MISMATCH);
+            IM_CHECK(w.find(word) != std::string::npos);
+            IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--ranges-in") == std::string::npos);
+            ctx->Yield(2);
+            IM_CHECK(!ctx->ItemExists("**/Start over##ses_loc"));
+        };
+        SES.simulate = false;                                     /* simulated rows, and the session is switched to the rig */
+        SES.in.body = "stand";
+        SES.in.nn_server = "10.0.0.5";
+        expect_mismatch("simulate unticked", "its captures are simulated and this session is on the rig");
+        SES.simulate = true;
+        SES.in.body.clear();
+        SES.in.nn_server.clear();
+        IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_OK);
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(3, "false").c_str()));
+        expect_mismatch("rig rows under a simulated session", "its captures are the rig's and this session is simulated");
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(2, "true", 2).c_str()));
+        expect_mismatch("another file version", "version 2");
+        /* a file that does not say (written before the flag) is the user's to judge: resumed */
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(4, NULL).c_str()));
+        IM_CHECK(ses_localize_resume(SES, &nd, &nr, NULL) == SES_RESUME_OK && nd == 4);
+
+        /* a complete file is not resumed: a run from it would measure nothing */
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(5, "true").c_str()));
+        IM_CHECK(ses_localize_resume(SES, &nd, &nr, NULL) == SES_RESUME_NONE && nd == 5 && nr == 5);
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--ranges-in") == std::string::npos);
+        ctx->Yield(2);
+        IM_CHECK(!ctx->ItemExists("**/Start over##ses_loc"));
+        /* nor a file that is not a ranges file */
+        IM_CHECK(ses_write_text(rp.c_str(), "{ \"rows\": 5, \"captures\": [1] }\n"));
+        IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_NONE);
+        DeleteFileA(rp.c_str());
+        SES = Session();
+        ses_clear_dir(dir);
     };
 
     t = IM_REGISTER_TEST(e, "session", "baffle_offset");

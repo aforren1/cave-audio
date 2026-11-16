@@ -417,8 +417,12 @@ double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3])
  * K latencies (per_row) or 1, started internally from the mean residual. `resid_out` (n*K, may be
  * NULL) gets measured minus modeled range, meters. Needs 5 <= K <= CALIB_LOC_MAX_ROWS, at least one
  * equation to spare, at least 4 used captures per used speaker, and per row at least 4 used captures.
- * Returns 1, or 0 on a degenerate or non-converging solve (nothing written). */
+ * Returns 1, or 0 on a degenerate or non-converging solve (nothing written). Converged means the FULL
+ * Gauss-Newton step is under 0.1 um in every component. A line search that finds no step with a real
+ * (Armijo) decrease counts as converged only when that full step was under CALIB_LOC_STALL_STEP_M: a
+ * minimum to the misfit's rounding, not a stall. */
 #define CALIB_LOC_MAX_ROWS 64
+#define CALIB_LOC_STALL_STEP_M 1e-4
 int calib_localize_joint(const double* range, const float (*mic)[3], int K, int n, const unsigned char* use,
                          const unsigned char* cap_use, int per_row, float (*pos_io)[3], double* lat_out,
                          double* resid_out);
@@ -439,6 +443,59 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
  * flagged capture and solves again once, where its residual against the solve without it reads the
  * whole error. */
 #define CALIB_LOC_RESID_FLAG_M 0.010
+/* bwa_calibrate --localize writes nothing when the RMS range residual over every used capture is past this:
+ * the captures disagree with the mic rows, so no position from them can be trusted. 5 x the flag: clean
+ * simulated runs sit under 1 mm, and 15 mm of capture noise on the rig's rows fits to about 14 mm. */
+#define CALIB_LOC_REFUSE_RMS_M 0.050
+
+/* --localize's captures on disk (--ranges-out, --ranges-in): what a run measured, so a canceled or refused
+ * run loses nothing, a solve can be repeated with no audio (--solve-only), and one bad row can be measured
+ * again (--retake) instead of the whole run. Arrivals are stored in SECONDS, not meters, so a later run at
+ * another speed of sound reads them right. Arrays are speaker-major, capture (s, k) at s * K + k; the per-row
+ * arrays hold K entries. have[] marks the captures present (an excluded speaker, a row not yet measured).
+ * tilt arrays may be NULL. */
+typedef struct {
+    int            n, K;
+    unsigned char* have;
+    double*        arrival_s;
+    float*         tilt_db;          /* --check-aim's direct-sound tilt */
+    float*         tilt_whole_db;    /* the same over the whole response */
+    float        (*planned)[3];      /* each row's target (the rows file) */
+    float        (*mic)[3];          /* where the mic was measured to be (tracked), else the target */
+    unsigned char* row_done;         /* K: the row was measured */
+    int            simulate;         /* 1 the captures are simulated, 0 the rig's; read: -1 when the file does not say */
+} CalibRanges;
+#define CALIB_RANGES_FORMAT  "bwa_calibrate localize ranges"
+#define CALIB_RANGES_VERSION 1
+/* Write r to path (JSON). Only rows with row_done are written. The file is built as <path>.tmp and moved
+ * onto path, so path always holds a whole file. 1, or 0 with a reason. */
+int calib_ranges_write(const char* path, const CalibRanges* r, char* err, size_t errcap);
+/* Read path into r, whose buffers are allocated for r->n speakers and r->K rows. The file must carry
+ * CALIB_RANGES_FORMAT at CALIB_RANGES_VERSION, the same speaker count and row count, and each row once.
+ * Rows the file lacks keep row_done 0. 1, or 0 with a reason. */
+int calib_ranges_read(const char* path, CalibRanges* r, char* err, size_t errcap);
+/* A run about to write path, where a file it did not create already is, sets that file aside first under
+ * the next free generation name, <path minus .json>.<N>.json (N = 1, 2, ...), its name into gen. copy 0
+ * moves it; copy 1 leaves path in place, for the run that rewrites the file it read, so a run stopped
+ * before its first row still has it. Nothing is ever replaced: a name in use is skipped (os_move_new
+ * refuses one), and no run deletes a file it did not create. Old generations are the user's to delete.
+ * 1 set aside, 0 no file at path, -1 it failed (a file that is there and cannot be opened, a folder). */
+int calib_ranges_set_aside(const char* path, int copy, char* gen, size_t gencap);
+/* A ranges file's header without its captures, for a caller deciding whether to resume from it: the
+ * version, the speaker and row counts it was written for, the rows it holds, and whether its captures are
+ * simulated (-1 when it does not say). Any pointer may be NULL. 1, or 0 when path is not a ranges file. */
+int calib_ranges_peek(const char* path, int* version, int* speakers, int* rows, int* done, int* simulate);
+
+/* The row-pair check localize prints from its second row on, before there are rows enough for the joint
+ * solve. For one speaker, its range change between mic rows a and b, less the change in latency, cannot
+ * exceed the distance d between the rows (the triangle inequality). The latency change is unknown but the
+ * same for every speaker, so take the value inside the most speakers' allowed intervals [dr - d - tol,
+ * dr + d + tol] and flag the speakers whose interval misses it. Catches a capture off by more than about
+ * the row spacing (a reflection meters late, a sweep read meters early), not small errors. use (may be
+ * NULL) skips speakers. Returns how many used speakers agree; *dlat gets the latency change. */
+#define CALIB_LOC_PAIR_TOL_M 0.05   /* the row-pair check's slack: range noise plus latency wander */
+int calib_row_pair_check(const double* ra, const double* rb, const unsigned char* use, int n, double d, double tol,
+                         double* dlat, unsigned char* flag);
 
 /* Write recovered speaker positions back into the layout JSON (sets each speaker's "position" [x,y,z],
  * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`.

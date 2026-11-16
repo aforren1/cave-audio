@@ -100,6 +100,9 @@ struct Session {
     std::string folder;                  /* absolute, no trailing separator; empty = no session open */
     std::string created;
     bool        simulate = true;
+    /* Not saved. The next localize run starts over where it would resume (ses_localize_resume); ses_begin
+     * clears it, so it is a choice about one run. */
+    bool        localize_start_over = false;
     int         next_run = 1;
     SesInputs   in;
     SesStep     step[SES_NSTEPS];
@@ -127,6 +130,19 @@ bool ses_load(Session* S, const std::string& folder, std::string* err);
 /* Why step k cannot run now ("" = it can), and why its record is stale ("" = it is current). */
 std::string ses_blocked(const Session& S, int k);
 std::string ses_stale(const Session& S, int k);
+/* The localize step's captures on disk. bwa_calibrate keeps them in as_built.ranges.json, rewritten after
+ * every row, so a run that stopped (a canceled step, an Enter that never came, a bump) leaves the rows it
+ * finished. What the next localize run does with them:
+ *   SES_RESUME_NONE      nothing to resume: no such file, not a ranges file, or it holds every row (a run
+ *                        from a complete file would measure nothing and solve to the same answer).
+ *   SES_RESUME_OK        some rows and not all: it passes --ranges-in and measures only what is missing,
+ *                        unless S.localize_start_over.
+ *   SES_RESUME_MISMATCH  some rows, but simulated ones under a rig session or the reverse (or another
+ *                        file version): the next run starts over, and why says which.
+ * done, rows and why may be NULL. The file is parsed once per change, not per call. */
+#define SES_LOCALIZE_RANGES "as_built.ranges.json"
+enum SesResume { SES_RESUME_NONE, SES_RESUME_OK, SES_RESUME_MISMATCH };
+SesResume ses_localize_resume(const Session& S, int* done, int* rows, std::string* why);
 /* The command line for a subprocess step, and the files it will consume. false + why = refused. */
 bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, std::vector<SesFile>* consumed,
                  std::string* why);

@@ -316,9 +316,16 @@ static int track_place(void* user, int li, float mic_out[3]) {
     place_cfg_direction(&cfg, T->turn_limit_deg);           /* a direction mode: the orientation must hold too */
     char what[48];
     snprintf(what, sizeof what, "position %d", li + 1);
-    if (mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, T->clear_s, what, &T->placed)) {
-        fprintf(stderr, "  no settled, LIVE pose for the tracked rigid body - refusing to measure this\n"
-                        "  placement from a guess\n");
+    const int pr = mic_track_place_console(T->mt, T->planned[li], &cfg, T->timeout_s, T->keys, T->clear_s, what, &T->placed);
+    if (pr) {
+        /* the wait printed its own reason; this line says what the run does about it, in the same terms */
+        if (pr == MIC_PLACE_NO_ENTER)
+            fprintf(stderr, "  the stand settled and no Enter arrived in time (--place-wait-enter): skipping this placement\n");
+        else if (pr == MIC_PLACE_PIPE_CLOSED)
+            fprintf(stderr, "  stdin's pipe closed, so no Enter can arrive (--place-wait-enter): skipping this placement\n");
+        else
+            fprintf(stderr, "  no settled, LIVE pose for the tracked rigid body - refusing to measure this\n"
+                            "  placement from a guess\n");
         return 0;
     }
     memcpy(mic_out, T->placed.center, sizeof T->placed.center);
@@ -690,6 +697,7 @@ int main(int argc, char** argv) {
     float place_tol_m = VAL_PLACE_TOL_M;
     double place_timeout = 300.0;
     double place_clear_s = -1.0;           /* < 0 = the default for this run */
+    int    place_wait_enter = 0;           /* --place-wait-enter: Enter may come down stdin's pipe */
     int tol_set = 0, timeout_set = 0;
     int mount_ring = 0, mount_off_set = 0;   /* --mount-offset ring | x,y,z */
     float mount_off[3] = { 0.f, 0.f, 0.f };
@@ -766,6 +774,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "--place-clear-s wants seconds, 0 to 120 (got %s)\n", argv[i]); return 2; }
             place_clear_s = v;
         }
+        else if (!strcmp(argv[i], "--place-wait-enter")) place_wait_enter = 1;
         else if (!strcmp(argv[i], "--mount-offset") && i+1 < argc) {   /* "ring" or "x,y,z" (body axes, m) */
             const char* s = argv[++i];
             if (!strcmp(s, "ring")) mount_ring = 1;
@@ -918,6 +927,9 @@ int main(int argc, char** argv) {
                    "                        center's height)\n"
                    "  --place-tol-mm <mm>   placement tolerance (default 20); the bump limit is half\n"
                    "  --place-clear-s <s>   count this long once the gate opens, in place of waiting for Enter\n"
+                   "  --place-wait-enter    wait for Enter once the gate opens, from the console or from\n"
+                   "                        stdin's pipe (calib_view's Send Enter). Without it only a\n"
+                   "                        console waits for Enter; anything else counts 5 s\n"
                    "  --place-timeout <s>   give up on a placement's gate after this (default 300);\n"
                    "                        the placement is skipped. On the rig F takes the\n"
                    "                        current reading anyway, with a warning\n"
@@ -967,6 +979,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--track-sim-bump/--track-sim-twist act on the SIMULATED stand; pass --track-sim\n"); return 2; }
     if (!tracked_run && (tol_set || timeout_set || mount_off_set || nn_server || nn_local)) {
         fprintf(stderr, "--place-tol-mm/--place-timeout/--mount-offset/--natnet-server/--natnet-local are --track options\n"); return 2; }
+    if (place_wait_enter && place_clear_s >= 0.0) {
+        fprintf(stderr, "--place-wait-enter waits for Enter and --place-clear-s counts instead: pass one\n"); return 2; }
+    /* before the tracker is opened: a refusal over the command line should not cost a NatNet connect */
+    if (place_wait_enter && track_body && !mic_track_stdin_takes_enter()) {
+        fprintf(stderr, "--place-wait-enter: stdin is neither a console nor a pipe, so no Enter can arrive\n"); return 2; }
     if (inject != -1 && (inject < 0 || inject >= ZYLIA_MICS)) {
         fprintf(stderr, "--inject-fault must be 0..%d\n", ZYLIA_MICS-1); return 2; }
 
@@ -1171,6 +1188,7 @@ int main(int argc, char** argv) {
         trk.turn_limit_deg = place_turn_limit_deg(place_tol_m, radius);   /* the directions are read at the radius */
         trk.timeout_s = place_timeout;
         trk.keys = !track_sim;
+        mic_track_wait_enter(place_wait_enter);
         trk.clear_s = place_clear_s >= 0.0 ? place_clear_s : mic_track_default_clear(track_sim);
         trk.sim = track_sim;
         if (track_sim && !survey_path)

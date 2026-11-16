@@ -154,19 +154,41 @@ struct MicPlaced {
  * place_cfg_direction) also shows the mount's yaw and holds while the stand turns ("turning"). keys != 0
  * (the rig): F takes the current reading anyway, with a warning; with no pose at all it aborts.
  * clear_s > 0: once the gate opens, count this long before taking the reading (place_clear_step).
- * clear_s = MIC_TRACK_CLEAR_KEY: once the gate opens, wait for Enter (needs keys != 0).
- * Returns 0 placed (out filled, the capsule table re-aimed when it can be), 1 timed out or aborted (the
- * reason printed). */
+ * clear_s = MIC_TRACK_CLEAR_KEY: once the gate opens, wait for Enter (needs keys != 0). That wait has no
+ * limit (timeout_s bounds only the gate) unless mic_track_wait_enter(1) was called: then, console or pipe,
+ * timeout_s bounds the gate and the Enter together, and a closed stdin pipe aborts.
+ * Returns 0 placed (out filled, the capsule table re-aimed when it can be), else why not (a MIC_PLACE_*
+ * code, the reason printed): the caller that goes on after a failed placement can say which it was. */
+enum {
+    MIC_PLACE_TIMED_OUT = 1,   /* the gate never opened inside timeout_s */
+    MIC_PLACE_ABORTED,         /* F with no live pose to take */
+    MIC_PLACE_NO_ENTER,        /* --place-wait-enter: the gate opened and no Enter came inside timeout_s */
+    MIC_PLACE_PIPE_CLOSED      /* --place-wait-enter: stdin's pipe has no writer left */
+};
 int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* cfg, double timeout_s,
                             int keys, double clear_s, const char* what, MicPlaced* out);
 
 /* Leaving the space matters: a body beside the array is a reflector the sweep measures, and footsteps are
- * what the noise floor check refuses. With a console the operator says when they have left. With none
- * (calib_view's Session tab runs the tools with no console, so no key can ever arrive) a wait for Enter
- * would hang until the timeout, so that path counts instead. */
+ * what the noise floor check refuses. With a console the operator says when they have left. With none, an
+ * Enter can arrive only down stdin's pipe, and only the caller knows whether anyone will send one
+ * (calib_view's Session tab does, from its Send Enter button; a script that pipes stdin does not). So the
+ * pipe is read only after mic_track_wait_enter(1), which is the tools' --place-wait-enter. Everything else
+ * counts instead of waiting for an Enter that would never come. */
 #define MIC_TRACK_CLEAR_S   5.0
 #define MIC_TRACK_CLEAR_KEY (-1.0)
-/* The clear_s a run gets when the command line does not set one. sim: 0. */
+/* --place-wait-enter: read Enter (and F) from stdin's pipe when there is no console. Off by default. */
+void mic_track_wait_enter(int on);
+/* Can an Enter reach stdin at all: a console, or a pipe. A file or NUL cannot deliver one, and a run given
+ * --place-wait-enter there would count instead without saying so; the tools refuse it. */
+int mic_track_stdin_takes_enter(void);
+/* A test hook, so a parent process can act on what this tool does and not on the clock. Files the tool
+ * creates: path + ".armed" once a placement reads keys (the drain is done), ".spent" when an Enter was
+ * read and did not start the sweeps, `path` when the wait for Enter is announced, ".taken" when a reading
+ * is taken. A file it reads: ".hold", there at the start of a placement, keeps the gate reading shut until
+ * ".go" appears. NULL or "" = off. */
+void mic_track_test_marker(const char* path);
+/* The clear_s a run gets when the command line does not set one. sim: 0. A console, or stdin's pipe after
+ * mic_track_wait_enter(1): MIC_TRACK_CLEAR_KEY. Anything else: MIC_TRACK_CLEAR_S. */
 double mic_track_default_clear(int sim);
 
 /* The bump check after one capture: note it, read the pose, place_bump_pose against the center and the

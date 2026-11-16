@@ -298,9 +298,11 @@ small. The agreement rule catches that burst; the SNR floor catches the gross fa
 channel, a wrong input, a capture swamped by noise). The window catches what neither sees: an
 impostor arrival louder than the real one.
 
-`--localize`, `--capsule-survey`, `--check` and the grid rows take one clean sweep a speaker, with
-the window and the floor. The `--zylia` position survey re-sweeps on the rig the same way; in
-simulate it computes its arrivals analytically and sweeps nothing.
+`--capsule-survey`, `--check` and the grid rows take one clean sweep a speaker, with the window
+and the floor. `--localize` takes two agreeing sweeps, as the trims do: on the rig a single sweep
+now and then read meters early, and one such capture spoils a speaker's position. The `--zylia`
+position survey re-sweeps on the rig the same way; in simulate it computes its arrivals
+analytically and sweeps nothing.
 
 ### Rehearse it: `--sim-interferer`
 
@@ -372,6 +374,54 @@ it. Do not expect it to be audible.
   the install drawings. The writeback records the plan the first time (see "Keep one file"
   above) and prints how many speakers it recorded one for. A speaker whose solve fails (the mic
   positions are degenerate for it) keeps the position the file already had, and the run says so.
+
+  The run writes nothing (exit 1) in three cases:
+
+  - No speaker could be solved. The mic rows are degenerate: all at one height, or on one line.
+    Spread the rows in all three directions.
+  - The joint solve does not converge.
+  - The fit misses the captures by more than 50 mm RMS (`CALIB_LOC_REFUSE_RMS_M`).
+
+  The last two mean the captures disagree with the mic rows, and a layout built from them is worse
+  than the plan. The log's `raw ranges` table (one line per speaker, one column per mic row) shows
+  which captures disagree.
+
+  Each row is checked as it lands, so you see a bad capture while the stand is still there:
+
+  - `localize: capture row K speaker S`: one line per capture, with its range, SNR and sweeps.
+  - `row K check`: from the second row on. A speaker whose range changed by more than the mic moved
+    (the triangle inequality, against each earlier row) is named. It catches a capture meters off.
+  - `row K fit`: from the fifth row on, the joint solve over the rows so far, and the captures more
+    than 10 mm off it. The first fit of a run (row 5, or the first row measured after a resume)
+    names every such capture so far, by speaker and row, so a bad capture in rows 1 to 4 shows.
+    Later fits name the new row's captures and any earlier one that newly crosses 10 mm. The list
+    is sorted largest first and cut after 8 names, with the count of the rest. One bad capture
+    pulls its whole row a little, so read the first name.
+
+  The captures are kept in a ranges file, rewritten after every row: `--ranges-out f.json`, or by
+  default the `--out` name with `.ranges.json` in place of `.json`. Arrivals are stored in seconds,
+  so a later run at another temperature reads them right. What the file buys:
+
+  - `--ranges-in f.json --solve-only` solves again with no audio, in seconds.
+  - `--ranges-in f.json --retake 3,7-8` measures those rows again and keeps the rest. Rows are
+    counted from 1. A retaken row takes its mic position from the rows file (untracked) or the
+    tracker, and replaces the old row only when its new captures are complete, so a retake that
+    stops partway leaves a file with every row in it.
+  - `--ranges-in f.json` alone measures the rows the file lacks, so a canceled run resumes. It
+    never measures a row the file already holds: if such a row lacks a capture, the run stops with
+    exit 2 and names the rows and speakers. Pass `--exclude` for speakers you left out on purpose,
+    or name the rows in `--retake`.
+  - `--exclude 14` never sweeps or solves speaker 14: an occluded box, or one not hung yet. It keeps
+    the position the layout gives it.
+
+  A run never overwrites a ranges file it did not create. A file already at the target is set
+  aside first as `f.1.json`, then `f.2.json`, and so on: moved when it is another run's, copied
+  when it is the file the run read. Delete old ones by hand when you no longer want them.
+
+  Three refusals protect the captures. A file of simulated captures is not added to by a rig run,
+  nor the reverse (exit 2). The ranges file may not be the `--out` layout, the `--layout` file or
+  the rows file (exit 2). If the ranges file cannot be written, the run stops at that row with
+  exit 1: the rows before it are in the file.
 
   With **`--zylia`** the mic is the ZM-1, and each range is the arrival at the array CENTER, pooled
   from the 19 capsules (the pressure proxy's `zylia_center_arrival`, see "The ZM-1 as the trim mic").
@@ -1856,11 +1906,19 @@ forever, so an occluded stand would otherwise hand back an old one.
 
 On the rig `F` takes the current reading anyway, with a warning. With no pose at all it aborts. No
 other key overrides the gate.
-`--place-timeout <s>` (default 300) aborts a wait that never ends. Once the gate opens, the tool waits
-for Enter, so you can leave the space first. It takes the reading when you press Enter. If the stand
-gets knocked on your way out, the gate closes and Enter does nothing until it opens again.
-`--place-clear-s <s>` counts that many seconds instead, and 0 starts at once. With no console, as in
-the Session tab, a wait for Enter could never end, so the default there is a 5 second count.
+`--place-timeout <s>` (default 300) aborts a gate that never opens. Once the gate opens, the tool
+waits for Enter, so you can leave the space first. It takes the reading when you press Enter. If the
+stand gets knocked on your way out, the gate closes and Enter does nothing until it opens again.
+An Enter sent before the tool says `settled` is spent: only one that arrives after the gate has
+opened starts the sweeps.
+`--place-clear-s <s>` counts that many seconds instead, and 0 starts at once.
+
+With no console (a script, a parent process) the default is a 5 second count, because no key can
+arrive. `--place-wait-enter` says someone will send the Enter down stdin's pipe: the Session tab
+passes it on the rig and sends it from its **Send Enter** button. With the flag, `--place-timeout`
+covers the gate and the Enter together, a pipe whose writer has gone ends the run (exit 1), and a
+stdin that is neither a console nor a pipe is refused (exit 2). Without it, a console waits for
+Enter with no limit. It cannot be combined with `--place-clear-s`.
 
 ### The bump check
 
@@ -2282,13 +2340,40 @@ tabs open the device per run and close it when the run ends; the Zylia tab holds
 NatNet is no conflict: the Placement panel and a tool both listen to the multicast stream
 (`SO_REUSEADDR`).
 
+### A localize run that stopped
+
+`bwa_calibrate --localize` keeps its captures in `as_built.ranges.json`, rewritten after every row.
+When a localize step stops partway (Cancel, a bump, an Enter that never came), that file holds the
+rows it finished. The next **Run** of the step resumes: the tab passes `--ranges-in
+as_built.ranges.json`, and the tool measures only the missing rows.
+
+A line under the step table says so while such a file exists: how many rows it holds, and that
+the next run RESUMES. **Start over** beside it switches the next run to a fresh one that measures
+every row. The file with the kept rows is then set aside as `as_built.ranges.1.json`, or the next
+free number. **Resume instead** switches back. The choice holds for one run.
+
+The tab checks one thing for you: rows from a simulated rehearsal are not resumed by a rig
+session, nor the reverse. The next run then starts over, and the line says why. If you changed
+the plan, the rows or the mount offset since those rows were measured, press **Start over**.
+
+A ranges file with every row in it is not resumed. To measure single rows again, run
+`bwa_calibrate` by hand with `--retake`.
+
 ### Prompts
 
-A tool runs with no console, so the tracked steps never wait for a key. The placement gate opens by
-itself when the stand is in tolerance and still, and `--place-timeout` (300 s by default) bounds the
-wait. Untracked, on the rig, `--localize`, the grid rows and `bwa_validate` stop at each placement
-and ask for Enter. The tab feeds the tool's stdin: place the ZM-1, then press **Send Enter**. That
-path cannot run in simulate (the tools skip the prompt there), so it is unverified.
+A tool runs with no console, so the tab feeds the tool's stdin, and **Send Enter** writes one Enter
+down it.
+
+Tracked, on the rig, the tab passes `--place-wait-enter` to the tool. The placement gate opens by
+itself when the stand is in tolerance and still, and the log then says `settled. Clear the space,
+then press Enter`. Leave the space, then press **Send Enter**: the sweeps start. `--place-timeout`
+(300 s by default) bounds the wait for the gate and for the Enter together.
+
+Untracked, on the rig, `--localize`, the grid rows and `bwa_validate` stop at each placement and
+ask for Enter. Place the ZM-1, then press **Send Enter**.
+
+Neither path can run in simulate (the tools skip the wait there), so the tab's side of both is
+unverified.
 
 ### Simulate
 

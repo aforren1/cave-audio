@@ -370,6 +370,26 @@ int os_mkdir(const char* utf8_path) {
 
 int os_remove(const char* utf8_path) { return (utf8_path && remove(utf8_path) == 0) ? 0 : 1; }
 int os_rmdir (const char* utf8_path) { return (utf8_path && rmdir (utf8_path) == 0) ? 0 : 1; }
+int os_path_kind(const char* utf8_path) {
+    struct stat st;
+    if (!utf8_path) return OS_PATH_OTHER;
+    if (lstat(utf8_path, &st) != 0) return (errno == ENOENT || errno == ENOTDIR) ? OS_PATH_NONE : OS_PATH_OTHER;
+    return S_ISREG(st.st_mode) ? OS_PATH_FILE : OS_PATH_OTHER;
+}
+int os_move_new(const char* utf8_from, const char* utf8_to) {
+    /* rename() replaces; link() refuses an existing name, atomically */
+    if (!utf8_from || !utf8_to || link(utf8_from, utf8_to) != 0) return 1;
+    unlink(utf8_from);
+    return 0;
+}
+int os_same_file(const char* utf8_a, const char* utf8_b) {
+    struct stat a, b;
+    if (!utf8_a || !utf8_b || stat(utf8_a, &a) != 0 || stat(utf8_b, &b) != 0) return 0;
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+int os_replace(const char* utf8_from, const char* utf8_to) {
+    return (utf8_from && utf8_to && rename(utf8_from, utf8_to) == 0) ? 0 : 1;      /* POSIX rename replaces */
+}
 
 /* ---- mutex ---- */
 

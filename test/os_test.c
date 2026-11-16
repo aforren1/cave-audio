@@ -448,6 +448,43 @@ static void file_section(void) {
             fclose(f);
         }
         CHECK(os_fopen(NULL, "rb") == NULL, "os_fopen(NULL) fails cleanly");
+        {
+            /* os_replace lands on a file that is already there: the old bytes go, the source name goes */
+            const char* tmp = "bwa_os_" "\xC3\xA9" "_" "\xE9\x9F\xB3" "/f.txt.tmp";
+            f = os_fopen(tmp, "wb");
+            if (f) { fputs("newer", f); fclose(f); }
+            CHECK(os_replace(tmp, file) == 0, "os_replace onto an existing file");
+            char buf[8] = { 0 };
+            f = os_fopen(file, "rb");
+            CHECK(f && fread(buf, 1, 5, f) == 5 && strcmp(buf, "newer") == 0, "os_replace: the target holds the new bytes");
+            if (f) fclose(f);
+            CHECK(os_fopen(tmp, "rb") == NULL, "os_replace: the source name is gone");
+            CHECK(os_replace(tmp, file) != 0, "os_replace with no source reports failure");
+            /* one file under two spellings, and two files */
+            const char* file2 = "bwa_os_" "\xC3\xA9" "_" "\xE9\x9F\xB3" "/./f.txt";
+            CHECK(os_same_file(file, file2) == 1, "os_same_file: ./ in the path is the same file");
+            f = os_fopen(tmp, "wb");
+            if (f) fclose(f);
+            CHECK(os_same_file(file, tmp) == 0, "os_same_file: two files are two");
+            CHECK(os_same_file(file, "bwa_os_no_such_file") == 0, "os_same_file: a missing file is no match");
+            /* os_move_new never lands on a file: tmp and file both exist here */
+            CHECK(os_move_new(tmp, file) != 0, "os_move_new refuses a name that is taken");
+            f = os_fopen(file, "rb");
+            {
+                char keep[8] = { 0 };
+                CHECK(f && fread(keep, 1, 5, f) == 5 && strcmp(keep, "newer") == 0, "os_move_new: the file it refused to land on is untouched");
+            }
+            if (f) fclose(f);
+            CHECK(os_move_new(tmp, dir) != 0, "os_move_new refuses to land on a directory");
+            CHECK(os_move_new("bwa_os_no_such_file", "bwa_os_no_such_target") != 0 && os_path_kind("bwa_os_no_such_target") == OS_PATH_NONE,
+                  "os_move_new with no source fails and creates nothing");
+            CHECK(os_path_kind(file) == OS_PATH_FILE && os_path_kind(dir) == OS_PATH_OTHER && os_path_kind("bwa_os_no_such_file") == OS_PATH_NONE,
+                  "os_path_kind: a file, a directory, nothing");
+            const char* moved = "bwa_os_" "\xC3\xA9" "_" "\xE9\x9F\xB3" "/f.moved";
+            CHECK(os_move_new(tmp, moved) == 0 && os_fopen(tmp, "rb") == NULL, "os_move_new to a free name moves");
+            os_remove(moved);
+            os_remove(tmp);
+        }
         CHECK(os_remove(file) == 0, "os_remove");
         CHECK(os_rmdir(dir) == 0, "os_rmdir");
         CHECK(os_remove(file) != 0, "os_remove on a gone file reports failure");

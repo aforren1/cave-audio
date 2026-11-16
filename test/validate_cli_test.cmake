@@ -128,8 +128,10 @@ if(MODE STREQUAL "track_settle")
   # A 40 mm tolerance: a center computed wrong by a few cm (the offset not rotated is 30 mm here) must
   # still pass the gate, so the check against the truth below is what catches it. At the default 20 mm
   # the gate would just time out, and the test would fail for the wrong reason.
+  # --place-wait-enter rides along: the simulated stand has nobody to press Enter, so it must change nothing
+  # here (a run that waited would end in the 60 s timeout and a skipped placement).
   run(settle 0 ${SIM} ${POS} --mount-offset 0.03,-0.12,0.05 --place-tol-mm 40 --place-timeout 60
-      --out settle.csv)
+      --place-wait-enter --out settle.csv)
   expect(settle "track: mount offset \\(0\\.0300 -0\\.1200 0\\.0500\\) m in body axes, from --mount-offset"
          "the offset source is named")
   expect(settle "HOLD moving" "the readout shows the stand moving in: the gate WAITS")
@@ -190,6 +192,17 @@ if(MODE STREQUAL "track_settle")
   run(simnosim 2 --track-sim)
   run(both 2 --simulate --track-sim --track 3)
   run(badtol 2 ${SIM} --place-tol-mm 0.5)
+  run(waitclear 2 ${SIM} --place-wait-enter --place-clear-s 2)   # wait for Enter, or count: not both
+  # --place-wait-enter with a stdin no Enter can come down (a file here) is refused, and BEFORE the tracker is
+  # opened: nothing answers NatNet on this address, and a run that tried to connect first would fail on that
+  # instead (another message, and seconds later).
+  file(WRITE "${WORK}/stdin.txt" "\n")
+  execute_process(COMMAND "${EXE}" --simulate --track 3 --natnet-server 127.0.0.1 --place-wait-enter
+                  WORKING_DIRECTORY "${WORK}" INPUT_FILE "${WORK}/stdin.txt"
+                  RESULT_VARIABLE rv OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 60)
+  if(NOT rv EQUAL 2 OR NOT err MATCHES "--place-wait-enter: stdin is neither a console nor a pipe")
+    message(FATAL_ERROR "validate_cli_test: stdinfile: exit ${rv}, expected 2 with the stdin reason before any tracker connect:\n${err}")
+  endif()
   # untracked --survey: a room-axes survey installs and a body-frame one is refused. It used to be
   # dropped silently, so a rig run fell back to the built-in table. The fixture is calibrate's, written
   # beside WORK in the build tree.

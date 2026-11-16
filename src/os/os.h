@@ -177,6 +177,23 @@ FILE* os_fopen(const char* utf8_path, const char* mode);
 int os_mkdir (const char* utf8_path);
 int os_remove(const char* utf8_path);
 int os_rmdir (const char* utf8_path);
+/* Move `from` onto `to`, replacing a file already there in one step, so a reader never finds half a
+ * file under `to`: a writer builds beside its target and then calls this. Same directory (or at least
+ * the same volume) only. 0 = ok. */
+int os_replace(const char* utf8_from, const char* utf8_to);
+/* What is at a path: OS_PATH_NONE nothing (and only then: a path that exists and cannot be looked at
+ * is NOT "nothing"), OS_PATH_FILE a regular file, OS_PATH_OTHER a directory or anything else, or a
+ * path whose kind cannot be told. A caller about to write somewhere needs "absent" told apart from
+ * "there, but I may not open it": an fopen that fails says neither. */
+enum { OS_PATH_NONE = 0, OS_PATH_FILE = 1, OS_PATH_OTHER = 2 };
+int os_path_kind(const char* utf8_path);
+/* Move `from` to `to` ONLY IF nothing is at `to`: never onto an existing file. 0 = ok; nonzero when
+ * `to` exists or the move failed. The pair of os_replace: that one is for a file being rewritten, this
+ * one for a file being set aside under a new name, where landing on another file loses that file. */
+int os_move_new(const char* utf8_from, const char* utf8_to);
+/* Do two paths name ONE existing file, however they are spelled ("a.json", "./a.json", another letter
+ * case on Windows, a link)? 1 yes; 0 no, or either cannot be opened. */
+int os_same_file(const char* utf8_a, const char* utf8_b);
 
 #if defined(_WIN32)
 /* UTF-8 to UTF-16 into a CALLER buffer, so no path conversion allocates. `out_cap` is in wchar_t

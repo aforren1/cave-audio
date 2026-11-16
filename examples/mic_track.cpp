@@ -3,16 +3,27 @@
  * survey, the simulated source and the console loop around it.
  */
 #include "mic_track.h"
+extern "C" {
+#include "os/os.h"      /* os_fopen: the test hook's marker files, UTF-8 like every other path */
+}
 
 #include <chrono>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <thread>
 #ifdef _WIN32
 #include <conio.h>         /* _kbhit/_getch: Enter starts the sweeps, F overrides the gate */
 #include <io.h>            /* _isatty: is there a console to press a key on */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>       /* PeekNamedPipe: --place-wait-enter's Enter can arrive down a pipe */
 #endif
 
 static void set_err(char* err, size_t cap, const char* m) { if (err && cap) snprintf(err, cap, "%s", m); }
@@ -416,13 +427,67 @@ static void sleep_poll(MicTrack* T) {
     else std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
+/* --place-wait-enter. A piped stdin says nothing about whether anyone will write to it: a script or a
+ * parent process that pipes stdin and never sends Enter would hold every placement until its timeout.
+ * So the pipe is read only when the caller says an Enter is coming (mic_track_wait_enter). */
+static int g_wait_enter;
+void mic_track_wait_enter(int on) { g_wait_enter = on != 0; }
+
+/* The test hook's marker (bwa_calibrate --track-sim-rig-wait): a parent process cannot see this tool's
+ * stdout through the pipe it writes Enter down, so the two moments it has to act on are files. */
+static std::string g_test_marker;
+void mic_track_test_marker(const char* path) { g_test_marker = path ? path : ""; }
+static void test_mark(const char* suffix) {
+    if (g_test_marker.empty()) return;
+    FILE* f = os_fopen((g_test_marker + suffix).c_str(), "wb");
+    if (f) fclose(f);
+}
+static int test_marked(const char* suffix) {
+    if (g_test_marker.empty()) return 0;
+    FILE* f = os_fopen((g_test_marker + suffix).c_str(), "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+#ifdef _WIN32
+/* calib_view's Session tab runs the tools with no console, and its Send Enter button writes "\n" down
+ * stdin's pipe. Reading that pipe lets the button start the sweeps the way a key does. Read without the
+ * CRT's buffer, and only what is already there. */
+static int stdin_is_pipe(void) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    return h && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE;
+}
+/* One byte, 0 when none is waiting, -1 when the pipe is closed (its writer is gone): no Enter can come. */
+static int pipe_read(void) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD avail = 0, got = 0;
+    char c = 0;
+    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1;
+    if (!avail) return 0;
+    if (!ReadFile(h, &c, 1, &got, NULL) || got != 1) return -1;
+    return (unsigned char)c;
+}
+#endif
+
+/* (mic_track.h) */
+int mic_track_stdin_takes_enter(void) {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) || stdin_is_pipe();
+#else
+    return 0;
+#endif
+}
+
+/* A key, 0 for none, -1 when --place-wait-enter reads a pipe that has closed. */
 static int key_read(void) {
 #ifdef _WIN32
-    if (_kbhit()) {
-        const int c = _getch();
-        if (c == 0 || c == 0xE0) { (void)_getch(); return 0; }   /* an arrow or function key is two codes */
-        return c;
-    }
+    if (_isatty(_fileno(stdin))) {
+        if (_kbhit()) {
+            const int c = _getch();
+            if (c == 0 || c == 0xE0) { (void)_getch(); return 0; }   /* an arrow or function key is two codes */
+            return c;
+        }
+    } else if (g_wait_enter && stdin_is_pipe()) return pipe_read();
 #endif
     return 0;
 }
@@ -430,7 +495,7 @@ static int key_read(void) {
 double mic_track_default_clear(int sim) {
     if (sim) return 0.0;
 #ifdef _WIN32
-    if (_isatty(_fileno(stdin))) return MIC_TRACK_CLEAR_KEY;
+    if (_isatty(_fileno(stdin)) || (g_wait_enter && stdin_is_pipe())) return MIC_TRACK_CLEAR_KEY;
 #endif
     return MIC_TRACK_CLEAR_S;
 }
@@ -439,7 +504,8 @@ double mic_track_default_clear(int sim) {
  * NEXT wait before the operator has moved: a forced reading at the old spot, or an abort with no pose. */
 static void keys_drain(void) {
 #ifdef _WIN32
-    while (_kbhit()) (void)_getch();
+    if (_isatty(_fileno(stdin))) { while (_kbhit()) (void)_getch(); }
+    else if (g_wait_enter && stdin_is_pipe()) { while (pipe_read() > 0) { } }
 #endif
 }
 
@@ -453,6 +519,10 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
     double last_print = -1.0;
     MicPose ps; int have = 0;
     const int wait_key = keys && clear_s < 0.0;
+    int was_open = 0;                                         /* the gate read OK on the pass before */
+    /* the test hook: <marker>.hold, when it is there at the start, keeps the gate reading shut until
+     * <marker>.go appears, so a test decides when the gate opens instead of racing it */
+    int test_hold = test_marked(".hold");
     char why[320] = "";                                       /* printed when it changes, not every 100 ms */
     double clear_end = -1.0;                                  /* place_clear_step's state */
     int announced = 0;
@@ -465,12 +535,32 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
            what, target[0], target[1], target[2], tol, g.cfg.still_m * 1e3, turn, g.cfg.window_s, g.cfg.hold_s);
     if (keys) {
         keys_drain();
-        printf("placement:   press F to take the current reading anyway\n");
+        test_mark(".armed");                                  /* from here on a key is read, not drained */
+#ifdef _WIN32
+        if (_isatty(_fileno(stdin)))                          /* down a pipe only Enter can arrive, so F is no offer */
+            printf("placement:   press F to take the current reading anyway\n");
+#endif
     }
     for (;;) {
         const double t = mic_track_now(T);
         have = mic_track_read(T, &ps);
-        const PlaceState st = place_gate_update_q(&g, t, have ? ps.center : NULL, have ? ps.q : NULL, target);
+        /* Everything queued is read every pass, so a key pressed during HOLD is spent, and a "\r\n" is one
+         * Enter and not an Enter now plus one for the next wait. Read BEFORE the gate is judged: what the
+         * keys mean depends on the gate as it was on the pass before (place_keys_action, below). */
+        int saw_enter = 0, saw_f = 0, closed = 0;
+        if (keys)
+            for (;;) {
+                const int kc = key_read();
+                if (kc < 0) { closed = 1; break; }
+                if (!kc) break;
+                if (kc == '\r' || kc == '\n') saw_enter = 1;
+                else if (kc == 'f' || kc == 'F') saw_f = 1;
+            }
+        PlaceState st = place_gate_update_q(&g, t, have ? ps.center : NULL, have ? ps.q : NULL, target);
+        if (test_hold && st == PLACE_OK) {
+            if (test_marked(".go")) test_hold = 0;
+            else st = PLACE_MOVING;
+        }
         const int clearing = place_clear_step(&clear_end, t, st == PLACE_OK, clear_s);
         const int awaiting = wait_key && st == PLACE_OK;
         if (clearing && !announced) {
@@ -478,7 +568,9 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             announced = 1;
         }
         if (awaiting && !announced) {
-            printf("\nplacement: settled. Clear the space, then press Enter to start the sweeps\n");
+            printf("\nplacement: settled. Clear the space, then press Enter (Send Enter in the Session tab) to start the sweeps\n");
+            fflush(stdout);
+            test_mark("");
             announced = 1;
         }
         if (st != PLACE_OK) announced = 0;
@@ -508,15 +600,22 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             fflush(stdout);
         }
         int forced = 0, go = !wait_key;
-        if (keys) {                                           /* read every pass, so a key pressed during HOLD is spent */
-            const PlaceKey k = place_key_action(key_read(), st);
+        if (keys) {
+            const PlaceKey k = place_keys_action(saw_enter, saw_f, st, was_open);
+            if (saw_enter && k != PLACE_KEY_GO) test_mark(".spent");
             if (k == PLACE_KEY_ABORT) {
                 printf("\nplacement: aborted: F with no live pose to take\n");
-                return 1;
+                return MIC_PLACE_ABORTED;
             }
             forced = k == PLACE_KEY_FORCE;
             if (k == PLACE_KEY_GO) go = 1;
+            if (closed && !forced && k != PLACE_KEY_GO) {     /* an Enter sent just before the writer left still counts */
+                printf("\nplacement: aborted: stdin's pipe is closed, so the Enter that --place-wait-enter waits for\n"
+                       "           cannot arrive\n");
+                return MIC_PLACE_PIPE_CLOSED;
+            }
         }
+        was_open = st == PLACE_OK;
         if ((st == PLACE_OK && !clearing && go) || forced) {
             /* forced before the window filled: the latest center is all there is */
             const float* c = (g.n >= 3) ? g.mean : g.center;
@@ -537,6 +636,7 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             printf("placement: measured center (%.4f %.4f %.4f), %.1f mm from the target; mount yaw %.1f deg, tilt %.1f deg%s\n",
                    out->center[0], out->center[1], out->center[2], out->dist_m * 1e3, out->yaw_deg, out->tilt_deg,
                    aimed ? "; capsule table re-aimed" : "");
+            test_mark(".taken");
             float tru[3];
             if (mic_track_sim_truth(T, tru))
                 printf("track-sim: true center (%.4f %.4f %.4f)\n", tru[0], tru[1], tru[2]);
@@ -546,13 +646,24 @@ int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* 
             }
             return 0;
         }
-        if (st == PLACE_OK) t0 = t;                           /* the timeout bounds a gate that never opens, not the walk out */
+        /* The timeout bounds a gate that never opens. Without --place-wait-enter (which is a console: the
+         * operator is there, and Enter is theirs to press) it does not bound the walk out. Under
+         * --place-wait-enter, console or pipe, the caller has said the Enter is someone's to send, and a
+         * sender that never does would hold the run forever: there the timeout bounds the gate and the
+         * Enter together. */
+        const int bounded_enter = wait_key && g_wait_enter;
+        if (st == PLACE_OK && !bounded_enter) t0 = t;
+        if (st == PLACE_OK && t - t0 > timeout_s) {
+            printf("\nplacement: timed out after %.0f s: the ZM-1 settled, and no Enter arrived (--place-wait-enter).\n"
+                   "           Send it sooner, or raise --place-timeout.\n", timeout_s);
+            return MIC_PLACE_NO_ENTER;
+        }
         if (t - t0 > timeout_s) {
             printf("\nplacement: timed out after %.0f s (%s): the ZM-1 never sat %s and still for %.1f s.\n"
                    "           Check the rigid body, the target and the tolerance (--place-tol-mm), or raise\n"
                    "           --place-timeout.\n",
                    timeout_s, place_state_name(st), g.cfg.tol_m > 0.f ? "inside the tolerance" : "", g.cfg.hold_s);
-            return 1;
+            return MIC_PLACE_TIMED_OUT;
         }
         sleep_poll(T);
     }

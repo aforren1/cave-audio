@@ -490,6 +490,22 @@ static int solve_n(double* A, double* b, double* x, int N) {
     return 1;
 }
 
+/* The joint solve's misfit: the sum of squared range residuals over the used captures. */
+static double lj_cost(const double* range, const float (*mic)[3], int K, int n, const unsigned char* use,
+                      const unsigned char* cap_use, int per_row, const double (*x)[3], const double* L) {
+    double f = 0.0;
+    for (int s = 0; s < n; ++s) {
+        if (use && !use[s]) continue;
+        for (int k = 0; k < K; ++k) {
+            if (cap_use && !cap_use[(size_t)s * K + k]) continue;
+            const double d[3] = { x[s][0] - mic[k][0], x[s][1] - mic[k][1], x[s][2] - mic[k][2] };
+            const double e = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) + L[per_row ? k : 0] - range[(size_t)s * K + k];
+            f += e * e;
+        }
+    }
+    return f;
+}
+
 int calib_localize_joint(const double* range, const float (*mic)[3], int K, int n, const unsigned char* use,
                          const unsigned char* cap_use, int per_row, float (*pos_io)[3], double* lat_out, double* resid_out) {
     if (!range || !mic || !pos_io || !lat_out || K < 5 || K > CALIB_LOC_MAX_ROWS || n <= 0) return 0;
@@ -521,8 +537,11 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
     double* S   = (double*)malloc((size_t)NL * NL * sizeof(double));
     double* rhs = (double*)malloc((size_t)NL * sizeof(double));
     double* dL  = (double*)malloc((size_t)NL * sizeof(double));
+    double (*dp)[3] = (double(*)[3])malloc((size_t)n * sizeof *dp);         /* the step, before its length is chosen */
+    double (*xt)[3] = (double(*)[3])malloc((size_t)n * sizeof *xt);         /* a trial point */
+    double* Lt  = (double*)malloc((size_t)NL * sizeof(double));
     int ok = 0;
-    if (!x || !Ai || !g || !B || !L || !S || !rhs || !dL) goto done;
+    if (!x || !Ai || !g || !B || !L || !S || !rhs || !dL || !dp || !xt || !Lt) goto done;
     for (int s = 0; s < n; ++s) for (int a = 0; a < 3; ++a) x[s][a] = pos_io[s][a];
 
     /* the latency start: the mean residual at the start positions, per row or over the run */
@@ -536,7 +555,19 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
     }
     for (int j = 0; j < NL; ++j) L[j] /= cnt[j];
 
-    for (int it = 0; it < 50 && !ok; ++it) {
+    /* Gauss-Newton with a backtracking step. The full step alone (the first version) converges in a few
+     * iterations on clean captures, but on the rig's, with tens of mm of misfit and the odd capture meters
+     * off, it oscillated and never got every step under 0.1 um, so localize discarded the solve for each
+     * speaker's own fit, the weakest answer it has. Halving the step until the misfit falls by a share of
+     * what the slope promises (Armijo) makes every iteration a real descent.
+     *
+     * Convergence is judged on the FULL Gauss-Newton step, never on the shortened one: a 1 m step cut to
+     * 2^-24 of itself is a tiny move and no minimum. And a tie is not a descent: a step too short to change
+     * the misfit past rounding must not count as taken. */
+    /* 500 iterations: the rig-rows case in calib_test (26 speakers, 15 rows, 15 mm of noise, four captures
+     * meters off, a placeholder start) takes 65, and clean captures 3 to 11. Each one is a K x K solve. */
+    for (int it = 0; it < 500 && !ok; ++it) {
+        double f0 = 0.0;                                                  /* the misfit at x, L */
         /* the normal equations [A_s B_s; B_s^T D] [dp; dL] = [g_s; h], reduced onto dL */
         for (int j = 0; j < NL * NL; ++j) S[j] = 0.0;
         for (int j = 0; j < NL; ++j) { S[j * NL + j] = cnt[j]; rhs[j] = 0.0; }
@@ -553,6 +584,7 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
                 if (!(r > 1e-6)) goto done;
                 const int j = per_row ? k : 0;
                 const double e = r + L[j] - range[(size_t)s * K + k];     /* model - measured */
+                f0 += e * e;
                 const double u[3] = { d[0] / r, d[1] / r, d[2] / r };
                 for (int a = 0; a < 3; ++a) {
                     g[s][a] += u[a] * e;
@@ -579,21 +611,50 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
         }
         if (!solve_n(S, rhs, dL, NL)) goto done;
         double mx = 0.0;
-        for (int j = 0; j < NL; ++j) { L[j] -= dL[j]; if (fabs(dL[j]) > mx) mx = fabs(dL[j]); }
+        for (int j = 0; j < NL; ++j) if (fabs(dL[j]) > mx) mx = fabs(dL[j]);
         for (int s = 0; s < n; ++s) {
+            dp[s][0] = dp[s][1] = dp[s][2] = 0.0;
             if (!LJ_SPK(s)) continue;
             const double* Bs = &B[(size_t)s * NL * 3];
             double q[3] = { g[s][0], g[s][1], g[s][2] };                  /* g - B dL */
             for (int j = 0; j < NL; ++j) for (int a = 0; a < 3; ++a) q[a] -= Bs[j * 3 + a] * dL[j];
             for (int a = 0; a < 3; ++a) {
-                const double dp = Ai[s][a][0]*q[0] + Ai[s][a][1]*q[1] + Ai[s][a][2]*q[2];
-                x[s][a] -= dp;
-                if (fabs(dp) > mx) mx = fabs(dp);
+                dp[s][a] = Ai[s][a][0]*q[0] + Ai[s][a][1]*q[1] + Ai[s][a][2]*q[2];
+                if (fabs(dp[s][a]) > mx) mx = fabs(dp[s][a]);
             }
-            if (!(isfinite(x[s][0]) && isfinite(x[s][1]) && isfinite(x[s][2]))) goto done;
         }
-        if (!isfinite(mx)) goto done;
-        if (mx < 1e-7) ok = 1;                                            /* every step under 0.1 um */
+        if (!isfinite(mx) || !isfinite(f0)) goto done;
+        if (mx < 1e-7) { ok = 1; break; }                                 /* the full step is under 0.1 um */
+        /* the slope along the step: the misfit at x - alpha * step starts out as f0 - 2 alpha gdot,
+         * gdot = sum over captures of residual * (the step's first-order change of that residual) */
+        double gdot = 0.0;
+        for (int s = 0; s < n; ++s) {
+            if (!LJ_SPK(s)) continue;
+            for (int k = 0; k < K; ++k) {
+                if (!LJ_CAP(s, k)) continue;
+                const double d[3] = { x[s][0] - mic[k][0], x[s][1] - mic[k][1], x[s][2] - mic[k][2] };
+                const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                const int j = per_row ? k : 0;
+                const double e = r + L[j] - range[(size_t)s * K + k];
+                gdot += e * ((d[0]*dp[s][0] + d[1]*dp[s][1] + d[2]*dp[s][2]) / r + dL[j]);
+            }
+        }
+        double alpha = 1.0, ft = INFINITY;
+        int took = 0;
+        if (isfinite(gdot) && gdot > 0.0)                                 /* else: not a descent direction at all */
+            for (int h = 0; h < 40; ++h) {
+                for (int s = 0; s < n; ++s) for (int a = 0; a < 3; ++a) xt[s][a] = x[s][a] - alpha * dp[s][a];
+                for (int j = 0; j < NL; ++j) Lt[j] = L[j] - alpha * dL[j];
+                ft = lj_cost(range, mic, K, n, use, cap_use, per_row, (const double (*)[3])xt, Lt);
+                if (isfinite(ft) && ft < f0 && ft <= f0 - 2e-4 * alpha * gdot) { took = 1; break; }
+                alpha *= 0.5;
+            }
+        /* No step length lowers the misfit. That is the minimum (to the misfit's rounding) only when the
+         * full step was already small; a long step that cannot descend is a stall, and calling it
+         * converged would hand the caller a point that is no fit at all. */
+        if (!took) { ok = mx < CALIB_LOC_STALL_STEP_M; break; }
+        memcpy(x, xt, (size_t)n * sizeof *x);
+        memcpy(L, Lt, (size_t)NL * sizeof(double));
     }
     if (ok) {
         /* every capture of a used speaker gets its residual, the excluded ones too: against a solve that
@@ -615,7 +676,7 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
 #undef LJ_SPK
 #undef LJ_CAP
 done:
-    free(x); free(Ai); free(g); free(B); free(L); free(S); free(rhs); free(dL);
+    free(x); free(Ai); free(g); free(B); free(L); free(S); free(rhs); free(dL); free(dp); free(xt); free(Lt);
     return ok;
 }
 
@@ -1355,4 +1416,267 @@ int calib_write_aim_sheet(const char* csv_path, const Layout* L, const unsigned 
     if (bad) { if (err && errcap) snprintf(err, errcap, "calib: write error on %s", csv_path); return 0; }
     if (nflag) *nflag = nf;
     return 1;
+}
+
+/* ---- the localize ranges file ---- */
+
+/* "%.3f" of a NaN or an infinity is not JSON, and the whole file would stop parsing over one tilt */
+static void ranges_put_tilt(FILE* f, int s, float v) {
+    if (isfinite(v)) fprintf(f, "%s%.3f", s ? ", " : "", v);
+    else             fprintf(f, "%snull", s ? ", " : "");
+}
+
+/* os_replace, tried for a quarter of a second. On Windows a rename fails while ANY process holds the file
+ * open without delete sharing, and a virus scanner or an indexer opens a file just written for a moment.
+ * Losing a row's write, or refusing a run, over that is not worth it. */
+static int ranges_replace(const char* from, const char* to) {
+    for (int tries = 0; tries < 6; ++tries) {
+        if (tries) os_sleep_ms(50);
+        if (os_replace(from, to) == 0) return 0;
+    }
+    return 1;
+}
+
+int calib_ranges_write(const char* path, const CalibRanges* r, char* err, size_t errcap) {
+    if (!path || !r || r->n <= 0 || r->K <= 0 || !r->have || !r->arrival_s || !r->planned || !r->mic || !r->row_done) {
+        if (err && errcap) snprintf(err, errcap, "ranges: bad arguments");
+        return 0;
+    }
+    /* Built beside the target and moved onto it: the file is rewritten after every row, and a run killed
+     * mid-write must not leave half a file where the earlier rows' captures were. */
+    char tmp[1024];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+        if (err && errcap) snprintf(err, errcap, "ranges: the path is too long: %s", path);
+        return 0;
+    }
+    FILE* f = os_fopen(tmp, "wb");
+    if (!f) { if (err && errcap) snprintf(err, errcap, "ranges: cannot write %s", tmp); return 0; }
+    fprintf(f, "{\n  \"format\": \"" CALIB_RANGES_FORMAT "\", \"version\": %d,\n", CALIB_RANGES_VERSION);
+    fprintf(f, "  \"simulate\": %s, \"speakers\": %d, \"rows\": %d,\n  \"captures\": [\n", r->simulate ? "true" : "false", r->n, r->K);
+    int first = 1;
+    for (int k = 0; k < r->K; ++k) {
+        if (!r->row_done[k]) continue;
+        fprintf(f, "%s    { \"row\": %d, \"planned\": [%.5f, %.5f, %.5f], \"mic\": [%.5f, %.5f, %.5f],\n",
+                first ? "" : ",\n", k + 1, r->planned[k][0], r->planned[k][1], r->planned[k][2],
+                r->mic[k][0], r->mic[k][1], r->mic[k][2]);
+        fprintf(f, "      \"arrival_s\": [");
+        first = 0;
+        for (int s = 0; s < r->n; ++s) {
+            const size_t i = (size_t)s * r->K + k;
+            if (r->have[i] && isfinite(r->arrival_s[i])) fprintf(f, "%s%.9f", s ? ", " : "", r->arrival_s[i]);
+            else                                         fprintf(f, "%snull", s ? ", " : "");
+        }
+        fprintf(f, "],\n      \"tilt_db\": [");
+        for (int s = 0; s < r->n; ++s) ranges_put_tilt(f, s, r->tilt_db ? r->tilt_db[(size_t)s * r->K + k] : 0.f);
+        fprintf(f, "],\n      \"tilt_whole_db\": [");
+        for (int s = 0; s < r->n; ++s) ranges_put_tilt(f, s, r->tilt_whole_db ? r->tilt_whole_db[(size_t)s * r->K + k] : 0.f);
+        fprintf(f, "] }");
+    }
+    fprintf(f, "\n  ]\n}\n");
+    const int ok = !ferror(f);
+    if (fclose(f) != 0 || !ok) {
+        if (err && errcap) snprintf(err, errcap, "ranges: write to %s failed", tmp);
+        os_remove(tmp);
+        return 0;
+    }
+    if (ranges_replace(tmp, path) != 0) {
+        if (err && errcap) snprintf(err, errcap, "ranges: cannot replace %s (the new captures are in %s)", path, tmp);
+        return 0;
+    }
+    return 1;
+}
+
+int calib_ranges_peek(const char* path, int* version, int* speakers, int* rows, int* done, int* simulate) {
+    char* text = path ? read_file(path, NULL) : NULL;
+    if (!text) return 0;
+    cJSON* root = cJSON_Parse(text);
+    free(text);
+    const cJSON* fmt = cJSON_GetObjectItemCaseSensitive(root, "format");
+    const cJSON* ver = cJSON_GetObjectItemCaseSensitive(root, "version");
+    const cJSON* ns = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    const cJSON* nk = cJSON_GetObjectItemCaseSensitive(root, "rows");
+    const cJSON* caps = cJSON_GetObjectItemCaseSensitive(root, "captures");
+    const cJSON* sim = cJSON_GetObjectItemCaseSensitive(root, "simulate");
+    const int ok = cJSON_IsString(fmt) && strcmp(fmt->valuestring, CALIB_RANGES_FORMAT) == 0 && cJSON_IsArray(caps);
+    if (ok) {
+        if (version)  *version  = cJSON_IsNumber(ver) ? ver->valueint : 0;
+        if (speakers) *speakers = cJSON_IsNumber(ns) ? ns->valueint : 0;
+        if (rows)     *rows     = cJSON_IsNumber(nk) ? nk->valueint : 0;
+        if (done)     *done     = cJSON_GetArraySize(caps);
+        if (simulate) *simulate = cJSON_IsBool(sim) ? cJSON_IsTrue(sim) : -1;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+int calib_ranges_set_aside(const char* path, int copy, char* gen, size_t gencap) {
+    if (!path || !gen || !gencap) return -1;
+    /* "No file" is only what the OS says is absent. A file that is there and cannot be opened (held open by
+     * another program, no permission) once read as "no file" too: nothing was set aside, and the run's first
+     * write then replaced it. A folder at the path is not a file to set aside either: refused. */
+    const int kind = os_path_kind(path);
+    if (kind == OS_PATH_NONE) return 0;
+    if (kind != OS_PATH_FILE) return -1;
+    size_t len = strlen(path);
+    if (len > 5 && strcmp(path + len - 5, ".json") == 0) len -= 5;
+    char tmp[1024];
+    if (copy) {
+        /* the copy is built under a .tmp name and then MOVED to its generation, so a generation name
+         * never holds half a file and the move's refusal of a taken name covers the copy too */
+        if (snprintf(tmp, sizeof tmp, "%.*s.aside.tmp", (int)len, path) >= (int)sizeof tmp) return -1;
+        FILE* f = os_fopen(path, "rb");
+        if (!f) return -1;
+        FILE* o = os_fopen(tmp, "wb");
+        if (!o) { fclose(f); return -1; }
+        char buf[4096];
+        size_t got;
+        int ok = 1;
+        while ((got = fread(buf, 1, sizeof buf, f)) > 0)
+            if (fwrite(buf, 1, got, o) != got) { ok = 0; break; }
+        ok = ok && !ferror(f);
+        fclose(f);
+        if (fclose(o) != 0) ok = 0;
+        if (!ok) { os_remove(tmp); return -1; }
+    }
+    /* The first free N. A name that is taken is skipped, never replaced, whatever holds it (a file, a folder,
+     * something unreadable). Whether a name is free is decided by the move itself, so a generation that
+     * appears between the look and the move is still not landed on. */
+    for (int n = 1; n < 100000; ++n) {
+        if (snprintf(gen, gencap, "%.*s.%d.json", (int)len, path, n) >= (int)gencap) break;
+        if (os_path_kind(gen) != OS_PATH_NONE) continue;
+        for (int tries = 0; tries < 6; ++tries) {              /* a scanner holding the file a moment (ranges_replace) */
+            if (tries) os_sleep_ms(50);
+            if (os_move_new(copy ? tmp : path, gen) == 0) return 1;
+        }
+        if (os_path_kind(gen) == OS_PATH_NONE) break;          /* the name is still free: it is the move that fails */
+    }
+    if (copy) os_remove(tmp);
+    return -1;
+}
+
+static int read_vec3(const cJSON* a, float v[3]) {
+    if (!cJSON_IsArray(a) || cJSON_GetArraySize(a) != 3) return 0;
+    for (int i = 0; i < 3; ++i) {
+        const cJSON* e = cJSON_GetArrayItem(a, i);
+        if (!cJSON_IsNumber(e) || !isfinite(e->valuedouble) || fabs(e->valuedouble) > 1e4) return 0;
+        v[i] = (float)e->valuedouble;
+    }
+    return 1;
+}
+
+int calib_ranges_read(const char* path, CalibRanges* r, char* err, size_t errcap) {
+#define RR_FAIL(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); goto fail; } while (0)
+    char* text = NULL;
+    cJSON* root = NULL;
+    if (!path || !r || r->n <= 0 || r->K <= 0 || !r->have || !r->arrival_s || !r->planned || !r->mic || !r->row_done) {
+        if (err && errcap) snprintf(err, errcap, "ranges: bad arguments");
+        return 0;
+    }
+    memset(r->row_done, 0, (size_t)r->K);
+    memset(r->have, 0, (size_t)r->n * r->K);
+    r->simulate = -1;
+    text = read_file(path, NULL);
+    if (!text) RR_FAIL("ranges: cannot read %s", path);
+    root = cJSON_Parse(text);
+    if (!root) RR_FAIL("ranges: %s is not JSON", path);
+    const cJSON* ns = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    const cJSON* nk = cJSON_GetObjectItemCaseSensitive(root, "rows");
+    const cJSON* caps = cJSON_GetObjectItemCaseSensitive(root, "captures");
+    const cJSON* fmt = cJSON_GetObjectItemCaseSensitive(root, "format");
+    const cJSON* ver = cJSON_GetObjectItemCaseSensitive(root, "version");
+    if (!cJSON_IsString(fmt) || strcmp(fmt->valuestring, CALIB_RANGES_FORMAT) != 0 ||
+        !cJSON_IsNumber(ns) || !cJSON_IsNumber(nk) || !cJSON_IsArray(caps)) RR_FAIL("ranges: %s is not a localize ranges file", path);
+    if (!cJSON_IsNumber(ver) || ver->valuedouble != (double)CALIB_RANGES_VERSION)
+        RR_FAIL("ranges: %s is version %g of the ranges file; this build reads version %d", path,
+                cJSON_IsNumber(ver) ? ver->valuedouble : 0.0, CALIB_RANGES_VERSION);
+    if (ns->valuedouble != (double)ns->valueint || nk->valuedouble != (double)nk->valueint)
+        RR_FAIL("ranges: %s: the speaker and row counts are not whole numbers", path);
+    if (ns->valueint != r->n) RR_FAIL("ranges: %s holds %d speakers, the layout has %d", path, ns->valueint, r->n);
+    if (nk->valueint != r->K) RR_FAIL("ranges: %s holds %d rows, the rows file has %d", path, nk->valueint, r->K);
+    {
+        const cJSON* sim = cJSON_GetObjectItemCaseSensitive(root, "simulate");
+        if (cJSON_IsBool(sim)) r->simulate = cJSON_IsTrue(sim);
+    }
+    const cJSON* c;
+    cJSON_ArrayForEach(c, caps) {
+        const cJSON* row = cJSON_GetObjectItemCaseSensitive(c, "row");
+        if (!cJSON_IsNumber(row) || row->valuedouble != (double)row->valueint || row->valueint < 1 || row->valueint > r->K)
+            RR_FAIL("ranges: %s: a capture's row is not a whole number from 1 to %d", path, r->K);
+        const int k = row->valueint - 1;
+        /* two entries for one row: which one the solve would get depends on their order, so neither */
+        if (r->row_done[k]) RR_FAIL("ranges: %s holds row %d twice", path, k + 1);
+        if (!read_vec3(cJSON_GetObjectItemCaseSensitive(c, "planned"), r->planned[k]) ||
+            !read_vec3(cJSON_GetObjectItemCaseSensitive(c, "mic"), r->mic[k])) RR_FAIL("ranges: %s: row %d's positions", path, k + 1);
+        const cJSON* arr = cJSON_GetObjectItemCaseSensitive(c, "arrival_s");
+        if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) != r->n) RR_FAIL("ranges: %s: row %d's arrivals", path, k + 1);
+        const cJSON* td = cJSON_GetObjectItemCaseSensitive(c, "tilt_db");
+        const cJSON* tw = cJSON_GetObjectItemCaseSensitive(c, "tilt_whole_db");
+        for (int s = 0; s < r->n; ++s) {
+            const size_t i = (size_t)s * r->K + k;
+            const cJSON* a = cJSON_GetArrayItem(arr, s);
+            if (cJSON_IsNumber(a)) {
+                if (!isfinite(a->valuedouble) || a->valuedouble < 0.0 || a->valuedouble > 10.0)
+                    RR_FAIL("ranges: %s: row %d speaker %d: arrival %g s", path, k + 1, s, a->valuedouble);
+                r->arrival_s[i] = a->valuedouble;
+                r->have[i] = 1;
+            } else if (!cJSON_IsNull(a)) RR_FAIL("ranges: %s: row %d speaker %d is not a number", path, k + 1, s);
+            const cJSON* t1 = cJSON_IsArray(td) ? cJSON_GetArrayItem(td, s) : NULL;
+            const cJSON* t2 = cJSON_IsArray(tw) ? cJSON_GetArrayItem(tw, s) : NULL;
+            if (r->tilt_db)       r->tilt_db[i]       = cJSON_IsNumber(t1) && isfinite(t1->valuedouble) ? (float)t1->valuedouble : 0.f;
+            if (r->tilt_whole_db) r->tilt_whole_db[i] = cJSON_IsNumber(t2) && isfinite(t2->valuedouble) ? (float)t2->valuedouble : 0.f;
+        }
+        r->row_done[k] = 1;
+    }
+    cJSON_Delete(root);
+    free(text);
+    return 1;
+fail:
+    cJSON_Delete(root);
+    free(text);
+    memset(r->row_done, 0, (size_t)r->K);
+    memset(r->have, 0, (size_t)r->n * r->K);
+    return 0;
+#undef RR_FAIL
+}
+
+/* ---- the row-pair check ---- */
+
+int calib_row_pair_check(const double* ra, const double* rb, const unsigned char* use, int n, double d, double tol,
+                         double* dlat, unsigned char* flag) {
+    if (!ra || !rb || n <= 0 || !(d >= 0.0) || !(tol >= 0.0)) return 0;
+    double best_x = 0.0;
+    int best = -1;
+    /* the most-covered point lies at one of the interval low edges: try each */
+    for (int i = 0; i < n; ++i) {
+        if (use && !use[i]) continue;
+        const double x = (rb[i] - ra[i]) - d - tol;
+        int c = 0;
+        for (int j = 0; j < n; ++j) {
+            if (use && !use[j]) continue;
+            const double dr = rb[j] - ra[j];
+            if (x >= dr - d - tol && x <= dr + d + tol) ++c;
+        }
+        if (c > best) { best = c; best_x = x; }
+    }
+    if (best < 0) return 0;
+    /* center it inside the agreeing speakers' common interval, so the flags do not hang on an edge */
+    double lo = -INFINITY, hi = INFINITY;
+    for (int j = 0; j < n; ++j) {
+        if (use && !use[j]) continue;
+        const double dr = rb[j] - ra[j];
+        if (best_x >= dr - d - tol && best_x <= dr + d + tol) {
+            if (dr - d - tol > lo) lo = dr - d - tol;
+            if (dr + d + tol < hi) hi = dr + d + tol;
+        }
+    }
+    const double x = (lo <= hi) ? 0.5 * (lo + hi) : best_x;
+    int agree = 0;
+    for (int j = 0; j < n; ++j) {
+        const double dr = rb[j] - ra[j];
+        const int ok = (use && !use[j]) || (x >= dr - d - tol && x <= dr + d + tol);
+        if (flag) flag[j] = (unsigned char)!ok;
+        if (!(use && !use[j]) && ok) ++agree;
+    }
+    if (dlat) *dlat = x;
+    return agree;
 }

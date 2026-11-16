@@ -247,12 +247,15 @@ check: no Motive data), 3 the tool's own check failed (flagged speakers, a disag
 - [ ] **Run** each step in order and read its result before the next. A failed step says why in
       its row and in the log, and the steps after it stay blocked until it passes. A step that does
       not apply: type a note, then **Skip**.
-- [ ] Tracked steps wait for the placement gate by themselves. Untracked, a step stops at each
-      row; place the ZM-1, then press **Send Enter**.
+- [ ] Tracked steps wait for the placement gate by themselves, then for you: when the log says
+      `settled. Clear the space, then press Enter`, leave the space and press **Send Enter**.
+      Untracked, a step stops at each row; place the ZM-1, then press **Send Enter**.
 - [ ] **Read the background line** the log prints after each step:
       `=== background: <step> <level> dBFS, <change> dB against <earlier step>`. `RISING` marks a
       rise of more than 6 dB. Find what got louder (a projector fan, an air handler, a door) and
       run that step again.
+- [ ] **Localize stopped partway?** Press **Run** again. The line under the table says the next run
+      RESUMES and how many rows it kept. **Start over** is for when the kept rows are wrong.
 - [ ] **A box moved?** Run localize again. Every step after it reads `STALE`, by name, and blocks
       the next until you run it again.
 
@@ -405,7 +408,16 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
       each placement line. The capsule survey checks the mount offset against these positions,
       and a stand that never turned hides an offset error from that check.
 - [ ] Each row waits until the stand is within 100 mm of the row and still, then records the
-      MEASURED position. The run lists the measured positions it solved with.
+      MEASURED position. The run lists the measured positions it solved with. Then it says
+      `settled. Clear the space, then press Enter`: step out of the room's middle first.
+- [ ] **Watch each row's check** before you move the stand: `row K check` from the second row,
+      `row K fit` from the fifth (its first line names bad captures from every row so far, by
+      speaker and row, largest first). A speaker named there had a capture meters off, or the stand
+      moved. Retake that row later with `--ranges-in <out>.ranges.json --retake K`: the captures
+      are kept after every row, so nothing else is measured again. Exclude a box you cannot clear
+      with `--exclude <speaker>`, and pass the same `--exclude` on every later run from that
+      file. A plain rerun does not lose the captures: it moves the old file to
+      `<out>.ranges.1.json` first (or the next free number).
 - [ ] The writeback prints `localize: recorded the plan for 24 of 24 speaker(s)` (your count):
       `as_built.json` now carries the plan beside the measured positions.
 - [ ] Pass: exit 0, no `trilateration failed` line, every position within a few centimeters of
@@ -429,7 +441,11 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
       not every error. The run drops the worst flagged capture once and solves again: a
       `dropped speaker S's capture at row R` line with no FLAGGED line after it is a pass, and the
       dropped capture's second residual tells you how far off it was. A FLAGGED line after a drop
-      means a second bad capture: re-take the run with those rows moved or repeated.
+      means a second bad capture: retake those rows (`--retake`).
+- [ ] **No REFUSED line**: the run writes nothing when no speaker can be solved (rows at one
+      height or on one line), when the joint solve does not converge, or when the fit misses the
+      captures by more than 50 mm RMS. Read the `raw ranges` table for the speaker or row that
+      disagrees, retake it, or exclude the box.
 - [ ] Optional, by hand: add `--check-aim` to fit each box's acoustic axis from these captures.
       A box more than 15 degrees off its aim is flagged
       ([calibration.md: Modes](./calibration.md#modes)).

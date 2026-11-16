@@ -3,11 +3,19 @@
 #include "core/layout.h"        /* BWA_ROOM_EQ_MAX (the room_eq writeback round-trip) */
 #include "dsp/sos.h"           /* the temperature parsers + the plausible-c guard */
 
+#include "os/os.h"             /* os_mkdir / os_rmdir: a folder in a generation's way */
+
 #include <cJSON.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <share.h>             /* _fsopen: a file held open against every other open */
+#else
+#include <sys/stat.h>          /* chmod: a file that may not be read */
+#include <unistd.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -855,6 +863,306 @@ int main(void) {
         CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, use, NULL, 1, p, lat, NULL), "joint localize: per row refuses 3 speakers");
         CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, use, NULL, 0, p, &lat1, NULL), "joint localize: one latency takes 3");
         CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, 4, NS, NULL, NULL, 1, p, lat, NULL), "joint localize: refuses 4 mic rows");
+        /* Real captures, not millimeter-clean ones: the rig's 15 measured rows (2026-11-12), 26 speakers 2 to 4 m
+         * out, a placeholder grid as the start, 15 mm of noise and four captures 1 to 3 m late (a reflection
+         * picked for the direct sound). An undamped step that must fall under 0.1 um never got there, so
+         * localize threw the solve away and wrote each speaker's own fit, meters off. With a backtracking step
+         * the solve stops at its least-squares minimum, which is all the data can give. */
+        {
+            enum { RK = 15, RS = 26 };
+            static const float rmic[RK][3] = {
+                {-0.0256f, 1.2491f,  0.0185f }, { 0.9920f, 1.2382f,  0.8999f }, {-0.8549f, 1.2458f,  0.9555f },
+                { 0.9547f, 1.2478f, -0.8886f }, {-0.9675f, 1.2538f, -0.8571f }, { 0.0768f, 1.4934f,  0.0479f },
+                { 0.9519f, 1.4829f,  0.9577f }, {-0.8504f, 1.4904f,  0.9517f }, { 0.9901f, 1.4920f, -0.9104f },
+                {-0.8761f, 1.4980f, -0.9963f }, {-0.0639f, 1.6749f, -0.0111f }, { 0.9083f, 1.6624f,  0.9434f },
+                {-0.8366f, 1.6672f,  0.8579f }, { 0.9197f, 1.6687f, -0.9528f }, {-0.9246f, 1.6726f, -0.8736f } };
+            static float rtruth[RS][3], rstart[RS][3];
+            static double rr[RS * RK], rl[RK];
+            int si = 0;
+            for (int a = -1; a <= 1; ++a) for (int b = 0; b <= 2; ++b) for (int c = -1; c <= 1; ++c) {
+                if (a == 0 && b == 1 && c == 0) continue;
+                rstart[si][0] = 1.5f * a; rstart[si][1] = 1.5f * b; rstart[si][2] = 1.5f * c;
+                rtruth[si][0] = 2.4f * a + 0.3f * (float)sin(1.3 * si);
+                rtruth[si][1] = 1.4f + 1.4f * (b - 1) + 0.3f * (float)sin(2.1 * si);
+                rtruth[si][2] = 2.4f * c + 0.3f * (float)sin(0.7 * si);
+                ++si;
+            }
+            uint32_t rg = 9001u;
+            for (int s = 0; s < RS; ++s)
+                for (int k = 0; k < RK; ++k) {
+                    const double dx = rtruth[s][0]-rmic[k][0], dy = rtruth[s][1]-rmic[k][1], dz = rtruth[s][2]-rmic[k][2];
+                    double nz = 0.0;
+                    for (int u = 0; u < 4; ++u) { rg = rg * 1664525u + 1013904223u; nz += (double)(rg >> 8) / (double)(1u << 24) - 0.5; }
+                    rr[s * RK + k] = sqrt(dx*dx + dy*dy + dz*dz) + 39.0 + nz * 0.026;   /* sum of 4 uniforms: sd ~15 mm */
+                }
+            rr[3 * RK + 2] += 1.1; rr[9 * RK + 7] += 2.6; rr[17 * RK + 0] += 1.7; rr[22 * RK + 11] += 3.0;
+            static float rgrid[RS][3];
+            static double rres[RS * RK];
+            memcpy(rgrid, rstart, sizeof rgrid);
+            const int conv = calib_localize_joint(rr, rmic, RK, RS, NULL, NULL, 1, rstart, rl, rres);
+            const double rw = conv ? worst_mm((const float (*)[3])rstart, (const float (*)[3])rtruth, RS) : -1.0;
+            double rmax = 0.0;
+            for (int i = 0; i < RS * RK; ++i) if (fabs(rres[i]) > rmax) rmax = fabs(rres[i]);
+            /* That minimum is a poor answer (a numpy port of the same fit, started from the truth, lands on the
+             * same 3.45 m worst speaker): four bad captures are enough to spoil a speaker on these rows. What
+             * the solve owes is to stop there and show it, with residuals far past the 10 mm flag, and to land
+             * near the truth once those captures are out. */
+            printf("joint localize: rig rows, 15 mm noise, 4 bad captures, placeholder start: converged %d, worst %.0f mm,"
+                   " largest residual %.0f mm\n", conv, rw, rmax * 1e3);
+            CHECK(conv, "joint localize: stops at its minimum on noisy captures with a few bad ones");
+            CHECK(conv && rmax > 10.0 * CALIB_LOC_RESID_FLAG_M, "joint localize: the bad captures show in the residuals");
+            /* "Converged" must mean a fit. The two checks above also pass for a solve that stops where it
+             * started and says converged (a line search that fails at once): every residual is large then.
+             * At the minimum most captures fit to about the noise, whatever the four bad ones do. */
+            {
+                static double ra[RS * RK];
+                int nr = 0;
+                for (int s = 0; s < RS; ++s)
+                    for (int k = 0; k < RK; ++k) {
+                        if ((s == 3 && k == 2) || (s == 9 && k == 7) || (s == 17 && k == 0) || (s == 22 && k == 11)) continue;
+                        ra[nr++] = fabs(rres[s * RK + k]);
+                    }
+                for (int i = 1; i < nr; ++i) {                  /* insertion sort: 386 values */
+                    const double v = ra[i];
+                    int j = i - 1;
+                    for (; j >= 0 && ra[j] > v; --j) ra[j + 1] = ra[j];
+                    ra[j + 1] = v;
+                }
+                const double med = ra[nr / 2];
+                printf("joint localize: rig rows: the good captures' median residual %.1f mm\n", med * 1e3);
+                CHECK(conv && med < 0.060, "joint localize: at its stop the good captures fit (median residual under 60 mm)");
+            }
+            static unsigned char rcu[RS * RK];
+            memset(rcu, 1, sizeof rcu);
+            rcu[3 * RK + 2] = rcu[9 * RK + 7] = rcu[17 * RK + 0] = rcu[22 * RK + 11] = 0;
+            memcpy(rstart, rgrid, sizeof rgrid);
+            const int conv2 = calib_localize_joint(rr, rmic, RK, RS, NULL, rcu, 1, rstart, rl, NULL);
+            const double rw2 = conv2 ? worst_mm((const float (*)[3])rstart, (const float (*)[3])rtruth, RS) : -1.0;
+            printf("joint localize: the same without the 4 bad captures: converged %d, worst %.0f mm\n", conv2, rw2);
+            CHECK(conv2 && rw2 < 200.0, "joint localize: without the bad captures the noisy solve lands near the truth");
+            /* A stall is not a minimum. The same captures behind a latency of 1e14 m: a double resolves 1/64 m
+             * there, so the misfit moves in steps and, near its floor, no step length lowers it, while the
+             * Gauss-Newton step is still centimeters (the residuals it is built from are rounded to 16 mm).
+             * That is the line search failing on a LONG step, and it must read as not converged: forced to
+             * "converged", it would return a point the solver could not improve and never checked. */
+            {
+                static double rbig[RS * RK];
+                for (int i = 0; i < RS * RK; ++i) rbig[i] = rr[i] - 39.0 + 1e14;
+                memcpy(rstart, rgrid, sizeof rgrid);
+                const int conv3 = calib_localize_joint(rbig, rmic, RK, RS, NULL, rcu, 1, rstart, rl, NULL);
+                printf("joint localize: ranges resolved to 16 mm (a 1e14 m latency): converged %d\n", conv3);
+                CHECK(!conv3, "joint localize: a line search that fails on a long step is a stall, not a minimum");
+            }
+        }
+    }
+
+    /* the localize ranges file: a round trip keeps every arrival, the gaps, and the rows not done */
+    {
+        enum { RN = 4, RK2 = 6 };
+        static unsigned char have[RN * RK2], have2[RN * RK2], done[RK2], done2[RK2];
+        static double arr[RN * RK2], arr2[RN * RK2];
+        static float tl[RN * RK2], tl2[RN * RK2], pl[RK2][3], pl2[RK2][3], mc[RK2][3], mc2[RK2][3];
+        for (int k = 0; k < RK2; ++k) {
+            done[k] = (unsigned char)(k != 4);
+            for (int a = 0; a < 3; ++a) { pl[k][a] = 0.1f * k + a; mc[k][a] = 0.1f * k + a + 0.0123f; }
+            for (int s = 0; s < RN; ++s) {
+                const int i = s * RK2 + k;
+                have[i] = (unsigned char)!(s == 2);                 /* speaker 2 excluded */
+                arr[i] = 0.09 + 0.001234567 * i;
+                tl[i] = 0.5f * (float)i;
+            }
+        }
+        CalibRanges w = { RN, RK2, have, arr, tl, NULL, pl, mc, done };
+        CalibRanges r = { RN, RK2, have2, arr2, tl2, NULL, pl2, mc2, done2 };
+        char e[256] = "";
+        const char* rp = "calib_test_ranges.json";
+        const int wok = calib_ranges_write(rp, &w, e, sizeof e);
+        const int rok = wok && calib_ranges_read(rp, &r, e, sizeof e);
+        int same = rok;
+        for (int k = 0; k < RK2 && same; ++k) {
+            same &= done2[k] == done[k];
+            if (!done[k]) continue;
+            same &= fabsf(mc2[k][1] - mc[k][1]) < 1e-5f && fabsf(pl2[k][2] - pl[k][2]) < 1e-5f;
+            for (int s = 0; s < RN; ++s) {
+                const int i = s * RK2 + k;
+                same &= have2[i] == have[i] && (!have[i] || fabs(arr2[i] - arr[i]) < 1e-9) && fabsf(tl2[i] - tl[i]) < 1e-3f;
+            }
+        }
+        CHECK(same, "ranges file: a round trip keeps the arrivals, the excluded speaker and the missing row");
+        /* a tilt that is not a number (a band with no energy) must not make the file unreadable */
+        {
+            const float keep = tl[5];
+            tl[5] = (float)NAN;
+            CHECK(calib_ranges_write(rp, &w, e, sizeof e) && calib_ranges_read(rp, &r, e, sizeof e) && tl2[5] == 0.f && tl2[6] == tl[6],
+                  "ranges file: a non-finite tilt is written as null and the file still reads");
+            tl[5] = keep;
+            CHECK(calib_ranges_write(rp, &w, e, sizeof e), "ranges file: written again");
+        }
+        CalibRanges bad = { RN + 1, RK2, have2, arr2, tl2, NULL, pl2, mc2, done2 };
+        CHECK(!calib_ranges_read(rp, &bad, e, sizeof e) && strstr(e, "speakers"), "ranges file: refuses another speaker count");
+        /* the write lands whole: built beside the target and moved onto it, nothing left behind */
+        {
+            FILE* tf = fopen("calib_test_ranges.json.tmp", "rb");
+            CHECK(tf == NULL, "ranges file: the write leaves no .tmp behind");
+            if (tf) fclose(tf);
+        }
+        /* what the reader refuses: another file's format, another version, one row twice */
+        {
+#define RANGES_ROW "{ \"row\": %d, \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], \"arrival_s\": [0.1, 0.1, null, 0.1] }"
+#define RANGES_ROW_F "{ \"row\": %.1f, \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], \"arrival_s\": [0.1, 0.1, null, 0.1] }"
+            static const struct { const char* head; int row_b; const char* want; const char* what; } bad_files[] = {
+                { "{ \"format\": \"bwa_calibrate localize ranges\", \"version\": 1,", 2, NULL, "ranges file: the hand-written fixture reads" },
+                { "{ \"format\": \"something else\", \"version\": 1,", 2, "not a localize ranges file", "ranges file: refuses another format" },
+                { "{ \"version\": 1,", 2, "not a localize ranges file", "ranges file: refuses a file with no format" },
+                { "{ \"format\": \"bwa_calibrate localize ranges\", \"version\": 2,", 2, "version 2", "ranges file: refuses another version" },
+                { "{ \"format\": \"bwa_calibrate localize ranges\",", 2, "version", "ranges file: refuses a file with no version" },
+                { "{ \"format\": \"bwa_calibrate localize ranges\", \"version\": 1,", 1, "row 1 twice", "ranges file: refuses one row twice" },
+                { "{ \"format\": \"bwa_calibrate localize ranges\", \"version\": 1,", -25, "not a whole number", "ranges file: refuses row 2.5" },
+            };
+            for (size_t b = 0; b < sizeof bad_files / sizeof bad_files[0]; ++b) {
+                FILE* bf = fopen(rp, "wb");
+                if (!bf) { CHECK(0, "ranges file: cannot write the fixture"); break; }
+                fprintf(bf, "%s \"speakers\": %d, \"rows\": %d, \"captures\": [\n", bad_files[b].head, RN, RK2);
+                /* row_b < 0 is tenths of a row: -25 writes row 2.5 */
+                if (bad_files[b].row_b < 0) fprintf(bf, RANGES_ROW ",\n" RANGES_ROW_F "\n] }\n", 1, -bad_files[b].row_b / 10.0);
+                else                        fprintf(bf, RANGES_ROW ",\n" RANGES_ROW "\n] }\n", 1, bad_files[b].row_b);
+                fclose(bf);
+                e[0] = 0;
+                const int got = calib_ranges_read(rp, &r, e, sizeof e);
+                if (!bad_files[b].want) CHECK(got && done2[0] && done2[1] && !done2[2] && !have2[2 * RK2 + 0], bad_files[b].what);
+                else                    CHECK(!got && strstr(e, bad_files[b].want), bad_files[b].what);
+            }
+#undef RANGES_ROW
+#undef RANGES_ROW_F
+        }
+        /* set_aside: a file in the way goes to the next free generation. Nothing is replaced: a name that is
+         * taken is skipped, whatever it holds. */
+        {
+            char gen[128] = "";
+            const char* g1 = "calib_test_ranges.1.json";
+            const char* g2 = "calib_test_ranges.2.json";
+            const char* g3 = "calib_test_ranges.3.json";
+            remove(g1); remove(g2); remove(g3);
+            FILE* of = fopen(g1, "wb");
+            if (of) { fputs("generation one", of); fclose(of); }
+            CHECK(calib_ranges_write(rp, &w, e, sizeof e), "ranges file: written again");
+            CHECK(calib_ranges_set_aside(rp, 0, gen, sizeof gen) == 1 && strcmp(gen, g2) == 0, "ranges set_aside: the file moves to the next FREE generation, .2");
+            FILE* gone = fopen(rp, "rb");
+            CHECK(gone == NULL, "ranges set_aside: a move leaves nothing at the path");
+            if (gone) fclose(gone);
+            {
+                char keep[32] = { 0 };
+                FILE* kf = fopen(g1, "rb");
+                CHECK(kf && fread(keep, 1, 14, kf) == 14 && strcmp(keep, "generation one") == 0, "ranges set_aside: the generation that was there is untouched");
+                if (kf) fclose(kf);
+            }
+            CHECK(calib_ranges_read(g2, &r, e, sizeof e) && done2[0] && !done2[4], "ranges set_aside: the new generation holds the captures");
+            CHECK(calib_ranges_set_aside(rp, 0, gen, sizeof gen) == 0, "ranges set_aside: no file, nothing to do");
+            /* the copy form, for the run that rewrites the file it read: path stays, and the copy is .3 */
+            CHECK(calib_ranges_write(rp, &w, e, sizeof e) && calib_ranges_set_aside(rp, 1, gen, sizeof gen) == 1 && strcmp(gen, g3) == 0,
+                  "ranges set_aside: copies to the next free generation, .3");
+            memset(done2, 0, sizeof done2);
+            CHECK(calib_ranges_read(rp, &r, e, sizeof e) && done2[0] && !done2[4], "ranges set_aside: a copy leaves the file in place");
+            memset(done2, 0, sizeof done2);
+            CHECK(calib_ranges_read(g3, &r, e, sizeof e) && done2[0] && !done2[4], "ranges set_aside: the copy holds the captures");
+            {
+                FILE* tf = fopen("calib_test_ranges.aside.tmp", "rb");
+                CHECK(tf == NULL, "ranges set_aside: the copy leaves no .tmp behind");
+                if (tf) fclose(tf);
+            }
+            remove(g1); remove(g2); remove(g3);
+            /* A file that is THERE and cannot be opened is not "no file". That reading set nothing aside, and
+             * the run's first write then replaced a file another program held open. Both forms refuse, the
+             * file stays, and no generation appears. */
+            {
+#ifdef _WIN32
+                FILE* held = _fsopen(rp, "rb", _SH_DENYRW);
+                const int locked = held != NULL;
+#else
+                const int locked = chmod(rp, 0) == 0 && fopen(rp, "rb") == NULL;   /* root opens it anyway: then nothing is tested */
+#endif
+                if (locked) {
+                    CHECK(calib_ranges_set_aside(rp, 0, gen, sizeof gen) == -1, "ranges set_aside: a file that cannot be opened is a refusal, not 'no file' (move)");
+                    CHECK(calib_ranges_set_aside(rp, 1, gen, sizeof gen) == -1, "ranges set_aside: a file that cannot be opened is a refusal, not 'no file' (copy)");
+                    CHECK(os_path_kind(rp) == OS_PATH_FILE && os_path_kind(g1) == OS_PATH_NONE, "ranges set_aside: the refused file stays, and no generation appears");
+                } else printf("ranges set_aside: could not make an unopenable file here; that check did not run\n");
+#ifdef _WIN32
+                if (held) fclose(held);
+#else
+                chmod(rp, 0644);
+#endif
+            }
+            /* a folder at the next generation's name is a name that is taken: skipped, like a file there */
+            CHECK(os_mkdir(g1) == 0 && calib_ranges_set_aside(rp, 0, gen, sizeof gen) == 1 && strcmp(gen, g2) == 0,
+                  "ranges set_aside: a folder at generation 1 is skipped, the file goes to .2");
+            os_rmdir(g1);
+            /* and a folder at the path itself is not a file to set aside */
+            CHECK(os_mkdir(rp) == 0 && calib_ranges_set_aside(rp, 0, gen, sizeof gen) == -1, "ranges set_aside: a folder at the path is refused");
+            os_rmdir(rp);
+            remove(g2);
+        }
+        /* the one record a ranges file keeps of its setup: simulated or not, read back, and through the peek */
+        {
+            CalibRanges ws = { RN, RK2, have, arr, tl, NULL, pl, mc, done, 1 };
+            CalibRanges rs = { RN, RK2, have2, arr2, tl2, NULL, pl2, mc2, done2, 0 };
+            int ver = 0, spk = 0, nrows = 0, nd = 0, sim = 7;
+            CHECK(calib_ranges_write(rp, &ws, e, sizeof e) && calib_ranges_read(rp, &rs, e, sizeof e) && rs.simulate == 1,
+                  "ranges file: simulated captures read back as simulated");
+            CHECK(calib_ranges_peek(rp, &ver, &spk, &nrows, &nd, &sim) && ver == CALIB_RANGES_VERSION && spk == RN && nrows == RK2 &&
+                  nd == RK2 - 1 && sim == 1, "ranges peek: the version, the counts, the rows held and the simulate flag");
+            ws.simulate = 0;
+            CHECK(calib_ranges_write(rp, &ws, e, sizeof e) && calib_ranges_read(rp, &rs, e, sizeof e) && rs.simulate == 0 &&
+                  calib_ranges_peek(rp, NULL, NULL, NULL, NULL, &sim) && sim == 0, "ranges file: the rig's captures read back as the rig's");
+            CHECK(!calib_ranges_peek("calib_test_no_such_file.json", &ver, &spk, &nrows, &nd, &sim), "ranges peek: no file is not a ranges file");
+            {
+                FILE* bf = fopen(rp, "wb");                    /* a file that does not say */
+                if (bf) {
+                    fprintf(bf, "{ \"format\": \"%s\", \"version\": 1, \"speakers\": %d, \"rows\": %d, \"captures\": [\n"
+                                "{ \"row\": 2, \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], \"arrival_s\": [0.1, 0.1, null, 0.1] } ] }\n",
+                            CALIB_RANGES_FORMAT, RN, RK2);
+                    fclose(bf);
+                }
+                CHECK(calib_ranges_read(rp, &rs, e, sizeof e) && rs.simulate == -1 && calib_ranges_peek(rp, NULL, NULL, NULL, NULL, &sim) && sim == -1,
+                      "ranges file: a file with no simulate flag reads as unknown");
+            }
+        }
+        remove(rp);
+    }
+
+    /* the row-pair check: a capture meters off is flagged, the latency change is found, good ones pass */
+    {
+        enum { PN = 8 };
+        const float ma[3] = { 0.f, 1.4f, 0.f }, mb[3] = { 0.9f, 1.4f, 0.9f };
+        const double d = sqrt(0.81 + 0.81);
+        double ra[PN], rb[PN], dl = 0.0;
+        unsigned char fl[PN];
+        for (int s = 0; s < PN; ++s) {
+            const double az = 2.0 * M_PI * s / PN;
+            const double p[3] = { 3.0 * sin(az), 1.4 + 0.8 * sin(3.0 * s), 3.0 * cos(az) };
+            ra[s] = sqrt((p[0]-ma[0])*(p[0]-ma[0]) + (p[1]-ma[1])*(p[1]-ma[1]) + (p[2]-ma[2])*(p[2]-ma[2])) + 30.0;
+            rb[s] = sqrt((p[0]-mb[0])*(p[0]-mb[0]) + (p[1]-mb[1])*(p[1]-mb[1]) + (p[2]-mb[2])*(p[2]-mb[2])) + 30.4;
+        }
+        rb[5] -= 4.47;                                         /* the rig's single sweep read 4.47 m early */
+        const int ag = calib_row_pair_check(ra, rb, NULL, PN, d, 0.01, &dl, fl);
+        int others = 0;
+        for (int s = 0; s < PN; ++s) others += s != 5 && fl[s];
+        printf("row pair: %d of %d agree, latency change %+.3f m (truth +0.400)\n", ag, PN, dl);
+        CHECK(ag == PN - 1 && fl[5] && !others, "row pair: the capture 4.47 m early is the one flagged");
+        /* The latency change is pinned only as well as the speakers bracket the mic's move. Two more, on the
+         * line of the move, one ahead and one behind: their ranges change by -d and +d exactly, so their
+         * allowed intervals share only [truth - tol, truth + tol], and the value returned is its middle. */
+        {
+            double ra2[PN + 2], rb2[PN + 2], dl2 = 0.0;
+            unsigned char fl2[PN + 2];
+            memcpy(ra2, ra, sizeof ra); memcpy(rb2, rb, sizeof rb);
+            ra2[PN]     = 3.0 + 30.0; rb2[PN]     = 3.0 - d + 30.4;      /* ahead of the move */
+            ra2[PN + 1] = 3.0 + 30.0; rb2[PN + 1] = 3.0 + d + 30.4;      /* behind it */
+            const int ag2 = calib_row_pair_check(ra2, rb2, NULL, PN + 2, d, 0.01, &dl2, fl2);
+            printf("row pair: bracketed by two speakers on the line of the move: latency change %+.4f m (truth +0.4000)\n", dl2);
+            CHECK(ag2 == PN + 1 && fl2[5] && fabs(dl2 - 0.4) < 0.002, "row pair: bracketed, the latency change is found to 2 mm");
+        }
+        unsigned char use[PN]; memset(use, 1, sizeof use); use[5] = 0;
+        CHECK(calib_row_pair_check(ra, rb, use, PN, d, 0.01, NULL, fl) == PN - 1 && !fl[5], "row pair: an excluded speaker is neither counted nor flagged");
     }
 
     /* position writeback round-trip */

@@ -1059,6 +1059,7 @@ through different capsules, which separates capsule error from field structure f
 | `--place-tol-mm <mm>` | the placement gate's tolerance (default 20); the bump limit is half of it, and the turn limit is the same budget at `--radius` (0.41° at the defaults) |
 | `--place-timeout <s>` | give up on one placement's gate after this many seconds (default 300) and skip that placement |
 | `--place-clear-s <s>` | count this long once the gate opens, in place of waiting for Enter. 0 starts at once. With no console the default is 5 |
+| `--place-wait-enter` | wait for Enter once the gate opens, from the console or from stdin's pipe. For a parent process that sends the Enter (the Session tab's **Send Enter**). `--place-timeout` then bounds the gate and the Enter together, and a closed pipe skips the placement at once. Without the flag, a console waits for Enter with no limit. Not with `--place-clear-s` |
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
 | `--natnet-local <ip>` | this machine's IP on Motive's network (default: the adapter that routes to `--natnet-server`) |
