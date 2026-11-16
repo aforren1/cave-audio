@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+Bump for calibration tools.
+
 ## [0.20.0]
 
 ### Added: device output on macOS (CoreAudio)
