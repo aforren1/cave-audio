@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.20.1]
+
 Bump for calibration tools.
 
 ## [0.20.0]
