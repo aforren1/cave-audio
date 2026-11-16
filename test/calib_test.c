@@ -998,7 +998,12 @@ int main(void) {
             tl[5] = keep;
             CHECK(calib_ranges_write(rp, &w, e, sizeof e), "ranges file: written again");
         }
-        CalibRanges bad = { RN + 1, RK2, have2, arr2, tl2, NULL, pl2, mc2, done2 };
+        /* buffers sized for the count it claims: the reader clears n*K of them before it reads the file, and
+         * pointing it at 4-speaker arrays overran have2 into the writer's done[] (on macOS's static layout) */
+        static unsigned char haveb[(RN + 1) * RK2];
+        static double arrb[(RN + 1) * RK2];
+        static float tlb[(RN + 1) * RK2];
+        CalibRanges bad = { RN + 1, RK2, haveb, arrb, tlb, NULL, pl2, mc2, done2 };
         CHECK(!calib_ranges_read(rp, &bad, e, sizeof e) && strstr(e, "speakers"), "ranges file: refuses another speaker count");
         /* the write lands whole: built beside the target and moved onto it, nothing left behind */
         {
@@ -1082,7 +1087,11 @@ int main(void) {
                 const int locked = chmod(rp, 0) == 0 && fopen(rp, "rb") == NULL;   /* root opens it anyway: then nothing is tested */
 #endif
                 if (locked) {
+                    /* POSIX can still link() a file it cannot read, so the move form sets it aside whole there; only
+                     * a Windows lock blocks the move. The copy has to read it, so it refuses everywhere. */
+#ifdef _WIN32
                     CHECK(calib_ranges_set_aside(rp, 0, gen, sizeof gen) == -1, "ranges set_aside: a file that cannot be opened is a refusal, not 'no file' (move)");
+#endif
                     CHECK(calib_ranges_set_aside(rp, 1, gen, sizeof gen) == -1, "ranges set_aside: a file that cannot be opened is a refusal, not 'no file' (copy)");
                     CHECK(os_path_kind(rp) == OS_PATH_FILE && os_path_kind(g1) == OS_PATH_NONE, "ranges set_aside: the refused file stays, and no generation appears");
                 } else printf("ranges set_aside: could not make an unopenable file here; that check did not run\n");
