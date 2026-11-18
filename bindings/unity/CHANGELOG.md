@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.21.0]
+
 ### Added: GameObject > BwAudio > CAVE Rig
 
 One menu item sets up a scene. It creates a `BwAudio` object with `Engine`, a `Room Origin` child
