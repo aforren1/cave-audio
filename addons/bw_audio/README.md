@@ -59,6 +59,58 @@ editor and a template_release library for each, so the extension loads in the ed
 
 ## Quickstart
 
+### On the CAVE: the rig scene
+
+1. Drag `addons/bw_audio/bwa_rig.tscn` into your scene, at the top of the tree. Instantiate
+   Child Scene does the same.
+2. Copy the rig's `trims.json` or `cave_layout.json` into the project and set the rig's
+   **Layout Path** to it.
+3. Move the `RoomOrigin` child to the CAVE floor center, on the floor. To reach it, right-click
+   the rig and turn on Editable Children.
+4. Rotate `RoomOrigin` 180 degrees about Y if the layout's front is the CAVE's back wall.
+5. Set the rig's **Listener** to your camera, or turn **Feed Listener** off to let the engine
+   read the tracker.
+
+The rig is a `BwaEngine` on the Cave profile with its **Room Origin** set to that child. It is
+an ordinary scene in your project, so edit it freely. The warning marker on the rig lists what
+is still missing.
+
+`RoomOrigin` is the room frame. Its blue arrow (+Z) is the layout's front, +z. Its red arrow
+(+X) is the layout's +x, which is the room's left when you face the front. Godot calls a node's
+-Z its forward. Ignore that here: the origin is a frame, not a facing.
+
+The origin must match the tracker's frame, not the wall you call the front. Motive's +z often
+points at the CAVE's back wall, and the measured layout inherits it. The symptom: sources come
+from behind when they should be ahead. Rotate `RoomOrigin` 180 degrees. Do not move the camera.
+
+Put the rig in each scene that makes sound. The engine reads the scene's `BwaRoomBox` and
+static `BwaAcousticGeometry` once, when it starts, so it must start with the scene. To keep one
+engine across content changes, put the rig in a main scene and swap child scenes under it. The
+same limit applies: geometry in a child scene loaded later misses the bake.
+
+An Autoload rig (Project Settings > Globals) works only for content with no room box and no
+static geometry. An Autoload starts before the scene exists. A `BwaRoomBox` that arrives later
+logs an error and is ignored. Late `BwaAcousticGeometry` warns and occludes nothing. If you do
+use one:
+
+- Autoload a configured copy saved outside `addons/`, so an addon update cannot overwrite it.
+- Keep `BwaEngine` out of the scenes.
+- Set the listener from the scene, with the Autoload's name. A NodePath cannot reach into a
+  scene that is not loaded yet.
+
+```gdscript
+BwaRig.listener = $Camera3D.get_path()
+```
+
+Only one `BwaEngine` runs. A second one that enters the tree is refused: it logs an error and
+stays inert, and the first keeps running with its own layout and room origin. Nothing is handed
+over.
+
+`bwa_rig.tscn` carries a fixed `uid`, so a scene that instances it keeps its reference across
+addon updates.
+
+### At a desk: the smallest scene
+
 The smallest scene that makes sound. Build this tree:
 
 ```
@@ -107,6 +159,49 @@ Two consequences worth knowing, both places Unity's advice does *not* carry over
   transform is wrong - not the handedness conversion.
 
 Budget time to verify with a known-position test source before trusting anything else.
+
+### Room origin
+
+`registration` is the transform from Godot world to room space. Set it from code, or point
+`BwaEngine.room_origin` at a Node3D and the engine derives it:
+
+```gdscript
+registration = origin.global_transform.affine_inverse()   # scale removed first
+```
+
+The origin's local axes become the room axes. A worked case, with the origin at `(2, 0, 1)` and
+a source at `(5, 0.5, 3)`:
+
+| Origin yaw about Y | Room position of the source |
+| --- | --- |
+| 0 degrees | `(3, 0.5, 2)` |
+| +90 degrees | `(-2, 0.5, 3)` |
+| 180 degrees | `(-3, 0.5, -2)` |
+
+What to know:
+
+- The engine compares the origin's global transform once per frame, before it pushes the
+  sources and the listener, and recomputes only when it changed. A moved origin takes effect
+  on the next frame. `BwaSpeakerView` follows it, in world space, under any parent.
+- Five things are converted through the registration once and do not follow a later change:
+  static `BwaAcousticGeometry`, the `BwaRoomBox` and the ground plane (at start),
+  `set_extra_listeners` positions and the FDN decay direction (when you call them). The first
+  registration change after start with any of them present warns once, and
+  `is_registration_stale()` reads true from then on. This covers a moved origin, a
+  `room_origin` set or re-pointed after start, and a write to `registration`. Place the
+  origin before you press play.
+- Scale is ignored, the origin's own and any parent's. Room meters are Godot meters. The engine
+  warns once.
+- A mirrored origin is refused. A negative scale on the origin or on a parent makes its
+  transform a reflection, which would mirror every position. The registration keeps its last
+  value and the engine warns once, with the node's path. A flattened axis and a non-finite
+  transform get the same treatment.
+- Keep the origin level. The engine warns once when it is tilted more than 1 degree.
+- While `room_origin` points at a node, that node owns the registration. A write to
+  `registration` is refused with a warning.
+- With `room_origin` empty, nothing changes: `registration` is identity until your code sets it.
+  Clear `room_origin` at run time and the registration keeps its last value. The same happens
+  when the origin node is freed, and the engine warns once.
 
 ## Channel count
 
@@ -227,6 +322,10 @@ core. It starts, it renders, it just sounds wrong:
   early reflections, so they render twice;
 - `feed_listener` on with no listener node, so the listener never leaves the origin;
 - a `layout_path` that does not exist, or a `res://` one that will not survive export;
+- an array profile (Cave, CaveSim, CaveBoth) with no `layout_path`, which renders the built-in
+  26-speaker grid and not your room;
+- a `room_origin` that is not a Node3D, is mirrored, is scaled, or is tilted more than
+  1 degree. The marker follows the origin as you move it in the editor;
 - ray-traced occlusion or pathing switched on without the SDK or without geometry;
 - `profile` set to Cave on a machine with no ASIO driver, which renders the speaker array
   into nothing and is silent by design.
@@ -358,7 +457,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -375,7 +474,7 @@ what the engine is rendering.
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
