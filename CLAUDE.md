@@ -444,7 +444,15 @@ src/
                          a stronger tap outside flags the capture), the IR SNR against a POSITIVE-lag floor
                          (measure_noise_floor: before the window and after the tail, never the negative lags where
                          the sweep's harmonics sit; 40 dB, provisional), a re-sweep on either, and for the trims and
-                         verify TWO AGREEING SWEEPS (1 sample, 0.2 dB). Live aiming's peak hold takes only clean
+                         verify TWO AGREEING SWEEPS (1 sample, 0.2 dB). --localize agrees at 3 samples, 1 dB
+                         (CALIB_LOC_AGREE_*; pass_quality resets a pass to the trims' pair). Every mode gets
+                         CALIB_SWEEP_MAX_TRIES 12 (the ZM-1's Via latency steps 0.3-0.4 ms and settles over ~30 s,
+                         rig 2026-11-17). Past that the trims and verify stop; localize prints a GAP for that
+                         speaker at that row and goes on: a null in the ranges file, masked out of the solve
+                         (cuse = have), kept by a resume, filled by --retake K. Two bounds on that: a row whose
+                         first 3 speakers all gap stops the run (a dead rig, LOC_DEAD_ROW_GAPS), and a row ending
+                         under 4 captures is not kept (it would cost every row its latency), so a resume retakes
+                         it. Localize does NOT wait a Via step out (3 samples agree mid-settle): its fit catches it. Live aiming's peak hold takes only clean
                          readings that two in a row agree on. bwa_validate holds every cell against one silent
                          capture per placement (VALID_BG_MIN_DB 20). --sim-interferer is the simulator's truth.
                          The CLAP path is ARM, THEN ACCEPT (the first transient in a 2 s armed window; the clicker
@@ -665,6 +673,11 @@ examples/              mic_track.h/.cpp: the tracked ZM-1 shared by bwa_calibrat
                        producer's run number and an FNV-1a hash, which is what makes a later step stale or
                        blocked; one session.log. bwa_calibrate --sim-truth and bwa_speaker_survey
                        --require-frame exist for it. Its UI tests are their own ctest, calib_view_session.
+                       The tab has native pickers, an ASIO driver dropdown, a localize grid with per-row
+                       retake, and one exclude list it passes to localize, trims, verify and the grid
+                       (bwa_calibrate --exclude; the capsule survey gets the complement). A new session
+                       defaults to the rig when an ASIO driver is installed. Every bwa_* exe carries
+                       cmake/bwa_utf8.manifest (UTF-8 code page), so non-ASCII paths work in argv.
                        speaker_survey.c = bwa_speaker_survey: the camera-visible speakers' rigid bodies
                        (named spk<N>) -> aim, position, and whether Motive's frame IS the layout's room
                        frame (--write copies aims into a layout copy; --simulate is the rehearsal and the
@@ -750,7 +763,8 @@ lower in every desktop count below; added 2026-10-15, the CI counts with it are 
 (`calib_view`, `calib_view_session`, `layout_tool`, `playground`), the nine `validate_*` runs (four plus `validate_track_settle`/`_bump`/`_twist`/`_ref_capture`/`_background`), the ten calibrate CLI runs
 (`calibrate_sim_room_aim`/`_trim`, `calibrate_verify_omni`/`_zylia`, `calibrate_zylia_trims`,
 `calibrate_aim_sheet`, `calibrate_live_zylia`, `calibrate_zylia_localize`, `calibrate_capsule_survey`,
-`calibrate_sweep_quality`), the six tracked-placement runs (`calibrate_track_settle`/
+`calibrate_sweep_quality`; `calibrate_exclude` and `calibrate_utf8_path` came after them on 2026-11-18,
+so every Windows count in this section is two higher than written), the six tracked-placement runs (`calibrate_track_settle`/
 `_ring`/`_bump`/`_refuse`/`_survey`/`_twist`) plus `calibrate_grid_rows`, the twelve optical-survey tests (`survey` plus eleven `speaker_survey_*`),
 and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all

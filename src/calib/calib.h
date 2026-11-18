@@ -236,16 +236,29 @@ int calib_arrival_window(const CalibWindow* w, const float spk[3], const float m
  * at most 0.2 dB (the trims and --verify count a value only then). PROVISIONAL. */
 #define CALIB_SWEEP_AGREE_SAMPLES 1.0f
 #define CALIB_SWEEP_AGREE_DB      0.2f
-#define CALIB_SWEEP_MAX_TRIES     5       /* sweeps per speaker before the run gives up on it */
+/* Localize reads only the arrival, and its fit flags a capture at 10 mm and refuses at 50 mm, so it
+ * agrees at 3 samples (21 mm at 48 kHz) and 1 dB. At 1 sample the rig's ZM-1 path (Dante Via) drifted
+ * 1.4 to 2 samples between sweeps at one placement and the speaker never agreed. PROVISIONAL. */
+#define CALIB_LOC_AGREE_SAMPLES   3.0f
+#define CALIB_LOC_AGREE_DB        1.0f
+/* Sweeps per speaker before the run gives up on it. 12, not 5: on the rig the ZM-1's Dante Via path
+ * steps its latency by 0.3 to 0.4 ms now and then and settles back over about 30 s (each sweep-to-sweep
+ * gap about 0.89x the last), and five sweeps ended just short of two agreeing. At the trims' and
+ * --verify's 1 sample, twelve wait the step out: the agreeing pair comes after it has settled.
+ * Localize does NOT wait: at 3 samples, two sweeps drifting 1.4 to 2 samples agree mid-settle. Its
+ * per-row latency, the running fit and the one drop are what catch such a capture. */
+#define CALIB_SWEEP_MAX_TRIES     12
 enum { CALIB_SWEEP_OK = 0, CALIB_SWEEP_OUTSIDE = 1, CALIB_SWEEP_NOISY = 2 };
 /* CALIB_SWEEP_OUTSIDE when m->outside, else CALIB_SWEEP_NOISY when the SNR is known and under
  * min_snr_db, else CALIB_SWEEP_OK. An unknown SNR (no noise region) passes. Pure. */
 int  calib_sweep_check(const MeasureResult* m, float min_snr_db);
 /* One ASCII line saying why (the arrival, the window, the outside tap and its level, or the SNR). */
 void calib_sweep_why(const MeasureResult* m, int code, double fs, char* buf, size_t cap);
-/* 1 when two sweeps of one speaker agree (the rule above). *d_samples and *d_db (either may be NULL)
- * receive the differences. Pure. */
-int  calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float* d_samples, float* d_db);
+/* 1 when two sweeps of one speaker agree within tol_samples and tol_db (CALIB_SWEEP_AGREE_* for the
+ * trims and verify, CALIB_LOC_AGREE_* for localize). *d_samples and *d_db (either may be NULL) receive
+ * the differences. Pure. */
+int  calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float tol_samples, float tol_db,
+                        float* d_samples, float* d_db);
 
 /* ---- the solved latency against the driver's own loop (--localize, the --zylia survey) ----
  * The solve recovers the WHOLE loop; the ASIO driver reports only its digital half. The residual,
@@ -353,6 +366,10 @@ int calib_write_aim_sheet(const char* csv_path, const Layout* L, const unsigned 
 /* Read the layout JSON at `in_path`, set each speaker's `gain_db` + `delay_ms` (preserving index,
  * position, the dbap block, everything else), and write to `out_path` (may equal in_path). The file's
  * speaker count must equal `n`. Returns 1 on success, 0 with a message in `err`. */
+/* calib_write_layout_skip: the same, but a speaker with skip[i] set (bwa_calibrate --exclude) keeps
+ * whatever the file has for it and its entry in gain_db / delay_ms is never read. skip may be NULL. */
+int calib_write_layout_skip(const char* in_path, const char* out_path, const float* gain_db, const float* delay_ms,
+                            const unsigned char* skip, int n, char* err, size_t errcap);
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap);
 
@@ -416,7 +433,9 @@ double calib_latency_dilution(const float (*anchor)[3], int K, const float x[3])
  * is the START (calib_trilaterate's per-speaker answers, or the plan) and the result. `lat_out` gets
  * K latencies (per_row) or 1, started internally from the mean residual. `resid_out` (n*K, may be
  * NULL) gets measured minus modeled range, meters. Needs 5 <= K <= CALIB_LOC_MAX_ROWS, at least one
- * equation to spare, at least 4 used captures per used speaker, and per row at least 4 used captures.
+ * equation to spare, at least 4 used captures per used speaker, and per row at least 4 used captures
+ * or NONE: a row with no used capture (a placement --localize did not keep) is left out, and its
+ * latency reads 0.
  * Returns 1, or 0 on a degenerate or non-converging solve (nothing written). Converged means the FULL
  * Gauss-Newton step is under 0.1 um in every component. A line search that finds no step with a real
  * (Armijo) decrease counts as converged only when that full step was under CALIB_LOC_STALL_STEP_M: a
@@ -556,6 +575,12 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
  * as if by one call each, but the file is read once and written once, so a grid that would overflow
  * BWA_RQ_GRID_MAX part-way, or a NaN in any row, fails before anything is written. `cuts` is
  * nmic * n * max_sections row-major (mic, then speaker), `counts` nmic * n. */
+/* calib_write_room_eq_grid_skip: the same, but a speaker with skip[s] set (--exclude) was not measured:
+ * at a position this call replaces it keeps the sections the file had there, and at a new position it has
+ * none. skip may be NULL. */
+int calib_write_room_eq_grid_skip(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
+                                  const MeasureEqSection* cuts, const int* counts, const unsigned char* skip, int n,
+                                  int max_sections, char* err, size_t errcap);
 int calib_write_room_eq_grid_n(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
                                const MeasureEqSection* cuts, const int* counts, int n,
                                int max_sections, char* err, size_t errcap);

@@ -106,6 +106,58 @@ editor and a template_release library for each, so the extension loads in the ed
 
 ## Quickstart
 
+### On the CAVE: the rig scene
+
+1. Drag `addons/bw_audio/bwa_rig.tscn` into your scene, at the top of the tree. Instantiate
+   Child Scene does the same.
+2. Copy the rig's `trims.json` or `cave_layout.json` into the project and set the rig's
+   **Layout Path** to it.
+3. Move the `RoomOrigin` child to the CAVE floor center, on the floor. To reach it, right-click
+   the rig and turn on Editable Children.
+4. Rotate `RoomOrigin` 180 degrees about Y if the layout's front is the CAVE's back wall.
+5. Set the rig's **Listener** to your camera, or turn **Feed Listener** off to let the engine
+   read the tracker.
+
+The rig is a `BwaEngine` on the Cave profile with its **Room Origin** set to that child. It is
+an ordinary scene in your project, so edit it freely. The warning marker on the rig lists what
+is still missing.
+
+`RoomOrigin` is the room frame. Its blue arrow (+Z) is the layout's front, +z. Its red arrow
+(+X) is the layout's +x, which is the room's left when you face the front. Godot calls a node's
+-Z its forward. Ignore that here: the origin is a frame, not a facing.
+
+The origin must match the tracker's frame, not the wall you call the front. Motive's +z often
+points at the CAVE's back wall, and the measured layout inherits it. The symptom: sources come
+from behind when they should be ahead. Rotate `RoomOrigin` 180 degrees. Do not move the camera.
+
+Put the rig in each scene that makes sound. The engine reads the scene's `BwaRoomBox` and
+static `BwaAcousticGeometry` once, when it starts, so it must start with the scene. To keep one
+engine across content changes, put the rig in a main scene and swap child scenes under it. The
+same limit applies: geometry in a child scene loaded later misses the bake.
+
+An Autoload rig (Project Settings > Globals) works only for content with no room box and no
+static geometry. An Autoload starts before the scene exists. A `BwaRoomBox` that arrives later
+logs an error and is ignored. Late `BwaAcousticGeometry` warns and occludes nothing. If you do
+use one:
+
+- Autoload a configured copy saved outside `addons/`, so an addon update cannot overwrite it.
+- Keep `BwaEngine` out of the scenes.
+- Set the listener from the scene, with the Autoload's name. A NodePath cannot reach into a
+  scene that is not loaded yet.
+
+```gdscript
+BwaRig.listener = $Camera3D.get_path()
+```
+
+Only one `BwaEngine` runs. A second one that enters the tree is refused: it logs an error and
+stays inert, and the first keeps running with its own layout and room origin. Nothing is handed
+over.
+
+`bwa_rig.tscn` carries a fixed `uid`, so a scene that instances it keeps its reference across
+addon updates.
+
+### At a desk: the smallest scene
+
 The smallest scene that makes sound. Build this tree:
 
 ```
@@ -232,6 +284,49 @@ Two consequences worth knowing, both places Unity's advice does *not* carry over
 
 Budget time to verify with a known-position test source before trusting anything else.
 
+### Room origin
+
+`registration` is the transform from Godot world to room space. Set it from code, or point
+`BwaEngine.room_origin` at a Node3D and the engine derives it:
+
+```gdscript
+registration = origin.global_transform.affine_inverse()   # scale removed first
+```
+
+The origin's local axes become the room axes. A worked case, with the origin at `(2, 0, 1)` and
+a source at `(5, 0.5, 3)`:
+
+| Origin yaw about Y | Room position of the source |
+| --- | --- |
+| 0 degrees | `(3, 0.5, 2)` |
+| +90 degrees | `(-2, 0.5, 3)` |
+| 180 degrees | `(-3, 0.5, -2)` |
+
+What to know:
+
+- The engine compares the origin's global transform once per frame, before it pushes the
+  sources and the listener, and recomputes only when it changed. A moved origin takes effect
+  on the next frame. `BwaSpeakerView` follows it, in world space, under any parent.
+- Five things are converted through the registration once and do not follow a later change:
+  static `BwaAcousticGeometry`, the `BwaRoomBox` and the ground plane (at start),
+  `set_extra_listeners` positions and the FDN decay direction (when you call them). The first
+  registration change after start with any of them present warns once, and
+  `is_registration_stale()` reads true from then on. This covers a moved origin, a
+  `room_origin` set or re-pointed after start, and a write to `registration`. Place the
+  origin before you press play.
+- Scale is ignored, the origin's own and any parent's. Room meters are Godot meters. The engine
+  warns once.
+- A mirrored origin is refused. A negative scale on the origin or on a parent makes its
+  transform a reflection, which would mirror every position. The registration keeps its last
+  value and the engine warns once, with the node's path. A flattened axis and a non-finite
+  transform get the same treatment.
+- Keep the origin level. The engine warns once when it is tilted more than 1 degree.
+- While `room_origin` points at a node, that node owns the registration. A write to
+  `registration` is refused with a warning.
+- With `room_origin` empty, nothing changes: `registration` is identity until your code sets it.
+  Clear `room_origin` at run time and the registration keeps its last value. The same happens
+  when the origin node is freed, and the engine warns once.
+
 ## Channel count
 
 The engine's channel count is **the layout's speaker count** (4 to 64, `BWA_MAX_CHANNELS`),
@@ -351,6 +446,10 @@ core. It starts, it renders, it just sounds wrong:
   early reflections, so they render twice;
 - `feed_listener` on with no listener node, so the listener never leaves the origin;
 - a `layout_path` that does not exist, or a `res://` one that will not survive export;
+- an array profile (Cave, CaveSim, CaveBoth) with no `layout_path`, which renders the built-in
+  26-speaker grid and not your room;
+- a `room_origin` that is not a Node3D, is mirrored, is scaled, or is tilted more than
+  1 degree. The marker follows the origin as you move it in the editor;
 - ray-traced occlusion or pathing switched on without the SDK or without geometry;
 - `profile` set to Cave on a machine with no ASIO driver, which renders the speaker array
   into nothing and is silent by design.
@@ -595,7 +694,7 @@ ctest --test-dir build-godot -C RelWithDebInfo -R godot_
   node's Godot forward equals the converted quaternion's room facing) rather than
   restating the conversion, over cardinal and random orientations. Pure float math, no
   godot-cpp, so it always builds.
-- **`godot_smoke`**, **`godot_frame`**, **`godot_minimal`**, **`godot_api_manual`**,
+- **`godot_smoke`**, **`godot_frame`**, **`godot_rig`**, **`godot_minimal`**, **`godot_api_manual`**,
   **`godot_api_null`**, **`godot_scene`**, **`godot_scene_no_room`**, **`godot_playground`** - the demo scenes and
   the playground self-test, self-checking and headless. These need an editor binary, which is
   not a build dependency, so point CMake at one:
@@ -632,6 +731,21 @@ either alone leaves a hole:
 Both check what a binding can actually get wrong: that every call reaches the core with its
 arguments intact, that handles survive, and that readbacks come back shaped right. Whether
 the DSP is *correct* is the engine's own suite's job.
+
+`rig.tscn` instances the shipped `addons/bw_audio/bwa_rig.tscn` and pins `room_origin` against
+hand-worked literals: the +90 degree and 180 degree rows of the table under "Room origin". The
+90 degree row is the one that catches a missing inverse. At 180 degrees a rotation is its own
+inverse, so that row alone cannot. A pitched origin covers the facing seam, because every yaw
+commutes with the seam's 180 degree yaw, and the scene reads the listener pose back out of the
+engine to check the push itself. It also checks:
+
+- the registration follows a moved origin, and a `BwaSpeakerView` under a turned, offset parent
+  follows in world space;
+- scale is ignored, down to 0.0005, and a mirrored origin is refused;
+- an origin under a parent that cancels its local transform gives identity;
+- a cleared `room_origin` keeps the last registration;
+- a `room_origin` re-pointed after start reads `is_registration_stale()`;
+- a second `BwaEngine` stays inert, and the first is still the engine after it leaves.
 
 `scene.tscn` covers the geometry path, where almost nothing is observable: there is no
 readback for the static mesh. The one crack of light is that enabling image-source early

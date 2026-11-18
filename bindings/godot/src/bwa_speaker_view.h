@@ -60,6 +60,8 @@ private:
 	std::vector<MeshInstance3D *> gizmos;
 	std::vector<Ref<StandardMaterial3D>> materials;
 	std::vector<Vector3> positions; /* Godot space, for nearest_speaker */
+	std::vector<Vector3> room_positions; /* as read from the engine; re-placed on a new registration */
+	uint32_t registration_seen = 0;      /* BwaEngine::registration_generation() at the last placement */
 
 	float gizmo_radius = 0.12f;
 	Color idle_color = Color(0.25f, 0.28f, 0.35f);

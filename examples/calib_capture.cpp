@@ -337,6 +337,30 @@ void calib_sim_set_latency_step(double seconds) {
     if (seconds == seconds) g_sim_lat_step_s = seconds;
 }
 
+/* calib_sim_set_capture_delay: the extra delay of the capture being synthesized. The count is bumped
+ * after a capture (intf_this_capture), so the one in progress is g_intf_count + 1. */
+static int    g_sim_cdel_caps[CALIB_SIM_INTF_MAX], g_sim_cdel_n;
+static double g_sim_cdel_s, g_sim_cdel_gain = 1.0;
+void calib_sim_set_capture_delay(const int* captures, int n, double seconds, double level_db) {
+    g_sim_cdel_n = 0;
+    if (!captures || n <= 0 || !(seconds == seconds) || !(level_db == level_db)) return;
+    g_sim_cdel_gain = pow(10.0, level_db / 20.0);
+    if (n > CALIB_SIM_INTF_MAX) n = CALIB_SIM_INTF_MAX;
+    memcpy(g_sim_cdel_caps, captures, (size_t)n * sizeof *captures);
+    g_sim_cdel_s = seconds;
+    g_sim_cdel_n = n;
+}
+static int sim_capture_delayed(void) {
+    for (int i = 0; i < g_sim_cdel_n; ++i) if (g_sim_cdel_caps[i] == g_intf_count + 1) return 1;
+    return 0;
+}
+static double sim_capture_delay_s(void) { return sim_capture_delayed() ? g_sim_cdel_s : 0.0; }
+/* the level offset of the capture in progress, on one synthesized row */
+static void sim_capture_level(float* row, int ncap) {
+    if (!sim_capture_delayed() || g_sim_cdel_gain == 1.0) return;
+    for (int i = 0; i < ncap; ++i) row[i] = (float)(row[i] * g_sim_cdel_gain);
+}
+
 /* the rotated (simulated-error) acoustic axis of speaker ch */
 static void sim_aim(const Layout* L, int ch, float aim[3]) {
     calib_sim_rotate(sim_speaker(L, ch)->aim, g_sim_aim_err_deg, aim);
@@ -361,6 +385,7 @@ static void sim_capture_core(int ch, const Layout* L, const float mic[3], double
 
 void calib_sim_capture_ex(int ch, const Layout* L, const float mic[3], double sos, const CalibSimOpts* o, float* cap) {
     sim_capture_core(ch, L, mic, sos, o, cap);
+    { int nsw, ncap; sim_lengths(o, &nsw, &ncap); sim_capture_level(cap, ncap); }
     if (intf_this_capture()) {
         int nsw, ncap; sim_lengths(o, &nsw, &ncap);
         intf_add(cap, ncap, mic, mic, sos, nsw);
@@ -414,7 +439,7 @@ static void sim_capture_core(int ch, const Layout* L, const float mic[3], double
     if (!(sos >= BWA_SOS_MIN_MPS && sos <= BWA_SOS_MAX_MPS)) sos = BWA_SOS_REF_MPS;
     /* system latency (plus this box's own extra, --sim-speaker-latency, and a mid-run step,
      * --sim-latency-step) + time of flight (fractional) */
-    const double lat_f = (double)CAL_SIM_LATENCY_SAMPLES + (calib_sim_speaker_latency(ch) + g_sim_lat_step_s) * CAL_FS;
+    const double lat_f = (double)CAL_SIM_LATENCY_SAMPLES + (calib_sim_speaker_latency(ch) + g_sim_lat_step_s + sim_capture_delay_s()) * CAL_FS;
     double delay_f = lat_f + dist / sos * CAL_FS;
     int    di = (int)delay_f; float frac = (float)(delay_f - di);
     double sens = calib_sim_sensitivity(ch);                      /* deterministic +/- ~1.4 dB wobble */
@@ -496,6 +521,7 @@ void calib_sim_capture_zylia_ex(int ch, const Layout* L, const float center[3], 
     for (int j = 0; j < ncaps; ++j) {
         const float at[3] = { center[0] + caps[j][0], center[1] + caps[j][1], center[2] + caps[j][2] };
         sim_capture_core(ch, L, at, sos, o, cap19 + (size_t)j * (size_t)stride);
+        { int nsw, ncap; sim_lengths(o, &nsw, &ncap); sim_capture_level(cap19 + (size_t)j * (size_t)stride, ncap); }
     }
     if (intf_this_capture()) {                          /* one capture: every capsule hears the one event */
         int nsw, ncap; sim_lengths(o, &nsw, &ncap);
@@ -818,16 +844,18 @@ int calib_measure_speaker(const CalibPass* P, int s, int through, MeasureResult*
             continue;
         }
         if (P->agree) {
+            const float tol_s = P->agree_samples > 0.f ? P->agree_samples : CALIB_SWEEP_AGREE_SAMPLES;
+            const float tol_db = P->agree_db > 0.f ? P->agree_db : CALIB_SWEEP_AGREE_DB;
             int hit = -1;
             for (int j = nclean - 1; j >= 0 && hit < 0; --j)
-                if (calib_sweeps_agree(&clean[j], &r, NULL, NULL)) hit = j;
+                if (calib_sweeps_agree(&clean[j], &r, tol_s, tol_db, NULL, NULL)) hit = j;
             if (hit < 0) {
                 if (nclean > 0) {
                     float ds = 0.f, ddb = 0.f;
-                    calib_sweeps_agree(&clean[nclean - 1], &r, &ds, &ddb);
+                    calib_sweeps_agree(&clean[nclean - 1], &r, tol_s, tol_db, &ds, &ddb);
                     ++mi->rej_disagree;
-                    meas_log(mi, "sweep %d: %.2f samples and %.2f dB from the last clean sweep (agreeing takes %.0f sample, %.1f dB)\n",
-                             k + 1, ds, ddb, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB);
+                    meas_log(mi, "sweep %d: %.2f samples and %.2f dB from the last clean sweep (agreeing takes %.0f sample(s), %.1f dB)\n",
+                             k + 1, ds, ddb, tol_s, tol_db);
                 }
                 clean[nclean++] = r;
                 continue;

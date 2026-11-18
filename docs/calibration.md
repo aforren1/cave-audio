@@ -278,11 +278,25 @@ capture will read less than these; how much less is the first thing to measure o
 `bwa_calibrate` and `bwa_calib_view`'s Capture tab cannot measure differently:
 
 1. A sweep outside its window or under the SNR floor is re-swept, with the reason printed.
-2. For the trims and `--verify`, a value counts only once **two clean sweeps agree**: arrivals
-   within a sample and levels within 0.2 dB (`CALIB_SWEEP_AGREE_SAMPLES`, `CALIB_SWEEP_AGREE_DB`).
-   Every clean sweep is kept, so a third that agrees with the first settles it whatever the second
-   was. The later sweep of the pair is the result.
-3. After `CALIB_SWEEP_MAX_TRIES` (5) sweeps with no result, the run stops and writes nothing.
+2. For the trims, `--verify` and `--localize`, a value counts only once **two clean sweeps
+   agree**. The trims and `--verify` take arrivals within a sample and levels within 0.2 dB
+   (`CALIB_SWEEP_AGREE_SAMPLES`, `CALIB_SWEEP_AGREE_DB`). `--localize` takes 3 samples and 1 dB
+   (`CALIB_LOC_AGREE_SAMPLES`, `CALIB_LOC_AGREE_DB`): it reads only the arrival, 3 samples is
+   21 mm, and its own fit flags a capture at 10 mm. Every clean sweep is kept, so a third that
+   agrees with the first settles it whatever the second was. The later sweep of the pair is the
+   result.
+3. A speaker gets `CALIB_SWEEP_MAX_TRIES` (12) sweeps. With no result after that, the trims and
+   `--verify` stop and write nothing (exit 1). `--localize` does not stop: it prints
+   `localize: GAP row K speaker S`, leaves that one capture out, and goes on (see the ranges file
+   below).
+
+The 12 sweeps and the looser localize tolerances come from the rig (2026-11-17). The ZM-1's Dante
+Via path stepped its latency by 0.3 to 0.4 ms at random and settled back over about 30 s. At one
+sample and five sweeps, the sweeps ran out before two agreed, and one such speaker stopped a
+localize run and cost every row after it. For the trims and `--verify`, twelve sweeps outlast the
+settling: at one sample, the pair that agrees comes after the step. `--localize` does not wait. At
+3 samples, two sweeps that drift 1.4 to 2 samples agree in the middle of the settling. Its
+per-row latency, the running fit and the one dropped capture are what catch such a capture.
 
 So a clean trim run costs two sweeps a speaker, and the run's last line says how many it took:
 
@@ -299,8 +313,8 @@ channel, a wrong input, a capture swamped by noise). The window catches what nei
 impostor arrival louder than the real one.
 
 `--capsule-survey`, `--check` and the grid rows take one clean sweep a speaker, with the window
-and the floor. `--localize` takes two agreeing sweeps, as the trims do: on the rig a single sweep
-now and then read meters early, and one such capture spoils a speaker's position. The `--zylia`
+and the floor. `--localize` takes two agreeing sweeps, at its own tolerances: on the rig a single
+sweep now and then read meters early, and one such capture spoils a speaker's position. The `--zylia`
 position survey re-sweeps on the rig the same way; in simulate it computes its arrivals
 analytically and sweeps nothing.
 
@@ -316,8 +330,15 @@ after the list are when it sounds (seconds into the capture), its RMS at the mic
 unit-sensitivity speaker's sweep at 1 m, and its kind: `click` (2 ms), `noise` (250 ms) or `sweep`
 (the capture's own sweep from another point: a mis-patched second speaker). It stands about 1.5 m
 from the mic, off any speaker. The `calibrate_sweep_quality` ctest runs that command and requires
-the clean run's trims; a stray sweep louder than the speaker on all five of one speaker's sweeps,
-which must stop the run with nothing written; and live aiming with one contaminated reading.
+the clean run's trims; a stray sweep louder than the speaker on all 12 of one speaker's sweeps,
+which must stop the run with nothing written; the same stray on 8 sweeps in a row, which must
+still measure the speaker; and live aiming with one contaminated reading.
+
+`--sim-capture-delay captures:samples` plays the speaker that many samples late on the captures
+listed, so two sweeps of one speaker disagree by a set amount. The ctests use it to hold the
+tolerances: 2 samples apart is re-swept by the trims and `--verify`, and taken by `--localize`.
+A third field, `captures:samples:dB`, makes those captures louder too (0.5 dB: refused by the
+trims, taken by `--localize`).
 
 ## Air temperature
 
@@ -373,7 +394,8 @@ it. Do not expect it to be audible.
   non-coplanar ([GDOP](./glossary.md#gdop)): clustered points amplify error. Cross-check against
   the install drawings. The writeback records the plan the first time (see "Keep one file"
   above) and prints how many speakers it recorded one for. A speaker whose solve fails (the mic
-  positions are degenerate for it) keeps the position the file already had, and the run says so.
+  positions are degenerate for it, or it has captures in fewer than 5 rows) keeps the position
+  the file already had, and the run says so.
 
   The run writes nothing (exit 1) in three cases:
 
@@ -389,6 +411,19 @@ it. Do not expect it to be audible.
   Each row is checked as it lands, so you see a bad capture while the stand is still there:
 
   - `localize: capture row K speaker S`: one line per capture, with its range, SNR and sweeps.
+  - `localize: GAP row K speaker S`: that speaker got no clean, agreeing pair in 12 sweeps at this
+    placement. The run goes on. The capture is a `null` in the ranges file and `gap` in the raw
+    ranges table, and the solve leaves it out: the speaker is solved from the rows it has, and it
+    needs 5. A speaker with fewer than 4 captures so far is left out of the running fit, and the
+    run says so once. A timeout or a dead capsule still stops the run.
+  - **A dead rig still stops the run.** When the first 3 speakers of a row all gap, the run stops
+    with exit 1 and a routing message: that is the signal path, not three boxes. Three, because
+    one or two boxes can be bad alone, and it costs 36 sweeps to find out, not a run of nulls.
+    The rows before it are in the ranges file. `--exclude` the boxes if they really cannot be
+    measured.
+  - `localize: row K has N capture(s) ... not kept`: a row that ends with fewer than 4 captures
+    cannot solve its own latency. It is not written, the solve runs per row over the rows kept,
+    and a resume measures it again.
   - `row K check`: from the second row on. A speaker whose range changed by more than the mic moved
     (the triangle inequality, against each earlier row) is named. It catches a capture meters off.
   - `row K fit`: from the fifth row on, the joint solve over the rows so far, and the captures more
@@ -406,13 +441,46 @@ it. Do not expect it to be audible.
   - `--ranges-in f.json --retake 3,7-8` measures those rows again and keeps the rest. Rows are
     counted from 1. A retaken row takes its mic position from the rows file (untracked) or the
     tracker, and replaces the old row only when its new captures are complete, so a retake that
-    stops partway leaves a file with every row in it.
+    stops partway leaves a file with every row in it. A retake sweeps the whole row at a fresh mic
+    position, because captures from two mic positions cannot share a row. So a speaker that gaps
+    on the retake loses the capture it had: the old one is only in the set-aside copy
+    (`f.1.json`).
   - `--ranges-in f.json` alone measures the rows the file lacks, so a canceled run resumes. It
-    never measures a row the file already holds: if such a row lacks a capture, the run stops with
-    exit 2 and names the rows and speakers. Pass `--exclude` for speakers you left out on purpose,
-    or name the rows in `--retake`.
+    never measures a row the file already holds. A row with a gap is a whole row: the resume keeps
+    the gap, and `--retake K` is what fills it.
+  - A speaker with no capture in any row is not solved and keeps its layout position. The run
+    names those speakers in one `WARNING` line. If you left them out with `--exclude` in the first
+    run, pass `--exclude` again: a resume without it sweeps them in the rows it measures.
   - `--exclude 14` never sweeps or solves speaker 14: an occluded box, or one not hung yet. It keeps
     the position the layout gives it.
+
+  The trims, `--verify` and `--room-eq-grid` take `--exclude` too, with the same list syntax
+  (`3,14`, `0-4`). Without it, one box the mic cannot hear stops a trim run: no clean measurement
+  in 12 sweeps, exit 1, nothing written. With it:
+
+  - Each run prints one line that names the excluded speakers, and never sweeps them.
+  - The trims solve only the measured speakers and write only their `gain_db` and `delay_ms`. An
+    excluded speaker keeps the values the layout has.
+  - The kept trims stay valid. A solve sets its own zero (the farthest box gets delay 0, the least
+    sensitive gets 0 dB), and the kept values carry the last run's zero. So the run moves the new
+    trims onto the old zero: it adds the median of (old value minus new value) over the measured
+    speakers, once for the delays and once for the gains, and prints
+    `trims: anchored to the kept trims through the N measured speakers: +0.833 ms and +0.00 dB on
+    each`. A plain `--verify` then passes for the excluded box too. If the offset would put a delay
+    under 0 or a gain over 0 dB, the whole set moves, kept trims included, and a second line says
+    by how much.
+  - A layout with no trims at all (every delay and gain 0) has nothing to anchor to. The run prints
+    `trims: WARNING the layout carried no trims` and names the excluded speakers as not aligned
+    with the rest. Measure them before you play through them.
+  - `--verify` leaves an excluded speaker out of the residuals, their medians and the spreads, and
+    prints no row for it.
+  - `--room-eq-grid` measures no cuts for an excluded speaker. At a position measured again it
+    keeps the sections the layout has for that speaker; at a new position it has none.
+
+  `--exclude` is refused with exit 2, with the reason, where it would be ignored: the capsule
+  survey (use `--speakers`), `--live`, `--aim-sheet`, `--check`, the `--zylia` position survey,
+  and `--eq` or `--room-eq`, which rewrite every speaker's filter. `bwa_validate` has no
+  `--exclude`: it measures rendered phantoms, and a phantom uses every speaker.
 
   A run never overwrites a ranges file it did not create. A file already at the target is set
   aside first as `f.1.json`, then `f.2.json`, and so on: moved when it is another run's, copied
@@ -2214,6 +2282,14 @@ Each step runs the tested tool, writes a new file in the folder, and hands that 
 step. The tab records what each step read, what it wrote and whether it passed, keeps one log, and
 reopens where you left off.
 
+Every path field has a **...** button that opens the Windows file or folder dialog. You can still
+type or paste a path. Pick a folder that already holds a session and the tab opens it; pick an
+empty one and press **New**.
+
+Non-ASCII paths work. Every `bwa_*` tool carries a UTF-8 code-page manifest, so a plan or rows file
+under `C:\Users\José` reaches the tool intact. The manifest needs Windows 10 1903 or later. On an
+older Windows the tab refuses a step whose command line has a non-ASCII path, and names the file.
+
 Unverified on hardware. Every step has run only in simulate.
 
 ### The folder
@@ -2238,12 +2314,12 @@ the session's own outputs. Load `grid.json` (or `trims.json`) into the engine wh
 | # | Step | Runs | Reads | Writes | Passes when |
 | --- | --- | --- | --- | --- | --- |
 | 1 | frame | `bwa_speaker_survey <plan> --require-frame --baffle-offset-m <baffle offset> --csv frame_check.csv` | the plan, the baffle offset | `frame_check.csv` | exit 0: Motive's frame agrees within 0.5° and 10 mm |
-| 2 | localize | `bwa_calibrate --layout <plan> --out as_built.json --zylia --localize <rows>` | the plan, the localize rows | `as_built.json` | exit 0 |
+| 2 | localize | `bwa_calibrate --layout <plan> --out as_built.json --zylia --localize <rows> [--ranges-in as_built.ranges.json [--retake <rows>]] [--exclude <list>]` | the plan, the localize rows, the exclude list | `as_built.json` | exit 0 |
 | 3 | capsules | `bwa_calibrate --layout as_built.json --zylia --capsule-survey capsules.json --mic <listening point> [--speakers <list>] [--latency <m>]` | `as_built.json` | `capsules.json` | exit 0 |
 | 4 | aim | the Aim tab, in this window | `as_built.json`, `capsules.json` | the readings you accept | every listed speaker has an accepted reading |
-| 5 | trims | `bwa_calibrate --layout as_built.json --out trims.json --zylia --trims --room --survey capsules.json` | `as_built.json`, `capsules.json` | `trims.json` | exit 0 |
-| 6 | verify | `bwa_calibrate --layout trims.json --zylia --verify --survey capsules.json` | `trims.json` | a status | exit 0; exit 3 means flagged speakers |
-| 7 | grid | `bwa_calibrate --layout trims.json --out grid.json --zylia --room-eq-grid <rows> [--survey capsules.json]` | `trims.json`, the grid rows, `capsules.json` | `grid.json` | exit 0 |
+| 5 | trims | `bwa_calibrate --layout as_built.json --out trims.json --zylia --trims --room --survey capsules.json [--exclude <list>]` | `as_built.json`, `capsules.json` | `trims.json` | exit 0 |
+| 6 | verify | `bwa_calibrate --layout trims.json --zylia --verify --survey capsules.json [--exclude <list>]` | `trims.json` | a status | exit 0; exit 3 means flagged speakers |
+| 7 | grid | `bwa_calibrate --layout trims.json --out grid.json --zylia --room-eq-grid <rows> [--survey capsules.json] [--exclude <list>]` | `trims.json`, the grid rows, `capsules.json` | `grid.json` | exit 0 |
 | 8 | validate | `bwa_validate --layout grid.json --out validate.csv --azimuths <n> [--positions <file>] [--no-reference] [--survey capsules.json]` | `grid.json` (`trims.json` when the grid was skipped), `capsules.json` | `validate.csv` | exit 0 |
 
 The flags in brackets depend on the session. The capsule step gets `--latency` only when localize
@@ -2258,11 +2334,41 @@ and `--temp` when you set one. Localize and the capsule survey take `--mount-off
 the body-frame survey carries the offset. The full command line is in the log and in the step's
 tooltip.
 
+The tab checks the typed values before a step starts and quotes them on the command line. A
+temperature that is not like `22.5C` or `72F`, a mount offset that is not `ring` or `x,y,z`, an
+address or a speaker list with a space in it: each blocks the step, and the step's row says which
+format it wants.
+
+The **ASIO driver** is a dropdown of the installed drivers, with **(auto)** first. **Refresh** reads
+the list again. Type the name in the field beside it for a driver the list does not show. Simulate
+opens no driver, so the three are disabled there.
+
 The frame step also takes the **baffle offset** input as `--baffle-offset-m`. It is a value, not a
 file, but the record keeps it the same way: change it and the frame step reads `STALE`, which
 blocks localize from running again until the frame step passes with the new value. The tab does not
 measure it. After localize, run `bwa_speaker_survey as_built.json` by hand and enter its
 `suggested --baffle-offset-m` (see "Measure the baffle depth" under "Optical speaker check").
+
+The **localize exclude** input is `--exclude` for every step that sweeps the whole array: speaker
+indices from 0, written `3,14` or `0-4`, no spaces. Use it for a box the ZM-1 cannot hear or one
+that is not hung yet.
+
+- Localize never sweeps or solves those speakers, and `as_built.json` keeps their plan positions.
+- The capsule survey sweeps every other speaker when **capsule speakers** is empty. A list you
+  type there wins.
+- Trims, verify and the grid get the same `--exclude`. The excluded boxes are not swept, keep the
+  trims and grid sections the layout has, and are left out of verify's residuals.
+- Validate takes no list. It renders phantoms, and a phantom uses every speaker.
+
+A list that names a speaker the layout does not have, or leaves too few (4 for localize and the
+capsule survey, 2 for trims, verify and the grid), blocks the step with that reason.
+
+The record keeps the list like the baffle offset, so a change makes localize `STALE`, and every
+step after it with it. A changed list never costs the rows already measured. Add a box late and
+the next run resumes or retakes as usual: its captures stay in the file, and the solve leaves it
+out. Take a box off the list and the kept rows have no capture of it, so the line above the grid
+names it: `speaker N was excluded when these rows were measured: retake at least 5 rows to solve
+it, or Start over`. Until then the run passes and leaves that box at its plan position.
 
 Validate passes on exit 0. It measures; the numbers are yours to judge (Stage 4b).
 
@@ -2356,13 +2462,45 @@ The tab checks one thing for you: rows from a simulated rehearsal are not resume
 session, nor the reverse. The next run then starts over, and the line says why. If you changed
 the plan, the rows or the mount offset since those rows were measured, press **Start over**.
 
-A ranges file with every row in it is not resumed. To measure single rows again, run
-`bwa_calibrate` by hand with `--retake`.
+A resume or a retake is refused before it starts when the rows file has another number of rows
+than the kept captures, or the plan another number of speakers. The message names both counts.
+Put the file back, or press **Start over**.
+
+A ranges file with every row in it is not resumed.
+
+### The localize grid, and retaking rows
+
+While `as_built.ranges.json` exists, **Localize captures** under the file chain shows it: one line
+per mic row, one column per speaker. On a small window with **Inputs** open it is below the fold:
+scroll the tab down, or collapse **Inputs**.
+
+| Mark | Meaning |
+| --- | --- |
+| `+` | captured |
+| `!` | a gap: the row was measured and this speaker got no clean, agreeing pair of sweeps |
+| `-` | the speaker is in **localize exclude** |
+| `.` | the row is not measured yet |
+
+The line above the grid counts the rows kept, the captures and the gaps. It names every speaker
+with fewer than 5 captures: a position takes 5, so the solve leaves that speaker where the plan has
+it.
+
+To measure rows again, tick their boxes in the first column and press **Run** on localize. The
+tab passes `--ranges-in as_built.ranges.json --retake <rows>`, and the tool measures those rows and
+any row the file lacks. This works on a whole file too. The boxes clear when the run starts.
+**Start over** disables them. So does a file the next run cannot resume from (a rehearsal's under a
+rig session, or the reverse), and the line under the grid says which.
+
+The tab does not read the file while a tool runs. During a localize run the grid shows the last
+run's captures, labeled as such, until the step ends.
 
 ### Prompts
 
 A tool runs with no console, so the tab feeds the tool's stdin, and **Send Enter** writes one Enter
-down it.
+down it. The button sits under the step table with **Cancel**. While the tool's newest line asks
+for Enter, the button is highlighted and the line beside it says `WAITING FOR YOU: clear the space,
+then Send Enter` (tracked) or `place the ZM-1, then Send Enter` (untracked). The highlight goes
+when you send the Enter, and comes back at the tool's next prompt.
 
 Tracked, on the rig, the tab passes `--place-wait-enter` to the tool. The placement gate opens by
 itself when the stand is in tolerance and still, and the log then says `settled. Clear the space,
@@ -2370,12 +2508,20 @@ then press Enter`. Leave the space, then press **Send Enter**: the sweeps start.
 (300 s by default) bounds the wait for the gate and for the Enter together.
 
 Untracked, on the rig, `--localize`, the grid rows and `bwa_validate` stop at each placement and
-ask for Enter. Place the ZM-1, then press **Send Enter**.
+ask for Enter. Place the ZM-1, then press **Send Enter**. `bwa_calibrate` throws away any Enter
+sent before the prompt, so one pressed during a row's sweeps cannot take the next row at the old
+spot. `bwa_validate` does not yet: press once per prompt.
 
-Neither path can run in simulate (the tools skip the wait there), so the tab's side of both is
-unverified.
+The tools skip the wait in simulate. The `enter_wait` test runs the tracked path anyway, through
+`bwa_calibrate --track-sim-rig-wait`, which makes the scripted stand wait as a rig stand does.
+`calibrate_track_bump` runs the untracked prompt through `--sim-by-hand`. A real stand and a real
+untracked row in the tab are unverified.
 
 ### Simulate
+
+A new session starts on the rig when an ASIO driver is installed on the machine, and in simulate
+when none is. The line beside the **simulate** box says which in words: `SIMULATE: a rehearsal`
+or `ON THE RIG`, with the driver and the input. Read it before the first step. The box changes it.
 
 **simulate** passes `--simulate` to every tool and `--track-sim` to every tracked one, and puts the
 Aim tab and the Placement panel in their simulate modes. The whole session rehearses on one
@@ -2394,6 +2540,24 @@ takes about 40 s.
 - **finish_rules**: exit 0 with the step's file missing, and a canceled run, both fail.
 - **baffle_offset**: the typed value reaches the frame check and `session.json`, and a change
   marks the frame step stale.
+- **picker**: a scripted picker stands in for the Windows dialog. A picked file fills its field and
+  `session.json`, a canceled pick changes nothing, and a picked session folder opens.
+- **localize_grid**: a hand-made ranges file with a gap and an excluded speaker shows the right
+  marks and summary, and the grid does not read the file again while a tool runs.
+- **localize_exclude**: the list reaches the localize command, the excluded box is never swept and
+  stays at the plan, and a change marks localize stale. A box taken off the list is named, and
+  retake and resume stay allowed.
+- **localize_retake**: a box is added to the exclude list, then a ticked row becomes
+  `--ranges-in as_built.ranges.json --retake 2 --exclude 1` on a real run. The run passes and
+  leaves that box at the plan. The tick clears when the run starts, and a later step reads stale.
+- **non_ascii**: a session folder with a non-ASCII name is made and used as named, and the frame
+  check runs on a non-ASCII plan inside it.
+- **drivers**: with a scripted driver list, a new session defaults to the rig or to simulate, and
+  the dropdown, **Refresh** and the typed name each set the driver a step opens.
+- **input_checks**: a malformed temperature, mount offset, speaker list or address blocks its
+  step with the format, and a good one arrives quoted.
+- **enter_wait**: a simulated tracked run that waits for Enter lights **Send Enter**, the press
+  puts the light out, and the next placement lights it again.
 - **failure_blocks**: a 3-speaker capsule survey exits 2, and aim, trims, verify, grid and validate
   refuse to run, each with its reason.
 

@@ -4,6 +4,55 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: GameObject > BwAudio > CAVE Rig
+
+One menu item sets up a scene. It creates a `BwAudio` object with `Engine`, a `Room Origin` child
+assigned to it, and a `Speaker View` child (off). It adds a `Room` child with `RoomConstraints`
+and `RoomView` (off) when `constraints.json` exists. Then move Room Origin to the CAVE floor center.
+
+- Layout File is pre-filled from the top of `Assets/StreamingAssets`: `trims.json`, else
+  `cave_layout.json`, else empty with a warning. The value keeps the file's on-disk case, which a
+  Linux or Android player needs.
+- Listener is the main camera of the rig's own scene. No main camera there warns.
+- Off in Play mode. Refuses while a prefab is open for editing.
+- It offers to disable Unity's built-in audio.
+- A scene that already has an `Engine` gets nothing new. The item selects the existing one.
+- One undo removes the rig. `BwAudio.EditorTools.CaveRig.Create()` is the scripted form.
+- `Engine` is now `[DisallowMultipleComponent]`.
+- The Unity-audio warning is plain ASCII now.
+
+### Added: Room Origin, the room registration as a scene object
+
+`Engine` has a **Room Origin** field. Put an empty GameObject at the CAVE floor center with its
+forward along the layout's +z and assign it. `Engine` sets `Room.UnityToRoom` from it every frame,
+so the listener, the sources, the geometry and the gizmos are all relative to it. If the layout's
++z is the CAVE's back wall (Motive's frame), rotate the origin 180 degrees and leave the camera
+alone.
+
+- `Engine` draws the room's front (+z, blue) and right (-x, red) at the origin.
+- With no origin assigned, behavior is unchanged: `Room.UnityToRoom` stays identity.
+- Scale on the origin is ignored, with one warning. A tilt over 1 degree warns once.
+- A moved origin re-bakes the static `AcousticGeometry` and pushes the ground plane again.
+- New: `Room.Height`.
+- New: `Room.RegistrationFrom`, `Room.SetOrigin`, `Room.ReleaseOrigin`, `Room.Revision`.
+- `SpeakerView` and `RoomView` follow a registration change made this way.
+
+### Changed
+
+- `Room.UnityToRoom` resets to identity on every entry into Play mode. With Domain Reload off it
+  used to keep the last session's value. Prefer Room Origin. Code that writes the matrix itself
+  must run after the reset and before `Engine.Awake`, which bakes the static geometry at execution
+  order -100: use `[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]`, or
+  an `Awake` with an execution order below -100. A default-order `Awake` is too late for the
+  geometry. A write from your own `SubsystemRegistration` method races the reset.
+- `Engine.SceneSetGround` takes the plane's height from the registration origin's height only
+  (`Room.Height`). It used to read `Room.Pos((0, y, 0)).y`, which is wrong under a registration
+  that is rotated and offset.
+- A second scene's `Engine` hands its Room Origin to the surviving `Engine` before it destroys
+  itself.
+- The PlayMode test driver runs against a copy of the package. Run against the repo folder, Unity
+  deleted the `.meta` of every native library that was not built on the machine.
+
 ## [0.20.2]
 
 Bump for MacOS fixes for calibration.

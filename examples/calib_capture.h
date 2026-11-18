@@ -103,6 +103,12 @@ double calib_sim_speaker_latency(int ch);
  * window is not told, the way a rig's is not. 0 restores it. Non-finite values are ignored. */
 void calib_sim_set_latency_step(double seconds);
 
+/* Simulate only: on the 1-based captures listed (the interferer's count, up to CALIB_SIM_INTF_MAX) the
+ * speaker under test plays `seconds` later and the whole capture `level_db` louder (bwa_calibrate
+ * --sim-capture-delay): one sweep of a speaker a set amount off the next, which is what the agreement
+ * tolerances are tested against. n 0 = off. Control thread. */
+void calib_sim_set_capture_delay(const int* captures, int n, double seconds, double level_db);
+
 /* Simulate only: a ROOM around the array (bwa_calibrate --sim-room), so the direct-sound gate and
  * the reverberant dilution it exists for have something to act on. `absorption` is every wall's
  * energy absorption coefficient in (0, 1]; 0 = off, the anechoic capture (the default).
@@ -272,6 +278,7 @@ typedef struct {
     int           have_win;
     CalibWindow   win;                 /* win.pos_m < 0: per speaker, calib_window_pos_m */
     int           agree;               /* 1 = a value counts only once two sweeps agree (trims, verify) */
+    float         agree_samples, agree_db; /* the agreement's tolerances; 0 = CALIB_SWEEP_AGREE_* */
 } CalibPass;
 #define CALIB_BG_SILENT_DBFS (-300.0f)
 enum { CALIB_MEAS_OK = 1, CALIB_MEAS_FAILED = 0, CALIB_MEAS_TIMEOUT = -1, CALIB_MEAS_DEAD = -2,
@@ -290,7 +297,7 @@ typedef struct {
                                         * this speaker's sound can arrive (up to MEASURE_NOISE_GUARD_S
                                         * before the window, or the arrival with none), dBFS, the median
                                         * over the ZM-1's capsules; CALIB_BG_SILENT_DBFS = silent (simulate) */
-    char   log[1400];                  /* one ASCII line per re-sweep, "sweep N: <why>", or empty */
+    char   log[4096];                  /* one ASCII line per re-sweep, "sweep N: <why>", or empty */
 } CalibMeasInfo;
 /* Captures and measures speaker s, re-sweeping (up to CALIB_SWEEP_MAX_TRIES) any sweep the window or
  * the SNR floor rejects (calib_sweep_check), and with P->agree until two clean sweeps agree

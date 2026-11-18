@@ -14,6 +14,7 @@ extern "C" {
 #include <windows.h>
 
 #include <algorithm>
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +157,14 @@ bool ses_file_exists(const std::string& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool ses_make_dir(const std::string& path) {
+    if (path.empty()) return false;
+    if (CreateDirectoryW(wide(path).c_str(), NULL)) return true;
+    const DWORD a = GetFileAttributesW(wide(path).c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+void ses_delete_file(const std::string& path) { if (!path.empty()) DeleteFileW(wide(path).c_str()); }
+
 static bool same_path(const std::string& a, const std::string& b) {
     return !a.empty() && !b.empty() && _stricmp(ses_abs(a).c_str(), ses_abs(b).c_str()) == 0;
 }
@@ -248,6 +257,7 @@ bool ses_save(const Session& S, std::string* err) {
     put_str(in, "natnet_local", I.nn_local);
     put_str(in, "stand_body", I.body); put_str(in, "mount_offset", I.mount_offset); put_str(in, "temp", I.temp);
     put_str(in, "localize_rows", I.localize_rows); put_str(in, "grid_rows", I.grid_rows);
+    put_str(in, "localize_exclude", I.localize_exclude);
     put_str(in, "frame_speakers", I.frame_speakers); put_str(in, "capsule_speakers", I.capsule_speakers);
     cJSON_AddNumberToObject(in, "baffle_offset_m", I.baffle_offset_m);
     put_str(in, "aim_speakers", I.aim_speakers); put_str(in, "validate_positions", I.validate_positions);
@@ -326,6 +336,7 @@ bool ses_load(Session* S, const std::string& folder, std::string* err) {
     I.nn_local = get_str(in, "natnet_local");
     I.body = get_str(in, "stand_body"); I.mount_offset = get_str(in, "mount_offset"); I.temp = get_str(in, "temp");
     I.localize_rows = get_str(in, "localize_rows"); I.grid_rows = get_str(in, "grid_rows");
+    I.localize_exclude = get_str(in, "localize_exclude");
     I.frame_speakers = get_str(in, "frame_speakers"); I.capsule_speakers = get_str(in, "capsule_speakers");
     I.baffle_offset_m = get_num(in, "baffle_offset_m", 0.0);
     if (!(fabs(I.baffle_offset_m) <= SES_BAFFLE_MAX_M)) I.baffle_offset_m = 0.0;   /* NaN or absurd: the default */
@@ -394,6 +405,7 @@ static std::string input_path(const Session& S, const std::string& what) {
 }
 /* a VALUE input a step read, as the text its record keeps; false = `what` is not a value input */
 static bool input_value(const Session& S, const std::string& what, std::string* txt) {
+    if (what == "localize_exclude") { *txt = S.in.localize_exclude; return true; }
     if (what != "baffle_offset_m") return false;
     char b[32];
     snprintf(b, sizeof b, "%.4f", S.in.baffle_offset_m);
@@ -421,7 +433,9 @@ std::string ses_stale(const Session& S, int k) {
             const std::string up = ses_stale(S, j);
             if (!up.empty()) return std::string(IDS[j]) + " is stale";
         } else if (input_value(S, f.what, &val)) {
-            if (val != f.path) return "the " + f.what + " input changed since this step ran (" + f.path + " then, " + val + " now)";
+            if (val != f.path)
+                return "the " + f.what + " input changed since this step ran (" + (f.path.empty() ? "none" : f.path) + " then, " +
+                       (val.empty() ? "none" : val) + " now)";
         } else {
             const std::string now = input_path(S, f.what);
             if (_stricmp(now.c_str(), f.path.c_str()) != 0) return "the " + f.what + " input changed since this step ran";
@@ -431,6 +445,7 @@ std::string ses_stale(const Session& S, int k) {
     return std::string();
 }
 
+static bool tracked(const Session& S);
 std::string ses_blocked(const Session& S, int k) {
     if (S.folder.empty()) return "no session is open";
     for (int j = 0; j < SES_NSTEPS; ++j) {
@@ -439,7 +454,7 @@ std::string ses_blocked(const Session& S, int k) {
         const std::string name = IDS[j];
         if (Q.status == SES_FAILED)
             return "needs " + name + "'s " + ARTS[j] + ", and " + name + " failed (exit " + std::to_string(Q.exit_code) +
-                   "): fix it and run it again";
+                   ", " + ses_exit_meaning(j, Q.exit_code) + "): fix it and run it again";
         if (Q.status == SES_SKIPPED) return "needs " + name + "'s " + ARTS[j] + ", and " + name + " was skipped";
         if (Q.status != SES_PASSED) return "needs " + name + "'s " + ARTS[j] + ": run " + name + " first";
         if (!ses_stale(S, j).empty()) return name + " is stale (" + ses_stale(S, j) + "): run it again first";
@@ -460,6 +475,41 @@ std::string ses_blocked(const Session& S, int k) {
         if (ARTS[j][0] && same_path(I.plan, art_path(S, j)))
             return "the plan is this session's own " + std::string(ARTS[j]) + ": pick the plan outside the session's outputs";
     if (k == SES_LOCALIZE && !ses_file_exists(ses_abs(I.localize_rows))) return "the localize rows are not a file: set them";
+    {   /* The lists go on a command line as typed, unquoted: a space would split one into two arguments
+         * (strtol skips it, so the parser alone lets "3, 14" through), and a malformed one is the tool's exit 2. */
+        auto bad = [](const std::string& l) {
+            int tmp[BWA_MAX_CHANNELS];
+            return l.find_first_of(" \t") != std::string::npos || ses_parse_speakers(l, BWA_MAX_CHANNELS, tmp, BWA_MAX_CHANNELS) < 0;
+        };
+        /* every step that reads the list: the four that pass it on, and the capsule survey's complement */
+        const bool sweeps = k == SES_LOCALIZE || k == SES_CAPSULES || k == SES_TRIMS || k == SES_VERIFY || k == SES_GRID;
+        if (sweeps && bad(I.localize_exclude)) return "the localize exclude list is not a list like 3,14 or 0-4 (no spaces)";
+        if (k == SES_CAPSULES && bad(I.capsule_speakers)) return "the capsule speakers are not a list like 0-9 or 3,7 (no spaces)";
+        if (k == SES_FRAME && S.simulate && bad(I.frame_speakers)) return "the frame speakers are not a list like 0,4,8 (no spaces)";
+    }
+    if (k != SES_AIM) {   /* the other typed values a command line carries: each in its tool's own format, or refused here */
+        auto num = [](const char** q) { char* e = NULL; (void)strtod(*q, &e); const bool ok = e != *q && !isspace((unsigned char)**q); *q = e; return ok; };
+        auto host = [](const std::string& h) {
+            for (char ch : h) if (!isalnum((unsigned char)ch) && ch != '.' && ch != ':' && ch != '-' && ch != '_') return false;
+            return true;
+        };
+        const bool cal = k != SES_FRAME && k != SES_VALIDATE;      /* a bwa_calibrate step */
+        if (cal && !I.temp.empty()) {
+            const char* q = I.temp.c_str();
+            if (!num(&q) || !(*q == 0 || (strchr("CcFf", *q) && q[1] == 0))) return "the temperature is not a number like 22.5C or 72F";
+        }
+        if (k != SES_FRAME && tracked(S) && !I.mount_offset.empty() && I.mount_offset != "ring") {
+            const char* q = I.mount_offset.c_str();
+            bool ok = num(&q);
+            for (int a = 0; a < 2 && ok; ++a) ok = *q++ == ',' && num(&q);
+            if (!ok || *q) return "the mount offset is not ring or x,y,z in meters, like 0.02,-0.11,0.04 (no spaces)";
+        }
+        if (!S.simulate && (k == SES_FRAME || !I.body.empty())) {
+            if (!host(I.nn_server)) return "the Motive IP is not an address like 192.168.7.14";
+            if (!host(I.nn_multicast)) return "the multicast group is not an address like 239.255.42.99";
+            if (!host(I.nn_local)) return "the local IP is not an address like 192.168.7.20";
+        }
+    }
     if (k == SES_GRID && !ses_file_exists(ses_abs(I.grid_rows))) return "the grid rows are not a file: set them";
     if (k == SES_VALIDATE && !I.validate_positions.empty() && !ses_file_exists(ses_abs(I.validate_positions)))
         return "the validate placements are not a file";
@@ -474,18 +524,73 @@ std::string ses_blocked(const Session& S, int k) {
 
 /* ---- the command lines ---------------------------------------------------------------------------- */
 
+/* The exclude list against the n speakers of the layout a step reads: how many it leaves, or -1 + why when
+ * it names a speaker past the layout or leaves fewer than `need` (the tool's own exit 2 in both cases).
+ * n <= 0 (the layout did not load): not judged. */
+static int exclude_left(const Session& S, int n, int need, const char* step, std::string* why) {
+    const std::string& l = S.in.localize_exclude;
+    if (l.empty() || n <= 0) return n;
+    int tmp[BWA_MAX_CHANNELS];
+    const int ne = ses_parse_speakers(l, n, tmp, BWA_MAX_CHANNELS);
+    if (ne < 0) {
+        *why = "the localize exclude list names a speaker the layout does not have (" + std::to_string(n) +
+               " speakers, 0 to " + std::to_string(n - 1) + ")";
+        return -1;
+    }
+    if (n - ne < need) {
+        *why = "the localize exclude list leaves " + std::to_string(n - ne) + " speaker(s), and " + step + " needs " + std::to_string(need);
+        return -1;
+    }
+    return n - ne;
+}
+/* --exclude for a step that sweeps the whole array (localize, trims, verify, the grid). false + why = refused. */
+static bool exclude_flag(const Session& S, int n, int need, const char* step, std::string* c, std::string* why) {
+    if (exclude_left(S, n, need, step, why) < 0) return false;
+    if (!S.in.localize_exclude.empty()) *c += " --exclude " + S.in.localize_exclude;
+    return true;
+}
+/* every speaker of n but the excluded ones, in the list syntax ("0-5,7-9"): the capsule survey's default */
+static std::string exclude_complement(const std::string& excl, int n) {
+    int list[BWA_MAX_CHANNELS];
+    unsigned char out[BWA_MAX_CHANNELS] = { 0 };
+    const int ne = ses_parse_speakers(excl, n, list, BWA_MAX_CHANNELS);
+    for (int i = 0; i < ne; ++i) out[list[i]] = 1;
+    std::string t;
+    for (int a = 0; a < n; ++a) {
+        if (out[a]) continue;
+        int b = a;
+        while (b + 1 < n && !out[b + 1]) ++b;
+        t += (t.empty() ? "" : ",") + std::to_string(a) + (b > a ? "-" + std::to_string(b) : "");
+        a = b;
+    }
+    return t;
+}
+/* rows in a rows file, the way the tools read one: "x y z" triples until one does not parse */
+static int count_rows(const std::string& path) {
+    FILE* f = open_u8(path, L"r");
+    if (!f) return 0;
+    int k = 0;
+    float v[3];
+    while (k < 1000 && fscanf(f, "%f %f %f", &v[0], &v[1], &v[2]) == 3) ++k;
+    fclose(f);
+    return k;
+}
+
 static bool tracked(const Session& S) { return S.simulate || !S.in.body.empty(); }
 
 /* the placement flags every tracked bwa_calibrate / bwa_validate step takes */
 static std::string track_flags(const Session& S) {
     const SesInputs& I = S.in;
     std::string c;
-    if (S.simulate) c += " --track-sim";
+    if (S.simulate) {
+        c += " --track-sim";
+        if (!S.sim_rig_wait.empty()) c += " --track-sim-rig-wait " + quote(S.sim_rig_wait) + " --place-wait-enter";
+    }
     else if (!I.body.empty()) {
         c += " --track " + quote(I.body);
-        if (!I.nn_server.empty()) c += " --natnet-server " + I.nn_server;
-        if (!I.nn_multicast.empty()) c += " --natnet-multicast " + I.nn_multicast;
-        if (!I.nn_local.empty()) c += " --natnet-local " + I.nn_local;
+        if (!I.nn_server.empty()) c += " --natnet-server " + quote(I.nn_server);
+        if (!I.nn_multicast.empty()) c += " --natnet-multicast " + quote(I.nn_multicast);
+        if (!I.nn_local.empty()) c += " --natnet-local " + quote(I.nn_local);
         /* the tool's stdin is this runner's pipe, and Send Enter writes down it: without the flag the tool
          * cannot know an Enter is coming and counts 5 s instead of waiting for the operator to leave */
         c += " --place-wait-enter";
@@ -508,7 +613,7 @@ static std::string device_flags(const Session& S, std::vector<SesFile>* consumed
         if (!I.driver.empty()) c += " --driver " + quote(I.driver);
         c += " --input " + std::to_string(I.input_first);
     }
-    if (!I.temp.empty()) c += " --temp " + I.temp;
+    if (!I.temp.empty()) c += " --temp " + quote(I.temp);
     return c;
 }
 static void use_art(const Session& S, int j, std::vector<SesFile>* consumed) {
@@ -526,7 +631,7 @@ static std::string survey_flags(const Session& S, bool mic_ok, const float ref[3
     std::string c;
     if (have) { c += " --survey capsules.json"; use_art(S, SES_CAPSULES, consumed); }
     if (tracked(S)) {
-        if (!have && !S.in.mount_offset.empty()) c += " --mount-offset " + S.in.mount_offset;
+        if (!have && !S.in.mount_offset.empty()) c += " --mount-offset " + quote(S.in.mount_offset);
     } else if (mic_ok) {
         const float* m = (have && C.have_center) ? C.center : ref;
         char b[96];
@@ -536,35 +641,132 @@ static std::string survey_flags(const Session& S, bool mic_ok, const float ref[3
     return c;
 }
 
+/* The localize ranges file, read once per change (its size and write time): the header for the resume
+ * line, the captures for the grid. UI thread only. NULL = no such file. */
+struct RangesMemo {
+    std::string path;
+    unsigned long long size = 0, mtime = 0;
+    bool ok = false, grid_ok = false;
+    int ver = 0, n = 0, rows = 0, done = 0, sim = -1;
+    SesLocGrid G;
+};
+static const RangesMemo* ranges_memo(const Session& S) {
+    static RangesMemo P;
+    if (S.folder.empty()) return NULL;
+    const std::string path = ses_join(S.folder, SES_LOCALIZE_RANGES);
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(wide(path).c_str(), GetFileExInfoStandard, &a)) return NULL;
+    const unsigned long long size = ((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    const unsigned long long mt = ((unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+    if (P.path == path && P.size == size && P.mtime == mt) return &P;
+    P.path = path; P.size = size; P.mtime = mt;
+    P.grid_ok = false;
+    P.ok = calib_ranges_peek(path.c_str(), &P.ver, &P.n, &P.rows, &P.done, &P.sim) != 0;
+    if (P.ok && P.n > 0 && P.n <= BWA_MAX_CHANNELS && P.rows > 0 && P.rows <= CALIB_LOC_MAX_ROWS) {
+        const size_t n = (size_t)P.n, K = (size_t)P.rows;
+        P.G.n = P.n; P.G.K = P.rows;
+        P.G.have.assign(n * K, 0);
+        P.G.row_done.assign(K, 0);
+        std::vector<double> arr(n * K);
+        std::vector<float> pos(K * 6);
+        CalibRanges r = { P.n, P.rows, P.G.have.data(), arr.data(), NULL, NULL, (float(*)[3])pos.data(),
+                          (float(*)[3])(pos.data() + K * 3), P.G.row_done.data(), -1 };
+        P.grid_ok = calib_ranges_read(path.c_str(), &r, NULL, 0) != 0;
+    }
+    return &P;
+}
+/* The rows on disk were measured under the last localize record's exclude list, and a changed list never
+ * costs them. MORE speakers excluded: their captures stay in the file and bwa_calibrate leaves an excluded
+ * speaker out of every check and solve, captures or not. Speakers RE-INCLUDED: the kept rows have no
+ * capture of them, so they stay unsolved (the tool says so and leaves them at the plan) until 5 rows are
+ * measured again; this names them, so that is said before the run and not found after it. A record
+ * without the entry (a session from before the input, a reset step) names nobody. */
+std::string ses_localize_reincluded(const Session& S, unsigned char* was) {
+    if (was) memset(was, 0, BWA_MAX_CHANNELS);
+    std::string then, t;
+    bool have = false;
+    for (const SesFile& f : S.step[SES_LOCALIZE].consumed)
+        if (f.what == "localize_exclude") { then = f.path; have = true; }
+    if (!have) return t;
+    int a[BWA_MAX_CHANNELS], b[BWA_MAX_CHANNELS];
+    unsigned char now[BWA_MAX_CHANNELS] = { 0 };
+    const int na = ses_parse_speakers(then, BWA_MAX_CHANNELS, a, BWA_MAX_CHANNELS);
+    const int nb = ses_parse_speakers(S.in.localize_exclude, BWA_MAX_CHANNELS, b, BWA_MAX_CHANNELS);
+    for (int i = 0; i < nb; ++i) now[b[i]] = 1;
+    for (int i = 0; i < na; ++i) {
+        if (now[a[i]]) continue;
+        if (was) was[a[i]] = 1;
+        t += (t.empty() ? "" : ",") + std::to_string(a[i]);
+    }
+    return t;
+}
+/* why the file's rows cannot go into the next run ("" = they can) */
+static std::string ranges_unusable(const RangesMemo& P, const Session& S) {
+    if (P.ver != CALIB_RANGES_VERSION) return "it is version " + std::to_string(P.ver) + " of the ranges file";
+    if (P.sim >= 0 && !P.sim != !S.simulate)
+        return P.sim ? "its captures are simulated and this session is on the rig"
+                     : "its captures are the rig's and this session is simulated";
+    return std::string();
+}
+
 SesResume ses_localize_resume(const Session& S, int* done, int* rows, std::string* why) {
     if (done) *done = 0;
     if (rows) *rows = 0;
     if (why) why->clear();
-    if (S.folder.empty()) return SES_RESUME_NONE;
-    const std::string path = ses_join(S.folder, SES_LOCALIZE_RANGES);
-    /* the file's header, parsed again only when the file changed (its size and write time) */
-    struct Peek { std::string path; unsigned long long size = 0, mtime = 0; bool ok = false; int ver = 0, rows = 0, done = 0, sim = -1; };
-    static Peek P;
-    WIN32_FILE_ATTRIBUTE_DATA a;
-    if (!GetFileAttributesExW(wide(path).c_str(), GetFileExInfoStandard, &a)) return SES_RESUME_NONE;
-    const unsigned long long size = ((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
-    const unsigned long long mt = ((unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
-    if (P.path != path || P.size != size || P.mtime != mt) {
-        P.path = path; P.size = size; P.mtime = mt;
-        P.ok = calib_ranges_peek(path.c_str(), &P.ver, NULL, &P.rows, &P.done, &P.sim) != 0;
-    }
-    if (!P.ok) return SES_RESUME_NONE;       /* not a file the tool can read: a fresh run sets it aside */
+    const RangesMemo* M = ranges_memo(S);
+    if (!M || !M->ok) return SES_RESUME_NONE;   /* no file, or not one the tool can read: a fresh run sets it aside */
+    const RangesMemo& P = *M;
     if (done) *done = P.done;
     if (rows) *rows = P.rows;
     if (!(P.done > 0 && P.done < P.rows)) return SES_RESUME_NONE;
     /* the one thing the tab checks for the user: a rehearsal's rows are not resumed by a rig run, nor the
      * reverse (the tool would refuse it). Whether the plan, the rows or the mount changed is theirs to know:
      * Start over is one click. */
-    if (P.ver == CALIB_RANGES_VERSION && (P.sim < 0 || !P.sim == !S.simulate)) return SES_RESUME_OK;
-    if (why) *why = P.ver != CALIB_RANGES_VERSION ? "it is version " + std::to_string(P.ver) + " of the ranges file"
-                  : P.sim ? "its captures are simulated and this session is on the rig"
-                          : "its captures are the rig's and this session is simulated";
+    const std::string un = ranges_unusable(P, S);
+    if (un.empty()) return SES_RESUME_OK;
+    if (why) *why = un;
     return SES_RESUME_MISMATCH;
+}
+
+const SesLocGrid* ses_localize_grid(const Session& S) {
+    const RangesMemo* M = ranges_memo(S);
+    return M && M->grid_ok ? &M->G : NULL;
+}
+
+int ses_localize_retake_rows(const Session& S, std::string* why) {
+    const RangesMemo* M = ranges_memo(S);
+    const std::string un = !M || !M->grid_ok ? "there is no ranges file this build can read"
+                         : M->done <= 0 ? "the file holds no measured row" : ranges_unusable(*M, S);
+    if (why) *why = un;
+    return un.empty() ? M->rows : 0;
+}
+
+char ses_grid_mark(const SesLocGrid& G, const unsigned char* excl, int s, int k, const unsigned char* was) {
+    if (excl && excl[s]) return '-';
+    if (!G.row_done[(size_t)k]) return '.';
+    if (G.have[(size_t)s * G.K + k]) return '+';
+    return was && was[s] ? '.' : '!';    /* left out when the row was measured: never swept, so no gap */
+}
+
+std::string ses_grid_summary(const SesLocGrid& G, const unsigned char* excl) {
+    int kept = 0, caps = 0, gaps = 0;
+    std::string few;
+    for (int k = 0; k < G.K; ++k) kept += G.row_done[(size_t)k] != 0;
+    for (int s = 0; s < G.n; ++s) {
+        int m = 0;
+        for (int k = 0; k < G.K; ++k) {
+            const char c = ses_grid_mark(G, excl, s, k);
+            m += c == '+'; gaps += c == '!';
+        }
+        caps += m;
+        if (m < 5 && !(excl && excl[s])) few += (few.empty() ? "" : ",") + std::to_string(s);
+    }
+    std::string t = "rows " + std::to_string(kept) + " of " + std::to_string(G.K) + ", captures " + std::to_string(caps) +
+                    ", gaps " + std::to_string(gaps);
+    /* a position takes 5 rows (bwa_calibrate): under 5 kept rows that is every speaker, so say it once */
+    if (kept < 5) t += "; under 5 rows, so no speaker solves yet";
+    else if (!few.empty()) t += "; under 5 captures, so not solved: speaker " + few;
+    return t;
 }
 
 bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, std::vector<SesFile>* consumed,
@@ -589,11 +791,11 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         }
         if (S.simulate) {
             c += " --simulate";
-            if (!I.frame_speakers.empty()) c += " --sim-speakers " + I.frame_speakers;
+            if (!I.frame_speakers.empty()) c += " --sim-speakers " + quote(I.frame_speakers);
         } else {
-            c += " --server " + I.nn_server;
-            if (!I.nn_multicast.empty()) c += " --multicast " + I.nn_multicast;
-            if (!I.nn_local.empty()) c += " --local " + I.nn_local;
+            c += " --server " + quote(I.nn_server);
+            if (!I.nn_multicast.empty()) c += " --multicast " + quote(I.nn_multicast);
+            if (!I.nn_local.empty()) c += " --local " + quote(I.nn_local);
         }
         use_input("plan", plan, consumed);
         break;
@@ -602,12 +804,43 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         const std::string rows = ses_abs(I.localize_rows);
         c = quote(T.calibrate) + " --layout " + quote(plan) + " --out as_built.json --zylia --localize " + quote(rows);
         c += device_flags(S, consumed) + track_flags(S);
-        if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + I.mount_offset;
+        if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + quote(I.mount_offset);
         /* A run that stopped partway is resumed, not repeated, when its file has this command's simulate
          * flag and the current version (ses_localize_resume). The ranges file is NOT a consumed input. The step rewrites it itself, so its hash
          * recorded at the start would read the step stale against its own output the moment it passed;
          * and what a later step consumes is as_built.json, which carries the result. */
-        if (!S.localize_start_over && ses_localize_resume(S, NULL, NULL, NULL) == SES_RESUME_OK) c += " --ranges-in " SES_LOCALIZE_RANGES;
+        {   /* checked rows are measured again from the same file, whole or not. The tool refuses --retake
+             * without --ranges-in, so the two go together or not at all; Start over drops both. */
+            const int K = ses_localize_retake_rows(S);
+            std::string rt;
+            for (int r = 0; r < K; ++r)
+                if (S.localize_retake >> r & 1) rt += (rt.empty() ? "" : ",") + std::to_string(r + 1);
+            if (!S.localize_start_over && (!rt.empty() || ses_localize_resume(S, NULL, NULL, NULL) == SES_RESUME_OK)) {
+                /* The tool refuses captures taken for another row or speaker count (exit 1, the reason only in
+                 * the log). Said here, by name, before anything starts. */
+                const RangesMemo* M = ranges_memo(S);
+                const int nrows = count_rows(rows);
+                int np = 0;
+                if (M && nrows != M->rows) {
+                    *why = "the localize rows file has " + std::to_string(nrows) + " rows, and " SES_LOCALIZE_RANGES " holds captures for " +
+                           std::to_string(M->rows) + ": put the rows file back, or press Start over";
+                    return false;
+                }
+                if (M && ses_layout_ref(plan, ref, &np) && np != M->n) {
+                    *why = "the plan has " + std::to_string(np) + " speakers, and " SES_LOCALIZE_RANGES " holds captures for " +
+                           std::to_string(M->n) + ": press Start over";
+                    return false;
+                }
+                c += " --ranges-in " SES_LOCALIZE_RANGES;
+                if (!rt.empty()) c += " --retake " + rt;
+            }
+        }
+        /* a value input, like the baffle offset: recorded even when empty, so adding one reads stale too.
+         * (A record from before this input has no entry, so adding a list does not mark that one stale.) */
+        /* against the plan's own count when it loads: past it the tool exits 2 and the grid marks nothing */
+        if (!ses_layout_ref(plan, ref, &n)) n = 0;
+        if (!exclude_flag(S, n, 4, "the localize solve", &c, why)) return false;
+        consumed->push_back({ "localize_exclude", I.localize_exclude, std::string(), 0 });
         use_input("plan", plan, consumed);
         use_input("localize_rows", rows, consumed);
         break;
@@ -618,14 +851,19 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         char mic[96];
         snprintf(mic, sizeof mic, " --mic %.4f %.4f %.4f", ref[0], ref[1], ref[2]);
         c = quote(T.calibrate) + " --layout as_built.json --zylia --capsule-survey capsules.json" + mic;
+        /* no list typed: every speaker but the ones localize left out, whose positions are the plan's guess */
         if (!I.capsule_speakers.empty()) c += " --speakers " + I.capsule_speakers;
+        else if (!I.localize_exclude.empty()) {
+            if (exclude_left(S, n, 4, "the capsule survey", why) < 0) return false;   /* else a bare or short --speakers */
+            c += " --speakers " + exclude_complement(I.localize_exclude, n);
+        }
         {   /* localize pins the latency (its mic rows move); the survey's own four-unknown solve cannot on
              * a dome, so hand it the one that is measured */
             const SesStep& Lz = S.step[SES_LOCALIZE];
             if (Lz.have_latency) { char lb[48]; snprintf(lb, sizeof lb, " --latency %.4f", Lz.latency_m); c += lb; }
         }
         c += device_flags(S, consumed) + track_flags(S);
-        if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + I.mount_offset;
+        if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + quote(I.mount_offset);
         use_art(S, SES_LOCALIZE, consumed);
         break;
     }
@@ -638,6 +876,8 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
                                                                            : " --zylia --verify");
         use_art(S, in, consumed);
         c += device_flags(S, consumed) + track_flags(S) + survey_flags(S, true, ref, consumed);
+        /* not swept, and what the layout has for them stays */
+        if (!exclude_flag(S, n, 2, k == SES_TRIMS ? "the trim solve" : "verify", &c, why)) return false;
         break;
     }
     case SES_GRID: {
@@ -647,6 +887,8 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         use_art(S, SES_TRIMS, consumed);
         use_input("grid_rows", rows, consumed);
         c += device_flags(S, consumed) + track_flags(S) + survey_flags(S, false, ref, consumed);
+        if (!ses_layout_ref(art_path(S, SES_TRIMS), ref, &n)) n = 0;
+        if (!exclude_flag(S, n, 2, "the grid", &c, why)) return false;
         break;
     }
     case SES_VALIDATE: {
@@ -668,11 +910,23 @@ bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, s
         }
         c += track_flags(S);
         if (S.step[SES_CAPSULES].status == SES_PASSED) { c += " --survey capsules.json"; use_art(S, SES_CAPSULES, consumed); }
-        else if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + I.mount_offset;
+        else if (tracked(S) && !I.mount_offset.empty()) c += " --mount-offset " + quote(I.mount_offset);
         break;
     }
     default:
         *why = "this step runs in the Aim tab, not as a tool";
+        return false;
+    }
+    /* The tools read a plain main argv, and their UTF-8 code-page manifest makes it UTF-8 on Windows 10
+     * 1903 and later. Before that the manifest is ignored (this process carries the same one, so its own
+     * code page tells) and a non-ASCII argument reaches the tool as bytes its file calls cannot open:
+     * refused here, by name, before anything starts. The session folder is not on the command line. */
+    for (size_t i = 0; GetACP() != CP_UTF8 && i < c.size(); ++i) {
+        if (!((unsigned char)c[i] & 0x80)) continue;
+        const size_t q0 = c.rfind('"', i), q1 = c.find('"', i);
+        const std::string arg = (q0 != std::string::npos && q1 != std::string::npos) ? c.substr(q0 + 1, q1 - q0 - 1) : std::string("that argument");
+        *why = std::string(k == SES_FRAME ? "bwa_speaker_survey" : k == SES_VALIDATE ? "bwa_validate" : "bwa_calibrate") +
+               " cannot take a non-ASCII path on this Windows (before 10 1903): move " + arg + " to an ASCII path";
         return false;
     }
     *cmd = c;
@@ -689,7 +943,7 @@ void ses_begin(Session* S, int k, const std::string& cmd, const std::vector<SesF
     P.started = ses_now();
     P.command = cmd;
     P.consumed = consumed;
-    if (k == SES_LOCALIZE) S->localize_start_over = false;   /* it was a choice about this run */
+    if (k == SES_LOCALIZE) { S->localize_start_over = false; S->localize_retake = 0; }   /* choices about this run */
 }
 
 void ses_skip(Session* S, int k, const std::string& note) {

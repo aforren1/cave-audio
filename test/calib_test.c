@@ -312,11 +312,21 @@ int main(void) {
             MeasureResult b = a;
             b.delay_samples = 101; b.delay_frac = 0.1f; b.level = 1.02f;       /* 0.9 sample, 0.17 dB */
             float ds = 0.f, ddb = 0.f;
-            CHECK(calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: within a sample and 0.2 dB");
+            CHECK(calib_sweeps_agree(&a, &b, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB, &ds, &ddb), "agree: within a sample and 0.2 dB");
             b.level = 1.03f;                                                    /* 0.26 dB */
-            CHECK(!calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: 0.26 dB apart does not");
+            CHECK(!calib_sweeps_agree(&a, &b, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB, &ds, &ddb), "agree: 0.26 dB apart does not");
             b.level = 1.f; b.delay_frac = 0.3f;                                 /* 1.1 samples */
-            CHECK(!calib_sweeps_agree(&a, &b, &ds, &ddb), "agree: 1.1 samples apart does not");
+            CHECK(!calib_sweeps_agree(&a, &b, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB, &ds, &ddb), "agree: 1.1 samples apart does not");
+            /* localize's tolerances (3 samples, 1 dB) take what the trims' refuse, and have their own edge */
+            b.delay_samples = 102; b.delay_frac = a.delay_frac; b.level = 1.06f; /* 2.0 samples, 0.51 dB */
+            CHECK(calib_sweeps_agree(&a, &b, CALIB_LOC_AGREE_SAMPLES, CALIB_LOC_AGREE_DB, &ds, &ddb) &&
+                  !calib_sweeps_agree(&a, &b, CALIB_SWEEP_AGREE_SAMPLES, CALIB_SWEEP_AGREE_DB, NULL, NULL),
+                  "agree: 2 samples and 0.5 dB agree for localize and not for the trims");
+            CHECK(fabsf(ds - 2.f) < 1e-3f && fabsf(ddb - 0.506f) < 0.01f, "agree: the differences are reported");
+            b.delay_samples = 103; b.delay_frac = a.delay_frac + 0.2f;          /* 3.2 samples */
+            CHECK(!calib_sweeps_agree(&a, &b, CALIB_LOC_AGREE_SAMPLES, CALIB_LOC_AGREE_DB, NULL, NULL), "agree: 3.2 samples apart does not, for localize");
+            b.delay_samples = 102; b.delay_frac = a.delay_frac; b.level = 1.13f; /* 1.06 dB */
+            CHECK(!calib_sweeps_agree(&a, &b, CALIB_LOC_AGREE_SAMPLES, CALIB_LOC_AGREE_DB, NULL, NULL), "agree: 1.06 dB apart does not, for localize");
         }
     }
 
@@ -851,6 +861,48 @@ int main(void) {
         for (int s = 3; s < NS; ++s) cu[s * NK + 1] = 0;
         CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize: per row refuses a row left 3 captures");
         rstep[5 * NK + 2] -= 0.040;
+
+        /* GAPS (--localize: a speaker with no agreeing pair at one placement). A masked capture's range slot
+         * is never written, so whatever it holds must not reach the solve: garbage there gives the positions
+         * and latencies of the same solve with clean values there, to the bit, and they land on the truth. */
+        {
+            float pg[NS][3];
+            double latg[NK];
+            memset(cu, 1, sizeof cu); cu[2 * NK + 4] = 0; cu[7 * NK + 0] = 0;
+            memcpy(p, start, sizeof p);
+            CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize, two gaps: solves");
+            const double keep24 = rstep[2 * NK + 4], keep70 = rstep[7 * NK + 0];
+            rstep[2 * NK + 4] = 0.0; rstep[7 * NK + 0] = 1.0e6;
+            memcpy(pg, start, sizeof pg);
+            CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, pg, latg, NULL), "joint localize, garbage in the gaps: solves");
+            CHECK(!memcmp(pg, p, sizeof p) && !memcmp(latg, lat, sizeof lat), "joint localize: a gap's range slot does not reach the solve");
+            CHECK(worst_mm((const float (*)[3])pg, (const float (*)[3])spk, NS) < 2.0, "joint localize, two gaps: every speaker within 2 mm");
+            rstep[2 * NK + 4] = keep24; rstep[7 * NK + 0] = keep70;
+        }
+        /* A row with NO used capture (a placement --localize did not keep) is left out and the solve stays
+         * per row: the other rows' latencies still carry the step and every speaker lands. One capture left
+         * in that row is too few for its latency, and refused. */
+        {
+            memset(cu, 1, sizeof cu);
+            for (int s = 0; s < NS; ++s) cu[s * NK + 1] = 0;
+            memcpy(p, start, sizeof p);
+            CHECK(calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize, an empty row: solves per row");
+            /* five bunched rows pin the latency against the radius less well than six (the dome trap), so the
+             * bounds are wider than the full solve's; the STEP shows in the rows' errors staying together */
+            double lo = 1e9, hi = -1e9;
+            for (int k = 0; k < NK; ++k) {
+                if (k == 1) continue;
+                const double e = lat[k] - (LAT + (k >= 3 ? STEP : 0.0));
+                if (e < lo) lo = e;
+                if (e > hi) hi = e;
+            }
+            worst = worst_mm((const float (*)[3])p, (const float (*)[3])spk, NS);
+            printf("joint localize: an empty row: worst %.2f mm, latency errors %+.2f..%+.2f mm, its own %.3f\n", worst, lo * 1e3, hi * 1e3, lat[1]);
+            CHECK(worst < 6.0 && hi - lo < 1.0e-3 && lat[1] == 0.0,
+                  "joint localize, an empty row: the speakers land, the other rows carry the step, its own latency reads 0");
+            cu[0 * NK + 1] = 1;
+            CHECK(!calib_localize_joint(rstep, (const float (*)[3])micp, NK, NS, NULL, cu, 1, p, lat, NULL), "joint localize: per row refuses a row left 1 capture");
+        }
 
         /* a speaker left out keeps its position; the refusals */
         unsigned char use[NS];

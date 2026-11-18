@@ -40,6 +40,7 @@ namespace BwAudio
         Material _material;
         MaterialPropertyBlock _mpb;
         int _colorId = -1;
+        int _roomRev;
 
         // OnEnable, not Start: Start runs once for the lifetime of the component, so toggling this view
         // off and back on would tear the markers down and never rebuild them.
@@ -67,6 +68,7 @@ namespace BwAudio
             }
             _mpb = new MaterialPropertyBlock();
 
+            _roomRev   = Room.Revision;
             _markers   = new Transform[n];
             _renderers = new Renderer[n];
             _shown     = new float[n];
@@ -94,6 +96,15 @@ namespace BwAudio
             if (_renderers == null) return;
             var eng = Engine.Instance;
             if (eng == null || !eng.Ready) return;
+
+            // The marker positions bake the registration, so a moved Engine.roomOrigin re-places them.
+            if (_roomRev != Room.Revision)
+            {
+                _roomRev = Room.Revision;
+                float[] xyz = eng.SpeakerPositions();
+                for (int i = 0; i < _markers.Length && i * 3 + 2 < xyz.Length; i++)
+                    _markers[i].position = Room.FromRoom(new Vector3(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]));
+            }
 
             float[] peaks = eng.BusLevels();
             float decay = releasePerSecond * Time.deltaTime;

@@ -37,14 +37,21 @@ static String to_os_path(const String &p) {
 
 void BwaEngine::_ready() {
 	if (Engine::get_singleton()->is_editor_hint()) {
+		editor_watch = true; // ...but do keep the room_origin warnings current
+		set_process(true);
 		return; // never grab an audio device just because a scene was opened
 	}
 	if (singleton && singleton != this) {
+		inert = true;
 		UtilityFunctions::push_error(
 				"BwaEngine: a second engine node entered the tree; only one may run. This one is "
-				"inert.");
+				"inert and the first keeps running with its own layout and room_origin. If the "
+				"rig is an Autoload, remove the BwaEngine from the scene.");
 		return;
 	}
+
+	/* Before anything reads the registration: the static scene below bakes through it. */
+	sync_room_origin();
 
 	const uint32_t dll = bwa_get_version();
 	if (dll != BWA_VERSION) {
@@ -147,6 +154,9 @@ void BwaEngine::_ready() {
 void BwaEngine::_process(double delta) {
 	(void)delta;
 	if (!eng) {
+		if (editor_watch) {
+			editor_watch_origin();
+		}
 		return;
 	}
 
@@ -156,6 +166,8 @@ void BwaEngine::_process(double delta) {
 	 * never revisited; a same-frame addition is simply picked up or caught next frame). A
 	 * range-for here is iterator invalidation; a copied snapshot is worse — it would keep a
 	 * dangling pointer to anything the handler freed. */
+	sync_room_origin(); // the frame every push below is expressed in
+
 	for (size_t i = 0; i < sources.size(); i++) {
 		sources[i]->push_frame(); // all sources first...
 	}
@@ -385,6 +397,213 @@ void BwaEngine::build_static_scene() {
 
 /* --- the coordinate seam --- */
 
+/* Unity's Engine.roomOrigin warns past the same 1 degree: the ground plane takes the origin's
+ * height only, so a tilted origin tilts every position against a floor that stayed level. */
+static const double ROOM_ORIGIN_TILT_COS = 0.99984769515639127; /* cos(1 deg) */
+
+/* Why an origin cannot give a registration. */
+enum RoomOriginFault { ORIGIN_OK = 0, ORIGIN_NON_FINITE, ORIGIN_COLLAPSED, ORIGIN_MIRRORED };
+
+/* Judged on the NORMALIZED axes, so a small uniform scale (0.001, a millimeter rig) is a
+ * scale to drop and not a collapse. A negative determinant is a reflection: orthonormalizing
+ * keeps it, every position would come out mirrored, and Quaternion(registration.basis * b)
+ * would be handed a matrix that is not a rotation. Refused rather than repaired, because
+ * which axis the user meant to flip is not ours to guess. */
+static RoomOriginFault room_origin_fault(const Transform3D &t) {
+	if (!t.is_finite()) {
+		return ORIGIN_NON_FINITE;
+	}
+	Vector3 c[3];
+	for (int i = 0; i < 3; i++) {
+		c[i] = t.basis.get_column(i);
+		const real_t len = c[i].length();
+		if (!(len > 0)) {
+			return ORIGIN_COLLAPSED;
+		}
+		c[i] /= len;
+	}
+	const double det = (double)c[0].cross(c[1]).dot(c[2]);
+	if (std::fabs(det) < 1e-6) {
+		return ORIGIN_COLLAPSED;
+	}
+	return det < 0.0 ? ORIGIN_MIRRORED : ORIGIN_OK;
+}
+
+static const char *room_origin_fault_text(RoomOriginFault f) {
+	switch (f) {
+		case ORIGIN_NON_FINITE:
+			return "has a non-finite transform";
+		case ORIGIN_COLLAPSED:
+			return "has a zero-length or flattened axis";
+		case ORIGIN_MIRRORED:
+			return "is mirrored (a negative scale on it or on a parent)";
+		default:
+			return "is fine";
+	}
+}
+
+static bool room_origin_scaled(const Basis &b) {
+	for (int i = 0; i < 3; i++) {
+		if (std::fabs((double)b.get_column(i).length() - 1.0) > 1e-3) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool room_origin_tilted(const Basis &b) {
+	const Vector3 up = b.get_column(1);
+	const double len = (double)up.length();
+	return len > 0.0 && (double)up.y / len < ROOM_ORIGIN_TILT_COS;
+}
+
+void BwaEngine::registration_changed() {
+	reg_gen++;
+	if (!eng || registration_stale) {
+		return; /* before start nothing has been converted yet */
+	}
+	const bool fdn_dir = fdn.enabled
+			&& (fdn.decay_dir[0] != 0.0f || fdn.decay_dir[1] != 0.0f || fdn.decay_dir[2] != 0.0f);
+	if (!ground_enabled && !BwaRoomBox::active() && BwaAcousticGeometry::registry().empty()
+			&& !extra_listeners_set && !fdn_dir) {
+		return; /* everything live is pushed per frame and simply follows */
+	}
+	registration_stale = true;
+	UtilityFunctions::push_warning(
+			"BwaEngine: the registration changed after start. Sources, the listener and speaker "
+			"views follow it. What was converted once does not, and keeps the old frame: static "
+			"acoustic geometry, the room box, the ground plane, set_extra_listeners positions "
+			"and the FDN decay direction. Set room_origin or registration before the engine "
+			"starts. is_registration_stale() now reads true.");
+}
+
+void BwaEngine::set_registration(const Transform3D &t) {
+	if (inert) {
+		if (!registration_refused_warned) {
+			registration_refused_warned = true;
+			UtilityFunctions::push_warning(
+					"BwaEngine: this node is the refused second engine and runs nothing, so its "
+					"registration is ignored. Set it on the BwaEngine that is running.");
+		}
+		return;
+	}
+	if (!room_origin_path.is_empty() && is_inside_tree()
+			&& !Engine::get_singleton()->is_editor_hint()
+			&& Object::cast_to<Node3D>(get_node_or_null(room_origin_path))) {
+		if (!registration_refused_warned) {
+			registration_refused_warned = true;
+			UtilityFunctions::push_warning(
+					"BwaEngine: registration is driven by room_origin, so this write is ignored. "
+					"Move the room_origin node, or clear room_origin first.");
+		}
+		return;
+	}
+	if (t == registration) {
+		return;
+	}
+	registration = t;
+	registration_changed();
+}
+
+void BwaEngine::set_room_origin(const NodePath &p) {
+	room_origin_path = p;
+	room_origin_tracked = false; /* a new node at the old node's transform still recomputes */
+	origin_missing_warned = false;
+	origin_invalid_warned = false;
+	editor_origin_state = -1;
+	update_configuration_warnings();
+	if (is_inside_tree() && !Engine::get_singleton()->is_editor_hint()) {
+		sync_room_origin();
+	}
+}
+
+void BwaEngine::sync_room_origin() {
+	if (inert || room_origin_path.is_empty()) {
+		return; /* no origin: the registration is whatever code set, identity by default */
+	}
+	Node3D *origin = Object::cast_to<Node3D>(get_node_or_null(room_origin_path));
+	if (!origin) {
+		/* Freed with its scene, or a bad path. Keep the last registration: jumping the whole
+		 * mix back to identity mid-run is worse than holding it. */
+		if (!origin_missing_warned) {
+			origin_missing_warned = true;
+			UtilityFunctions::push_warning(vformat(
+					"BwaEngine: room_origin \"%s\" is not a Node3D in the tree; the registration "
+					"keeps its last value.",
+					String(room_origin_path)));
+		}
+		return;
+	}
+	const Transform3D t = origin->get_global_transform();
+	const RoomOriginFault fault = room_origin_fault(t);
+	/* Non-finite is judged before the moved test: a NaN never compares equal, so it would
+	 * read as "moved" on every frame. */
+	const bool same = fault != ORIGIN_NON_FINITE && room_origin_tracked && t == room_origin_seen;
+	if (same) {
+		return;
+	}
+	if (fault != ORIGIN_OK) {
+		/* All three faults hold the registration, like a freed origin. */
+		if (!origin_invalid_warned) {
+			origin_invalid_warned = true;
+			UtilityFunctions::push_warning(vformat(
+					"BwaEngine: room_origin \"%s\" %s, so it cannot set the registration. The "
+					"registration keeps its last value.",
+					String(room_origin_path), String(room_origin_fault_text(fault))));
+		}
+		if (fault != ORIGIN_NON_FINITE) {
+			room_origin_seen = t;
+			room_origin_tracked = true;
+		}
+		return;
+	}
+	room_origin_seen = t;
+	room_origin_tracked = true;
+
+	if (!origin_scale_warned && room_origin_scaled(t.basis)) {
+		origin_scale_warned = true;
+		UtilityFunctions::push_warning(
+				"BwaEngine: room_origin is scaled (its own scale or a parent's). The scale is "
+				"ignored: room meters are Godot meters.");
+	}
+	const Basis rot = t.basis.orthonormalized();
+	if (!origin_tilt_warned && room_origin_tilted(rot)) {
+		origin_tilt_warned = true;
+		UtilityFunctions::push_warning(
+				"BwaEngine: room_origin is tilted more than 1 degree. Keep it level: the room "
+				"frame's +Y is up and the ground plane uses the origin's height only.");
+	}
+	/* A frame, not a facing: the origin's local axes are the room axes, so this takes the
+	 * plain inverse and NOT the 180 degree facing swizzle of bwa_room.h. */
+	const Transform3D reg = Transform3D(rot, t.origin).affine_inverse();
+	if (reg == registration) {
+		return; /* re-pointed at a node that says the same thing: nothing went stale */
+	}
+	registration = reg;
+	registration_changed();
+}
+
+/* Editor only. The engine never runs there, so this is the whole cost of keeping the scale,
+ * tilt and mirror warnings honest while someone drags the origin around. */
+void BwaEngine::editor_watch_origin() {
+	if (room_origin_path.is_empty()) {
+		return;
+	}
+	const Node3D *origin = Object::cast_to<Node3D>(get_node_or_null(room_origin_path));
+	Transform3D t;
+	int state = 0; /* 0 = unresolved, 1 = non-finite, 2 = a transform worth comparing */
+	if (origin) {
+		t = origin->get_global_transform();
+		state = t.is_finite() ? 2 : 1;
+	}
+	if (state == editor_origin_state && (state != 2 || t == room_origin_seen)) {
+		return;
+	}
+	editor_origin_state = state;
+	room_origin_seen = t;
+	update_configuration_warnings();
+}
+
 Quaternion BwaEngine::to_room_orientation(const Basis &b) const {
 	const Quaternion g = Quaternion((registration.basis * b).orthonormalized());
 	const float in[4] = { (float)g.x, (float)g.y, (float)g.z, (float)g.w };
@@ -438,6 +657,7 @@ void BwaEngine::set_extra_listeners(const PackedVector3Array &positions) {
 		return;
 	}
 	const int n = MIN(positions.size(), BWA_EXTRA_LIS);
+	extra_listeners_set = n > 0; /* room positions as of NOW; see registration_changed */
 	float xyz[BWA_EXTRA_LIS * 3];
 	for (int i = 0; i < n; i++) {
 		const Vector3 p = to_room_position(positions[i]);
@@ -1339,6 +1559,37 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 					"Feed Listener is off - so the pose comes from a tracker, which must be "
 					"connected for the render to follow the head.");
 	}
+	if (layout_path.is_empty() && profile != PROFILE_BINAURAL) {
+		/* Binaural is exempt: no physical array, so the default grid costs nothing there and a
+		 * warning on every correct desk scene would teach people to ignore the marker. */
+		w.push_back("No layout: this array profile will render the built-in 26-speaker grid, "
+					"not your room. Copy the rig's trims.json or cave_layout.json into the "
+					"project (under res://) and set Layout Path to it.");
+	}
+	if (!room_origin_path.is_empty() && is_inside_tree()) {
+		const Node3D *origin = Object::cast_to<Node3D>(get_node_or_null(room_origin_path));
+		if (!origin) {
+			w.push_back("Room Origin does not point at a Node3D, so the registration never "
+						"follows it.");
+		} else {
+			const Transform3D t = origin->get_global_transform();
+			const RoomOriginFault fault = room_origin_fault(t);
+			if (fault != ORIGIN_OK) {
+				w.push_back(vformat("Room Origin %s, so it cannot set the registration and the "
+									"engine will ignore it.",
+						String(room_origin_fault_text(fault))));
+			} else {
+				if (room_origin_scaled(t.basis)) {
+					w.push_back("Room Origin is scaled (its own scale or a parent's). The scale "
+								"is ignored: room meters are Godot meters. Set it back to 1.");
+				}
+				if (room_origin_tilted(t.basis.orthonormalized())) {
+					w.push_back("Room Origin is tilted more than 1 degree. Keep it level and "
+								"turn it about Y only.");
+				}
+			}
+		}
+	}
 	if (!layout_path.is_empty()) {
 		/* A failed layout load is not fatal at create: the core falls back to the 26-speaker
 		 * grid, quietly changing the channel count on a smaller rig. bwa_start does refuse
@@ -1399,6 +1650,8 @@ void BwaEngine::_bind_methods() {
 	M(set_fdn_decay_factor, "factor"); M0(get_fdn_decay_factor);
 
 	M(set_registration, "xform"); M0(get_registration);
+	M(set_room_origin, "path"); M0(get_room_origin);
+	M0(is_registration_stale);
 	M(to_room_position, "v"); M(to_room_direction, "v");
 	M(to_room_orientation, "basis"); M(to_room_yaw, "basis");
 	M(from_room_position, "v"); M(from_room_direction, "v");
@@ -1547,6 +1800,9 @@ void BwaEngine::_bind_methods() {
 			"set_layout_path", "get_layout_path");
 	ADD_PROPERTY(PropertyInfo(Variant::TRANSFORM3D, "registration"), "set_registration",
 			"get_registration");
+	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "room_origin",
+						 PROPERTY_HINT_NODE_PATH_VALID_TYPES, "Node3D"),
+			"set_room_origin", "get_room_origin");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ground_enabled"), "set_ground_enabled",
 			"get_ground_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ground_height"), "set_ground_height",

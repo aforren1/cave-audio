@@ -1281,7 +1281,7 @@ if(BWA_BUILD_TESTS)
       COMMAND ${CMAKE_COMMAND} -DUNITY_EXE=${BWA_UNITY_EXE}
               -DREPO=${CMAKE_SOURCE_DIR}
               -DPROJECT_DIR=${BWA_UNITY_TEST_PROJECT}
-              -DMIN_TESTS=20
+              -DMIN_TESTS=31
               -P ${CMAKE_SOURCE_DIR}/bindings/unity/test~/run_unity_tests.cmake)
     # The first run resolves packages and imports the project from scratch; later runs reuse its
     # Library cache. RUN_SERIAL because the editor takes an exclusive lock on that project.
@@ -1468,7 +1468,7 @@ if(BWA_BUILD_CALIBVIEW)
     ${BWA_IMGUI_INC} ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR})
   target_compile_definitions(bwa_calib_view PRIVATE ${BWA_IMGUI_DEFS})
   target_compile_features(bwa_calib_view PRIVATE cxx_std_17)      # bwa_theme.h uses inline variables
-  target_link_libraries(bwa_calib_view PRIVATE bwa_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
+  target_link_libraries(bwa_calib_view PRIVATE bwa_core d3d11 d3dcompiler comdlg32 ole32)   # comdlg32, ole32: the file and folder pickers
   bwa_tool_icon(bwa_calib_view)
   # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the
   # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
@@ -1610,13 +1610,22 @@ if(BWA_BUILD_CALIBRATE)
     # tracked (body frame, acoustic mount offset) and untracked (room axes), plus its refusals.
     foreach(_bwa_cli verify_omni verify_zylia zylia_trims aim_sheet live_zylia
                      track_settle track_ring track_bump track_refuse track_survey track_twist grid_rows
-                     zylia_localize capsule_survey sweep_quality)
+                     zylia_localize capsule_survey sweep_quality exclude)
       add_test(NAME calibrate_${_bwa_cli}
                COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DMODE=${_bwa_cli}
                        -DLAYOUT=${CMAKE_BINARY_DIR}/calib_sim_room_layout.json
                        -DWORK=${CMAKE_BINARY_DIR}/calib_cli_${_bwa_cli}
                        -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
     endforeach()
+    # Non-ASCII paths in argv: only where the UTF-8 code-page manifest is applied (the if(MSVC) block near the
+    # end of this file). It runs a second tool too, so a manifest on bwa_calibrate alone fails it.
+    if(MSVC)
+      add_test(NAME calibrate_utf8_path
+               COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DSURVEY=$<TARGET_FILE:bwa_speaker_survey>
+                       -DMODE=utf8_path -DLAYOUT=${CMAKE_BINARY_DIR}/calib_sim_room_layout.json
+                       -DWORK=${CMAKE_BINARY_DIR}/calib_cli_utf8_path
+                       -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
+    endif()
     # calib_view's capture/zylia_matches_cli runs this tool on the setup the Capture tab just ran and
     # requires the same trims, so the tab and the CLI cannot drift. Without it that test says it did not run.
     if(TARGET bwa_calib_view)
@@ -1640,6 +1649,23 @@ if(BWA_BUILD_CALIBRATE)
   if(BWA_WITH_ASIO)
     bwa_add_asio_host(bwa_zylia_probe)
   endif()
+endif()
+
+# ---- Windows: every bwa_* tool runs with a UTF-8 process code page -------------------------------
+# The tools take a plain main(argc, argv), and the engine's path family (os_fopen) takes UTF-8. With
+# the system code page, a non-ASCII layout or rows path on the command line reached os_fopen as ANSI
+# bytes and failed to open. The activeCodePage manifest (Windows 10 1903 and later; ignored before)
+# makes argv, getenv and every *A call UTF-8. Applied once, to every bwa_* executable in this
+# directory, after they all exist. Not the engine DLL: a DLL takes its host's code page, and its
+# callers hand it UTF-8 already. The calibrate_utf8_path ctest pins it.
+if(MSVC)
+  get_property(_bwa_dir_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t IN LISTS _bwa_dir_targets)
+    get_target_property(_kind ${_t} TYPE)
+    if(_kind STREQUAL "EXECUTABLE" AND _t MATCHES "^bwa_")
+      target_sources(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bwa_utf8.manifest)
+    endif()
+  endforeach()
 endif()
 
 # ---- wasm with phonon: every executable takes the C++ link driver --------------------------------

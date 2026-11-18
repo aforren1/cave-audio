@@ -53,6 +53,8 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 
 #include <d3d11.h>
 #include <commdlg.h>       /* GetOpenFileNameA: the native file picker (comdlg32) */
+#include <cderr.h>         /* FNERR_BUFFERTOOSMALL */
+#include <shobjidl.h>      /* IFileOpenDialog: the Session tab's folder picker (ole32) */
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -199,6 +201,51 @@ static bool pick_file(char* buf, size_t cap, const char* filter) {
     snprintf(buf, cap, "%s", tmp);
     return true;
 }
+
+/* The Session tab's pickers: a folder, a .json or a .txt, as a UTF-8 path. The tab calls them through
+ * g_ses_pick, because a native modal cannot be driven by the test engine: the tests point it at a stub. */
+enum { PICK_FOLDER, PICK_JSON, PICK_TXT };
+static void ses_say(const char* fmt, ...);         /* the Session tab's message line (below) */
+static bool ses_pick_native(int kind, std::string* out) {
+    wchar_t w[1024] = L"";
+    std::wstring ws;
+    if (kind == PICK_FOLDER) {
+        /* S_FALSE (already initialized on this thread) is balanced like S_OK; another apartment model is used as it is */
+        const HRESULT co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        IFileOpenDialog* d = NULL;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) {
+            DWORD opt = 0;
+            d->GetOptions(&opt);
+            d->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+            IShellItem* it = NULL;
+            if (SUCCEEDED(d->Show(g_hwnd)) && SUCCEEDED(d->GetResult(&it))) {
+                PWSTR p = NULL;
+                if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { ws = p; CoTaskMemFree(p); }
+                it->Release();
+            }
+            d->Release();
+        }
+        if (SUCCEEDED(co)) CoUninitialize();
+    } else {
+        OPENFILENAMEW ofn = { sizeof ofn };
+        ofn.hwndOwner   = g_hwnd;
+        ofn.lpstrFilter = kind == PICK_JSON ? L"json (*.json)\0*.json\0all files (*.*)\0*.*\0" : L"text (*.txt)\0*.txt\0all files (*.*)\0*.*\0";
+        ofn.lpstrFile   = w;
+        ofn.nMaxFile    = (DWORD)(sizeof w / sizeof w[0]);
+        ofn.Flags       = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;   /* NOCHANGEDIR: see pick_file */
+        if (GetOpenFileNameW(&ofn)) ws = w;
+        else if (CommDlgExtendedError() == FNERR_BUFFERTOOSMALL)   /* not a cancel: say so */
+            ses_say("the picked path is longer than the dialog can return: move the file to a shorter path");
+    }
+    if (ws.empty()) return false;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
+    if (n <= 1) return false;
+    out->assign((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &(*out)[0], n, NULL, NULL);
+    out->resize((size_t)n - 1);
+    return true;
+}
+static bool (*g_ses_pick)(int kind, std::string* out) = ses_pick_native;
 
 /* picking any one "<prefix>_NN.wav" IR selects the whole set: strip the suffix back to the prefix */
 static void wav_to_prefix(char* p) {
@@ -2957,26 +3004,40 @@ static int       g_ses_aim_cur = -1;               /* the speaker the session ha
 static size_t    g_ses_shown;                      /* log lines shown: scroll to the bottom on news */
 static char      g_ses_msg[600];
 static char      g_ses_note[200];                  /* the note a skip records */
+static int       g_ses_waiting;                    /* the running tool asks for Enter: 1 tracked (settled), 2 untracked (place it) */
+static bool      g_ses_enter_sent;                 /* Send Enter was pressed for this prompt */
 struct SesUi {
     char dir[512], plan[512], driver[128], server[64], multicast[64], local_iface[64], body[64], offset[64], temp[32];
-    char lrows[512], grows[512], fspk[128], cspk[128], aspk[128], vpos[512], truth[512];
+    char lrows[512], grows[512], fspk[128], cspk[128], aspk[128], vpos[512], truth[512], excl[128];
 };
 static SesUi SU;
 
 static bool ses_busy(void) { return SR.state.load(std::memory_order_acquire) != 0; }
 
+/* The installed ASIO drivers, for the driver dropdown and for a new session's simulate default. Through a
+ * pointer so the tests can script the list (the same kind of seam as g_ses_pick). The list is read when
+ * first needed and on Refresh, not every frame: it is a registry scan. */
+static int (*g_ses_drivers)(char (*names)[32], int max) = calib_asio_driver_names;
+static char g_ses_drv[32][32];
+static int  g_ses_drv_n = -1;                      /* -1 = not read yet */
+static void ses_drivers_refresh(void) {
+    g_ses_drv_n = g_ses_drivers(g_ses_drv, 32);
+    if (g_ses_drv_n < 0) g_ses_drv_n = 0;
+}
+
 /* a tool beside this exe, or where ctest's environment says */
 static std::string find_tool(const char* env, const char* exe) {
     const char* e = getenv(env);
-    if (e && *e && GetFileAttributesA(e) != INVALID_FILE_ATTRIBUTES) return ses_abs(e);
-    char self[MAX_PATH];
-    const DWORD k = GetModuleFileNameA(NULL, self, MAX_PATH);
-    if (!k || k >= MAX_PATH) return std::string();
+    if (e && *e && ses_file_exists(e)) return ses_abs(e);
+    wchar_t wself[MAX_PATH];
+    char self[MAX_PATH * 3];             /* UTF-8, like every path the session holds */
+    const DWORD k = GetModuleFileNameW(NULL, wself, MAX_PATH);
+    if (!k || k >= MAX_PATH || !WideCharToMultiByte(CP_UTF8, 0, wself, -1, self, (int)sizeof self, NULL, NULL)) return std::string();
     char* sl = strrchr(self, '\\');
     if (!sl) return std::string();
     sl[1] = 0;
     const std::string p = std::string(self) + exe;
-    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES ? p : std::string();
+    return ses_file_exists(p) ? p : std::string();
 }
 static SesTools ses_tools(void) {
     SesTools T;
@@ -3016,6 +3077,7 @@ static void ses_ui_from(void) {
     snprintf(SU.aspk, sizeof SU.aspk, "%s", I.aim_speakers.c_str());
     snprintf(SU.vpos, sizeof SU.vpos, "%s", I.validate_positions.c_str());
     snprintf(SU.truth, sizeof SU.truth, "%s", I.sim_truth.c_str());
+    snprintf(SU.excl, sizeof SU.excl, "%s", I.localize_exclude.c_str());
 }
 static void ses_ui_to(void) {
     SesInputs& I = SES.in;
@@ -3023,12 +3085,13 @@ static void ses_ui_to(void) {
     I.body = SU.body; I.mount_offset = SU.offset; I.temp = SU.temp;
     I.localize_rows = SU.lrows; I.grid_rows = SU.grows; I.frame_speakers = SU.fspk;
     I.capsule_speakers = SU.cspk; I.aim_speakers = SU.aspk; I.validate_positions = SU.vpos; I.sim_truth = SU.truth;
+    I.localize_exclude = SU.excl;
 }
 
 static void ses_open(bool make) {
     if (ses_busy()) { ses_say("a step is running: cancel it first"); return; }
     const std::string dir = ses_abs(SU.dir);
-    if (dir.empty()) { ses_say("type the session folder"); return; }
+    if (dir.empty()) { ses_say("type the session folder, or pick it with the ... button"); return; }
     std::string e;
     Session N;
     if (ses_load(&N, dir, &e)) {
@@ -3041,18 +3104,20 @@ static void ses_open(bool make) {
         return;
     }
     if (!make) { ses_say("%s", e.c_str()); return; }
-    if (!CreateDirectoryA(dir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        ses_say("cannot make the folder %s", dir.c_str()); return; }
-    const bool sim = SES.simulate;
+    if (!ses_make_dir(dir)) { ses_say("cannot make the folder %s", dir.c_str()); return; }
     SES = Session();                     /* the inputs typed so far carry over into the new session */
     SES.folder = dir;
     SES.created = ses_now();
-    SES.simulate = sim;
+    /* A machine with an ASIO driver is taken for the rig, one without for a desk: the default that is right
+     * more often on each. The banner under the folder says which, and the box beside it changes it. */
+    ses_drivers_refresh();
+    SES.simulate = g_ses_drv_n == 0;
     ses_ui_to();
     ses_save_now();
     ses_log_reload(&SR, ses_logpath());
     ses_log(&SR, ses_logpath(), "=== " + ses_now() + ": session created in " + dir);
-    ses_say("made a new session in %s", dir.c_str());
+    ses_say("made a new session in %s: %s", dir.c_str(),
+            SES.simulate ? "SIMULATE is on (no ASIO driver is installed here)" : "ON THE RIG (an ASIO driver is installed): tick simulate for a rehearsal");
 }
 
 /* who holds the audio device in this window, if anyone */
@@ -3169,7 +3234,7 @@ static void ses_run_step(int k) {
         return;
     }
     /* the step's old file goes first: a run that fails must not leave the last run's file looking current */
-    if (ses_step_artifact(k)[0]) DeleteFileA(ses_join(SES.folder, ses_step_artifact(k)).c_str());
+    if (ses_step_artifact(k)[0]) ses_delete_file(ses_join(SES.folder, ses_step_artifact(k)));
     ses_begin(&SES, k, cmd, cons);
     ses_save_now();
     ses_log(&SR, ses_logpath(), "=== " + ses_now() + ": " + ses_step_id(k) + " run " + std::to_string(SES.step[k].run) + ": " + cmd);
@@ -3272,6 +3337,111 @@ static void ses_input(const char* label, const char* hint, char* buf, size_t cap
     bwTip(tip);
 }
 
+/* the "..." beside a path field: true when the picker gave a path that fits, now in buf */
+static bool ses_pick_button(const char* id, int kind, char* buf, size_t cap) {
+    const bool hit = ImGui::Button(id);
+    bwTip(kind == PICK_FOLDER ? "pick the folder" : "pick the file");
+    std::string p;
+    if (!hit || !g_ses_pick(kind, &p)) return false;
+    if (p.size() >= cap) {               /* never a silent cut: a truncated path is another path */
+        ses_say("the picked path is longer than this field holds (%d bytes of %d): move it to a shorter path", (int)p.size(), (int)cap - 1);
+        return false;
+    }
+    snprintf(buf, cap, "%s", p.c_str());
+    return true;
+}
+/* a path input: the typed field (the tests drive it, and a paste works), its label, and the picker at the right edge */
+static void ses_path(const char* label, const char* hint, char* buf, size_t cap, const char* pick_id, int kind, const char* tip) {
+    const float bw = ImGui::CalcTextSize("...").x + 2.f * ImGui::GetStyle().FramePadding.x;
+    const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    /* a path longer than the field clips: the tooltip carries it whole */
+    ses_input(label, hint, buf, cap, -uiScaled(190), buf[0] ? (std::string(tip) + "\n\n" + buf).c_str() : tip);
+    ImGui::SameLine(right - bw);
+    if (ses_pick_button(pick_id, kind, buf, cap)) { ses_ui_to(); g_ses_dirty = true; }
+}
+
+/* the localize captures on disk as a table, rows down and speakers across, with a retake box per row */
+static const SesLocGrid* g_ses_grid;               /* the last read: not refreshed while a tool runs */
+static unsigned char     g_ses_grid_excl[BWA_MAX_CHANNELS];   /* the exclude input as the grid drew it */
+static std::string       g_ses_grid_sum;           /* the summary line as drawn */
+static unsigned char     g_ses_grid_was[BWA_MAX_CHANNELS];    /* excluded when the rows were measured, not now */
+static void ses_grid_ui(bool busy) {
+    /* Not read while a tool runs: the file is the tool's to rename and rewrite meanwhile, and a held
+     * handle blocks the rename. The grid shows the last read until the step is collected. */
+    if (!busy) g_ses_grid = ses_localize_grid(SES);
+    if (!g_ses_grid) return;
+    const SesLocGrid& G = *g_ses_grid;
+    if (!ImGui::CollapsingHeader("Localize captures##ses", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    const ImVec4 red(1.0f, 0.42f, 0.42f, 1.0f), green(0.45f, 0.85f, 0.5f, 1.0f), dim = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    unsigned char* const excl = g_ses_grid_excl;
+    {
+        int list[BWA_MAX_CHANNELS];
+        const int ne = ses_parse_speakers(SES.in.localize_exclude, G.n, list, BWA_MAX_CHANNELS);
+        memset(g_ses_grid_excl, 0, sizeof g_ses_grid_excl);
+        for (int i = 0; i < ne; ++i) excl[list[i]] = 1;
+    }
+    std::string no_retake;
+    const int can = busy ? 0 : ses_localize_retake_rows(SES, &no_retake);
+    const bool retake_ok = can == G.K && !SES.localize_start_over;
+    g_ses_grid_sum = ses_grid_summary(G, excl);
+    ImGui::TextUnformatted(g_ses_grid_sum.c_str());
+    {   /* a box taken off the exclude list has no capture in the kept rows: said here, before the run */
+        const std::string back = ses_localize_reincluded(SES, g_ses_grid_was);
+        if (!back.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "speaker %s was excluded when these rows were measured: retake at least 5 rows "
+                               "to solve it, or Start over", back.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    }
+    if (busy && g_ses_step == SES_LOCALIZE) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "(from the last run; refreshes when this run ends)");
+    }
+    ImGui::TextDisabled("+ captured   ! gap   - excluded   . not measured yet      tick a row to measure it again on the next localize Run");
+    const float rowh = ImGui::GetFrameHeightWithSpacing();
+    const int shown = G.K < 8 ? G.K : 8;                         /* more rows scroll: the log below keeps its room */
+    if (ImGui::BeginTable("seslocgrid", G.n + 1, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                          ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY, ImVec2(0.f, rowh * (float)(shown + 1) + uiScaled(18)))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupColumn("retake row");
+        char h[16];
+        for (int s = 0; s < G.n; ++s) { snprintf(h, sizeof h, "%d", s); ImGui::TableSetupColumn(h, ImGuiTableColumnFlags_WidthFixed, uiScaled(18)); }
+        ImGui::TableHeadersRow();
+        for (int k = 0; k < G.K; ++k) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            char id[32];
+            snprintf(id, sizeof id, "%d##ses_retake", k + 1);
+            bool on = (SES.localize_retake >> k & 1) != 0;
+            ImGui::BeginDisabled(!retake_ok);
+            if (ImGui::Checkbox(id, &on)) SES.localize_retake ^= 1ull << k;
+            ImGui::EndDisabled();
+            for (int s = 0; s < G.n; ++s) {
+                ImGui::TableNextColumn();
+                const char c = ses_grid_mark(G, excl, s, k, g_ses_grid_was);
+                ImGui::TextColored(c == '+' ? green : c == '!' ? red : dim, "%c", c);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("speaker %d, row %d: %s", s, k + 1, c == '+' ? "captured" : c == '!' ? "GAP: no clean, agreeing pair of sweeps"
+                                      : c == '-' ? "excluded" : "not measured yet");
+            }
+        }
+        ImGui::EndTable();
+    }
+    if (!retake_ok && !busy) {
+        ImGui::PushTextWrapPos(0.0f);
+        if (SES.localize_start_over) ImGui::TextDisabled("the next run starts over, so there are no rows to retake");
+        else ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "no retake: %s. The next localize run STARTS OVER: it measures every row.", no_retake.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    else if (SES.localize_retake) {
+        std::string l;
+        for (int k = 0; k < G.K; ++k) if (SES.localize_retake >> k & 1) l += (l.empty() ? "" : ",") + std::to_string(k + 1);
+        ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.35f, 1.f), "the next localize run measures row %s again (--ranges-in %s --retake %s)",
+                           l.c_str(), SES_LOCALIZE_RANGES, l.c_str());
+    }
+}
+
 static void tab_session(void) {
     const ImVec4 red(1.0f, 0.42f, 0.42f, 1.0f), amber(0.95f, 0.8f, 0.35f, 1.f), green(0.45f, 0.85f, 0.5f, 1.0f);
     const bool busy = ses_busy();
@@ -3280,6 +3450,10 @@ static void tab_session(void) {
     ImGui::SetNextItemWidth(-uiScaled(250));
     ImGui::InputTextWithHint("##sesdir", "session folder (one per rig day)", SU.dir, sizeof SU.dir);
     bwTip("the folder that holds session.json, session.log and every file the steps write. The plan is never written");
+    ImGui::SameLine();
+    /* a picked folder that already holds a session is opened; an empty one waits for New */
+    if (ses_pick_button("...##ses_pick_dir", PICK_FOLDER, SU.dir, sizeof SU.dir) && ses_file_exists(ses_join(ses_abs(SU.dir), "session.json")))
+        ses_open(false);
     ImGui::SameLine(); if (ImGui::Button("New##ses")) ses_open(true);
     bwTip("make the folder and a new session in it, with the inputs below");
     ImGui::SameLine(); if (ImGui::Button("Open##ses")) ses_open(false);
@@ -3291,25 +3465,51 @@ static void tab_session(void) {
                             "writing a new file in the folder and handing it to the next.");
         return;
     }
+    ImGui::PushTextWrapPos(0.0f);                                /* a long folder wraps, never clips */
     ImGui::TextDisabled("session %s, created %s", SES.folder.c_str(), SES.created.c_str());
+    ImGui::PopTextWrapPos();
 
     /* -------- inputs -------- */
     ImGui::BeginDisabled(busy);
     if (ImGui::Checkbox("simulate##ses", &SES.simulate)) g_ses_dirty = true;
     bwTip("no hardware: every tool runs with --simulate, the tracked ones with --track-sim, and the Aim tab and the "
           "Placement panel in their simulate modes. The whole session rehearses on this machine");
+    ImGui::SameLine();                   /* said in words beside the box, so a rehearsal is never taken for the rig or the reverse */
+    if (SES.simulate) ImGui::TextColored(amber, "SIMULATE: a rehearsal. No device is opened and nothing plays; every file here is simulated.");
+    else ImGui::TextColored(green, "ON THE RIG: the steps play through %s and measure with the ZM-1 on input %d.",
+                            SES.in.driver.empty() ? "the ASIO driver (auto)" : SES.in.driver.c_str(), SES.in.input_first);
     if (ImGui::CollapsingHeader("Inputs##ses", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const float w_long = -uiScaled(160), w_mid = uiScaled(160), w_short = uiScaled(90);
-        ses_input("plan layout##ses", "the Stage 1 plan (read, never written)", SU.plan, sizeof SU.plan, w_long,
-                  "the plan layout: the frame check and the localize run read it; the localize run writes as_built.json");
-        ses_input("localize rows##ses", "x y z per line, 5 or more, off one plane", SU.lrows, sizeof SU.lrows, w_long,
-                  "the ZM-1 placements for --localize; tracked, each is a plan and the measured center is recorded");
-        ses_input("grid rows##ses", "x y z per line, up to 16, 250 mm apart", SU.grows, sizeof SU.grows, w_long,
-                  "the room-EQ grid placements (--room-eq-grid rows.txt)");
-        ses_input("validate placements##ses", "x y z per line (empty = the tool's default envelope)", SU.vpos, sizeof SU.vpos, w_long,
-                  "bwa_validate --positions; empty runs its default listener envelope");
-        ses_input("##sesdrv", "ASIO driver (auto)", SU.driver, sizeof SU.driver, w_mid, "the ASIO driver every step opens; empty = auto");
-        ImGui::SameLine(); ImGui::SetNextItemWidth(w_short);
+        const float w_mid = uiScaled(160), w_short = uiScaled(90);
+        ses_path("plan layout##ses", "the Stage 1 plan, a layout .json (read, never written)", SU.plan, sizeof SU.plan, "...##ses_pick_plan", PICK_JSON,
+                 "the plan layout: the frame check and the localize run read it; the localize run writes as_built.json");
+        ses_path("localize rows##ses", "a .txt: x y z per line, 5 or more, off one plane", SU.lrows, sizeof SU.lrows, "...##ses_pick_lrows", PICK_TXT,
+                 "the ZM-1 placements for --localize, in meters; tracked, each is a plan and the measured center is recorded");
+        ses_path("grid rows##ses", "a .txt: x y z per line, up to 16, 250 mm apart", SU.grows, sizeof SU.grows, "...##ses_pick_grows", PICK_TXT,
+                 "the room-EQ grid placements, in meters (--room-eq-grid rows.txt)");
+        ses_path("validate placements##ses", "a .txt: x y z [label] per line (empty = the tool's default envelope)", SU.vpos, sizeof SU.vpos,
+                 "...##ses_pick_vpos", PICK_TXT, "bwa_validate --positions, in meters; empty runs its default listener envelope");
+        ImGui::BeginDisabled(SES.simulate);                      /* simulate opens no driver */
+        if (g_ses_drv_n < 0) ses_drivers_refresh();
+        ImGui::SetNextItemWidth(w_mid);
+        if (ImGui::BeginCombo("##sesdrvlist", SU.driver[0] ? SU.driver : "ASIO driver (auto)")) {
+            if (ImGui::Selectable("(auto)##sesdrv_auto", !SU.driver[0])) { SU.driver[0] = 0; ses_ui_to(); g_ses_dirty = true; }
+            for (int i = 0; i < g_ses_drv_n; ++i)
+                if (ImGui::Selectable(g_ses_drv[i], !strcmp(SU.driver, g_ses_drv[i]))) {
+                    snprintf(SU.driver, sizeof SU.driver, "%s", g_ses_drv[i]); ses_ui_to(); g_ses_dirty = true;
+                }
+            if (!g_ses_drv_n) ImGui::TextDisabled("(no ASIO driver is installed)");
+            ImGui::EndCombo();
+        }
+        bwTip("the ASIO driver every step opens (--driver): the installed ones, or auto");
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh##ses_drv")) ses_drivers_refresh();
+        bwTip("read the installed ASIO drivers again (after an install, or after Dante Via starts)");
+        ImGui::SameLine();
+        ses_input("##sesdrv", "or type a driver name", SU.driver, sizeof SU.driver, w_mid,
+                  "a driver the list does not show: its name as bwa_calibrate --list-drivers prints it; empty = auto");
+        ImGui::EndDisabled();
+        if (SES.simulate) { ImGui::SameLine(); ImGui::TextDisabled("(simulate opens no driver)"); }
+        ImGui::SetNextItemWidth(w_short);
         if (ImGui::InputInt("first ZM-1 input##ses", &SES.in.input_first)) { if (SES.in.input_first < 0) SES.in.input_first = 0; g_ses_dirty = true; }
         bwTip("the driver input carrying the ZM-1's first capsule (--input, --mic-in)");
         ImGui::SameLine(); ses_input("temperature##ses", "e.g. 22.5C", SU.temp, sizeof SU.temp, w_short,
@@ -3334,6 +3534,11 @@ static void tab_session(void) {
               "the frame step stale");
         ImGui::SameLine(); ses_input("frame speakers##ses", "simulate: e.g. 0,4,8", SU.fspk, sizeof SU.fspk, w_mid,
                   "simulate only: which speakers the simulated cameras see (--sim-speakers); empty = the tool's four");
+        ses_input("localize exclude##ses", "e.g. 3,14 (empty = none)", SU.excl, sizeof SU.excl, w_mid,
+                  "speakers the localize run never sweeps or solves (--exclude; 0-based, like 3,14 or 0-4): an occluded box, or "
+                  "one not hung yet. They keep the plan's position. A change makes the localize step stale. Only localize "
+                  "takes it: the capsule survey, trims, verify, the grid and validate still sweep every speaker, so leave an "
+                  "excluded box out of the capsule speakers too");
         ImGui::SameLine(); ses_input("capsule speakers##ses", "e.g. 0-9 (empty = all)", SU.cspk, sizeof SU.cspk, w_mid,
                                      "the capsule survey's speakers (--speakers): 6 or more, high and low");
         ImGui::SameLine(); ses_input("aim speakers##ses", "e.g. 3,7", SU.aspk, sizeof SU.aspk, w_mid,
@@ -3356,9 +3561,10 @@ static void tab_session(void) {
         bwTip("how long a tracked step waits for the placement gate and then for Send Enter (--place-timeout); "
               "the gate opens by itself");
         if (SES.simulate)
-            ses_input("simulated truth##ses", "a layout: where the speakers really stand (optional)", SU.truth, sizeof SU.truth, w_long,
-                      "simulate only (bwa_calibrate --sim-truth): the speakers stand here, not at the plan, so the "
-                      "rehearsal has an as-built to find");
+            ses_path("simulated truth##ses", "a layout .json: where the speakers really stand (optional)", SU.truth, sizeof SU.truth,
+                     "...##ses_pick_truth", PICK_JSON,
+                     "simulate only (bwa_calibrate --sim-truth): the speakers stand here, not at the plan, so the "
+                     "rehearsal has an as-built to find");
     }
     ImGui::EndDisabled();
 
@@ -3406,6 +3612,7 @@ static void tab_session(void) {
                 for (const SesFile& u : P.consumed) {
                     const size_t sl = u.path.find_last_of("\\/");
                     if (u.what == "baffle_offset_m") { f += (f.empty() ? "" : ", ") + ("baffle " + u.path + " m"); continue; }
+                    if (u.what == "localize_exclude") { if (!u.path.empty()) f += (f.empty() ? "" : ", ") + ("exclude " + u.path); continue; }
                     f += (f.empty() ? "" : ", ") + (sl == std::string::npos ? u.path : u.path.substr(sl + 1));
                 }
                 std::string o;
@@ -3455,6 +3662,38 @@ static void tab_session(void) {
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    /* -------- the running step: here, under the table, so Send Enter is on screen whatever is below -------- */
+    g_ses_waiting = 0;
+    if (busy) {
+        /* The tool is waiting for Enter while its newest line says so: the tracked gate's live line ends in
+         * "press Enter" until the sweeps start (mic_track.cpp), the untracked rows stop on "... and press
+         * Enter..." (bwa_calibrate) or "press ENTER" (bwa_validate). Once sent, the highlight goes until the
+         * tool has moved on, so the next prompt lights it again. */
+        {
+            std::lock_guard<std::mutex> lk(SR.mu);
+            const std::string& last = !SR.partial.empty() ? SR.partial : (SR.lines.empty() ? SR.partial : SR.lines.back());
+            if (last.find("press Enter") != std::string::npos || last.find("press ENTER") != std::string::npos)
+                g_ses_waiting = (last.find("place the mic") != std::string::npos || last.find("Place the ZM-1") != std::string::npos) ? 2 : 1;
+        }
+        if (!g_ses_waiting) g_ses_enter_sent = false;
+        const bool lit = g_ses_waiting && !g_ses_enter_sent;
+        ImGui::TextColored(amber, "%s is running", ses_step_id(g_ses_step));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel##ses")) ses_run_cancel(&SR);
+        bwTip("stop the tool now (it is killed; on the rig the device closes with it). The step reads failed");
+        ImGui::SameLine();
+        if (lit) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.80f, 0.55f, 0.10f, 1.f));
+        const bool send = ImGui::SmallButton("Send Enter##ses");
+        if (lit) ImGui::PopStyleColor();
+        if (send) { ses_run_enter(&SR); g_ses_enter_sent = true; }
+        bwTip("on the rig a run stops with 'press Enter': tracked, once the stand has settled (leave the space first); "
+              "untracked, at each row (place the ZM-1 first). Then send it");
+        if (lit) {
+            ImGui::SameLine();
+            ImGui::TextColored(amber, g_ses_waiting == 2 ? "WAITING FOR YOU: place the ZM-1, then Send Enter"
+                                                         : "WAITING FOR YOU: clear the space, then Send Enter");
+        }
     }
     {   /* localize stopped partway: say what its next run will do with the rows it kept, and let that be changed */
         /* Not asked while a tool runs: the answer is about the NEXT run, and the file is the tool's to
@@ -3519,6 +3758,8 @@ static void tab_session(void) {
         }
     }
 
+    ses_grid_ui(busy);                   /* under the controls above, which stay beside the step table */
+
     /* -------- the aim step's speakers -------- */
     if (!aim_list.empty() && ImGui::CollapsingHeader("Live aiming (the aim step)##ses", ImGuiTreeNodeFlags_DefaultOpen)) {
         const SesStep& P = SES.step[SES_AIM];
@@ -3543,20 +3784,10 @@ static void tab_session(void) {
         ImGui::TextDisabled("If a box moves, run localize again: everything after it reads stale.");
     }
 
-    /* -------- the running step -------- */
-    if (busy) {
-        ImGui::TextColored(amber, "%s is running", ses_step_id(g_ses_step));
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Cancel##ses")) ses_run_cancel(&SR);
-        bwTip("stop the tool now (it is killed; on the rig the device closes with it). The step reads failed");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Send Enter##ses")) ses_run_enter(&SR);
-        bwTip("on the rig a run stops with 'press Enter': tracked, once the stand has settled (leave the space first); "
-              "untracked, at each row (place the ZM-1 first). Then send it");
-    }
-
     /* -------- the log -------- */
-    ImGui::BeginChild("seslog", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+    /* the rest of the window, but never squeezed away: with the grid open on a small window the tab scrolls instead */
+    const float log_h = ImGui::GetContentRegionAvail().y;
+    ImGui::BeginChild("seslog", ImVec2(0, log_h > uiScaled(140) ? 0.f : uiScaled(140)), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
     {
         std::lock_guard<std::mutex> lk(SR.mu);
         ImGuiListClipper clip;
@@ -3969,6 +4200,14 @@ static void ses_clear_dir(const char* dir) {
     static const char* const files[] = { "session.json", "session.json.tmp", "session.log", "frame_check.csv", "as_built.json",
                                          "capsules.json", "trims.json", "grid.json", "validate.csv" };
     for (const char* f : files) DeleteFileA(ses_join(ses_abs(dir), f).c_str());
+    /* localize's captures and every generation a rerun set aside: left behind, a "new" session resumes
+     * from them and draws their grid */
+    WIN32_FIND_DATAA fd;
+    const HANDLE h = FindFirstFileA(ses_join(ses_abs(dir), "as_built.ranges*.json").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do DeleteFileA(ses_join(ses_abs(dir), fd.cFileName).c_str()); while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
     RemoveDirectoryA(dir);
 }
 /* wait for the running step to be collected (ses_poll runs every frame) */
@@ -4005,6 +4244,7 @@ static void ses_ui_new(ImGuiTestContext* ctx, const char* dir, const char* capsu
     ctx->ItemClick("**/New##ses");
     ctx->Yield(2);
     IM_CHECK(!SES.folder.empty());
+    ctx->ItemOpen("**/Inputs##ses");
     ctx->ItemCheck("**/simulate##ses");
     ses_ui_type(ctx, "**/plan layout##ses", plan);
     ses_ui_type(ctx, "**/localize rows##ses", SES_ROWS);
@@ -4016,6 +4256,14 @@ static void ses_ui_new(ImGuiTestContext* ctx, const char* dir, const char* capsu
     if (aim_speakers) ses_ui_type(ctx, "**/aim speakers##ses", aim_speakers);
     ctx->ItemInputValue("**/validate azimuths##ses", 3);
     ses_ui_type(ctx, "**/simulated truth##ses", truth);
+    ctx->Yield(2);
+}
+/* Bring the localize grid on screen. With the inputs open it is below the fold of the 1280x800 test window:
+ * the tab scrolls to it, as a user would, but the engine scrolls only an item's own window (the grid's
+ * table), not the tab around it, and a clipped item cannot be found at all. */
+static void ses_ui_show_grid(ImGuiTestContext* ctx) {
+    ImGuiWindow* tab = ctx->ItemInfo("**/Run##ses_frame").Window;
+    if (tab) ctx->ScrollToBottom(tab->ID);
     ctx->Yield(2);
 }
 static float ses_dist(const float a[3], const float b[3]) { return dist3(a, b); }
@@ -4043,7 +4291,7 @@ static bool ses_same(const Session& A, const Session& B, std::string* why) {
     if (I.plan != J2.plan || I.localize_rows != J2.localize_rows || I.grid_rows != J2.grid_rows || I.mount_offset != J2.mount_offset ||
         I.aim_speakers != J2.aim_speakers || I.capsule_speakers != J2.capsule_speakers || I.validate_positions != J2.validate_positions ||
         I.validate_azimuths != J2.validate_azimuths || I.sim_truth != J2.sim_truth || I.input_first != J2.input_first ||
-        I.baffle_offset_m != J2.baffle_offset_m ||
+        I.baffle_offset_m != J2.baffle_offset_m || I.localize_exclude != J2.localize_exclude ||
         I.validate_reference != J2.validate_reference || I.place_timeout_s != J2.place_timeout_s) { *why = "inputs"; return false; }
     for (int k = 0; k < SES_NSTEPS; ++k) {
         const SesStep &P = A.step[k], &Q = B.step[k];
@@ -5721,7 +5969,7 @@ static void register_tests(ImGuiTestEngine* e) {
         std::string cmd, why;
         std::vector<SesFile> cons;
         IM_CHECK(ses_command(R, SES_FRAME, T, &cmd, &cons, &why));
-        IM_CHECK(cmd.find(" --local 10.0.0.2") != std::string::npos);
+        IM_CHECK(cmd.find(" --local \"10.0.0.2\"") != std::string::npos);
         ses_begin(&R, SES_FRAME, cmd, cons);                      /* localize is blocked until the frame passes */
         IM_CHECK(ses_write_text(ses_join(R.folder, "frame_check.csv").c_str(), "index\n"));
         ses_finish(&R, SES_FRAME, 0, "summary: matched 4\n", false);
@@ -5729,7 +5977,7 @@ static void register_tests(ImGuiTestEngine* e) {
         const bool have_cmd = ses_command(R, SES_LOCALIZE, T, &cmd, &cons, &why);
         printf("session test: localize command: %s%s\n", cmd.c_str(), why.c_str());
         IM_CHECK(have_cmd);
-        IM_CHECK(cmd.find(" --natnet-local 10.0.0.2") != std::string::npos);
+        IM_CHECK(cmd.find(" --natnet-local \"10.0.0.2\"") != std::string::npos);
         /* a tracked rig step waits for Send Enter: without the flag the tool cannot know its stdin pipe
          * has a writer, and counts 5 s instead */
         IM_CHECK(cmd.find(" --place-wait-enter") != std::string::npos);
@@ -5762,9 +6010,10 @@ static void register_tests(ImGuiTestEngine* e) {
         auto ranges_text = [](int nrows, const char* simulate, int version = 1) {
             std::string t = std::string("{ \"format\": \"") + CALIB_RANGES_FORMAT + "\", \"version\": " + std::to_string(version) + ",\n";
             if (simulate) t += std::string("\"simulate\": ") + simulate + ", ";
-            t += "\"speakers\": 1, \"rows\": 5, \"captures\": [";
+            t += "\"speakers\": 10, \"rows\": 5, \"captures\": [";   /* the plan's count and the rows file's */
             for (int r = 1; r <= nrows; ++r)
-                t += std::string(r > 1 ? ", " : "") + "{ \"row\": " + std::to_string(r) + ", \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], \"arrival_s\": [0.1] }";
+                t += std::string(r > 1 ? ", " : "") + "{ \"row\": " + std::to_string(r) + ", \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], "
+                     "\"arrival_s\": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1] }";
             return t + "] }\n";
         };
 
@@ -5779,6 +6028,25 @@ static void register_tests(ImGuiTestEngine* e) {
         printf("session test: localize command after an aborted run: %s\n", cmd.c_str());
         IM_CHECK(cmd.find(" --ranges-in as_built.ranges.json") != std::string::npos);
         for (const SesFile& u : cons) IM_CHECK(u.path.find("ranges") == std::string::npos);   /* never a consumed input */
+        /* Captures for another row count or speaker count are the tool's exit 1, its reason only in the log:
+         * the tab names the mismatch before anything starts. A sixth row in the rows file, then a 5-speaker plan. */
+        {
+            const std::string keep_rows = SES.in.localize_rows;
+            IM_CHECK(ses_write_text("calibview_ses_rows6.txt", "0.6 1.2 0.4\n-0.6 1.6 0.5\n0.5 1.8 -0.6\n-0.5 1.0 -0.5\n0.0 1.45 0.0\n0.2 1.3 0.2\n"));
+            SES.in.localize_rows = "calibview_ses_rows6.txt";
+            IM_CHECK(!ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+            printf("session test: resume with a sixth row: %s\n", why.c_str());
+            IM_CHECK(why.find("the localize rows file has 6 rows, and as_built.ranges.json holds captures for 5") == 0);
+            SES.in.localize_rows = keep_rows;
+            Session X = SES;                                      /* a copy: another plan makes the frame record stale */
+            X.in.plan = SES_PLAN_FEW;
+            ses_skip(&X, SES_FRAME, "not under test");
+            IM_CHECK(!ses_command(X, SES_LOCALIZE, T, &cmd, &cons, &why));
+            printf("session test: resume under a 5-speaker plan: %s\n", why.c_str());
+            IM_CHECK(why.find("the plan has 5 speakers, and as_built.ranges.json holds captures for 10") == 0);
+            IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+            DeleteFileA("calibview_ses_rows6.txt");
+        }
         /* Start over, through the button: the next command has no --ranges-in, and the line says so */
         ctx->Yield(2);
         ctx->ItemClick("**/Start over##ses_loc");
@@ -5821,6 +6089,12 @@ static void register_tests(ImGuiTestEngine* e) {
         SES.in.body.clear();
         SES.in.nn_server.clear();
         IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_OK);
+        /* a speaker added to the exclude list since (the record's list: none) costs no row: still resumed */
+        SES.in.localize_exclude = "0";
+        IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_OK);
+        IM_CHECK(ses_localize_reincluded(SES).empty());
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find(" --ranges-in as_built.ranges.json --exclude 0") != std::string::npos);
+        SES.in.localize_exclude.clear();
         IM_CHECK(ses_write_text(rp.c_str(), ranges_text(3, "false").c_str()));
         expect_mismatch("rig rows under a simulated session", "its captures are the rig's and this session is simulated");
         IM_CHECK(ses_write_text(rp.c_str(), ranges_text(2, "true", 2).c_str()));
@@ -5839,6 +6113,647 @@ static void register_tests(ImGuiTestEngine* e) {
         IM_CHECK(ses_write_text(rp.c_str(), "{ \"rows\": 5, \"captures\": [1] }\n"));
         IM_CHECK(ses_localize_resume(SES, NULL, NULL, NULL) == SES_RESUME_NONE);
         DeleteFileA(rp.c_str());
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* The "..." pickers, through the seam: the native dialog is never opened here. A picked file lands in
+     * its field, the session and session.json; a canceled pick changes nothing; a picked folder that holds
+     * a session opens it. */
+    t = IM_REGISTER_TEST(e, "session", "picker");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_picker";
+        static std::string give;                                  /* what the scripted picker returns; empty = canceled */
+        static int asked;                                         /* the kind the tab asked for */
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        g_ses_pick = [](int kind, std::string* out) { asked = kind; if (give.empty()) return false; *out = give; return true; };
+        const std::string truth = ses_abs(SES_TRUTH), grid = ses_abs(SES_GRIDR), folder = SES.folder;
+        give = truth; asked = -1;
+        ctx->ItemClick("**/...##ses_pick_plan");
+        ctx->Yield(2);
+        const bool plan_ok = asked == PICK_JSON && truth == SU.plan && SES.in.plan == truth;
+        Session R;
+        const bool saved = ses_load(&R, folder, NULL) && R.in.plan == truth;
+        give = grid; asked = -1;
+        ctx->ItemClick("**/...##ses_pick_lrows");
+        ctx->Yield(2);
+        const bool rows_ok = asked == PICK_TXT && grid == SU.lrows && SES.in.localize_rows == grid;
+        give = std::string(600, 'a') + ".json";                   /* longer than the field: said, never cut */
+        g_ses_msg[0] = 0;
+        ctx->ItemClick("**/...##ses_pick_plan");
+        ctx->Yield(2);
+        const bool long_ok = truth == SU.plan && SES.in.plan == truth && strstr(g_ses_msg, "longer than this field holds") != NULL;
+        give.clear(); asked = -1;                                 /* canceled: the field keeps its path */
+        ctx->ItemClick("**/...##ses_pick_grows");
+        ctx->Yield(2);
+        const bool cancel_ok = asked == PICK_TXT && ses_abs(SU.grows) == grid && ses_abs(SES.in.grid_rows) == grid;
+        /* the folder: forget the session, pick its folder, and it is open again */
+        ses_save_now();
+        SES = Session();
+        memset(&SU, 0, sizeof SU);
+        ctx->Yield(2);
+        give = folder; asked = -1;
+        ctx->ItemClick("**/...##ses_pick_dir");
+        ctx->Yield(2);
+        const bool dir_ok = asked == PICK_FOLDER && folder == SU.dir && SES.folder == folder && SES.in.plan == truth;
+        g_ses_pick = ses_pick_native;
+        printf("session test: picker: plan %d saved %d rows %d cancel %d folder %d\n", plan_ok, saved, rows_ok, cancel_ok, dir_ok);
+        IM_CHECK(plan_ok);
+        IM_CHECK(saved);
+        IM_CHECK(rows_ok);
+        IM_CHECK(long_ok);
+        IM_CHECK(cancel_ok);
+        IM_CHECK(dir_ok);
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* The localize grid from a hand-made ranges file: 4 speakers, 5 rows, rows 1 to 3 measured, speaker 1
+     * with a gap at row 2, speaker 3 never captured and excluded in the session. Then the guard: while a
+     * tool runs, the file is not read again. */
+    t = IM_REGISTER_TEST(e, "session", "localize_grid");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_locgrid";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        const std::string rp = ses_join(SES.folder, SES_LOCALIZE_RANGES);
+        DeleteFileA(rp.c_str());
+        ses_ui_show_grid(ctx);
+        IM_CHECK(g_ses_grid == NULL);
+        IM_CHECK(!ctx->ItemExists("**/1##ses_retake"));
+        auto ranges_text = [](int nrows, int gap_row = 2) {
+            std::string t = std::string("{ \"format\": \"") + CALIB_RANGES_FORMAT + "\", \"version\": 1, \"simulate\": true, "
+                            "\"speakers\": 4, \"rows\": 5, \"captures\": [";
+            for (int r = 1; r <= nrows; ++r)
+                t += std::string(r > 1 ? ", " : "") + "{ \"row\": " + std::to_string(r) + ", \"planned\": [0, 1, 0], \"mic\": [0, 1, 0], "
+                     "\"arrival_s\": [0.01, " + (r == gap_row ? "null" : "0.011") + ", 0.012, null] }";
+            return t + "] }\n";
+        };
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(3).c_str()));
+        ses_ui_show_grid(ctx);                                    /* reachable with the inputs open: the tab scrolls to it */
+        IM_CHECK(ctx->ItemExists("**/1##ses_retake") && ctx->ItemExists("**/5##ses_retake"));
+        ses_ui_type(ctx, "**/localize exclude##ses", "3");
+        ctx->Yield(2);
+        IM_CHECK(g_ses_grid != NULL);
+        const SesLocGrid& G = *g_ses_grid;
+        IM_CHECK(G.n == 4 && G.K == 5);
+        std::string rows[4];
+        for (int s = 0; s < 4; ++s) for (int k = 0; k < 5; ++k) rows[s] += ses_grid_mark(G, g_ses_grid_excl, s, k);
+        printf("session test: grid: %s | %s | %s | %s : %s\n", rows[0].c_str(), rows[1].c_str(), rows[2].c_str(), rows[3].c_str(), g_ses_grid_sum.c_str());
+        IM_CHECK_STR_EQ(rows[0].c_str(), "+++..");                /* captured, then not measured yet */
+        IM_CHECK_STR_EQ(rows[1].c_str(), "+!+..");                /* the gap */
+        IM_CHECK_STR_EQ(rows[2].c_str(), "+++..");
+        IM_CHECK_STR_EQ(rows[3].c_str(), "-----");                /* excluded, measured or not */
+        IM_CHECK_STR_EQ(g_ses_grid_sum.c_str(), "rows 3 of 5, captures 8, gaps 1; under 5 rows, so no speaker solves yet");
+        /* not excluded, the same speaker's cells are gaps: the two states differ only by the input */
+        ses_ui_type(ctx, "**/localize exclude##ses", "");
+        ctx->Yield(2);
+        IM_CHECK_EQ(ses_grid_mark(G, g_ses_grid_excl, 3, 0), '!');
+        IM_CHECK_EQ(ses_grid_mark(G, g_ses_grid_excl, 3, 4), '.');
+        /* a rewrite of the same size (the gap moves to row 3): the write time alone says it changed */
+        IM_CHECK_EQ(ranges_text(3, 3).size(), ranges_text(3).size());
+        ctx->SleepNoSkip(0.05f, 0.05f);                           /* past the file time's tick */
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(3, 3).c_str()));
+        ctx->Yield(2);
+        IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 1, 1), '+');
+        IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 1, 2), '!');
+        /* every row, with speaker 1 short of 5 captures */
+        IM_CHECK(ses_write_text(rp.c_str(), ranges_text(5).c_str()));
+        ses_ui_type(ctx, "**/localize exclude##ses", "3");
+        ctx->Yield(2);
+        IM_CHECK_STR_EQ(g_ses_grid_sum.c_str(), "rows 5 of 5, captures 14, gaps 1; under 5 captures, so not solved: speaker 1");
+
+        /* while a tool runs the file is the tool's: the grid keeps its last read, and reads again after */
+        SR.state.store(1);                                        /* busy, with no process behind it */
+        ctx->Yield(2);
+        const bool wrote = ses_write_text(rp.c_str(), ranges_text(4).c_str()) != 0;
+        ctx->Yield(3);
+        const bool held = g_ses_grid && g_ses_grid->row_done[4] == 1;
+        SR.state.store(0);
+        ctx->Yield(3);
+        const bool read_after = g_ses_grid && g_ses_grid->row_done[4] == 0 && g_ses_grid->row_done[3] == 1;
+        printf("session test: grid while busy: wrote %d, kept the last read %d, read again after %d\n", wrote, held, read_after);
+        IM_CHECK(wrote);
+        IM_CHECK(held);
+        IM_CHECK(read_after);
+        DeleteFileA(rp.c_str());
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* Exclude, through a real localize run: the list reaches the command line and the record, the tool
+     * never sweeps the box (no capture in any row) and leaves it at the plan, the grid marks it, and a
+     * change to the input makes localize stale. Speaker 6 stands 78 mm off its plan in the truth. */
+    t = IM_REGISTER_TEST(e, "session", "localize_exclude");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_exclude";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
+        ses_ui_type(ctx, "**/##sesnote", "checked with Motive's own tools");
+        ctx->ItemClick("**/Skip##ses_frame");
+        ctx->Yield(2);
+        SesTools T;
+        T.calibrate = "bwa_calibrate.exe";                        /* the builder alone; the real run finds its own */
+        std::string cmd, why;
+        std::vector<SesFile> cons;
+        {   /* The add case, on a hand-made record of a run with no list: the empty entry is recorded, comes
+             * back from session.json, and a list typed afterwards reads stale. */
+            IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--exclude") == std::string::npos);
+            ses_begin(&SES, SES_LOCALIZE, cmd, cons);
+            IM_CHECK(ses_write_text(ses_join(SES.folder, "as_built.json").c_str(), "{}\n"));
+            ses_finish(&SES, SES_LOCALIZE, 0, "", false);
+            IM_CHECK_EQ(SES.step[SES_LOCALIZE].status, SES_PASSED);
+            IM_CHECK(ses_used(SES_LOCALIZE, "localize_exclude") && ses_used(SES_LOCALIZE, "localize_exclude")->path.empty());
+            ses_save_now();
+            Session R0;
+            IM_CHECK(ses_load(&R0, SES.folder, NULL));
+            bool kept = false;
+            for (const SesFile& f : R0.step[SES_LOCALIZE].consumed) kept |= f.what == "localize_exclude" && f.path.empty();
+            IM_CHECK(kept);
+            IM_CHECK(ses_stale(R0, SES_LOCALIZE).empty());
+            ses_ui_type(ctx, "**/localize exclude##ses", "6");
+            ctx->Yield(2);
+            const std::string st0 = ses_stale(SES, SES_LOCALIZE);
+            printf("session test: after an exclude list was added, localize STALE: %s\n", st0.c_str());
+            IM_CHECK(st0.find("none then, 6 now") != std::string::npos);
+        }
+        ses_ui_type(ctx, "**/localize exclude##ses", "6, 7");     /* not the tool's syntax: refused here, with the reason */
+        ctx->ItemClick("**/Run##ses_localize");
+        ctx->Yield(2);
+        IM_CHECK(!ses_busy());
+        IM_CHECK(strstr(g_ses_msg, "localize: refused: the localize exclude list") == g_ses_msg);
+        ses_ui_type(ctx, "**/localize exclude##ses", "30");       /* a list, but the plan has 10 speakers */
+        ctx->ItemClick("**/Run##ses_localize");
+        ctx->Yield(2);
+        IM_CHECK(!ses_busy());
+        IM_CHECK(strstr(g_ses_msg, "names a speaker the layout does not have (10 speakers") != NULL);
+        ses_ui_type(ctx, "**/localize exclude##ses", "6");
+        ses_ui_run(ctx, SES_LOCALIZE, 180.0);
+        const SesStep& P = SES.step[SES_LOCALIZE];
+        printf("session test: exclude: %s\n", P.command.c_str());
+        IM_CHECK_EQ(P.status, SES_PASSED);
+        IM_CHECK(P.command.find(" --exclude 6") != std::string::npos);
+        IM_CHECK(ses_used(SES_LOCALIZE, "localize_exclude") && ses_used(SES_LOCALIZE, "localize_exclude")->path == "6");
+        IM_CHECK(ses_stale(SES, SES_LOCALIZE).empty());
+        static Layout LA, LP, LT;
+        char err[256];
+        IM_CHECK(layout_load(ses_join(SES.folder, "as_built.json").c_str(), 48000, &LA, err, sizeof err));
+        IM_CHECK(layout_load(SES_PLAN, 48000, &LP, err, sizeof err));
+        IM_CHECK(layout_load(SES_TRUTH, 48000, &LT, err, sizeof err));
+        IM_CHECK_LT(ses_dist(LA.speakers[6].pos, LP.speakers[6].pos), 1e-4f);   /* left where the plan has it */
+        IM_CHECK_GT(ses_dist(LA.speakers[6].pos, LT.speakers[6].pos), 0.05f);
+        IM_CHECK_LT(ses_dist(LA.speakers[1].pos, LT.speakers[1].pos), 0.015f);  /* the others were measured */
+        ctx->Yield(2);
+        IM_CHECK(g_ses_grid != NULL && g_ses_grid->n == SES_NSPK && g_ses_grid->K == 5);
+        for (int k = 0; k < 5; ++k) {
+            IM_CHECK_EQ(g_ses_grid->have[(size_t)6 * 5 + k], 0);  /* never swept */
+            IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 6, k), '-');
+            IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 5, k), '+');
+        }
+        {   /* The later sweeping steps take the same list, and an empty capsule list becomes everyone else.
+             * On a copy whose earlier steps are marked done, so only the command lines are built. */
+            Session X = SES;
+            IM_CHECK(ses_command(X, SES_CAPSULES, T, &cmd, &cons, &why));
+            printf("session test: exclude: capsules: %s\n", cmd.c_str());
+            IM_CHECK(cmd.find(" --speakers 0-5,7-9 ") != std::string::npos);
+            X.in.capsule_speakers = "0-3";                        /* a typed list wins */
+            IM_CHECK(ses_command(X, SES_CAPSULES, T, &cmd, &cons, &why) && cmd.find(" --speakers 0-3 ") != std::string::npos);
+            X.step[SES_CAPSULES].status = X.step[SES_AIM].status = X.step[SES_VERIFY].status = SES_SKIPPED;
+            IM_CHECK(ses_command(X, SES_TRIMS, T, &cmd, &cons, &why) && cmd.find(" --trims") != std::string::npos);
+            IM_CHECK(cmd.find(" --exclude 6") != std::string::npos);
+            IM_CHECK(CopyFileA(ses_join(X.folder, "as_built.json").c_str(), ses_join(X.folder, "trims.json").c_str(), FALSE));
+            SesStep& Tr = X.step[SES_TRIMS];
+            Tr.status = SES_PASSED;
+            Tr.run = X.next_run++;
+            Tr.consumed.push_back({ "localize", "as_built.json", ses_hash_file(ses_join(X.folder, "as_built.json")), X.step[SES_LOCALIZE].run });
+            IM_CHECK(ses_command(X, SES_VERIFY, T, &cmd, &cons, &why) && cmd.find(" --verify") != std::string::npos);
+            IM_CHECK(cmd.find(" --exclude 6") != std::string::npos);
+            IM_CHECK(ses_command(X, SES_GRID, T, &cmd, &cons, &why) && cmd.find(" --room-eq-grid ") != std::string::npos);
+            IM_CHECK(cmd.find(" --exclude 6") != std::string::npos);
+            {   /* the edges, each refused with its reason before a tool starts: a list that leaves the capsule
+                 * survey nobody (a bare --speakers) or a solve too few, and a malformed one */
+                Session E = X;
+                /* the list as if localize had run under it: a changed list reads stale first, and blocks for that */
+                auto list = [&](const char* v) {
+                    E.in.localize_exclude = v;
+                    for (SesFile& f : E.step[SES_LOCALIZE].consumed) if (f.what == "localize_exclude") f.path = v;
+                };
+                E.in.capsule_speakers.clear();
+                E.step[SES_CAPSULES] = SesStep();
+                list("0-9");
+                IM_CHECK(!ses_command(E, SES_CAPSULES, T, &cmd, &cons, &why));
+                printf("session test: exclude: every speaker: %s\n", why.c_str());
+                IM_CHECK(why.find("the localize exclude list leaves 0 speaker(s), and the capsule survey needs 4") == 0);
+                list("0-8");
+                E.step[SES_CAPSULES].status = SES_SKIPPED;
+                IM_CHECK(!ses_command(E, SES_TRIMS, T, &cmd, &cons, &why));
+                IM_CHECK(why.find("the localize exclude list leaves 1 speaker(s), and the trim solve needs 2") == 0);
+                IM_CHECK(!ses_command(E, SES_GRID, T, &cmd, &cons, &why) && why.find("and the grid needs 2") != std::string::npos);
+                list("6,,x");
+                E.step[SES_CAPSULES] = SesStep();
+                IM_CHECK(ses_blocked(E, SES_CAPSULES).find("the localize exclude list is not a list") == 0);
+            }
+            T.validate = "bwa_validate.exe";                      /* validate renders phantoms: every speaker, no list */
+            X.step[SES_GRID].status = SES_SKIPPED;
+            IM_CHECK(ses_command(X, SES_VALIDATE, T, &cmd, &cons, &why) && cmd.find("--exclude") == std::string::npos);
+            DeleteFileA(ses_join(X.folder, "trims.json").c_str());
+        }
+        /* session.json carries it, and a change reads stale */
+        ses_save_now();
+        Session R;
+        IM_CHECK(ses_load(&R, SES.folder, NULL));
+        IM_CHECK_STR_EQ(R.in.localize_exclude.c_str(), "6");
+        ses_ui_type(ctx, "**/localize exclude##ses", "");
+        ctx->Yield(2);
+        const std::string st = ses_stale(SES, SES_LOCALIZE);
+        printf("session test: after the exclude list changed, localize STALE: %s\n", st.c_str());
+        IM_CHECK(st.find("localize_exclude input changed") != std::string::npos && st.find("6 then, none now") != std::string::npos);
+        /* The rows on disk were measured with 6 left out, and 6 is now back in. They are still retaken and
+         * resumed, but speaker 6 is named: it has no capture in them, so a retake of row 2 alone leaves it
+         * unsolved. Its cells read not measured, where a swept speaker's empty cell is a gap. */
+        std::string nr;
+        IM_CHECK_EQ(ses_localize_retake_rows(SES, &nr), 5);
+        IM_CHECK_STR_EQ(ses_localize_reincluded(SES).c_str(), "6");
+        SES.localize_retake = 2ull;
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find(" --ranges-in as_built.ranges.json --retake 2") != std::string::npos &&
+                 cmd.find("--exclude") == std::string::npos);
+        SES.localize_retake = 0;
+        ses_ui_show_grid(ctx);
+        IM_CHECK_EQ(g_ses_grid_was[6], 1);
+        IM_CHECK_EQ(g_ses_grid_was[5], 0);
+        for (int k = 0; k < 5; ++k) IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 6, k, g_ses_grid_was), '.');
+        IM_CHECK_EQ(ses_grid_mark(*g_ses_grid, g_ses_grid_excl, 6, 0), '!');   /* without the record it would read as a gap */
+        ses_ui_type(ctx, "**/localize exclude##ses", "6");
+        ctx->Yield(2);
+        IM_CHECK(ses_stale(SES, SES_LOCALIZE).empty());
+        IM_CHECK(ses_localize_reincluded(SES).empty());
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* Retake, through two real localize runs: a whole run leaves a whole ranges file (nothing to resume);
+     * ticking row 2 makes the next run --ranges-in + --retake 2, the box clears when that run starts, and
+     * the tool accepts the command and measures that row alone. */
+    t = IM_REGISTER_TEST(e, "session", "localize_retake");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_retake";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL, SES_PLAN_FEW, SES_TRUTH_FEW);
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
+        ses_ui_type(ctx, "**/##sesnote", "checked with Motive's own tools");
+        ctx->ItemClick("**/Skip##ses_frame");
+        ctx->Yield(2);
+        ses_ui_run(ctx, SES_LOCALIZE, 180.0);
+        IM_CHECK_EQ(SES.step[SES_LOCALIZE].status, SES_PASSED);
+        IM_CHECK(SES.step[SES_LOCALIZE].command.find("--ranges-in") == std::string::npos);
+        IM_CHECK(SES.step[SES_LOCALIZE].command.find("--retake") == std::string::npos);
+        ctx->Yield(2);
+        IM_CHECK(g_ses_grid != NULL && g_ses_grid->K == 5);
+        IM_CHECK_EQ(ses_localize_retake_rows(SES), 5);
+        {   /* a later step that read this run's as_built.json: current now, STALE once the retake ran */
+            SesStep& C = SES.step[SES_CAPSULES];
+            C.status = SES_PASSED;
+            C.run = SES.next_run++;
+            C.consumed.push_back({ "localize", "as_built.json", ses_hash_file(ses_join(SES.folder, "as_built.json")), SES.step[SES_LOCALIZE].run });
+            IM_CHECK(ses_stale(SES, SES_CAPSULES).empty());
+        }
+        /* A box found occluded after the first run: adding it to the list makes localize stale and costs no
+         * row. The retake below runs under the longer list, on a file that holds captures of that speaker. */
+        ses_ui_type(ctx, "**/localize exclude##ses", "1");
+        ctx->Yield(2);
+        IM_CHECK(ses_stale(SES, SES_LOCALIZE).find("none then, 1 now") != std::string::npos);
+        IM_CHECK_EQ(ses_localize_retake_rows(SES), 5);
+        IM_CHECK(ses_localize_reincluded(SES).empty());
+        IM_CHECK(g_ses_grid->have[(size_t)1 * 5 + 0] == 1);       /* swept in the first run */
+        ses_ui_show_grid(ctx);
+        ctx->ItemCheck("**/2##ses_retake");
+        ctx->Yield(2);
+        IM_CHECK_EQ(SES.localize_retake, 2ull);
+        /* the builder alone: two rows in order; a rig session does not retake a rehearsal's file; Start over drops it */
+        {
+            SesTools T;
+            T.calibrate = "bwa_calibrate.exe";
+            std::string cmd, why;
+            std::vector<SesFile> cons;
+            Session X = SES;
+            X.localize_retake = 2ull | 8ull;
+            IM_CHECK(ses_command(X, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find(" --ranges-in as_built.ranges.json --retake 2,4 --exclude 1") != std::string::npos);
+            X.localize_start_over = true;
+            IM_CHECK(ses_command(X, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--ranges-in") == std::string::npos && cmd.find("--retake") == std::string::npos);
+            X.localize_start_over = false;
+            X.simulate = false; X.in.body = "stand"; X.in.nn_server = "10.0.0.5";
+            IM_CHECK(ses_command(X, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--ranges-in") == std::string::npos && cmd.find("--retake") == std::string::npos);
+        }
+        ctx->ItemClick("**/Run##ses_localize");
+        ctx->Yield(2);
+        const bool started = ses_busy() || SES.step[SES_LOCALIZE].run > 0;
+        const bool cleared = SES.localize_retake == 0;
+        ses_ui_wait(ctx, 180.0);
+        const SesStep& P = SES.step[SES_LOCALIZE];
+        printf("session test: retake: %s (exit %d): %s\n", ses_status_name(P.status), P.exit_code, P.command.c_str());
+        IM_CHECK(started);
+        IM_CHECK(cleared);
+        IM_CHECK(P.command.find(" --ranges-in as_built.ranges.json --retake 2") != std::string::npos);
+        IM_CHECK_EQ(P.status, SES_PASSED);
+        IM_CHECK(ses_log_has("localize: measuring row(s) 2;"));
+        IM_CHECK(P.command.find(" --exclude 1") != std::string::npos);
+        IM_CHECK(ses_stale(SES, SES_LOCALIZE).empty());           /* the run under the new list clears it */
+        {   /* the tool left speaker 1 out of the solve although the file holds its captures: it stays at the
+             * plan (62 to 78 mm from where it stands), and the others land on the truth */
+            static Layout LA, LP, LT;
+            char err[256];
+            IM_CHECK(layout_load(ses_join(SES.folder, "as_built.json").c_str(), 48000, &LA, err, sizeof err));
+            IM_CHECK(layout_load(SES_PLAN_FEW, 48000, &LP, err, sizeof err));
+            IM_CHECK(layout_load(SES_TRUTH_FEW, 48000, &LT, err, sizeof err));
+            IM_CHECK_LT(ses_dist(LA.speakers[1].pos, LP.speakers[1].pos), 1e-4f);
+            IM_CHECK_GT(ses_dist(LA.speakers[1].pos, LT.speakers[1].pos), 0.05f);
+            IM_CHECK_LT(ses_dist(LA.speakers[3].pos, LT.speakers[3].pos), 0.015f);
+            IM_CHECK_LT(ses_dist(LA.speakers[4].pos, LT.speakers[4].pos), 0.015f);
+        }
+        IM_CHECK(ses_stale(SES, SES_CAPSULES).find("localize ran again") != std::string::npos);
+        ses_ui_show_grid(ctx);
+        IM_CHECK(!(ctx->ItemInfo("**/2##ses_retake").StatusFlags & ImGuiItemStatusFlags_Checked));
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* Non-ASCII paths. The session's own files go through the wide calls: New makes the folder that was
+     * named (no mojibake sibling), and a rerun deletes the step's old file there, so a failed run does not
+     * leave the last run's file looking current. A non-ASCII plan on a tool's command line works where the
+     * tools' UTF-8 code-page manifest takes (Windows 10 1903 and later): the frame check runs on one here.
+     * Where it does not, the step is refused by name before it starts. */
+    t = IM_REGISTER_TEST(e, "session", "non_ascii");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_caf\xC3\xA9";
+        static const wchar_t* wdir = L"calibview_session_caf\x00e9";
+        static const char* plan = "calibview_ses_plan_caf\xC3\xA9.json";
+        static const wchar_t* wplan = L"calibview_ses_plan_caf\x00e9.json";
+        const std::wstring wcsv = std::wstring(wdir) + L"\\frame_check.csv";
+        auto clean = [&]() {
+            for (const wchar_t* f : { L"\\session.json", L"\\session.json.tmp", L"\\session.log", L"\\frame_check.csv" })
+                DeleteFileW((std::wstring(wdir) + f).c_str());
+            RemoveDirectoryW(wdir);
+            if (GetACP() != CP_UTF8) RemoveDirectoryA(dir);       /* the mojibake sibling a broken build makes */
+            DeleteFileW(wplan);
+        };
+        ses_write_fixtures();
+        clean();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        const DWORD a = GetFileAttributesW(wdir);
+        IM_CHECK(a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY));
+        IM_CHECK(GetFileAttributesW((std::wstring(wdir) + L"\\session.json").c_str()) != INVALID_FILE_ATTRIBUTES);
+        if (GetACP() != CP_UTF8) IM_CHECK(GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES);
+        else printf("session test: non_ascii: the code page is UTF-8, so the A calls cannot be told from the wide ones here\n");
+
+        /* a frame run that fails at once (the "tool" is whoami, which rejects the arguments) must not leave
+         * the stale frame_check.csv behind */
+        FILE* sf = _wfopen(wcsv.c_str(), L"wb");
+        IM_CHECK(sf != NULL);
+        fputs("stale\n", sf);
+        fclose(sf);
+        char sys[MAX_PATH];
+        GetSystemDirectoryA(sys, MAX_PATH);
+        const char* old = getenv("BWA_SPEAKER_SURVEY_EXE");
+        const std::string keep = old ? old : "";
+        _putenv_s("BWA_SPEAKER_SURVEY_EXE", (std::string(sys) + "\\whoami.exe").c_str());
+        ses_ui_run(ctx, SES_FRAME, 60.0);
+        _putenv_s("BWA_SPEAKER_SURVEY_EXE", keep.c_str());
+        IM_CHECK_EQ(SES.step[SES_FRAME].status, SES_FAILED);
+        IM_CHECK(GetFileAttributesW(wcsv.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+        /* A non-ASCII plan, in this non-ASCII folder. With the tools' UTF-8 code-page manifest (Windows 10 1903
+         * and later, which this process shares) the frame check reads it and passes. Where the manifest did
+         * not take, the step is refused by name before it starts. */
+        IM_CHECK(CopyFileW(L"calibview_ses_plan.json", wplan, FALSE));
+        ses_ui_type(ctx, "**/plan layout##ses", plan);
+        ctx->Yield(2);
+        IM_CHECK(ses_blocked(SES, SES_FRAME).empty());
+        if (GetACP() == CP_UTF8) {
+            ses_ui_run(ctx, SES_FRAME, 60.0);
+            IM_CHECK_EQ(SES.step[SES_FRAME].status, SES_PASSED);
+            IM_CHECK(SES.step[SES_FRAME].command.find(plan) != std::string::npos);
+            IM_CHECK(GetFileAttributesW(wcsv.c_str()) != INVALID_FILE_ATTRIBUTES);
+        } else {
+            SesTools T;
+            T.survey = "bwa_speaker_survey.exe";
+            std::string cmd, why;
+            std::vector<SesFile> cons;
+            IM_CHECK(!ses_command(SES, SES_FRAME, T, &cmd, &cons, &why));
+            IM_CHECK(why.find("bwa_speaker_survey cannot take a non-ASCII path on this Windows") == 0 && why.find(plan) != std::string::npos);
+            ctx->ItemClick("**/Run##ses_frame");
+            ctx->Yield(2);
+            IM_CHECK(!ses_busy());
+            IM_CHECK(strstr(g_ses_msg, "frame: refused: bwa_speaker_survey cannot take a non-ASCII path") == g_ses_msg);
+        }
+        SES = Session();
+        clean();
+    };
+
+    /* The ASIO driver list, scripted: a new session defaults to the rig when a driver is installed and to
+     * simulate when none is; the dropdown, Refresh and the typed fallback all set the driver the steps open. */
+    t = IM_REGISTER_TEST(e, "session", "drivers");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_drivers";
+        static int give, calls;
+        auto fresh = [&](void) {                                  /* New, and nothing else: the default is what is under test */
+            ctx->SetRef("calib view");
+            ctx->ItemClick("**/Session");
+            SES = Session();
+            memset(&SU, 0, sizeof SU);
+            ses_clear_dir(dir);
+            ses_ui_type(ctx, "**/##sesdir", dir);
+            ctx->ItemClick("**/New##ses");
+            ctx->Yield(2);
+        };
+        ses_write_fixtures();
+        g_ses_drivers = [](char (*names)[32], int max) {
+            ++calls;
+            for (int i = 0; i < give && i < max; ++i) snprintf(names[i], 32, "Fake ASIO %d", i);
+            return give;
+        };
+        give = 0;
+        fresh();
+        const bool desk = !SES.folder.empty() && SES.simulate && strstr(g_ses_msg, "SIMULATE is on") != NULL;
+        give = 2;
+        fresh();
+        const bool rig = !SES.folder.empty() && !SES.simulate && strstr(g_ses_msg, "ON THE RIG") != NULL;
+        ctx->ItemOpen("**/Inputs##ses");
+        auto pick = [&](const char* item) {                       /* open the dropdown, click the entry in its popup */
+            /* by id: a combo reports no label to the engine, so the wildcard cannot find it. It sits in the tab's
+             * same id scope as the Refresh button beside it. */
+            ctx->ItemClick(ImHashStr("##sesdrvlist", 0, ctx->ItemInfo("**/Refresh##ses_drv").ParentID));
+            ctx->Yield(2);
+            ctx->ItemClick((std::string("//$FOCUSED/") + item).c_str());
+        };
+        pick("Fake ASIO 1");
+        ctx->Yield(2);
+        const bool picked = SES.in.driver == "Fake ASIO 1";
+        Session R;
+        const bool saved = ses_load(&R, SES.folder, NULL) && R.in.driver == "Fake ASIO 1" && !R.simulate;
+        give = 3;
+        const int before = calls;
+        ctx->ItemClick("**/Refresh##ses_drv");
+        ctx->Yield(2);
+        const bool refreshed = calls == before + 1 && g_ses_drv_n == 3;
+        pick("Fake ASIO 2");
+        ctx->Yield(2);
+        const bool picked2 = SES.in.driver == "Fake ASIO 2";
+        pick("(auto)##sesdrv_auto");
+        ctx->Yield(2);
+        const bool autod = SES.in.driver.empty();
+        ses_ui_type(ctx, "**/##sesdrv", "Unlisted Driver");
+        ctx->Yield(2);
+        const bool typed = SES.in.driver == "Unlisted Driver";
+        /* and it is what a step opens; simulate opens none */
+        ses_ui_type(ctx, "**/plan layout##ses", SES_PLAN);
+        ses_ui_type(ctx, "**/localize rows##ses", SES_ROWS);
+        ses_skip(&SES, SES_FRAME, "not under test");
+        SesTools T;
+        T.calibrate = "bwa_calibrate.exe";
+        std::string cmd, why;
+        std::vector<SesFile> cons;
+        const bool on_rig = ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find(" --driver \"Unlisted Driver\" --input 0") != std::string::npos &&
+                            cmd.find("--simulate") == std::string::npos;
+        ctx->ItemCheck("**/simulate##ses");
+        ctx->Yield(2);
+        const bool in_sim = ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why) && cmd.find("--driver") == std::string::npos &&
+                            cmd.find(" --simulate") != std::string::npos;
+        g_ses_drivers = calib_asio_driver_names;
+        g_ses_drv_n = -1;
+        printf("session test: drivers: desk %d rig %d picked %d saved %d refreshed %d picked2 %d auto %d typed %d on_rig %d in_sim %d\n",
+               desk, rig, picked, saved, refreshed, picked2, autod, typed, on_rig, in_sim);
+        IM_CHECK(desk);
+        IM_CHECK(rig);
+        IM_CHECK(picked);
+        IM_CHECK(saved);
+        IM_CHECK(refreshed);
+        IM_CHECK(picked2);
+        IM_CHECK(autod);
+        IM_CHECK(typed);
+        IM_CHECK(on_rig);
+        IM_CHECK(in_sim);
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* The typed values a command line carries are checked in the tab and quoted: a bad one blocks the step
+     * with its format, a good one arrives as one argument. */
+    t = IM_REGISTER_TEST(e, "session", "input_checks");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_inputs";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL);
+        SesTools T;
+        T.calibrate = "bwa_calibrate.exe";
+        T.survey = "bwa_speaker_survey.exe";
+        std::string cmd, why;
+        std::vector<SesFile> cons;
+        ses_ui_type(ctx, "**/temperature##ses", "22.5C");
+        ses_ui_type(ctx, "**/frame speakers##ses", "0,4,8");
+        ctx->Yield(2);
+        IM_CHECK(ses_command(SES, SES_FRAME, T, &cmd, &cons, &why) && cmd.find(" --sim-speakers \"0,4,8\"") != std::string::npos);
+        ses_skip(&SES, SES_FRAME, "not under test");
+        IM_CHECK(ses_command(SES, SES_LOCALIZE, T, &cmd, &cons, &why));
+        printf("session test: input_checks: %s\n", cmd.c_str());
+        IM_CHECK(cmd.find(" --temp \"22.5C\"") != std::string::npos);
+        IM_CHECK(cmd.find(" --mount-offset \"0.02,-0.11,0.04\"") != std::string::npos);
+        struct Bad { const char* item; const char* bad; const char* good; int step; const char* says; };
+        static const Bad bads[] = {
+            { "**/temperature##ses", "22 C", "72F", SES_LOCALIZE, "the temperature is not a number like 22.5C or 72F" },
+            { "**/temperature##ses", "warm", "", SES_LOCALIZE, "the temperature is not a number" },
+            { "**/mount offset##ses", "0.02, -0.11, 0.04", "ring", SES_LOCALIZE, "the mount offset is not ring or x,y,z" },
+            { "**/mount offset##ses", "0.02,-0.11", "0.02,-0.11,0.04", SES_LOCALIZE, "the mount offset is not ring or x,y,z" } };
+        for (const Bad& b : bads) {
+            ses_ui_type(ctx, b.item, b.bad);
+            ctx->Yield(2);
+            const std::string bl = ses_blocked(SES, b.step);
+            printf("session test: input_checks: '%s' -> %s\n", b.bad, bl.c_str());
+            IM_CHECK(bl.find(b.says) == 0);
+            IM_CHECK(!ses_command(SES, b.step, T, &cmd, &cons, &why));
+            ses_ui_type(ctx, b.item, b.good);
+            ctx->Yield(2);
+            IM_CHECK(ses_blocked(SES, b.step).empty());
+        }
+        /* the frame step's own two: the simulated cameras' list, and (on the rig) Motive's address */
+        SES.step[SES_FRAME] = SesStep();
+        ses_ui_type(ctx, "**/frame speakers##ses", "0, 4");
+        ctx->Yield(2);
+        IM_CHECK(ses_blocked(SES, SES_FRAME).find("the frame speakers are not a list") == 0);
+        ses_ui_type(ctx, "**/frame speakers##ses", "");
+        Session X = SES;
+        X.simulate = false;
+        X.in.nn_server = "192.168.7.14 x";
+        IM_CHECK(ses_blocked(X, SES_FRAME).find("the Motive IP is not an address") == 0);
+        X.in.nn_server = "192.168.7.14";
+        IM_CHECK(ses_command(X, SES_FRAME, T, &cmd, &cons, &why) && cmd.find(" --server \"192.168.7.14\"") != std::string::npos);
+        SES = Session();
+        ses_clear_dir(dir);
+    };
+
+    /* Waiting for Enter, on a simulated tracked run made to wait as a rig run does (--track-sim-rig-wait):
+     * the tool's settled line lights Send Enter and says who is waiting, pressing it puts the light out,
+     * the tool moves on (the sweeps), and its next placement lights it again. */
+    t = IM_REGISTER_TEST(e, "session", "enter_wait");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        static const char* dir = "calibview_session_enter";
+        ses_write_fixtures();
+        ses_ui_new(ctx, dir, NULL, NULL, SES_PLAN_FEW, SES_TRUTH_FEW);
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
+        ses_skip(&SES, SES_FRAME, "not under test");
+        const std::string mark = ses_join(SES.folder, "wait.mark");
+        for (const char* sfx : { "", ".armed", ".taken", ".spent", ".hold", ".go" }) DeleteFileA((mark + sfx).c_str());
+        SES.sim_rig_wait = mark;
+        auto wait_for = [&](int want, double secs) {
+            const double t0 = ImGui::GetTime();
+            while (ses_busy() && g_ses_waiting != want && ImGui::GetTime() - t0 < secs) ctx->Yield();
+            return g_ses_waiting == want && ses_busy();
+        };
+        ctx->ItemClick("**/Run##ses_localize");
+        ctx->Yield(2);
+        const bool started = ses_busy() && SES.step[SES_LOCALIZE].command.find(" --track-sim-rig-wait ") != std::string::npos &&
+                             SES.step[SES_LOCALIZE].command.find(" --place-wait-enter") != std::string::npos;
+        const bool quiet_first = g_ses_waiting == 0;              /* the stand has not settled yet */
+        const bool asked = wait_for(1, 60.0);
+        ctx->Yield(2);
+        const bool lit = asked && !g_ses_enter_sent && ses_log_has("placement: settled. Clear the space, then press Enter");
+        ctx->ItemClick("**/Send Enter##ses");
+        const bool sent = g_ses_enter_sent || g_ses_waiting == 0;  /* out at once, before the tool has answered */
+        const bool moved_on = wait_for(0, 30.0);
+        const bool asked_again = wait_for(1, 120.0) && !g_ses_enter_sent;   /* the second row's placement */
+        ctx->ItemClick("**/Cancel##ses");
+        ses_ui_wait(ctx, 30.0);
+        printf("session test: enter_wait: started %d quiet_first %d asked %d lit %d sent %d moved_on %d asked_again %d\n",
+               started, quiet_first, asked, lit, sent, moved_on, asked_again);
+        IM_CHECK(started);
+        IM_CHECK(quiet_first);
+        IM_CHECK(asked);
+        IM_CHECK(lit);
+        IM_CHECK(sent);
+        IM_CHECK(moved_on);
+        IM_CHECK(asked_again);
+        IM_CHECK_EQ(SES.step[SES_LOCALIZE].status, SES_FAILED);  /* canceled */
+        IM_CHECK_EQ(g_ses_waiting, 0);
+        {   /* The untracked prompt, as bwa_calibrate prints it (a whole line; calibrate_track_bump pins that):
+             * live while it is the newest line, out once the tool has printed anything after it. The lines are
+             * put in the log by hand under a runner marked busy: no session step reaches that prompt in simulate. */
+            { std::lock_guard<std::mutex> lk(SR.mu); SR.partial.clear(); SR.lines.push_back("  -> place the mic at (0.30 1.40 0.20) and press Enter"); }
+            SR.state.store(1);
+            ctx->Yield(2);
+            const int at_prompt = g_ses_waiting;
+            { std::lock_guard<std::mutex> lk(SR.mu); SR.lines.push_back("  clear the space: the sweeps start in 5 s"); }
+            ctx->Yield(2);
+            const int after = g_ses_waiting;
+            SR.state.store(0);
+            ctx->Yield(2);
+            IM_CHECK_EQ(at_prompt, 2);
+            IM_CHECK_EQ(after, 0);
+        }
+        for (const char* sfx : { "", ".armed", ".taken", ".spent" }) DeleteFileA((mark + sfx).c_str());
+        DeleteFileA(ses_join(SES.folder, SES_LOCALIZE_RANGES).c_str());
         SES = Session();
         ses_clear_dir(dir);
     };

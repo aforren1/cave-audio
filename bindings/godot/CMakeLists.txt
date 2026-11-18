@@ -142,7 +142,7 @@ if(BWA_BUILD_TESTS)
               -P ${CMAKE_CURRENT_SOURCE_DIR}/test/godot_import.cmake)
     set_tests_properties(godot_import PROPERTIES FIXTURES_SETUP godot_project TIMEOUT 300)
 
-    foreach(scene smoke frame)
+    foreach(scene smoke frame rig)
       add_test(NAME godot_${scene}
         COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
                 "res://demo/${scene}.tscn")

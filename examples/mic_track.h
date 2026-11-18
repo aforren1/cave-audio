@@ -187,6 +187,13 @@ int mic_track_stdin_takes_enter(void);
  * is taken. A file it reads: ".hold", there at the start of a placement, keeps the gate reading shut until
  * ".go" appears. NULL or "" = off. */
 void mic_track_test_marker(const char* path);
+/* The untracked rows' stop ("place the mic and press Enter"). Input that arrived before this wait is thrown
+ * away first, from the console or from stdin's pipe (the Session tab's Send Enter): an Enter sent during the
+ * last row's sweeps would otherwise answer this prompt with the mic still at the old spot. Then `prompt` is
+ * printed as one whole line, so a caller streaming the output sees it as the newest line exactly while the
+ * tool waits, and the wait reads the pipe raw (the CRT would buffer two Enters into one read). With the
+ * test marker set, path + ".hand<k>" appears when the k-th wait starts and ".hand<k>.go" when it ends. */
+void mic_track_by_hand_wait(const char* prompt);
 /* The clear_s a run gets when the command line does not set one. sim: 0. A console, or stdin's pipe after
  * mic_track_wait_enter(1): MIC_TRACK_CLEAR_KEY. Anything else: MIC_TRACK_CLEAR_S. */
 double mic_track_default_clear(int sim);

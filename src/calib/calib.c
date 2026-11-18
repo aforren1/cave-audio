@@ -308,14 +308,15 @@ void calib_sweep_why(const MeasureResult* m, int code, double fs, char* buf, siz
                  (m->delay_samples + m->delay_frac) * ms, m->snr_db);
 }
 
-int calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float* d_samples, float* d_db) {
+int calib_sweeps_agree(const MeasureResult* a, const MeasureResult* b, float tol_samples, float tol_db,
+                       float* d_samples, float* d_db) {
     if (!a || !b) return 0;
     const double ta = (double)a->delay_samples + a->delay_frac, tb = (double)b->delay_samples + b->delay_frac;
     const double ds = fabs(ta - tb);
     const double db = (a->level > 0.f && b->level > 0.f) ? fabs(20.0 * log10((double)a->level / (double)b->level)) : 1e9;
     if (d_samples) *d_samples = (float)ds;
     if (d_db) *d_db = (float)(db < 1e9 ? db : 999.0);
-    return ds <= CALIB_SWEEP_AGREE_SAMPLES && db <= CALIB_SWEEP_AGREE_DB;
+    return ds <= tol_samples && db <= tol_db;
 }
 
 double calib_latency_bound_s(int zylia) { return zylia ? CALIB_WIN_LAT_DRIVER_S : CALIB_LAT_OMNI_S; }
@@ -521,8 +522,11 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
         if (ns < 4) return 0;                                             /* 3 unknowns and one to spare */
         ++m; neq += ns;
     }
-    if (m < 1 || neq <= 3 * m + NL) return 0;
-    if (per_row) for (int k = 0; k < K; ++k) if (cnt[k] < 4) return 0;
+    /* per row, a row with NO used capture has no latency to solve and is left out (its latency reads 0);
+     * one with 1 to 3 has too few for its own */
+    int nrow = NL;
+    if (per_row) for (int k = 0; k < K; ++k) { if (!cnt[k]) --nrow; else if (cnt[k] < 4) return 0; }
+    if (m < 1 || nrow < 1 || neq <= 3 * m + nrow) return 0;
     if (!per_row) { cnt[0] = neq; }                                       /* the one latency sees every equation */
     for (int s = 0; s < n; ++s)
         if (LJ_SPK(s) && !(isfinite(pos_io[s][0]) && isfinite(pos_io[s][1]) && isfinite(pos_io[s][2]))) return 0;
@@ -553,7 +557,7 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
             L[per_row ? k : 0] += range[(size_t)s * K + k] - sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
         }
     }
-    for (int j = 0; j < NL; ++j) L[j] /= cnt[j];
+    for (int j = 0; j < NL; ++j) if (cnt[j]) L[j] /= cnt[j];
 
     /* Gauss-Newton with a backtracking step. The full step alone (the first version) converges in a few
      * iterations on clean captures, but on the rig's, with tens of mm of misfit and the odd capture meters
@@ -570,7 +574,7 @@ int calib_localize_joint(const double* range, const float (*mic)[3], int K, int 
         double f0 = 0.0;                                                  /* the misfit at x, L */
         /* the normal equations [A_s B_s; B_s^T D] [dp; dL] = [g_s; h], reduced onto dL */
         for (int j = 0; j < NL * NL; ++j) S[j] = 0.0;
-        for (int j = 0; j < NL; ++j) { S[j * NL + j] = cnt[j]; rhs[j] = 0.0; }
+        for (int j = 0; j < NL; ++j) { S[j * NL + j] = cnt[j] ? cnt[j] : 1; rhs[j] = 0.0; }   /* an empty row: dL 0 */
         for (int s = 0; s < n; ++s) {
             if (!LJ_SPK(s)) continue;
             double A[3][3] = {{0}};
@@ -727,6 +731,11 @@ static cJSON* spk_by_index(cJSON* speakers, int idx) {
 
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap) {
+    return calib_write_layout_skip(in_path, out_path, gain_db, delay_ms, NULL, n, err, errcap);
+}
+
+int calib_write_layout_skip(const char* in_path, const char* out_path, const float* gain_db, const float* delay_ms,
+                            const unsigned char* skip, int n, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
 
@@ -742,11 +751,13 @@ int calib_write_layout(const char* in_path, const char* out_path,
      * capture leg survives the solve as NaN) serializes as JSON `null`, and out_path usually IS the
      * layout — the write would destroy the good calibration in place and only fail at next load */
     for (int i = 0; i < n; ++i)
-        if (!isfinite(gain_db[i]) || gain_db[i] < -100.f || gain_db[i] > 24.f ||
-            !isfinite(delay_ms[i]) || delay_ms[i] < 0.f || delay_ms[i] > 1000.f)
+        if (!(skip && skip[i]) &&
+            (!isfinite(gain_db[i]) || gain_db[i] < -100.f || gain_db[i] > 24.f ||
+             !isfinite(delay_ms[i]) || delay_ms[i] < 0.f || delay_ms[i] > 1000.f))
             FAIL("calib: refusing to write a non-finite/out-of-range trim (bad measurement?)");
 
     for (int i = 0; i < n; ++i) {
+        if (skip && skip[i]) continue;                   /* not measured: the file's values stay */
         cJSON* sp = spk_by_index(speakers, i);
         if (!sp) FAIL("calib: layout has no speaker record with that index");
         cJSON* g  = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
@@ -1029,6 +1040,12 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
 int calib_write_room_eq_grid_n(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
                                const MeasureEqSection* cuts, const int* counts, int n,
                                int max_sections, char* err, size_t errcap) {
+    return calib_write_room_eq_grid_skip(in_path, out_path, nmic, mics, cuts, counts, NULL, n, max_sections, err, errcap);
+}
+
+int calib_write_room_eq_grid_skip(const char* in_path, const char* out_path, int nmic, const float (*mics)[3],
+                                  const MeasureEqSection* cuts, const int* counts, const unsigned char* skip, int n,
+                                  int max_sections, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
     cJSON* narr = NULL;             /* the rebuilt grid; owned here until attached to root */
@@ -1118,6 +1135,7 @@ int calib_write_room_eq_grid_n(const char* in_path, const char* out_path, int nm
         memcpy(gpos[slot], mic, sizeof(float) * 3);
         for (int s = 0; s < n; ++s) {
             const int ks = k * n + s;
+            if (skip && skip[s]) continue;               /* not measured: a replaced slot keeps what it read back */
             int m = counts[ks] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[ks];
             if (m > max_sections) m = max_sections;
             for (int t = 0; t < m; ++t) ALL(slot, s)[t] = cuts[(size_t)ks * max_sections + t];

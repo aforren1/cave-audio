@@ -26,8 +26,24 @@ namespace BwAudio.EditorTools
                     "[bw_audio] Unity's built-in audio is ENABLED. The bw_audio engine owns the audio " +
                     "device, so leaving Unity audio on wastes CPU, can contend for the monitor's output " +
                     "device, and plays stray AudioSources the wrong way (not through the CAVE array). " +
-                    "Run Tools → BwAudio → Disable Unity Audio, or tick Project Settings → " +
-                    "Audio → “Disable Unity Audio”.");
+                    "Run Tools > BwAudio > Disable Unity Audio, or tick Project Settings > " +
+                    "Audio > 'Disable Unity Audio'.");
+        }
+
+        // The same check, asked for by a setup step (CaveRig) instead of by the editor loading. It
+        // may offer the fix because the user just asked for a working rig. A dialog would hang a
+        // batchmode editor, so that case only warns.
+        internal static void CheckFromSetup()
+        {
+            if (IsUnityAudioDisabled()) return;
+            if (!Application.isBatchMode &&
+                EditorUtility.DisplayDialog("BwAudio",
+                    "Unity's built-in audio is enabled. The bw_audio engine owns the audio device, so " +
+                    "Unity audio should be off.\n\nDisable it now? (Project Settings > Audio > " +
+                    "Disable Unity Audio)", "Disable Unity Audio", "Not now"))
+                DisableUnityAudio();
+            else
+                WarnIfEnabled();
         }
 
         [MenuItem("Tools/BwAudio/Disable Unity Audio")]
@@ -47,7 +63,7 @@ namespace BwAudio.EditorTools
             return (objs != null && objs.Length > 0 && objs[0] != null) ? new SerializedObject(objs[0]) : null;
         }
 
-        static bool IsUnityAudioDisabled()
+        internal static bool IsUnityAudioDisabled()
         {
             var p = LoadAudioManager()?.FindProperty("m_DisableAudio");
             return p != null && p.boolValue;   // can't read it -> assume not disabled (warn, don't hide)

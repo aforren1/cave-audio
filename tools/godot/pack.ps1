@@ -256,6 +256,8 @@ $dest = Join-Path $stage 'addons/bw_audio'
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'bin') | Out-Null
 
 Copy-Item (Join-Path $addon 'bw_audio.gdextension') $dest
+# The drop-in rig (BwaEngine + RoomOrigin, room_origin wired): the README's quick start drags it in.
+Copy-Item (Join-Path $addon 'bwa_rig.tscn') $dest
 
 # The binaries the manifest promises (parsed at the top of this script, and already verified to
 # exist). A path may carry a subdirectory - Linux's engine library does, because it has the same

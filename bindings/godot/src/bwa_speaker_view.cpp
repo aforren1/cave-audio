@@ -50,12 +50,17 @@ void BwaSpeakerView::_ready() {
 		/* Speaker positions come back in ROOM space; the view lives in the scene, so they
 		 * come back through the registration transform. */
 		const Vector3 p = owner->from_room_position(speakers[i]);
-		gz->set_position(p);
+		/* from_room_position is a WORLD position, and this view may sit under any parent:
+		 * top-level so the gizmo neither inherits that transform nor drifts when it moves. */
+		gz->set_as_top_level(true);
+		gz->set_global_position(p);
 
 		gizmos.push_back(gz);
 		materials.push_back(mat);
 		positions.push_back(p);
+		room_positions.push_back(speakers[i]);
 	}
+	registration_seen = owner->registration_generation();
 	set_process(true);
 }
 
@@ -63,6 +68,15 @@ void BwaSpeakerView::_process(double delta) {
 	(void)delta;
 	if (!owner || !owner->is_running() || gizmos.empty()) {
 		return;
+	}
+	/* The registration moved (a room_origin node, or set_registration): the room positions
+	 * are the same, their Godot-space places are not. One integer compare on a quiet frame. */
+	if (owner->registration_generation() != registration_seen) {
+		registration_seen = owner->registration_generation();
+		for (size_t i = 0; i < gizmos.size(); i++) {
+			positions[i] = owner->from_room_position(room_positions[i]);
+			gizmos[i]->set_global_position(positions[i]);
+		}
 	}
 	const PackedFloat32Array peaks = owner->get_bus_levels();
 	const int n = MIN(peaks.size(), (int)gizmos.size());

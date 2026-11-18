@@ -106,11 +106,17 @@ public:
 	void _exit_tree() override;
 
 	/* --- device configuration (read at _ready) --- */
-	void set_profile(Profile p) { profile = p; }
+	void set_profile(Profile p) {
+		profile = p;
+		update_configuration_warnings(); /* the no-layout warning depends on it */
+	}
 	Profile get_profile() const { return profile; }
 	void set_sink(Sink s) { sink = s; }
 	Sink get_sink() const { return sink; }
-	void set_layout_path(const String &p) { layout_path = p; }
+	void set_layout_path(const String &p) {
+		layout_path = p;
+		update_configuration_warnings();
+	}
 	String get_layout_path() const { return layout_path; }
 	/* The device for whichever backend opens it: the exact name or id from get_devices(). Empty =
 	 * that backend's default. set_asio_driver is the old spelling of the same property, kept so
@@ -180,8 +186,27 @@ public:
 	Ref<BwaMaterial> get_ground_material() const { return ground_material; }
 
 	/* --- the coordinate seam --- */
-	void set_registration(const Transform3D &t) { registration = t; }
+	/* `registration` is Godot world -> room. Set it from code, or point `room_origin` at a
+	 * Node3D and the engine derives it: registration = inverse(origin's global transform), so
+	 * the origin's local axes ARE the room axes (its +Z, the blue arrow, is room front; NOT
+	 * its -Z "forward", which is a facing convention and has no say over a frame). Scale is
+	 * dropped. The node is compared once per _process and the inverse recomputed only when it
+	 * moved. While room_origin resolves it OWNS the registration: set_registration refuses.
+	 * An origin that is mirrored (negative determinant), collapsed or non-finite is REFUSED:
+	 * the registration holds its last value and the engine warns once.
+	 *
+	 * The registration is read at CALL time by everything that is converted once: the static
+	 * geometry, room box and ground plane (at start), set_extra_listeners and the FDN decay
+	 * direction. None of those follow a later change, so the first change after start with
+	 * any of them present warns once and latches is_registration_stale(). */
+	void set_registration(const Transform3D &t);
 	Transform3D get_registration() const { return registration; }
+	void set_room_origin(const NodePath &p);
+	NodePath get_room_origin() const { return room_origin_path; }
+	/* Bumped on every registration change. Not bound: it is how a C++ client that cached
+	 * Godot-space positions (BwaSpeakerView) learns they went stale. */
+	uint32_t registration_generation() const { return reg_gen; }
+	bool is_registration_stale() const { return registration_stale; }
 	Vector3 to_room_position(const Vector3 &v) const { return registration.xform(v); }
 	Vector3 to_room_direction(const Vector3 &v) const { return registration.basis.xform(v); }
 	Quaternion to_room_orientation(const Basis &b) const;
@@ -577,6 +602,26 @@ private:
 	Ref<BwaMaterial> ground_material;
 
 	Transform3D registration; /* Godot world -> room/Motive origin; identity until surveyed */
+	NodePath room_origin_path;        /* optional Node3D that drives `registration` */
+	Transform3D room_origin_seen;     /* its global transform at the last recompute */
+	bool room_origin_tracked = false; /* room_origin_seen is valid */
+	uint32_t reg_gen = 0;
+	bool origin_scale_warned = false; /* each of these fires once per engine node */
+	bool origin_tilt_warned = false;
+	bool origin_missing_warned = false;
+	bool origin_invalid_warned = false;
+	bool registration_refused_warned = false;
+	bool registration_stale = false; /* see is_registration_stale */
+	bool extra_listeners_set = false; /* converted through the registration at call time */
+	bool inert = false;               /* the refused duplicate: owns no engine, never will */
+	bool editor_watch = false;        /* editor only: refresh the warnings when the origin moves */
+	int editor_origin_state = -1;
+	/* Re-derive `registration` from room_origin when the node moved. */
+	void sync_room_origin();
+	/* Every registration write ends here: bumps the generation and, after start, flags what
+	 * was converted through the old value. */
+	void registration_changed();
+	void editor_watch_origin();
 	NodePath listener_path;
 	bool feed_listener = true; /* false => the core reads NatNet itself (cave/both) */
 

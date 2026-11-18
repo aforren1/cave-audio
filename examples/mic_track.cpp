@@ -509,6 +509,33 @@ static void keys_drain(void) {
 #endif
 }
 
+void mic_track_by_hand_wait(const char* prompt) {
+    static int k = 0;
+    char sfx[32];
+    ++k;
+#ifdef _WIN32
+    const int pipe = !_isatty(_fileno(stdin)) && stdin_is_pipe();
+    if (pipe) { while (pipe_read() > 0) { } }                 /* whatever was sent before this wait */
+    else if (_isatty(_fileno(stdin))) { while (_kbhit()) (void)_getch(); }
+#endif
+    printf("%s\n", prompt);
+    fflush(stdout);
+    snprintf(sfx, sizeof sfx, ".hand%d", k);
+    test_mark(sfx);
+#ifdef _WIN32
+    if (pipe) {
+        for (;;) {
+            const int c = pipe_read();
+            if (c < 0 || c == '\n' || c == '\r') break;       /* Enter, or the writer is gone: as getchar's EOF was */
+            if (!c) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } else
+#endif
+        (void)getchar();
+    snprintf(sfx, sizeof sfx, ".hand%d.go", k);
+    test_mark(sfx);
+}
+
 int mic_track_place_console(MicTrack* T, const float target[3], const PlaceCfg* cfg, double timeout_s,
                             int keys, double clear_s, const char* what, MicPlaced* out) {
     PlaceGate g;

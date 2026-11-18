@@ -1,0 +1,7 @@
+[gd_scene format=3 uid="uid://k1dtwya5ed4"]
+
+[node name="BwaRig" type="BwaEngine"]
+profile = 0
+room_origin = NodePath("RoomOrigin")
+
+[node name="RoomOrigin" type="Node3D" parent="."]

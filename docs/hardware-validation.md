@@ -38,8 +38,9 @@ and fill it in as you go.
       `ctest --test-dir build -C RelWithDebInfo` and get it green before you leave. Never debug a
       known failure through speakers. `bw_audio.dll` is the only library to carry: Steam Audio is
       linked into it.
-- [ ] **Rehearse the whole session in simulate.** `bwa_calib_view`, Session tab: type a folder,
-      **New**, tick **simulate**, fill the inputs (see [Stage 2](#stage-2-calibration-the-session)).
+- [ ] **Rehearse the whole session in simulate.** `bwa_calib_view`, Session tab: pick a folder
+      (the **...** button), **New**, tick **simulate**, fill the inputs (see
+      [Stage 2](#stage-2-calibration-the-session)).
       Set **simulated truth** to a copy of the plan with a few speakers moved several centimeters.
       Run every step. Pass: `as_built.json` lands on the truth, not on the plan.
 - [ ] **Rehearse the tracker**: in any `bwa_calibrate` command below, replace the device and
@@ -231,31 +232,41 @@ check: no Motive data), 3 the tool's own check failed (flagged speakers, a disag
       temperature, and leave them on for every step. Their fans are the noise floor the sweeps
       must clear; the 3 F of warming is under the survey's other errors
       ([calibration.md: Air temperature](./calibration.md#air-temperature)).
-- [ ] **Session tab**: a new folder for the day, **New**, untick **simulate**.
-- [ ] **Inputs:**
+- [ ] **Session tab**: a new folder for the day (**...** picks it; the dialog can make it),
+      **New**. On a machine with an ASIO driver the session starts on the rig. Read the line
+      beside the **simulate** box: it must say `ON THE RIG`.
+- [ ] **Inputs** (each path has a **...** picker):
       - **plan layout**: the plan from Stage 1 (read, never written);
       - **localize rows**: `x y z` per line, 5 or more, off one plane, spread over the working
         area;
       - **grid rows**: `x y z` per line, up to 16, 250 mm apart or more, at ear height;
       - **validate placements**: `x y z [label]` per line (empty is the tool's default envelope);
-      - the ASIO driver, the first ZM-1 input (0), the temperature (`22.5C` or `72F`);
+      - the ASIO driver (pick it from the dropdown; **Refresh** after Dante Via starts), the
+        first ZM-1 input (0), the temperature (`22.5C` or `72F`);
       - the stand's rigid body, Motive's IP, the multicast group, the mount offset (`ring`);
       - **baffle offset**: the depth from the speakers' baffles back to their acoustic centers,
         in meters. A guess (or 0) until step 1's second pass measures it;
-      - **capsule speakers**: 6 or more, high and low (empty is all);
+      - **localize exclude**: boxes no step may sweep, like `3,14` (empty is none). Localize, the
+        capsule survey, trims, verify and the grid leave them out; validate still plays them.
+        Add a box at any time: localize reads `STALE`, and its next run keeps the rows it has;
+      - **capsule speakers**: 6 or more, high and low (empty is every speaker not excluded);
       - **aim speakers**: the boxes the cameras cannot see.
 - [ ] **Run** each step in order and read its result before the next. A failed step says why in
       its row and in the log, and the steps after it stay blocked until it passes. A step that does
       not apply: type a note, then **Skip**.
 - [ ] Tracked steps wait for the placement gate by themselves, then for you: when the log says
       `settled. Clear the space, then press Enter`, leave the space and press **Send Enter**.
-      Untracked, a step stops at each row; place the ZM-1, then press **Send Enter**.
+      Untracked, a step stops at each row; place the ZM-1, then press **Send Enter**. The button
+      is highlighted and says `WAITING FOR YOU` while the tool waits.
 - [ ] **Read the background line** the log prints after each step:
       `=== background: <step> <level> dBFS, <change> dB against <earlier step>`. `RISING` marks a
       rise of more than 6 dB. Find what got louder (a projector fan, an air handler, a door) and
       run that step again.
 - [ ] **Localize stopped partway?** Press **Run** again. The line under the table says the next run
       RESUMES and how many rows it kept. **Start over** is for when the kept rows are wrong.
+- [ ] **A bad row, or a gap?** The **Localize captures** grid shows every row against every
+      speaker (`+` captured, `!` gap). Tick the row's box and press **Run** on localize: only
+      that row is measured again.
 - [ ] **A box moved?** Run localize again. Every step after it reads `STALE`, by name, and blocks
       the next until you run it again.
 
@@ -413,15 +424,20 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
 - [ ] **Watch each row's check** before you move the stand: `row K check` from the second row,
       `row K fit` from the fifth (its first line names bad captures from every row so far, by
       speaker and row, largest first). A speaker named there had a capture meters off, or the stand
-      moved. Retake that row later with `--ranges-in <out>.ranges.json --retake K`: the captures
-      are kept after every row, so nothing else is measured again. Exclude a box you cannot clear
-      with `--exclude <speaker>`, and pass the same `--exclude` on every later run from that
-      file. A plain rerun does not lose the captures: it moves the old file to
-      `<out>.ranges.1.json` first (or the next free number).
+      moved. Retake that row later with `--ranges-in <out>.ranges.json --retake K` (in the Session
+      tab: tick the row in the grid, then **Run**): the captures are kept after every row, so
+      nothing else is measured again. Exclude a box you cannot clear with `--exclude <speaker>`,
+      and pass the same `--exclude` on every later run from that file (the Session tab's
+      **localize exclude** input does both). A plain rerun does not lose the captures: it moves
+      the old file to `<out>.ranges.1.json` first (or the next free number).
+- [ ] **Note each `GAP row K speaker S` line.** The run goes on past it and solves that speaker
+      from its other rows. Fill each one before you leave with `--retake K`. The raw ranges table
+      shows them as `gap`.
 - [ ] The writeback prints `localize: recorded the plan for 24 of 24 speaker(s)` (your count):
       `as_built.json` now carries the plan beside the measured positions.
-- [ ] Pass: exit 0, no `trilateration failed` line, every position within a few centimeters of
-      its plan or you know why, and a sane latency residual (below).
+- [ ] Pass: exit 0, no `trilateration failed`, `a position takes 5 rows` or
+      `no capture in any row` line, every position within a few centimeters of its plan or you
+      know why, and a sane latency residual (below).
 - [ ] **Latency residual**: the `-> residual <ms>` at the end of the `solved system latency`
       line must be positive. Negative is a wrong device or a sample-rate mismatch. With the ZM-1
       on Dante Via, tens of ms is a correct run. The driver does not report the Via leg (about
@@ -452,7 +468,13 @@ bwa_calibrate --layout plan.json --out as_built.json --zylia --localize localize
 - [ ] **Then go back to step 1, passes 2 and 3**: read the baffle depth off `as_built.json`, set
       it, and run the frame check again.
 
-On failure: `no clean measurement in 5 sweeps` stops the run; see [Sweep quality](#sweep-quality).
+On failure: a `GAP` line is not a failure. That speaker got no two agreeing sweeps in 12 at that
+placement. When the first 3 speakers of a row all gap, the run stops (exit 1): check the routing,
+the mic input and the level, then resume with `--ranges-in`. A `row K has N capture(s) ... not
+kept` line means a resume measures that row again. A speaker with gaps in most rows is a box or a
+routing problem, and
+`no capture in any row of speaker(s)` on a resume means a forgotten `--exclude`. See
+[Sweep quality](#sweep-quality).
 A capsule called dead: check its input with `bwa_zylia_probe`.
 
 ### Step 3: capsule survey
@@ -632,8 +654,13 @@ Every sweep in Stage 2 passes the same checks
   where the tap was. Often a mis-patched output, or a box far off its layout position.
   `--window-m` widens the margin (0.10 m for a surveyed speaker, 0.50 m at its plan).
 - **The IR SNR floor**: 40 dB, provisional. A capture under it is re-swept.
-- **Two-sweep agreement** (the trims and verify only): a sample and 0.2 dB.
-- **Five sweeps** with no clean result stop the run with nothing written (exit 1).
+- **Two-sweep agreement**: a sample and 0.2 dB for the trims and verify, 3 samples and 1 dB for
+  localize.
+- **Twelve sweeps** with no clean result stop the trims and verify with nothing written (exit 1).
+  Localize leaves a gap at that row and goes on. Twelve, because on the rig (2026-11-17) the ZM-1's
+  Dante Via latency stepped 0.3 to 0.4 ms and took about 30 s to settle, and five sweeps ran out
+  first. The trims and verify wait a step out this way. Localize does not: at 3 samples it takes
+  a pair mid-settle, and its row fit and FLAGGED lines are what show it.
 - **The background**: each run prints `background: <median> dBFS median, <loudest> dBFS loudest`,
   and the Session log compares each step with the last.
 

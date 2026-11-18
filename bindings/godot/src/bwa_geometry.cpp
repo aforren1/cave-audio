@@ -53,6 +53,14 @@ void BwaAcousticGeometry::_enter_tree() {
 		return;
 	}
 	statics.push_back(this);
+	if (BwaEngine::get_singleton() && BwaEngine::get_singleton()->is_running()) {
+		/* The static mesh is collected once, in BwaEngine::_ready. Nothing collects again. */
+		UtilityFunctions::push_warning(
+				"BwaAcousticGeometry: added after the engine started, so it missed the static "
+				"bake and occludes nothing. An Autoload engine (or one that outlives a scene "
+				"change) starts before this scene exists. Put the BwaEngine, or bwa_rig.tscn, in "
+				"the same scene as its geometry.");
+	}
 }
 
 void BwaAcousticGeometry::_exit_tree() {
@@ -260,8 +268,10 @@ void BwaRoomBox::_enter_tree() {
 		/* The engine collects room boxes before bwa_start because the image-source handoff
 		 * assumes the audio thread is not yet running. Arriving late is not recoverable. */
 		UtilityFunctions::push_error(
-				"BwaRoomBox: added after the engine started. The room box is load-time only - put "
-				"it in the scene alongside BwaEngine.");
+				"BwaRoomBox: added after the engine started, so it is ignored. The engine reads "
+				"the room box once, when it starts, and an Autoload engine (or one that outlives "
+				"a scene change) starts before this scene exists. Put the BwaEngine, or "
+				"bwa_rig.tscn, in the same scene as the room box.");
 	}
 }
 

@@ -111,6 +111,12 @@ See its [README](../bindings/unity/README.md) for install + plugin staging. Star
 which the Package Manager imports into your project: it is the orbiting click described above, on
 an `Engine` plus a `PushEmitter`, and it needs no audio asset.
 
+Quick start: **GameObject > BwAudio > CAVE Rig**, then move **Room Origin** to the CAVE floor
+center. The item creates the `Engine`, pre-fills its Layout File from `Assets/StreamingAssets`
+(`trims.json`, else `cave_layout.json`, else empty with a warning), binds the listener to the main
+camera, adds the Room Origin as a child, and checks Unity's built-in audio. The README lists what
+it creates. The sections below explain each part.
+
 Four core pieces:
 
 - **`Bwa`**: the P/Invoke layer, verified against the ABI (the Binding section below names the two calls it skips).
@@ -139,6 +145,9 @@ The rest of the Runtime folder:
 
 Editor side:
 
+- `CaveRig`: the **GameObject > BwAudio > CAVE Rig** menu item. `CaveRig.Create()` is the same
+  setup from a script. It is a menu item and not a prefab: a prefab in a package is read-only, so
+  a project would live in overrides of it.
 - `ProjectCheck`: warns when Unity's built-in audio is still enabled, with one-click disable.
 - `ClipDrawer`: the `[Clip]` file picker.
 - Custom inspectors for `Engine`, `Emitter` and `MaterialAsset`. They hide settings that do not
@@ -350,7 +359,7 @@ spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
 ```csharp
 using UnityEngine;
 public static class Room {
-    public static Matrix4x4 UnityToRoom = Matrix4x4.identity;  // set once from CAVE registration
+    public static Matrix4x4 UnityToRoom = Matrix4x4.identity;  // the CAVE registration; Engine.roomOrigin sets it
     public static Vector3 Pos(Vector3 v) {
         v = UnityToRoom.MultiplyPoint3x4(v);
         return new Vector3(-v.x, v.y, v.z);                    // baseline LH->RH; real map in UnityToRoom
@@ -369,6 +378,52 @@ public static class Room {
     }
 }
 ```
+
+### Register the room
+
+The layout was measured in the tracker's frame, so the scene has to say where that frame is.
+`Engine` has a **Room Origin** field for it. No code.
+
+**GameObject > BwAudio > CAVE Rig** creates the origin as a child of the `Engine` object and
+assigns it. You still place it (step 1) and turn it (step 2). By hand:
+
+1. Create an empty GameObject. Put it at the room-frame origin: the CAVE floor center, on the floor.
+2. Turn it so its forward (the blue arrow) points along the layout's +z, the room's front.
+3. Assign it to `Engine` > **Room Origin**.
+
+The listener, every source, the acoustic geometry and every gizmo are now relative to that object.
+`Engine` draws a marker at the origin: a blue arrow for room front (+z) and a red line for room
+right (-x). Face along the blue arrow. Red must be on your right.
+
+The origin must match the tracker's frame, not the wall you call the front. Motive's +z often
+points at the CAVE's back wall, and the measured layout inherits it. The symptom: the demo only
+makes sense with the camera on the opposite side. Rotate the origin 180 degrees about Y. Do not
+move the camera.
+
+What to know:
+
+- `Engine` reads the origin every frame before it pushes the listener and the sources, so a moved
+  origin takes effect on the next frame. `SpeakerView` and `RoomView` follow it.
+- A moved origin also re-bakes the static `AcousticGeometry` and pushes the `SceneSetGround` plane
+  again. The re-bake is a BVH rebuild, so do not animate the origin in a scene with static
+  geometry. The FDN decay direction is load-time and keeps the direction it had at start.
+- Keep the origin level. `SceneSetGround` uses the origin's height only, and `Engine` warns once
+  when the origin is tilted more than 1 degree.
+- Scale is ignored, the origin's own and any parent's. Room meters are Unity meters. `Engine`
+  warns once.
+- With no origin assigned, nothing changes. `Room.UnityToRoom` stays identity unless your code
+  writes it.
+- The registration belongs to the `Engine` object. Destroying the `Engine` returns
+  `Room.UnityToRoom` to identity, and so does entering Play mode, so one play session's
+  registration cannot leak into the next.
+- During play the `Engine` survives scene loads, and its registration survives with it. A new
+  scene that brings its own `Engine` with a Room Origin hands that origin to the surviving
+  `Engine`. A new scene without one keeps the previous registration: if the old origin was
+  destroyed with its scene, `Engine` warns once. Parent the origin under the `Engine` to keep it.
+
+The math: `Room.UnityToRoom` becomes the inverse of the origin's position and rotation, which takes
+a Unity world point into the origin's local frame. `Room.Pos` then applies the X mirror, once. The
+origin's forward becomes room +z and its right becomes room -x.
 
 ### Bootstrap (centralized per-frame push)
 
@@ -552,6 +607,10 @@ The binding has a headless PlayMode suite in [`bindings/unity/test~/`](../bindin
 drives the real components against the real `bw_audio.dll`, so the completion and loop feeds, the
 region and seek calls, and the bed event route are executed, not only compiled.
 
+The same ctest entry first runs a small EditMode suite (`test~/EditMode`) for the editor tooling:
+the CAVE Rig menu item's hierarchy, layout pre-fill, single-`Engine` rule and undo. It is a second
+editor launch, because `-testPlatform` takes one value. Its floor is `MIN_EDIT_TESTS` in the driver.
+
 Run it with the rest of the suite:
 
 ```
@@ -565,7 +624,7 @@ tests gate on `BWA_GODOT_EXE`. Unity is not a build dependency and CI has no edi
 
 Three choices make it work without hardware:
 
-- **PlayMode, not EditMode.** `Engine.LateUpdate` is the pump and both event drains run in it.
+- **PlayMode, not EditMode, for the components.** `Engine.LateUpdate` is the pump and both event drains run in it.
   EditMode turns no frames, so it can never report a completion.
 - **The offline sink.** The suite sets `sink = Null`, which is the shipping topology minus the
   device: a real audio thread, a real command ring, real event rings. `Manual` has no audio thread
@@ -581,6 +640,10 @@ or polls is-playing. Turning the pump back on then gives exactly one pump agains
 That is what makes "a clip shorter than a frame fires `onFinished` exactly once" decidable instead
 of a race the test happens to win.
 
+The suite runs against a copy of the package, made fresh on every run. Unity treats a package
+referenced by path as writable and deletes any `.meta` whose asset is missing, which includes the
+`.meta` of every native library this machine did not build.
+
 The folder is named `test~` because Unity ignores any folder whose name ends in `~`. Drop the suffix
 and the package carries a second copy of the test assembly into every project that references it,
 which is a duplicate assembly name and a compile error.
@@ -591,7 +654,8 @@ which is a duplicate assembly name and a compile error.
   globals persist. `bwa_create` must not assume zeroed global state, and `bwa_destroy`
   must fully tidy up. Otherwise you get "fine on first Play, crashes on second."
   If Domain Reload is disabled for fast enter-play, C# statics persist too. Guard
-  the `Instance` re-init.
+  the `Instance` re-init. `Room.UnityToRoom` is one of those statics: it resets to identity
+  on every entry into Play mode, and `Engine` sets it again from **Room Origin**.
 - **Bypass `AudioClip`.** The core loads wav itself. Hand it `StreamingAssets`
   paths (real files on desktop builds) and keep audio assets out of Unity's
   import pipeline.
@@ -660,6 +724,51 @@ a Developer ID signature and notarization, which nothing here does yet.
 traps. This section carries only what belongs in the cross-engine comparison. Start with
 [`demo/minimal.tscn`](../bindings/godot/demo/minimal.tscn), the orbiting click on a `BwaEngine`
 plus a `BwaEmitter`.
+
+### Quick start on the CAVE
+
+Drag `addons/bw_audio/bwa_rig.tscn` into your scene. Move its `RoomOrigin` child to the CAVE
+floor center. Rotate it 180 degrees about Y if the layout's front is the CAVE's back wall.
+
+Then set two properties on the rig: **Layout Path**, to the `trims.json` or `cave_layout.json`
+you copied into the project, and **Listener**, to your camera. Turn **Feed Listener** off
+instead to let the engine read the tracker. To reach `RoomOrigin` on an instanced rig,
+right-click the rig and turn on Editable Children.
+
+What you get:
+
+- The rig is a `BwaEngine` on the Cave profile, with a `RoomOrigin` Node3D child and
+  `room_origin` pointing at it. It is the Godot counterpart of Unity's
+  `GameObject > BwAudio > CAVE Rig`. A scene under `addons/` is an ordinary project file, so it
+  needs no menu item and no editor plugin.
+- `room_origin` is the counterpart of Unity's `Engine.roomOrigin`. `BwaEngine` sets
+  `registration` to the inverse of the origin's global transform, with scale removed. The
+  origin's local axes become the room axes: its blue arrow (+Z) is the layout's front and its
+  red arrow (+X) is the layout's +x, the room's left. There is no mirror and no facing flip.
+  Godot's -Z forward is a facing convention, and the origin is a frame.
+- With the origin at `(2, 0, 1)`, a source at `(5, 0.5, 3)` is at room `(3, 0.5, 2)`. Yaw the
+  origin +90 degrees and it is at `(-2, 0.5, 3)`. Yaw it 180 degrees and it is at
+  `(-3, 0.5, -2)`. The `godot_rig` ctest pins the last two.
+- `BwaEngine` compares the origin once per frame and recomputes only when it moved.
+  `BwaSpeakerView` follows. Static acoustic geometry, the room box and the ground plane are
+  baked at start, and `set_extra_listeners` and the FDN decay direction are converted when
+  called. None of them follow a later registration change: the engine warns once and
+  `is_registration_stale()` reads true. This differs from Unity, which re-bakes.
+- Scale is ignored, and a tilt past 1 degree is reported. A mirrored origin (a negative scale)
+  is refused, and the registration keeps its last value. Each warns once at run time and shows
+  on the node's warning marker in the editor. An array profile with no layout path shows there
+  too.
+- With `room_origin` empty, nothing changes. `registration` stays identity until code sets it.
+
+Put the rig in each scene that makes sound, or in a main scene that swaps child scenes under
+it. The engine reads the room box and the static geometry once, when it starts, so it must
+start with the scene that holds them. An Autoload rig (Project Settings > Globals) starts
+before any scene, so use one only for content with no `BwaRoomBox` and no static
+`BwaAcousticGeometry`. Only one `BwaEngine` runs: a second one is refused, logs an error and
+stays inert, and the first keeps its layout and room origin. Unity hands a new scene's origin
+to the surviving `Engine`. Godot does not.
+
+### The binding
 
 No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as a method
 on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPushSource`,

@@ -84,6 +84,7 @@ struct SesInputs {
     std::string mount_offset;            /* "ring", "x,y,z", or empty (0: the pivot is the center) */
     std::string temp;                    /* --temp, empty = the layout's or 20 C */
     std::string localize_rows, grid_rows;
+    std::string localize_exclude;        /* --exclude for localize ("3,14"): speakers never swept or solved */
     std::string frame_speakers;          /* simulate: --sim-speakers for the frame check, empty = the tool's 4 */
     double      baffle_offset_m = 0.0;   /* the frame check's --baffle-offset-m: layout positions are acoustic
                                           * centers, the markers sit on the baffle this far in front of them */
@@ -103,6 +104,12 @@ struct Session {
     /* Not saved. The next localize run starts over where it would resume (ses_localize_resume); ses_begin
      * clears it, so it is a choice about one run. */
     bool        localize_start_over = false;
+    /* Not saved either. The rows the next localize run measures again (--retake): bit k is row k + 1.
+     * ses_begin clears it too. */
+    unsigned long long localize_retake = 0;
+    /* Not saved: a test hook. Simulate: the tracked tools wait for the scripted stand and for Send Enter the
+     * way a rig run does (bwa_calibrate --track-sim-rig-wait <this marker> --place-wait-enter). */
+    std::string sim_rig_wait;
     int         next_run = 1;
     SesInputs   in;
     SesStep     step[SES_NSTEPS];
@@ -122,6 +129,9 @@ std::string ses_hash_file(const std::string& path);   /* FNV-1a 64 as 16 hex dig
 std::string ses_abs(const std::string& path);         /* absolute, from the current directory; "" stays "" */
 std::string ses_join(const std::string& folder, const std::string& name);
 bool        ses_file_exists(const std::string& path);
+/* Paths here are UTF-8, so the tab never hands one to a Win32 *A call: these go through the wide ones. */
+bool        ses_make_dir(const std::string& path);    /* true when it is there afterwards */
+void        ses_delete_file(const std::string& path);
 
 /* The session file: <folder>/session.json, written whole through a temp file and a rename. */
 bool ses_save(const Session& S, std::string* err);
@@ -139,10 +149,33 @@ std::string ses_stale(const Session& S, int k);
  *                        unless S.localize_start_over.
  *   SES_RESUME_MISMATCH  some rows, but simulated ones under a rig session or the reverse (or another
  *                        file version): the next run starts over, and why says which.
+ * A changed exclude list is no mismatch: see ses_localize_reincluded.
  * done, rows and why may be NULL. The file is parsed once per change, not per call. */
 #define SES_LOCALIZE_RANGES "as_built.ranges.json"
 enum SesResume { SES_RESUME_NONE, SES_RESUME_OK, SES_RESUME_MISMATCH };
 SesResume ses_localize_resume(const Session& S, int* done, int* rows, std::string* why);
+/* The same file's captures, for the tab's grid: have[s * K + k] is speaker s at row k (0-based), row_done[k]
+ * says the row was measured. NULL when there is no file this build can read. The pointer is to the one
+ * cached copy, parsed again only when the file changed. It opens the file, so never call it while a tool
+ * runs: a held handle blocks the tool's rename. */
+struct SesLocGrid { int n = 0, K = 0; std::vector<unsigned char> have, row_done; };
+const SesLocGrid* ses_localize_grid(const Session& S);
+/* One cell as text: '+' captured, '!' a gap (measured, no capture), '-' the speaker is excluded, '.' the row
+ * is not measured yet. excl holds G.n flags (the exclude input, parsed). */
+char ses_grid_mark(const SesLocGrid& G, const unsigned char* excl, int s, int k, const unsigned char* was = NULL);
+/* The speakers the last localize record left out and the exclude input no longer does, as a list ("6",
+ * "3,14"; "" = none), and their flags into was (BWA_MAX_CHANNELS entries, may be NULL). The kept rows hold
+ * no capture of them, so they are not solved until 5 rows are measured again: ses_grid_mark shows their
+ * empty cells as not measured rather than as gaps, and the tab names them. Adding speakers to the list
+ * needs nothing: their captures stay in the file and every solve leaves them out. */
+std::string ses_localize_reincluded(const Session& S, unsigned char* was = NULL);
+/* The grid in one line: rows kept, captures, gaps, and the speakers a solve would leave out (under 5
+ * captures; an excluded speaker is not listed). */
+std::string ses_grid_summary(const SesLocGrid& G, const unsigned char* excl);
+/* How many rows the file holds when the next run can retake some (--ranges-in + --retake): the file is
+ * this build's version and its simulate flag is the session's. 0 = it cannot, and why (may be NULL) says
+ * which. */
+int ses_localize_retake_rows(const Session& S, std::string* why = NULL);
 /* The command line for a subprocess step, and the files it will consume. false + why = refused. */
 bool ses_command(const Session& S, int k, const SesTools& T, std::string* cmd, std::vector<SesFile>* consumed,
                  std::string* why);
