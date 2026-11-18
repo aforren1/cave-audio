@@ -34,20 +34,28 @@ namespace BwAudio
         int _colorId = -1;
         GameObject _root;
         bool _warned;
+        int _roomRev;
 
         // OnEnable, not Start: Start runs once per component lifetime, so toggling the view off and back
         // on would tear the boxes down and never rebuild them (the same reason SpeakerView does this).
         void OnEnable() => Rebuild();
         void OnDisable() => Teardown();
 
+        // The vertices bake the registration, so a change made through Engine.roomOrigin rebuilds them.
+        // LateUpdate, after the Engine's (order -100) has applied this frame's origin. An origin that
+        // moves every frame rebuilds every frame, which allocates: fine for a re-registration, not for
+        // a rig that never stops moving.
+        void LateUpdate() { if (_roomRev != Room.Revision) Rebuild(); }
+
         /// <summary>
-        /// Rebuild the boxes. Call this after changing `Room.UnityToRoom` or the constraints file: the
-        /// vertices bake the room-to-Unity transform at build time, so a later registration change does
-        /// not move them by itself.
+        /// Rebuild the boxes. Call this after writing `Room.UnityToRoom` yourself or changing the
+        /// constraints file: the vertices bake the room-to-Unity transform at build time. A change made
+        /// through `Engine.roomOrigin` rebuilds by itself.
         /// </summary>
         public void Rebuild()
         {
             Teardown();
+            _roomRev = Room.Revision;
             if (_rc == null) _rc = GetComponent<RoomConstraints>();
             var data = _rc.Constraints;                       // parses on first access
             if (data == null)

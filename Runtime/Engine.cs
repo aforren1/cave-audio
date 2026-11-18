@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -11,6 +11,7 @@ using UnityEngine.SceneManagement;
 namespace BwAudio
 {
     [DefaultExecutionOrder(-100)]
+    [DisallowMultipleComponent]   // one native engine per object; the singleton check covers the rest
     public sealed class Engine : MonoBehaviour
     {
         public static Engine Instance { get; private set; }
@@ -50,6 +51,16 @@ namespace BwAudio
 
         /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>
         public string asioDriver { get { return device; } set { device = value; } }
+
+        [Header("Room registration")]
+        [Tooltip("Where the physical room sits in this scene. Put an empty GameObject at the room-frame " +
+                 "origin (the CAVE floor center) with its forward (blue, +Z) along the layout's +Z, and " +
+                 "assign it. The listener, every source, the geometry and the gizmos are then relative " +
+                 "to it. It must match the tracker's frame, because the layout was measured there: if " +
+                 "the layout's +Z points at the back wall, yaw the origin 180 degrees. Followed every " +
+                 "frame. Its scale is ignored. Empty = Room.UnityToRoom is left alone (identity unless " +
+                 "your code sets it).")]
+        public Transform roomOrigin;
 
         [Header("Listener")]
         [Tooltip("The tracked head: your OptiTrack rigid body, or the XR camera at a desk. Required " +
@@ -233,11 +244,22 @@ namespace BwAudio
         readonly Dictionary<MaterialAsset, uint> _matCache = new();
         readonly Dictionary<BwaMaterialPreset, uint> _presetCache = new();
         bool _rebakeStatic;      // a scene loaded/unloaded: re-collect static AcousticGeometry next LateUpdate
+        bool _staticHasGeometry; // the static mesh holds AcousticGeometry, which bakes the registration (the box does not)
         bool _hasStaticMesh;     // whether a non-empty static mesh is currently pushed (so we know to clear it)
 
         void Awake()
         {
-            if (Instance != null) { Destroy(gameObject); return; }   // a working manager already owns the engine
+            if (Instance != null)                                    // a working manager already owns the engine
+            {
+                // This scene brought its own Engine, and its origin says where the room is in THIS
+                // scene. The survivor came from another scene and would keep that scene's registration.
+                if (roomOrigin) Instance.AdoptRoomOrigin(roomOrigin, transform);
+                Destroy(gameObject); return;
+            }
+
+            // Before anything reads the seam: the FDN decay direction and the static geometry bake
+            // below both go through Room.
+            ApplyRoomOrigin();
 
             // ABI guard, before any struct crosses the boundary: a stale staged bw_audio.dll after an
             // ABI break runs with mismatched enums/struct layouts — silent corruption, not a crash. The
@@ -486,6 +508,7 @@ namespace BwAudio
         void OnValidate()
         {
             _layoutXyzFrom = null;                                       // re-read the layout for the gizmos
+            ApplyRoomOrigin();                                           // assigned, swapped or cleared in the Inspector
             if (Application.isPlaying && Ready) ApplyLiveSettings();
         }
 
@@ -1065,9 +1088,12 @@ namespace BwAudio
         public void SceneSetGround(float worldY, MaterialAsset material = null, bool pressureRelease = false)
         {
             if (!Ready) return;
-            float roomY = Room.Pos(new Vector3(0f, worldY, 0f)).y;   // registration offset applies to heights too
-            Bwa.bwa_scene_set_ground(_eng, roomY, ResolveMaterial(material), pressureRelease);
+            // Kept so a moved Room Origin can push the plane again (OnRegistrationChanged).
+            _groundSet = true; _groundWorldY = worldY; _groundMaterial = material; _groundPressureRelease = pressureRelease;
+            // The origin's HEIGHT only: a level plane has no single room height under a tilted registration.
+            Bwa.bwa_scene_set_ground(_eng, Room.Height(worldY), ResolveMaterial(material), pressureRelease);
         }
+        bool _groundSet, _groundPressureRelease; float _groundWorldY; MaterialAsset _groundMaterial;
 
         /// <summary>Flag room-box faces whose image-source reflection inverts (pressure-release: the
         /// physics of reflecting off a much softer medium). Bit f = face f in the box order
@@ -1117,6 +1143,7 @@ namespace BwAudio
                     if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
                     AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, ResolveMaterial(g.material));
                 }
+            _staticHasGeometry = geos != null && geos.Length > 0;
             if (tris.Count == 0) { ClearStaticMesh(); return; }
             Bwa.bwa_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
             _hasStaticMesh = true;
@@ -1239,8 +1266,115 @@ namespace BwAudio
                 _bedsByHandle.Remove(b.NativeHandle);
         }
 
+        // ---- room registration ----------------------------------------------------------------------
+        //
+        // Room.UnityToRoom is a static, and this Engine is its owner while roomOrigin is set. Lifetime:
+        //   - applied in Awake, every LateUpdate before the push, and from OnValidate / OnDrawGizmos in
+        //     the stopped editor;
+        //   - held while this object lives, a disabled Engine included (it still owns the native engine
+        //     and its sources);
+        //   - released to identity in OnDestroy. Room clears it by itself when the owner is gone without
+        //     one (a closed edit-mode scene) and on every entry into Play mode.
+        // An origin that goes away DURING play keeps the last registration: the Engine is
+        // DontDestroyOnLoad and the origin usually is not, and a scene load must not turn the room
+        // around mid-session.
+        // Known limit, stopped editor only: two Engines with different origins both write the one
+        // static as they draw, so the last one drawn wins. Play mode has one Engine.
+        bool _originHeld, _originLostWarned, _originScaleWarned, _originTiltWarned, _fdnDirectionWarned;
+        Transform _originSeen;   // the origin the warnings above were armed for
+
+        bool ApplyRoomOrigin()
+        {
+            // A duplicate Engine that Awake is about to destroy must not take the registration.
+            if (Application.isPlaying && Instance != null && Instance != this) return false;
+            bool changed;
+            if (roomOrigin)
+            {
+                bool fresh = !ReferenceEquals(roomOrigin, _originSeen);
+                if (fresh)                                   // a new origin gets its own warnings
+                {
+                    _originSeen = roomOrigin;
+                    _originLostWarned = _originScaleWarned = _originTiltWarned = false;
+                }
+                _originHeld = Application.isPlaying;
+                changed = Room.SetOrigin(roomOrigin, this);
+                // Only when the pose moved, not every frame. A scale edited by itself moves nothing
+                // (scale is not in the registration), so it is caught at the next move.
+                if (changed || fresh) CheckOriginShape();
+            }
+            else if (_originHeld)
+            {
+                if (!_originLostWarned)
+                {
+                    _originLostWarned = true;
+                    Debug.LogWarning("[bw_audio] Room Origin is gone (destroyed with its scene, or " +
+                                     "cleared). Keeping the last registration until a new origin is " +
+                                     "assigned. Parent the origin under the Engine to keep it across " +
+                                     "scene loads, or call Room.ReleaseOrigin(engine) to go back to " +
+                                     "identity.", this);
+                }
+                return false;
+            }
+            else
+            {
+                _originSeen = null;
+                changed = Room.ReleaseOrigin(this);
+            }
+            if (changed && Application.isPlaying && Ready) OnRegistrationChanged();
+            return changed;
+        }
+
+        void CheckOriginShape()
+        {
+            if (!_originScaleWarned && (roomOrigin.lossyScale - Vector3.one).sqrMagnitude > 1e-6f)
+            {
+                _originScaleWarned = true;
+                Debug.LogWarning("[bw_audio] Room Origin '" + roomOrigin.name + "' has a scale of " +
+                                 roomOrigin.lossyScale + " (its own or a parent's). The scale is " +
+                                 "ignored: room meters are Unity meters.", this);
+            }
+            float tilt = Vector3.Angle(roomOrigin.up, Vector3.up);
+            if (!_originTiltWarned && tilt > 1f)
+            {
+                _originTiltWarned = true;
+                Debug.LogWarning("[bw_audio] Room Origin '" + roomOrigin.name + "' is tilted " +
+                                 tilt.ToString("F1") + " degrees from level. A CAVE floor origin " +
+                                 "should be level. Positions and directions follow the tilt, but " +
+                                 "SceneSetGround uses the origin's height only.", this);
+            }
+        }
+
+        // The registration moved while the engine runs. Positions follow by themselves (they are pushed
+        // every frame); these are the things that BAKED the old one. Not the room box: it is authored
+        // in room meters. Runs only on a change, so a still origin costs nothing.
+        void OnRegistrationChanged()
+        {
+            if (_staticHasGeometry) _rebakeStatic = true;    // static AcousticGeometry: one BVH rebuild, this LateUpdate
+            if (_groundSet)
+                Bwa.bwa_scene_set_ground(_eng, Room.Height(_groundWorldY), ResolveMaterial(_groundMaterial),
+                                         _groundPressureRelease);
+            // The FDN's decay direction rides bwa_fdn_config, which is load-time: the ABI has no live call.
+            if (enableFdnReverb && fdnDecayDirection != Vector3.zero && !_fdnDirectionWarned)
+            {
+                _fdnDirectionWarned = true;
+                Debug.LogWarning("[bw_audio] Room Origin moved after start. The FDN decay direction is " +
+                                 "load-time and keeps the room direction it had at start.", this);
+            }
+        }
+
+        // A second scene's Engine found this one alive and is about to destroy itself. Its origin is
+        // the room's place in the scene that just loaded, so take it.
+        void AdoptRoomOrigin(Transform origin, Transform dying)
+        {
+            // An origin parented under the dying Engine would die with it one frame later.
+            if (origin != dying && origin.IsChildOf(dying)) origin.SetParent(transform, worldPositionStays: true);
+            roomOrigin = origin;
+            ApplyRoomOrigin();
+        }
+
         void LateUpdate()
         {
+            ApplyRoomOrigin();   // before the Ready check: a failed engine still draws its gizmos in the right place
             if (!Ready) return;
             RefreshClock();   // keep the wall↔dsp offset estimator warm even when no helper ran this frame
             if (_rebakeStatic)   // a scene loaded/unloaded since last frame -> re-collect static geometry once
@@ -1417,9 +1551,12 @@ namespace BwAudio
         // possible check on the one setting that silently ruins spatial audio.
         void OnDrawGizmos()
         {
+            // Stopped, nothing else follows a moved origin (OnValidate fires on Inspector edits only).
+            if (!Application.isPlaying) ApplyRoomOrigin();
             var prev = Gizmos.matrix;
             Gizmos.matrix = Room.RoomToUnityMatrix();
 
+            if (roomOrigin) DrawRoomAxes();
             if (enableRoomBox)
             {
                 Gizmos.color = new Color(1f, 0.9f, 0.3f, 0.9f);
@@ -1429,6 +1566,29 @@ namespace BwAudio
             if (showSpeakers) DrawSpeakers();
 
             Gizmos.matrix = prev;
+        }
+
+        // The room frame at its origin, in room meters: blue = the layout's +z, red = room-right, which
+        // is -x. Blue must point at whatever wall the LAYOUT calls front. That can be the CAVE's back
+        // wall (Motive's +z often is). Red on the left when you face along blue would be a mirror, which
+        // this registration cannot produce.
+        void DrawRoomAxes()
+        {
+            const float len = 0.6f, y = 0.02f, head = 0.08f;   // lifted off the floor so a ground plane does not hide it
+            var o     = new Vector3(0f, y, 0f);
+            var front = new Vector3(0f, y, len);
+            var right = new Vector3(-len * 0.6f, y, 0f);
+            Gizmos.color = new Color(0.25f, 0.5f, 1f, 1f);
+            Gizmos.DrawLine(o, front);
+            Gizmos.DrawLine(front, front + new Vector3( head * 0.5f, 0f, -head));
+            Gizmos.DrawLine(front, front + new Vector3(-head * 0.5f, 0f, -head));
+            Gizmos.color = new Color(1f, 0.3f, 0.3f, 1f);
+            Gizmos.DrawLine(o, right);
+            Gizmos.DrawSphere(right, 0.02f);
+#if UNITY_EDITOR
+            UnityEditor.Handles.Label(Room.FromRoom(front), "room front (+z)");
+            UnityEditor.Handles.Label(Room.FromRoom(right), "room right (-x)");
+#endif
         }
 
         // Stopped: the layout FILE (the geometry you authored). Running: the ENGINE's own readback, which
@@ -1511,6 +1671,7 @@ namespace BwAudio
                 SceneManager.sceneLoaded   -= OnSceneChanged;
                 SceneManager.sceneUnloaded -= OnSceneChanged;
             }
+            Room.ReleaseOrigin(this);   // no-op unless this Engine holds the registration
             if (!Ready) return;
             Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
             if (Instance == this) Instance = null;

@@ -92,14 +92,14 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime`, `Editor` and `Samples~` only, and
 Unity itself ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Assets under StreamingAssets
 
@@ -145,8 +145,9 @@ A layout you named but that failed to load never gets that far: `bwa_start` refu
 run with no layout path set at all.
 
 Every gizmo goes through `Room.RoomToUnityMatrix()`, the inverse of the coordinate seam. So if the
-array and the room land somewhere unexpected in the scene, your `Room.UnityToRoom` registration is
-wrong. That is the cheapest possible check on the one setting that silently ruins spatial audio.
+array and the room land somewhere unexpected in the scene, your registration (`Engine`'s Room
+Origin) is wrong. That is the cheapest possible check on the one setting that silently ruins
+spatial audio.
 
 ### Watching the array from inside the CAVE
 
@@ -166,9 +167,9 @@ and confirm the speaker that lights up is the one that makes noise.
 
 To see the room itself in a build, add **`RoomView`** beside `RoomConstraints`. It draws the
 truss, screens and projectors as unlit wireframes and follows the same show toggles. It does not
-need an engine, so it still draws when the engine fails to start. Call `RoomView.Rebuild()` after
-you change `Room.UnityToRoom`, because `RoomView` bakes the transform into the boxes when it builds
-them.
+need an engine, so it still draws when the engine fails to start. It follows `Engine`'s Room Origin.
+Call `RoomView.Rebuild()` after you write `Room.UnityToRoom` yourself, because `RoomView` bakes the
+transform into the boxes when it builds them.
 
 > **While the Unity Editor is open it holds `bw_audio.dll` loaded**, so the file is locked. A CMake
 > rebuild will fail its POST_BUILD copy into `Runtime/Plugins/x86_64/`, and so will `pack.ps1`. Close
@@ -191,7 +192,29 @@ Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit 
 sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
 `Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
 Every other binding of this engine ships the same demo, which makes them comparable by ear (see
-`https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/integration.md`, "The minimal example").
+`https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md`, "The minimal example").
+
+Then set up your scene in one step: **GameObject > BwAudio > CAVE Rig**, then move **Room Origin**
+to the CAVE floor center. The same item is in the Hierarchy's right-click menu. It creates:
+
+- **`BwAudio`**, with `Engine`. Layout File is `trims.json` if the top of `Assets/StreamingAssets`
+  has one, else `cave_layout.json`. Subfolders are not searched. With neither, it is empty: the
+  built-in default grid runs, and the console says so. Listener is the main camera of the scene
+  the rig is in. With no camera tagged `MainCamera` there, it is left empty with a warning: Unity
+  does not save a reference to a camera in another scene.
+- **`Room Origin`**, a child, assigned to `Engine` > Room Origin. It starts at the world origin and
+  faces +z. Move it to the floor center. Rotate it 180 degrees about Y if the layout's front is the
+  CAVE's back wall. It is a child so that it survives scene loads with the `Engine`.
+- **`Speaker View`**, a child with `SpeakerView`. The component is off. Turn it on to see the array
+  in a build.
+- **`Room`**, a child with `RoomConstraints` and `RoomView`, only when `constraints.json` exists.
+  `RoomView` is off for the same reason.
+
+The item then checks Unity's built-in audio and offers to disable it. A scene that already has an
+`Engine` gets nothing new: the item selects the existing one and logs why. The item is off in Play
+mode and refuses while a prefab is open for editing. One undo removes the rig. From a script, call `BwAudio.EditorTools.CaveRig.Create()`.
+
+The manual steps, which are what the item does:
 
 1. Add **`Engine`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,
    the `listener` transform (your OptiTrack head rigid body or XR camera), and - optionally -
@@ -316,8 +339,13 @@ Reference one asset from many objects; it's minted once. No material = the engin
 The engine works in **room space: right-handed, +Y up, +Z forward** (Motive's default streamed frame);
 Unity is left-handed, +Y up, +Z forward. Up and forward agree, so the baseline conversion is a
 single X mirror (`Room` does it in one place - Unity identity rotation maps to room identity).
-Set `Room.UnityToRoom` once from your CAVE registration (the rigid transform mapping Unity world →
-the physical room origin/axes). **Getting this wrong silently swaps front/back or left/right.**
+**Register the room** with `Engine` > **Room Origin**: put an empty GameObject at the CAVE floor
+center, turn its forward (blue arrow) along the layout's +z, and assign it. `Engine` then keeps
+`Room.UnityToRoom` set from it every frame and draws the room's front and right at the origin. The
+layout was measured in the tracker's frame, so match that frame: if the layout's +z is the back
+wall, rotate the origin 180 degrees about Y. With no origin assigned, `Room.UnityToRoom` stays
+identity unless your code writes it. **Getting this wrong silently swaps front/back or left/right.**
+See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md#register-the-room).
 
 ## Threading and lifecycle notes
 
@@ -377,7 +405,7 @@ zero count proves nothing.
 ### Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -398,7 +426,7 @@ release. On a tag it also creates the Release with the stamped version.
 
 **Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
 Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
-and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/3731dd636087/docs/build.md#continuous-integration) for the
+and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md#continuous-integration) for the
 rest.
 
 Locally:
