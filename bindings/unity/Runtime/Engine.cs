@@ -3,10 +3,10 @@
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
 // components, so per-emitter pushes could commit a half-moved frame). See docs/integration.md.
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace BwAudio
 {
@@ -15,6 +15,38 @@ namespace BwAudio
     public sealed class Engine : MonoBehaviour
     {
         public static Engine Instance { get; private set; }
+
+        [Header("Cluster")]
+        [Tooltip("Whether this process opens the audio device. Off: the Engine applies Room Origin and " +
+                 "does nothing else. It creates no native engine, opens no device, and every BwAudio " +
+                 "component is a silent no-op. In a cluster, set Engine.OwnsAudioPredicate from your " +
+                 "cluster toolkit instead and leave this on. Read once, in Awake.")]
+        public bool ownsAudio = true;
+
+        /// <summary>A process-wide answer to "does this process own the audio device", for a cluster
+        /// where every node runs the same scene and exactly one may open the device. Set it before the
+        /// scene loads, for example from a
+        /// <c>[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]</c> method
+        /// that asks the cluster toolkit whether this node is the server. Null means own audio.
+        /// <para>Engine.Awake (execution order -100) calls it ONCE, so the toolkit must know the
+        /// node's role by then, and the answer cannot change for that Engine's lifetime. An Engine owns
+        /// audio only when both this and <see cref="ownsAudio"/> say so. A predicate that throws is
+        /// logged and read as false. It is cleared on every entry into Play mode.</para></summary>
+        public static Func<bool> OwnsAudioPredicate;
+
+        // With Domain Reload off, statics survive into the next Play session; a predicate captured
+        // from the last one must not decide this one. Runs before BeforeSceneLoad, where it is set.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void ResetOnPlay() { OwnsAudioPredicate = null; ComponentWaitFrames = 0; }
+
+        /// <summary>Frames that BwAudio components have spent waiting for an Engine, summed over all of
+        /// them. It rises while components exist and no Engine has finished Awake. It stays flat on a
+        /// node that does not own audio, because nothing waits there. A diagnostic.</summary>
+        public static long ComponentWaitFrames { get; private set; }
+
+        /// <summary>The ownership decision Awake made. False on a node that leaves the device to
+        /// another node: <see cref="Ready"/> stays false, and Room Origin still applies.</summary>
+        public bool OwnsAudio { get; private set; }
 
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
@@ -243,7 +275,7 @@ namespace BwAudio
         // objects that survive scene unloads), unlike the old per-SetupScene-call cache.
         readonly Dictionary<MaterialAsset, uint> _matCache = new();
         readonly Dictionary<BwaMaterialPreset, uint> _presetCache = new();
-        bool _rebakeStatic;      // a scene loaded/unloaded: re-collect static AcousticGeometry next LateUpdate
+        bool _rebakeStatic;      // static AcousticGeometry changed: re-collect it in the next LateUpdate
         bool _staticHasGeometry; // the static mesh holds AcousticGeometry, which bakes the registration (the box does not)
         bool _hasStaticMesh;     // whether a non-empty static mesh is currently pushed (so we know to clear it)
 
@@ -258,8 +290,18 @@ namespace BwAudio
             }
 
             // Before anything reads the seam: the FDN decay direction and the static geometry bake
-            // below both go through Room.
+            // below both go through Room. Before the ownership check too: every node of a cluster
+            // draws with Room.FromRoom, so the registration must not depend on who owns audio.
             ApplyRoomOrigin();
+
+            OwnsAudio = ownsAudio && AskOwnsAudio();
+            if (!OwnsAudio)
+            {
+                Claim();
+                Debug.Log("[bw_audio] this process does not own audio: no device opened, no native " +
+                          "engine. Room Origin still applies.");
+                return;
+            }
 
             // ABI guard, before any struct crosses the boundary: a stale staged bw_audio.dll after an
             // ABI break runs with mismatched enums/struct layouts — silent corruption, not a crash. The
@@ -272,7 +314,7 @@ namespace BwAudio
                                Bwa.VersionString(dllVersion) + ", this binding was built against " +
                                Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start — restage " +
                                "the DLL or update the package so they match.");
-                return;                                              // Instance NOT claimed
+                Claim(); return;
             }
 
             // Struct-layout guard, same class of failure as the version check above and the one struct
@@ -287,14 +329,14 @@ namespace BwAudio
                                Bwa.SourcePreset(BwaSourceKind.Default).structSize + " bytes, the binding " +
                                "marshals " + descSize + ". Refusing to start — restage the DLL or update " +
                                "the package so they match.");
-                return;                                              // Instance NOT claimed
+                Claim(); return;
             }
 
             // Empty maps to layout_path = NULL, the ABI's only way to run the default grid, exactly
             // like asioDriver below. Path.Combine of an empty string would yield the StreamingAssets
             // DIRECTORY: still an explicit path, which fails to load and then fails bwa_start
             // (BWA_ERR_LAYOUT), leaving the default grid unreachable.
-            string layoutFull = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null;
+            string layoutFull = layoutFile.Length > 0 ? AssetPath(layoutFile) : null;
             // Binaural drives no speakers: the layout only places the virtual speakers the diffuse
             // bed decodes through, and the default grid serves that fine. The refusal exists so the
             // ARRAY never pans over the wrong room, so a desk scene on the default profile must not
@@ -318,7 +360,7 @@ namespace BwAudio
                 bedDecoder = bedDecoder,
             };
             _eng = Bwa.bwa_create(in cfg);
-            if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); return; }   // Instance NOT claimed
+            if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); Claim(); return; }
 
             // The layout resolves inside bwa_create, so the channel count is known before start — and it is
             // the LAYOUT's speaker count, not a constant. A failed EXPLICIT load leaves bwa_create usable
@@ -340,7 +382,7 @@ namespace BwAudio
             if (Bwa.bwa_start(_eng) != BwaResult.Ok)
             {
                 Debug.LogError("[bw_audio] bwa_start failed: " + Bwa.LastError(_eng));
-                Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero; return;     // Instance NOT claimed -> another manager can try
+                Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero; Claim(); return;
             }
 
             // Internal tracking: connect the engine to the NatNet stream itself (runtime call — no env
@@ -358,12 +400,9 @@ namespace BwAudio
                                    "pose): " + Bwa.LastError(_eng));
             }
 
-            // Only claim the singleton once we have a live engine, so a failed init leaves Instance free.
-            Instance = this; DontDestroyOnLoad(gameObject);
-            // Follow Unity's loaded scenes: re-bake the static acoustic geometry when one loads/unloads, so
-            // the persistent engine's scene tracks the (possibly additive) game scenes on top of it.
-            SceneManager.sceneLoaded   += OnSceneChanged;
-            SceneManager.sceneUnloaded += OnSceneChanged;
+            // Static geometry follows scene loads by itself: AcousticGeometry reports its own enable
+            // and disable (StaticGeometryChanged), and a scene load or unload is exactly that.
+            Claim();
             Debug.Log($"[bw_audio] started, backend={Bwa.Backend(_eng)}, channels={_channels}");
 
             // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
@@ -372,6 +411,24 @@ namespace BwAudio
                 Debug.LogWarning("[bw_audio] 'Feed Listener' is on but no listener Transform is assigned — " +
                                  "the listener will never move from the array centroid. Assign the tracked " +
                                  "head (or turn Feed Listener off to let the engine read NatNet itself).");
+        }
+
+        // Every way out of Awake claims the singleton: started, not owning audio, or failed. All three
+        // keep applying Room Origin and survive scene loads, so the nodes of a cluster never disagree
+        // on the room, and a component finding an Engine that is not Ready knows none is coming
+        // (ForComponent). A failed start therefore leaves no room for a second Engine to try.
+        void Claim() { Instance = this; DontDestroyOnLoad(gameObject); }
+
+        bool AskOwnsAudio()
+        {
+            if (OwnsAudioPredicate == null) return true;
+            try { return OwnsAudioPredicate(); }
+            catch (Exception ex)
+            {
+                Debug.LogError("[bw_audio] Engine.OwnsAudioPredicate threw, so this process does not own " +
+                               "audio: " + ex.GetType().Name + ": " + ex.Message, this);
+                return false;
+            }
         }
 
         // Everything the engine wants set BEFORE bwa_start (the reverb beds — the bed decoder and pathing
@@ -512,6 +569,14 @@ namespace BwAudio
             if (Application.isPlaying && Ready) ApplyLiveSettings();
         }
 
+        /// <summary>Where the engine reads a clip or layout path from. A relative path is relative to
+        /// StreamingAssets. An ABSOLUTE path is used as it is: write a generated clip to
+        /// <c>Application.temporaryCachePath</c> and pass its full path to any clip field or load
+        /// call. That is a contract, not an accident of Path.Combine. For audio you generate
+        /// continuously, use <see cref="PushEmitter"/>: there is no load from memory.</summary>
+        public static string AssetPath(string clip)
+            => Path.IsPathRooted(clip) ? clip : Path.Combine(Application.streamingAssetsPath, clip);
+
         /// <summary>Load a clip through the engine's shared asset cache. `flags` picks the loader, and the
         /// cache key is (path, flags): the same clip with the same flags always returns the same handle,
         /// and the same clip with DIFFERENT flags is a different asset (a file held in RAM and the same
@@ -526,7 +591,7 @@ namespace BwAudio
             if (!Ready || string.IsNullOrEmpty(clip)) return 0;
             var key = (uint)flags + "|" + clip;
             if (_loadFailed.Contains(key)) return 0;          // already logged; don't re-hit the disk
-            uint s = Bwa.bwa_sound_acquire(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags);
+            uint s = Bwa.bwa_sound_acquire(_eng, AssetPath(clip), flags);
             if (s == 0)
             {
                 _loadFailed.Add(key);
@@ -549,7 +614,7 @@ namespace BwAudio
             if (!Ready || string.IsNullOrEmpty(clip)) return 0;
             var key = (uint)flags + "|" + clip;
             if (_loadFailed.Contains(key)) return 0;
-            uint s = Bwa.bwa_sound_acquire_async(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags);
+            uint s = Bwa.bwa_sound_acquire_async(_eng, AssetPath(clip), flags);
             if (s == 0)
             {
                 _loadFailed.Add(key);
@@ -596,6 +661,31 @@ namespace BwAudio
             return 0;
         }
 
+        // ---- the one waiting rule for components that need the native engine ------------------------
+        //
+        // SourceBase, AmbisonicBed and DynamicAcousticGeometry all wait the same way, so a component
+        // that comes up before the Engine (init order, a runtime spawn, a scene loaded first) catches
+        // up instead of switching itself off, and one on a node that does not own audio stops asking.
+
+        /// <summary>The Engine a component may create native objects under, or null. `wait` is true
+        /// while one may still come (no Engine has finished Awake yet), and false when none ever will:
+        /// Awake always claims Instance, so a claimed Engine that is not Ready does not own audio or
+        /// failed to start.</summary>
+        internal static Engine ForComponent(out bool wait)
+        {
+            var e = Instance;
+            wait = !e;
+            return e && e.Ready ? e : null;
+        }
+
+        /// <summary>Call `attempt` once a frame until it returns true. The caller stops it in OnDisable
+        /// (StopAllCoroutines): Unity stops a coroutine when the GameObject deactivates, not when the
+        /// component is disabled.</summary>
+        internal static IEnumerator RetryEachFrame(Func<bool> attempt)
+        {
+            do { yield return null; ComponentWaitFrames++; } while (!attempt());
+        }
+
         /// <summary>Load a mono point-source asset (cached by path). Returns 0 on failure.</summary>
         public uint Load(string clip) => Acquire(clip, BwaLoadFlags.None);
 
@@ -618,7 +708,7 @@ namespace BwAudio
         /// not release against it.</para></summary>
         public uint Find(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
             => Ready && !string.IsNullOrEmpty(clip)
-                 ? Bwa.bwa_sound_find(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags)
+                 ? Bwa.bwa_sound_find(_eng, AssetPath(clip), flags)
                  : 0;
 
         // Metadata probes the cache FIRST so asking a resident clip its length costs no reference.
@@ -792,7 +882,10 @@ namespace BwAudio
         /// reused, so don't mutate it.</summary>
         public float[] SpeakerPositions()
         {
-            if (!Ready) return Array.Empty<float>();
+            // No engine (a node that does not own audio, or a failed start): the layout FILE, as the
+            // stopped editor's gizmos draw it, so every render node can still show the array. Empty
+            // for the default grid, which has no file.
+            if (!Ready) return LayoutFileSpeakers() ?? Array.Empty<float>();
             if (_speakers == null || _speakers.Length != _channels * 3)
             {
                 _speakers = new float[_channels * 3];
@@ -1107,15 +1200,13 @@ namespace BwAudio
         }
 
         // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
-        // seeds the ISM early-reflection room. The ABI takes it live too, but Engine only calls it here
-        // and on scene loads, so it stays on this path. Any
-        // acoustic geometry goes through RebuildSceneMesh, which is runtime-safe and shared with the
-        // per-scene re-bake below.
+        // seeds the ISM early-reflection room. The ABI takes it live too, but Engine only calls it here,
+        // so it stays on this path. Any acoustic geometry goes through RebuildSceneMesh, which is
+        // runtime-safe and shared with the live re-bake below.
         void SetupScene()
         {
-            var geos = FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None);
-            bool haveGeo = geos != null && geos.Length > 0;
-            if (!haveGeo && enableRoomBox)
+            var geos = CollectStaticGeometry();
+            if (geos.Count == 0 && enableRoomBox)
             {
                 uint mb = ResolvePreset(roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
@@ -1126,46 +1217,68 @@ namespace BwAudio
             RebuildSceneMesh(geos);
         }
 
-        // Collect all currently-loaded AcousticGeometry (+ the optional box, baked as geometry) into ONE
-        // mesh and push it. Uses bwa_scene_set_mesh_mat only — runtime-safe (a BVH rebuild, fine on a
-        // scene transition), and it never touches bwa_scene_set_box's ISM path. Called at load time and
-        // on every scene load/unload so the acoustic scene follows Unity's loaded scenes (additive
-        // included: FindObjectsByType spans them all).
-        void RebuildSceneMesh(AcousticGeometry[] geos)
+        // Every AcousticGeometry that should occlude right now: on an active object, component enabled.
+        // Not isActiveAndEnabled, which stays false until a component's OnEnable has run, and Awake's
+        // bake runs before the scene's other components get theirs. Also records what this bake holds,
+        // which is what StaticGeometryChanged compares against.
+        List<AcousticGeometry> CollectStaticGeometry()
+        {
+            _bakedGeometry.Clear();
+            var live = new List<AcousticGeometry>();
+            foreach (var g in FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None))
+                if (g.enabled && g.gameObject.activeInHierarchy) { live.Add(g); _bakedGeometry.Add(g); }
+            return live;
+        }
+        readonly HashSet<AcousticGeometry> _bakedGeometry = new();   // what the engine's static mesh holds
+
+        /// <summary>An AcousticGeometry was enabled or disabled (spawned, toggled, or its scene loaded or
+        /// unloaded). Marks the static mesh for one rebuild in this frame's LateUpdate, however many
+        /// objects change. An enable the last bake already holds is skipped (the scene's own objects
+        /// enable right after Awake baked them); a disable and re-enable in one frame still rebuilds.</summary>
+        internal void StaticGeometryChanged(AcousticGeometry g, bool enabled)
+        {
+            if (_bakedGeometry.Contains(g) != enabled) _rebakeStatic = true;
+        }
+
+        // Collect the static geometry (+ the optional box, baked as geometry) into ONE mesh and push it.
+        // Uses bwa_scene_set_mesh_mat only: runtime-safe, and it never touches bwa_scene_set_box's ISM
+        // path. The control-thread cost is this managed copy (each mesh's vertices and triangles, and
+        // the three arrays handed over) plus the engine's own copy; the BVH rebuild runs on the
+        // engine's sim thread. Rare by design: at load, on a geometry enable or disable, and on a
+        // moved Room Origin.
+        void RebuildSceneMesh(List<AcousticGeometry> geos)
         {
             var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
             if (enableRoomBox)
                 AddBox(verts, tris, triMat, roomSizeMeters, ResolvePreset(roomMaterial));
-            if (geos != null)
-                foreach (var g in geos)
-                {
-                    var mesh = g.ResolveMesh();
-                    if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
-                    AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, ResolveMaterial(g.material));
-                }
-            _staticHasGeometry = geos != null && geos.Length > 0;
+            foreach (var g in geos)
+            {
+                var mesh = g.ResolveMesh();
+                if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
+                AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, ResolveMaterial(g.material));
+            }
+            _staticHasGeometry = geos.Count > 0;
+            StaticRebuilds++;
             if (tris.Count == 0) { ClearStaticMesh(); return; }
             Bwa.bwa_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
             _hasStaticMesh = true;
-            Debug.Log($"[bw_audio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris");
+            // Once, at the load-time bake: a per-rebuild line (with its stack trace) is noise under churn.
+            if (StaticRebuilds == 1) Debug.Log($"[bw_audio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris");
         }
 
-        // Drop the prior scene's static geometry when nothing is loaded. bwa_scene_set_mesh_mat rejects
-        // an empty mesh, so replace it with a tiny degenerate triangle far outside the room (no ray
-        // reaches it). Only when a mesh is actually up, so an empty install pushes nothing.
+        /// <summary>How many times the static acoustic mesh has been rebuilt (the load-time bake
+        /// included). A diagnostic for geometry churn: it should move on a door, not every frame.</summary>
+        public int StaticRebuilds { get; private set; }
+
+        // Drop the static geometry when none is left. Only when a mesh is actually up, so an empty
+        // install pushes nothing. NULL arrays with zero counts are the ABI's documented clear (an
+        // engine older than this binding refused it, so pair the binding with its own engine build).
         void ClearStaticMesh()
         {
             if (!_hasStaticMesh) return;
-            var v = new[] { 1000f, 1000f, 1000f,  1000.02f, 1000f, 1000f,  1000f, 1000.02f, 1000f };
-            Bwa.bwa_scene_set_mesh_mat(_eng, v, 3, new[] { 0, 1, 2 }, 1, new uint[] { 0 });
+            Bwa.bwa_scene_set_mesh_mat(_eng, null, 0, null, 0, null);
             _hasStaticMesh = false;
         }
-
-        // A scene loaded/unloaded (sceneUnloaded fires AFTER its objects are destroyed, so a re-collect
-        // naturally drops them). Defer to LateUpdate so several additive loads in one frame coalesce into
-        // a single BVH rebuild.
-        void OnSceneChanged(Scene s, LoadSceneMode m) => _rebakeStatic = true;
-        void OnSceneChanged(Scene s)                  => _rebakeStatic = true;
 
         // Append a Unity mesh, transformed local -> world -> room space. Whether the winding must be
         // reversed to keep front faces depends on the SIGN of the full linear map's determinant (the
@@ -1380,7 +1493,7 @@ namespace BwAudio
             if (_rebakeStatic)   // a scene loaded/unloaded since last frame -> re-collect static geometry once
             {
                 _rebakeStatic = false;
-                RebuildSceneMesh(FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None));
+                RebuildSceneMesh(CollectStaticGeometry());
             }
             // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
             // Unregister -> _sources.Remove mid-loop. Mutating the list under a foreach would throw and
@@ -1393,8 +1506,9 @@ namespace BwAudio
                 var p = Room.Pos(listener.position);
                 var q = Room.Rot(listener.rotation);
                 Bwa.bwa_set_listener_pose(_eng, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
+                CheckListenerPlacement(p);
             }
-            PushExtraListeners();                                  // ...the other occupants (commit-gated too)...
+            PushExtraListeners();                                 // ...the other occupants (commit-gated too)...
             Bwa.bwa_commit(_eng);                                    // ...then one atomic snapshot
             // ...and only THEN the event drains. bwa_commit is what runs the pass that fills both rings,
             // so polling before it reads a frame-old picture and delays every callback by a frame for no
@@ -1405,6 +1519,68 @@ namespace BwAudio
             DrainLooped();
             PostCommitPass();
         }
+
+        // A listener far from the speakers is not an error to the engine: it pans for wherever the head
+        // is, and a head 12 m away from the array just hears "mostly nothing". That is the symptom of a
+        // wrong Listener Transform or Room Origin, so say it once per excursion, at most every 30 s.
+        // Two tests, each with a margin for a head above a ring of speakers or a seated listener:
+        //   - the array profiles: outside the speakers' bounding box. Binaural drives no speakers, and
+        //     at a desk the head can be anywhere, so it never gets this one.
+        //   - any profile with the room box on: outside the box, which is what the reflections mirror off.
+        // Not armed until the listener first moves or ListenerGraceS passes: a head parked at the floor
+        // origin until tracking connects is not a misconfiguration.
+        const float ListenerMarginM = 1f;
+        const float ListenerWarnEveryS = 30f;
+        const float ListenerGraceS = 5f;
+        bool _listenerOutside, _speakerBoxValid, _listenerArmed, _listenerSeen;
+        float _listenerWarnAfter, _listenerFirstSeenAt;
+        Vector3 _speakerLo, _speakerHi, _listenerFirstPos;
+
+        void CheckListenerPlacement(Vector3 p)
+        {
+            if (!_listenerArmed)
+            {
+                if (!_listenerSeen) { _listenerSeen = true; _listenerFirstPos = p; _listenerFirstSeenAt = Time.realtimeSinceStartup; }
+                _listenerArmed = (p - _listenerFirstPos).sqrMagnitude > 1e-4f ||
+                                 Time.realtimeSinceStartup - _listenerFirstSeenAt > ListenerGraceS;
+                if (!_listenerArmed) return;
+            }
+            string what = null; float by = 0f;
+            if (profile != BwaProfile.Binaural)
+            {
+                if (!_speakerBoxValid)
+                {
+                    var xyz = SpeakerPositions();   // fixed for the engine's lifetime
+                    _speakerLo = Vector3.positiveInfinity; _speakerHi = Vector3.negativeInfinity;
+                    for (int i = 0; i + 2 < xyz.Length; i += 3)
+                    {
+                        var s = new Vector3(xyz[i], xyz[i + 1], xyz[i + 2]);
+                        _speakerLo = Vector3.Min(_speakerLo, s); _speakerHi = Vector3.Max(_speakerHi, s);
+                    }
+                    _speakerBoxValid = xyz.Length >= 3;
+                }
+                if (_speakerBoxValid) { by = OutsideBy(p, _speakerLo, _speakerHi); if (by > ListenerMarginM) what = "the speaker array's bounding box"; }
+            }
+            if (what == null && enableRoomBox)
+            {
+                var half = new Vector3(roomSizeMeters.x * 0.5f, 0f, roomSizeMeters.z * 0.5f);
+                by = OutsideBy(p, -half, half + new Vector3(0f, roomSizeMeters.y, 0f));
+                if (by > ListenerMarginM) what = "the room box";
+            }
+
+            bool outside = what != null;
+            if (outside && !_listenerOutside && Time.realtimeSinceStartup >= _listenerWarnAfter)
+            {
+                _listenerWarnAfter = Time.realtimeSinceStartup + ListenerWarnEveryS;
+                Debug.LogWarning($"[bw_audio] Listener '{listener.name}' is at room ({p.x:F2}, {p.y:F2}, " +
+                                 $"{p.z:F2}), {by:F1} m outside {what}. Every source is panned for a head " +
+                                 "that is not in the room. Check Engine > Listener and Room Origin.", this);
+            }
+            _listenerOutside = outside;
+        }
+
+        static float OutsideBy(Vector3 p, Vector3 lo, Vector3 hi)
+            => Vector3.Max(Vector3.Max(lo - p, p - hi), Vector3.zero).magnitude;
 
         // Every handle bwa_poll_ended reports, routed to the source component that owns it. THIS is the
         // one place that call may be made from: the drain is engine-wide and destructive, so a second
@@ -1642,7 +1818,7 @@ namespace BwAudio
             if (string.IsNullOrEmpty(layoutFile)) return null;
             try
             {
-                string path = Path.Combine(Application.streamingAssetsPath, layoutFile);
+                string path = AssetPath(layoutFile);
                 if (!File.Exists(path)) return null;
                 var f = JsonUtility.FromJson<LayoutFile>(File.ReadAllText(path));
                 if (f?.speakers == null) return null;
@@ -1666,15 +1842,11 @@ namespace BwAudio
 
         void OnDestroy()
         {
-            if (Instance == this)   // only the live engine subscribed (after claiming Instance)
-            {
-                SceneManager.sceneLoaded   -= OnSceneChanged;
-                SceneManager.sceneUnloaded -= OnSceneChanged;
-            }
             Room.ReleaseOrigin(this);   // no-op unless this Engine holds the registration
+            // Before the Ready check: an Engine that does not own audio claims Instance too.
+            if (Instance == this) Instance = null;
             if (!Ready) return;
             Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
-            if (Instance == this) Instance = null;
         }
     }
 }

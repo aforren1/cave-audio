@@ -195,10 +195,12 @@ public:
 	 * An origin that is mirrored (negative determinant), collapsed or non-finite is REFUSED:
 	 * the registration holds its last value and the engine warns once.
 	 *
-	 * The registration is read at CALL time by everything that is converted once: the static
-	 * geometry, room box and ground plane (at start), set_extra_listeners and the FDN decay
-	 * direction. None of those follow a later change, so the first change after start with
-	 * any of them present warns once and latches is_registration_stale(). */
+	 * The static mesh (BwaAcousticGeometry and the room box's walls) and the ground plane follow
+	 * a change: the next _process re-pushes them, one BVH rebuild. BwaDynamicGeometry re-places
+	 * itself. Three things do not follow: set_extra_listeners and the FDN decay direction
+	 * (converted at CALL time), and the room box's image-source room, which the ABI anchors at
+	 * the room origin by size alone. The first change after start with any of them present warns
+	 * once and latches is_registration_stale(). */
 	void set_registration(const Transform3D &t);
 	Transform3D get_registration() const { return registration; }
 	void set_room_origin(const NodePath &p);
@@ -418,8 +420,13 @@ public:
 	/* Flag box faces whose image-source reflection inverts (bit f = face f, -x,+x,-y,+y,-z,+z):
 	 * an underwater room's ceiling-as-surface is 1 << 3. Call after scene_set_box/_set_ground. */
 	void scene_set_pressure_release(int face_mask);
+	/* Replaces the whole static mesh. The BwaAcousticGeometry merge replaces it in turn, on the
+	 * next frame that set changes, so use one or the other. */
 	void scene_set_mesh(const PackedVector3Array &verts, const PackedInt32Array &tris,
 			const PackedInt32Array &tri_materials);
+	/* How many times the static mesh was rebuilt or cleared, the start bake included. A churn
+	 * diagnostic: it should move on a door, not every frame. */
+	int get_static_rebuilds() const { return static_rebuilds; }
 	int scene_add_dynamic_mesh(
 			const PackedVector3Array &verts, const PackedInt32Array &tris, int material);
 	void scene_set_dynamic_transform(int handle, const Vector3 &godot_pos, const Quaternion &rot);
@@ -535,6 +542,27 @@ private:
 	 * bwa_geometry.h: the core replaces the whole static mesh per call, so collecting is the
 	 * only way a room box and separate occluders can coexist. */
 	void build_static_scene();
+	/* Per frame: re-merge when the visible static set differs from the baked one, or when the
+	 * registration moved under baked geometry. At most one rebuild per frame. */
+	void refresh_static_scene();
+	/* Merge the start-time box walls and every visible BwaAcousticGeometry and push it, or
+	 * clear when nothing is left. */
+	void commit_static_scene();
+	void push_ground();
+	static std::vector<uint64_t> visible_statics();
+
+	std::vector<uint64_t> static_baked; /* instance ids the static mesh holds, sorted */
+	uint32_t static_seen = 0;           /* BwaAcousticGeometry::revision() at the last look */
+	bool static_reg_dirty = false;      /* the registration moved since the last bake */
+	bool static_mesh_up = false;        /* a merged mesh is pushed, so a clear has work to do */
+	bool ground_pushed = false;         /* the ground plane is the room (read at start) */
+	int static_rebuilds = 0;
+	int press_mask = 0;          /* the last scene_set_pressure_release, for push_ground */
+	bool press_mask_set = false;
+	/* The room box as read at start, in Godot world. A box is start-only (see BwaRoomBox), so
+	 * its walls are kept here rather than re-read from a node that may have left. */
+	PackedVector3Array box_faces;
+	PackedInt32Array box_tri_mats;
 
 	/* The ONE call site of bwa_poll_ended / bwa_poll_looped (see poll_ended above for why it has
 	 * to be exactly one), run right after the commit that fills the rings. Routes each handle to

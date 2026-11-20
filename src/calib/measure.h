@@ -78,14 +78,21 @@ typedef struct {
  *           the reflections and the reverberant tail have died. Lags past ncap - nref see only the
  *           sweep's low end, so this region is a narrower band than the first; it is where a
  *           transient late in the capture shows.
- * The exponential sweep's harmonic-distortion products land at NEGATIVE lags, which this
- * deconvolution puts at the END of its FFT buffer, past ncap, so neither region holds them. With
+ * The exponential sweep's harmonic-distortion products land AHEAD of their arrival: order k by
+ * nref ln(k) / ln(f2 / f1) samples (measure_harmonic_lead), 150 ms for the 1.5 s sweep's second
+ * harmonic and 50 ms for the 0.5 s live sweep's. An arrival earlier than that puts the product at a
+ * negative lag, past ncap in the FFT buffer, where neither region holds it. A later one (the rig's
+ * ZM-1 chain is about 65 ms) puts it in the "before" region, so measure_response leaves
+ * MEASURE_HARM_GUARD_S either side of orders 2..MEASURE_HARM_MAX of the found arrival out of both
+ * regions: a speaker's distortion is not the room's noise. With
  * no window, lo = hi = the found arrival. The floor is the RMS of the LOUDEST block, so one cough
  * in an otherwise quiet capture reads as the cough. */
 #define MEASURE_NOISE_GUARD_S 0.002
 #define MEASURE_NOISE_SKIP_S  0.30
 #define MEASURE_NOISE_BLOCK_S 0.02
 #define MEASURE_NOISE_MIN_N   64       /* fewer samples than this in a region: the region is skipped */
+#define MEASURE_HARM_MAX      4        /* harmonic orders 2..4 are kept out of the noise regions */
+#define MEASURE_HARM_GUARD_S  0.005
 
 /* Room characterization from the captured impulse response — a treatment diagnostic, NOT a model to
  * match (matching would double-count: the engine renders the virtual room AND the real room adds its
@@ -142,12 +149,24 @@ int measure_response_pick(const float* capture, int ncap, const float* ref, int 
                           int exp_lo, int exp_hi, int pick_lo, int pick_hi, MeasureResult* out,
                           float* win, int win_len, int pre, int* win_start);
 
+/* measure_response_pick with the positive lags ending at lag_hi (0 = ncap): the peak search, the outside
+ * flag and the noise floor read [0, lag_hi) only. For a capture that holds a SECOND sweep a known gap
+ * later (live aiming's reference, calib_live_read): its arrival sits at a later lag of this same IR and is
+ * not this speaker's interferer. */
+int measure_response_lim(const float* capture, int ncap, const float* ref, int nref,
+                         double f1, double f2, double fs, const double band_hz[2],
+                         int exp_lo, int exp_hi, int pick_lo, int pick_hi, int lag_hi, MeasureResult* out,
+                         float* win, int win_len, int pre, int* win_start);
+
 int measure_response_ex(const float* capture, int ncap, const float* ref, int nref,
                         double f1, double f2, double fs, const double band_hz[2],
                         int exp_lo, int exp_hi, MeasureResult* out,
                         float* win, int win_len, int pre, int* win_start);
 
-/* The noise floor of an IR (the regions above): the RMS of the loudest MEASURE_NOISE_BLOCK_S block in
+/* Samples by which an exponential sweep's order-k harmonic product leads its arrival (0 on bad input). */
+double measure_harmonic_lead(int nref, int k, double f1, double f2);
+
+/* The noise floor of an IR (the regions above, with no harmonic exclusion): the RMS of the loudest MEASURE_NOISE_BLOCK_S block in
  * [0, lo - guard) and [hi + skip, ncap). *n receives the samples looked at (0 = no region). Pure. */
 double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs, int* n);
 

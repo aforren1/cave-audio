@@ -10,6 +10,12 @@
  * bwa_start. The room box captures the shoebox for the image-source reflections through
  * scene_set_ism_room (with or without the Steam Audio SDK), which leaves the ray-traced mesh
  * alone, and then contributes its own walls to that merged mesh.
+ *
+ * After start the static set keeps following the tree: entering, leaving and a visibility
+ * change bump revision(), and BwaEngine re-merges at most once per frame, only when the set of
+ * visible pieces differs from the one it last baked. Hidden means not occluding, the way a
+ * disabled object is in Unity. Each re-merge is a full BVH rebuild, so a prop that toggles
+ * often belongs in BwaDynamicGeometry.
  */
 #pragma once
 
@@ -28,7 +34,8 @@ namespace godot {
 class BwaEngine;
 class BwaMaterial;
 
-/* Static occluding / reflecting geometry. Committed once, before the engine starts. */
+/* Static occluding / reflecting geometry. Merged into the one static mesh at start and again
+ * whenever the visible set changes (see above). Moving one does not re-merge. */
 class BwaAcousticGeometry : public Node3D {
 	GDCLASS(BwaAcousticGeometry, Node3D)
 
@@ -53,14 +60,19 @@ public:
 	Ref<BwaMaterial> material_ref() const { return material; }
 
 	static const std::vector<BwaAcousticGeometry *> &registry() { return statics; }
+	/* Bumped by every enter, exit and visibility change. BwaEngine compares it once per frame,
+	 * so any number of changes in one frame cost one look at the set. */
+	static uint32_t revision() { return rev; }
 
 protected:
 	static void _bind_methods();
+	void _notification(int p_what);
 
 private:
 	Ref<Mesh> resolve_mesh() const;
 
 	static std::vector<BwaAcousticGeometry *> statics;
+	static uint32_t rev;
 
 	Ref<Mesh> mesh;
 	NodePath source; /* a MeshInstance3D to take the mesh AND transform from; overrides `mesh` */
@@ -98,6 +110,7 @@ private:
 	BwaEngine *owner = nullptr;
 	int handle = -1;
 	Transform3D pushed;
+	uint32_t pushed_reg_gen = 0; /* the registration the last placement went through */
 
 	Ref<Mesh> mesh;
 	Ref<BwaMaterial> material;

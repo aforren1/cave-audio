@@ -42,6 +42,19 @@ extern "C" {
 #define CAL_LIVE_NSWEEP 24000            /* 0.5 s */
 #define CAL_LIVE_NTAIL  12000            /* 0.25 s */
 #define CAL_LIVE_CAPLEN (CAL_LIVE_NSWEEP + CAL_LIVE_NTAIL)
+/* Live aiming with a reference speaker (--live-ref, calib_live_read): the live sweep plays from the live
+ * speaker and, this many samples later, from the reference, in ONE capture. The gap has to leave the
+ * live speaker a noise region AFTER its arrival: MEASURE_NOISE_SKIP_S (0.30 s) for its room tail, and the
+ * region must end ahead of the reference's order-4 harmonic product, which leads the reference's arrival
+ * by 0.10 s. That is 0.41 s before any region exists; the sweep's own 0.5 s leaves about 80 ms of it, and
+ * the reference's sweep starts as the live one ends. The reference's "before" region is then the live
+ * speaker's tail 0.5 s on. The capture is 1.25 s. */
+#define CAL_LIVE_REF_GAP    CAL_LIVE_NSWEEP
+#define CAL_LIVE_REF_CAPLEN (CAL_LIVE_REF_GAP + CAL_LIVE_CAPLEN)
+/* The reference's implied latency against the previous reading's: past this many samples the latency
+ * moved (a Dante Via step is 14 to 19; sweep-to-sweep jitter on the rig is under 2) and the reading is
+ * not held. PROVISIONAL. */
+#define CAL_LIVE_LAT_MOVED_SAMPLES 2.0
 /* the simulator's system latency: every simulated arrival is this plus the time of flight */
 #define CAL_SIM_LATENCY_SAMPLES 512
 
@@ -68,6 +81,10 @@ typedef struct {
     const float* true_pos;   /* NULL = the layout's position */
     const float* true_aim;   /* NULL = the layout's aim (rotated by calib_sim_set_aim_error); any length */
     int          on_axis;    /* 1 = apply the model's on-axis response (when it carries one) */
+    double       ref_step_s; /* calib_live_read with a reference only: the latency steps by this much INSIDE the
+                              * capture, after the live speaker's sweep and before the reference's (a
+                              * Dante Via re-sync mid-reading). The caller makes it stick afterwards
+                              * (calib_sim_set_latency_step). */
     float        screen_db;  /* > 0 = a screen in front of the speaker: this much loss well above
                               * CALIB_SIM_SCREEN_HZ, a smooth first-order-like shelf, on EVERY path out of
                               * the speaker (direct, images, tail). The same at every aim, so it is
@@ -327,14 +344,40 @@ typedef struct {
     int    quality;                /* calib_sweep_check of the pool: CALIB_SWEEP_OK is a CLEAN reading,
                                     * the only kind the peak hold may hold (calib_peak_update) */
     char   why[200];               /* calib_sweep_why, when quality is not OK */
+    /* with a reference (CalibLiveRef): */
+    int    ref;                    /* the reference speaker this reading used, -1 = none */
+    int    ref_ok;                 /* its arrival was clean: ref_lat_s is THIS reading's latency. 0 with a
+                                    * reference = no distance from this reading */
+    double ref_lat_s;              /* its center arrival minus |its layout position - the center| / c */
+    int    lat_moved;              /* ref_lat_s is more than CAL_LIVE_LAT_MOVED_SAMPLES off the previous
+                                    * reading's: quality is CALIB_LIVE_LAT_MOVED, the reading is not held */
+    float  lat_moved_samples;
 } CalibLiveReading;
-/* `win` (NULL = no window): the expected-arrival window for the live speaker, from the ZM-1's center
+/* `quality` values past calib_sweep_check's, live aiming with a reference only. BASELINE: the first
+ * reading with a clean reference has no latency to compare with, so it is never held. */
+enum { CALIB_LIVE_REF_BAD = 16, CALIB_LIVE_LAT_MOVED = 17, CALIB_LIVE_BASELINE = 18 };
+/* The in-capture latency reference. The ZM-1's Dante Via leg steps the system latency 0.3 to 0.4 ms at
+ * random, and a latency taken once before the loop turns each step into 10 to 14 cm of range. So each
+ * reading plays the live speaker and then, CAL_LIVE_REF_GAP later, a speaker whose layout position is
+ * trusted; the capture's impulse response carries both direct sounds, and the reference's gives the
+ * latency of THIS second. The live speaker plays FIRST: a step inside the capture then always reaches the
+ * reference's sweep, so it shows as a jump in ref_lat_s on the reading it spoiled. calib_live_read keeps
+ * prev_lat_s, the last latency a clean reference gave: it is what the next reading's windows are timed
+ * from (+/- CALIB_WIN_LAT_KNOWN_S), and a reference not found there is searched once more over the whole
+ * response, so a step past the margin is followed. Zero the struct but for `spk` at the start of a run. */
+typedef struct {
+    int    spk;                    /* the reference speaker; -1 = none */
+    int    have_prev;
+    double prev_lat_s;
+} CalibLiveRef;
+/* `ref` (NULL or spk < 0 = none): the in-capture latency reference, CalibLiveRef above.
+ * `win` (NULL = no window): the expected-arrival window for the live speaker, from the ZM-1's center
  * (`believed`, where the run thinks the array is; NULL = center) to wherever the box may be: the
  * window is the union of the ones read from its as-built position and its plan, with win->pos_m of
  * margin around each, since the installer is moving it from one toward the other. */
 int calib_live_read(int spk, const Layout* L, const float center[3], double sos, int simulate,
                     const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out,
-                    const CalibWindow* win, const float* believed);
+                    const CalibWindow* win, const float* believed, CalibLiveRef* ref);
 
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);
@@ -368,6 +411,9 @@ int  calib_asio_capture_signal(int ch, const float* sig, int nsig);
  * with 1 <= nsig <= ncap. The live aiming mode's shorter sweep: CAL_LIVE_NSWEEP into CAL_LIVE_CAPLEN.
  * Unverified on hardware like the rest of the shell. */
 int  calib_asio_capture_len(int ch, const float* sig, int nsig, int ncap);
+/* ... with the same signal also on output `ch2`, starting `gap` samples later (ch2 < 0 = none, exactly
+ * calib_asio_capture_len): live aiming's reference. gap + nsig <= ncap. */
+int  calib_asio_capture_pair(int ch, int ch2, int gap, const float* sig, int nsig, int ncap);
 void calib_asio_close(void);
 /* Driver-reported latencies from the LAST calib_asio_open (valid until the next open — they
  * survive close, so a solve that runs after teardown can still cross-check): output = render->DAC,

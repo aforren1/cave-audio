@@ -13,6 +13,7 @@
 #include "bwa_room.h"
 #include "bwa_source_base.h"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace godot;
@@ -167,6 +168,7 @@ void BwaEngine::_process(double delta) {
 	 * range-for here is iterator invalidation; a copied snapshot is worse — it would keep a
 	 * dangling pointer to anything the handler freed. */
 	sync_room_origin(); // the frame every push below is expressed in
+	refresh_static_scene(); // after the origin: a moved one re-bakes in this same frame
 
 	for (size_t i = 0; i < sources.size(); i++) {
 		sources[i]->push_frame(); // all sources first...
@@ -298,6 +300,9 @@ void BwaEngine::_exit_tree() {
 	bwa_destroy(eng);
 	eng = nullptr;
 	sounds.clear(); /* no releases: bwa_destroy took the whole cache with it */
+	static_mesh_up = false; /* the static mesh died with the engine */
+	static_baked.clear();
+	press_mask_set = false;
 	/* Detach every source that outlives this engine, not just forget them: their `owner`
 	 * back-pointers would otherwise dangle, and the next setter call on such a source (from
 	 * a script, an animation, anywhere) would dereference a freed node. Exit order usually
@@ -322,32 +327,30 @@ void BwaEngine::_exit_tree() {
 
 void BwaEngine::build_static_scene() {
 	BwaRoomBox *box = BwaRoomBox::active();
-	const std::vector<BwaAcousticGeometry *> &geo = BwaAcousticGeometry::registry();
 
 	/* The ground/surface plane: the outdoor degenerate of the box, applied at the same
 	 * pre-start moment for the same reason (the image-source handoff is load-time). A
 	 * BwaRoomBox wins when both exist — one room at a time, and the box is the more
 	 * deliberate act of authoring. */
+	ground_pushed = false;
 	if (ground_enabled) {
 		if (box) {
 			UtilityFunctions::push_warning(
 					"BwaEngine: both a BwaRoomBox and ground_enabled - the box wins (one room at "
 					"a time); disable one.");
 		} else {
-			const int tok = ground_material.is_valid() ? (int)ground_material->token(this) : 0;
-			scene_set_ground(ground_height, tok, ground_pressure_release);
+			ground_pushed = true;
+			push_ground();
 		}
-	}
-
-	if (!box && geo.empty()) {
-		return;
 	}
 
 	/* Capture the shoebox for the image-source early reflections. That half works with or without
 	 * the Steam Audio SDK, so it matters even in a phonon-free build. Uses the ISM-ONLY call, so it
-	 * no longer clobbers the static mesh and the ordering below stopped mattering. */
-	PackedVector3Array faces;
-	PackedInt32Array tri_materials;
+	 * does not clobber the static mesh. Its walls then join the merged mesh as ordinary geometry.
+	 * Without that, the commonest Godot setup (a box and nothing else) had an empty ray-traced
+	 * scene: no occlusion from the room's own walls. */
+	box_faces.clear();
+	box_tri_mats.clear();
 	if (box) {
 		PackedInt32Array face_tokens;
 		for (int f = 0; f < 6; f++) {
@@ -356,15 +359,38 @@ void BwaEngine::build_static_scene() {
 		}
 		const Vector3 s = box->room_size();
 		scene_set_ism_room((float)s.x, (float)s.y, (float)s.z, face_tokens);
-
-		/* Its walls then join the merged mesh as ordinary geometry, alongside everything else. */
-		faces.append_array(box->wall_faces());
+		box_faces = box->wall_faces();
 		for (int t = 0; t < 12; t++) {
-			tri_materials.push_back(face_tokens[t / 2]);
+			box_tri_mats.push_back(face_tokens[t / 2]);
 		}
 	}
 
-	for (BwaAcousticGeometry *g : geo) {
+	static_seen = BwaAcousticGeometry::revision();
+	static_reg_dirty = false;
+	commit_static_scene();
+}
+
+std::vector<uint64_t> BwaEngine::visible_statics() {
+	std::vector<uint64_t> ids;
+	for (BwaAcousticGeometry *g : BwaAcousticGeometry::registry()) {
+		if (g->is_visible_in_tree()) {
+			ids.push_back(g->get_instance_id());
+		}
+	}
+	/* Instance ids, never pointers: a freed node's address can come back as a new node, and a
+	 * pointer compare would then call a changed set unchanged. */
+	std::sort(ids.begin(), ids.end());
+	return ids;
+}
+
+void BwaEngine::commit_static_scene() {
+	PackedVector3Array faces = box_faces;
+	PackedInt32Array tri_materials = box_tri_mats;
+	static_baked = visible_statics();
+	for (BwaAcousticGeometry *g : BwaAcousticGeometry::registry()) {
+		if (!g->is_visible_in_tree()) {
+			continue;
+		}
 		const PackedVector3Array f = g->world_faces();
 		if (f.is_empty()) {
 			continue;
@@ -377,13 +403,19 @@ void BwaEngine::build_static_scene() {
 		}
 	}
 
-	/* Nothing to commit only when there is genuinely no geometry. The box no longer commits itself:
-	 * scene_set_ism_room captures the shoebox for the image-source path and deliberately leaves the
-	 * ray-traced static mesh alone, so a box-with-no-other-occluders scene reaches here with its 12
-	 * wall triangles in `faces` and MUST still be committed. Skipping it (as the old
-	 * "scene_set_box already committed exactly this mesh" early-out did) left the commonest Godot
-	 * setup with an empty ray-traced scene: no occlusion from the room's own walls. */
 	if (faces.is_empty()) {
+		if (!static_mesh_up) {
+			return; /* nothing pushed, nothing to drop: an empty install pushes nothing */
+		}
+		/* The ground plane's own quad IS the static mesh when it is the room, so put it back.
+		 * Otherwise the ABI's documented clear: NULL arrays, zero counts. */
+		if (ground_pushed) {
+			push_ground();
+		} else {
+			bwa_scene_set_mesh_mat(eng, nullptr, 0, nullptr, 0, nullptr);
+		}
+		static_mesh_up = false;
+		static_rebuilds++;
 		return;
 	}
 
@@ -393,6 +425,39 @@ void BwaEngine::build_static_scene() {
 		tris[i] = i; // get_faces() is already a triangle soup, so the index list is trivial
 	}
 	scene_set_mesh(faces, tris, tri_materials);
+	static_mesh_up = true;
+	static_rebuilds++;
+}
+
+void BwaEngine::refresh_static_scene() {
+	const uint32_t rev = BwaAcousticGeometry::revision();
+	if (rev == static_seen && !static_reg_dirty) {
+		return; /* the common frame: nothing entered, left, hid or moved the frame */
+	}
+	static_seen = rev;
+	const bool moved = static_reg_dirty;
+	static_reg_dirty = false;
+	if (moved && ground_pushed) {
+		push_ground(); /* replaces the merged mesh with its quad; the commit below restores it */
+		static_mesh_up = false;
+	}
+	/* A toggle and its undo in one frame leave the set as baked, and cost nothing. */
+	const bool baked_frame = !static_baked.empty() || !box_faces.is_empty();
+	if (visible_statics() != static_baked || (moved && baked_frame)) {
+		commit_static_scene();
+	}
+}
+
+void BwaEngine::push_ground() {
+	/* bwa_scene_set_ground rebuilds the image-source room from scratch, which drops a
+	 * pressure-release mask set after start. Put it back. */
+	const bool had_mask = press_mask_set;
+	const int mask = press_mask;
+	const int tok = ground_material.is_valid() ? (int)ground_material->token(this) : 0;
+	scene_set_ground(ground_height, tok, ground_pressure_release);
+	if (had_mask) {
+		scene_set_pressure_release(mask);
+	}
 }
 
 /* --- the coordinate seam --- */
@@ -459,22 +524,28 @@ static bool room_origin_tilted(const Basis &b) {
 
 void BwaEngine::registration_changed() {
 	reg_gen++;
-	if (!eng || registration_stale) {
+	if (!eng) {
 		return; /* before start nothing has been converted yet */
+	}
+	static_reg_dirty = true; /* the static mesh and the ground plane re-bake next _process */
+	if (registration_stale) {
+		return;
 	}
 	const bool fdn_dir = fdn.enabled
 			&& (fdn.decay_dir[0] != 0.0f || fdn.decay_dir[1] != 0.0f || fdn.decay_dir[2] != 0.0f);
-	if (!ground_enabled && !BwaRoomBox::active() && BwaAcousticGeometry::registry().empty()
-			&& !extra_listeners_set && !fdn_dir) {
-		return; /* everything live is pushed per frame and simply follows */
+	/* The box's image-source room has no position to re-push: the ABI anchors it at the room
+	 * origin by size alone. Its ray-traced walls re-bake, so after a change the two disagree. */
+	const bool box = !box_faces.is_empty();
+	if (!extra_listeners_set && !fdn_dir && !box) {
+		return; /* everything else is pushed per frame or re-baked, and follows */
 	}
 	registration_stale = true;
 	UtilityFunctions::push_warning(
-			"BwaEngine: the registration changed after start. Sources, the listener and speaker "
-			"views follow it. What was converted once does not, and keeps the old frame: static "
-			"acoustic geometry, the room box, the ground plane, set_extra_listeners positions "
-			"and the FDN decay direction. Set room_origin or registration before the engine "
-			"starts. is_registration_stale() now reads true.");
+			"BwaEngine: the registration changed after start. Three things keep the old frame: "
+			"set_extra_listeners positions (call it again), the FDN decay direction (load-time) "
+			"and the room box's image-source reflections, which the engine anchors at the room "
+			"origin. The box's walls, the static geometry and the ground plane follow. "
+			"is_registration_stale() now reads true.");
 }
 
 void BwaEngine::set_registration(const Transform3D &t) {
@@ -1147,6 +1218,7 @@ void BwaEngine::scene_set_ism_room(float w, float h, float d, const PackedInt32A
 		f[i] = (bwa_material)faces[i];
 	}
 	bwa_scene_set_ism_room(eng, w, h, d, f);
+	press_mask_set = false; /* a new room resets every face */
 }
 
 void BwaEngine::scene_set_box(float w, float h, float d, const PackedInt32Array &faces) {
@@ -1158,6 +1230,7 @@ void BwaEngine::scene_set_box(float w, float h, float d, const PackedInt32Array 
 		f[i] = (bwa_material)faces[i];
 	}
 	bwa_scene_set_box(eng, w, h, d, f);
+	press_mask_set = false;
 }
 
 void BwaEngine::scene_set_ground(float y, int material, bool pressure_release) {
@@ -1168,11 +1241,14 @@ void BwaEngine::scene_set_ground(float y, int material, bool pressure_release) {
 	 * applies (the box escapes this only because it takes sizes, not positions). */
 	const float room_y = (float)to_room_position(Vector3(0, y, 0)).y;
 	bwa_scene_set_ground(eng, room_y, (bwa_material)material, pressure_release);
+	press_mask_set = false;
 }
 
 void BwaEngine::scene_set_pressure_release(int face_mask) {
 	if (eng) {
 		bwa_scene_set_pressure_release(eng, (uint32_t)face_mask);
+		press_mask = face_mask; /* kept so a re-pushed ground can restore it */
+		press_mask_set = true;
 	}
 }
 
@@ -1727,6 +1803,7 @@ void BwaEngine::_bind_methods() {
 	M(set_ground_pressure_release, "on"); M0(get_ground_pressure_release);
 	M(set_ground_material, "material"); M0(get_ground_material);
 	M(scene_set_mesh, "verts", "tris", "tri_materials");
+	M0(get_static_rebuilds);
 	M(scene_add_dynamic_mesh, "verts", "tris", "material");
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
 	M(scene_remove_dynamic_mesh, "handle");

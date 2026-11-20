@@ -11,6 +11,7 @@
 using namespace godot;
 
 std::vector<BwaAcousticGeometry *> BwaAcousticGeometry::statics;
+uint32_t BwaAcousticGeometry::rev = 0;
 BwaRoomBox *BwaRoomBox::current = nullptr;
 
 /* ---------------------------------------------------------------- static geometry --- */
@@ -53,22 +54,24 @@ void BwaAcousticGeometry::_enter_tree() {
 		return;
 	}
 	statics.push_back(this);
-	if (BwaEngine::get_singleton() && BwaEngine::get_singleton()->is_running()) {
-		/* The static mesh is collected once, in BwaEngine::_ready. Nothing collects again. */
-		UtilityFunctions::push_warning(
-				"BwaAcousticGeometry: added after the engine started, so it missed the static "
-				"bake and occludes nothing. An Autoload engine (or one that outlives a scene "
-				"change) starts before this scene exists. Put the BwaEngine, or bwa_rig.tscn, in "
-				"the same scene as its geometry.");
-	}
+	rev++;
 }
 
 void BwaAcousticGeometry::_exit_tree() {
 	for (size_t i = 0; i < statics.size(); i++) {
 		if (statics[i] == this) {
 			statics.erase(statics.begin() + (long)i);
+			rev++;
 			return;
 		}
+	}
+}
+
+/* Node3D sends this to every visible descendant when an ancestor is shown or hidden, so a
+ * hidden parent takes its whole subtree out of the static mesh. */
+void BwaAcousticGeometry::_notification(int p_what) {
+	if (p_what == NOTIFICATION_VISIBILITY_CHANGED && is_inside_tree()) {
+		rev++;
 	}
 }
 
@@ -133,6 +136,7 @@ void BwaDynamicGeometry::_ready() {
 	handle = owner->scene_add_dynamic_mesh(verts, tris, (int)tok);
 	if (handle >= 0) {
 		pushed = get_global_transform();
+		pushed_reg_gen = owner->registration_generation();
 		owner->scene_set_dynamic_transform(
 				handle, pushed.origin, Quaternion(pushed.basis.orthonormalized()));
 		set_process(true);
@@ -144,11 +148,13 @@ void BwaDynamicGeometry::_process(double delta) {
 	if (handle < 0 || !owner || !owner->is_running()) {
 		return;
 	}
+	/* A moved room_origin moves a still mover in the room too, so the registration counts. */
 	const Transform3D t = get_global_transform();
-	if (t == pushed) {
+	if (t == pushed && owner->registration_generation() == pushed_reg_gen) {
 		return; // a refit costs something; do not pay it for a stationary mover
 	}
 	pushed = t;
+	pushed_reg_gen = owner->registration_generation();
 	owner->scene_set_dynamic_transform(handle, t.origin, Quaternion(t.basis.orthonormalized()));
 }
 
@@ -265,13 +271,16 @@ void BwaRoomBox::_enter_tree() {
 	}
 	current = this;
 	if (BwaEngine::get_singleton() && BwaEngine::get_singleton()->is_running()) {
-		/* The engine collects room boxes before bwa_start because the image-source handoff
-		 * assumes the audio thread is not yet running. Arriving late is not recoverable. */
+		/* Not a threading limit (bwa_scene_set_ism_room is live-safe). The ABI can set the
+		 * image-source shoebox but never remove it, so a box that joined late could not leave
+		 * again: its reflections would outlive the node. One box, read at start, is the honest
+		 * contract. Static geometry has no such hole and follows the tree. */
 		UtilityFunctions::push_error(
 				"BwaRoomBox: added after the engine started, so it is ignored. The engine reads "
-				"the room box once, when it starts, and an Autoload engine (or one that outlives "
-				"a scene change) starts before this scene exists. Put the BwaEngine, or "
-				"bwa_rig.tscn, in the same scene as the room box.");
+				"the room box once, when it starts: the image-source room can be set but not "
+				"removed, so a box could not leave again. An Autoload engine starts before this "
+				"scene exists. Put the BwaEngine, or bwa_rig.tscn, in the same scene as the room "
+				"box, or put the box in the rig.");
 	}
 }
 

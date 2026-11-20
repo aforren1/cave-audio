@@ -1968,7 +1968,11 @@ void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const
                            const bwa_material* tri_material) {
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
-    if (!mesh_geometry_ok(verts, nverts, tris, ntris)) {
+    /* The header's documented CLEAR (both pointers NULL, both counts <= 0) goes straight through:
+     * steam_scene recognizes the same shape and drops the static mesh. The check below would refuse
+     * it as an empty mesh, which left the old geometry occluding after its last owner went away. */
+    const bool clear = !verts && !tris && nverts <= 0 && ntris <= 0;
+    if (!clear && !mesh_geometry_ok(verts, nverts, tris, ntris)) {
         set_error(e, "bwa_scene_set_mesh_mat: every triangle index must be in [0, nverts), and the "
                      "mesh must be non-empty");
         return;

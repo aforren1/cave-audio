@@ -11,6 +11,7 @@ extern "C" {
 }
 
 #include <atomic>
+#include "calib_job.h"                 /* the SDK-free per-block logic */
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -599,9 +600,20 @@ void calib_measure_rows(const float* rows, int nrows, int stride, int ncap, cons
     for (auto& t : pool) t.join();
 }
 
+/* calib_measure_zylia_rows with the positive lags ending at lag_hi (0 = ncap; measure_response_lim) */
+static int zylia_rows_lim(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
+                          const double band_hz[2], int exp_lo, int exp_hi, int lag_hi,
+                          MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]);
+
 int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
                              const double band_hz[2], int exp_lo, int exp_hi,
                              MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]) {
+    return zylia_rows_lim(rows, stride, ncap, sweep, nsweep, band_hz, exp_lo, exp_hi, 0, res, ok);
+}
+
+static int zylia_rows_lim(const float* rows, int stride, int ncap, const float* sweep, int nsweep,
+                          const double band_hz[2], int exp_lo, int exp_hi, int lag_hi,
+                          MeasureResult res[ZYLIA_MICS], int ok[ZYLIA_MICS]) {
     /* each capsule's IR window: from 64 samples before its own peak, 256 long, which holds the
      * reference taper (-ZYLIA_XC_PRE .. +ZYLIA_XC_POST around the strongest peak) plus the array's
      * aperture either side */
@@ -620,7 +632,7 @@ int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const floa
             mean[i] = (float)(acc / ZYLIA_MICS);
         }
         MeasureResult m;
-        if (measure_response_ex(mean, ncap, sweep, nsweep, CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, &m, NULL, 0, 0, NULL)) {
+        if (measure_response_lim(mean, ncap, sweep, nsweep, CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, 0, 0, lag_hi, &m, NULL, 0, 0, NULL)) {
             const int w = (int)ceil(0.06 / 300.0 * CAL_FS) + 8;
             pick_lo = m.delay_samples - w;
             pick_hi = m.delay_samples + w + 1;
@@ -631,9 +643,9 @@ int calib_measure_zylia_rows(const float* rows, int stride, int ncap, const floa
     std::atomic<int> next(0);
     auto work = [&]() {
         for (int j; (j = next.fetch_add(1)) < ZYLIA_MICS; )
-            ok[j] = measure_response_pick(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
-                                          CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, pick_lo, pick_hi, &res[j],
-                                          win[j], XW, XPRE, &start[j]);
+            ok[j] = measure_response_lim(rows + (size_t)j * (size_t)stride, ncap, sweep, nsweep,
+                                         CAL_F1, CAL_F2, CAL_FS, band_hz, exp_lo, exp_hi, pick_lo, pick_hi, lag_hi, &res[j],
+                                         win[j], XW, XPRE, &start[j]);
     };
     std::vector<std::thread> pool;
     for (int w = 1; w < nw; ++w) pool.emplace_back(work);
@@ -870,33 +882,115 @@ int calib_measure_speaker(const CalibPass* P, int s, int through, MeasureResult*
     return CALIB_MEAS_UNCLEAN;
 }
 
+/* The simulated reference sweep, added CAL_LIVE_REF_GAP into each capsule row: the reference plays from
+ * its layout position and aim, with no screen, at the latency after o->ref_step_s. */
+static void sim_live_ref(int rs, const Layout* L, const float center[3], const float (*caps)[3], double sos,
+                         const CalibSimOpts* o, float* cap19) {
+    static float row[CAL_LIVE_REF_CAPLEN];             /* one capture at a time, like the rest of the simulator */
+    CalibSimOpts r = *o;
+    r.true_pos = NULL; r.true_aim = NULL; r.screen_db = 0.f;
+    const double keep = g_sim_lat_step_s;
+    if (o->ref_step_s == o->ref_step_s) g_sim_lat_step_s += o->ref_step_s;
+    for (int j = 0; j < ZYLIA_MICS; ++j) {
+        const float at[3] = { center[0] + caps[j][0], center[1] + caps[j][1], center[2] + caps[j][2] };
+        sim_capture_core(rs, L, at, sos, &r, row);
+        float* d = cap19 + (size_t)j * CAL_CAPLEN + CAL_LIVE_REF_GAP;
+        for (int i = 0; i < CAL_LIVE_CAPLEN; ++i) d[i] += row[i];
+    }
+    g_sim_lat_step_s = keep;
+}
+
+/* The reference's arrival, from the capture GAP samples in: there the live speaker's direct sound sits at
+ * a negative lag, so this is the single-sweep measurement with a pointer offset. Searched in the window
+ * `w` gives (NULL = the whole response); when a stronger tap lies outside it, or nothing is found, once
+ * more over the whole response, which is how a latency that stepped past the window's margin is found
+ * again. Returns 1 with the pooled arrival in *arr_samples, or 0 with `why`. Only timing is read. */
+static int live_ref_arrival(int rs, const Layout* L, const float m[3], double sos, const float* lsweep, const float* cap19,
+                            const CalibWindow* w, double* arr_samples, char* why, size_t whycap) {
+    const double band[2] = { CALIB_LIVE_MID_HZ, CALIB_LIVE_HIGH_HZ };
+    int rlo = 0, rhi = 0;
+    if (w) {
+        CalibWindow rw = *w;
+        rw.pos_m = calib_window_pos_m(L, rs) + CALIB_WIN_ZM1_M;   /* its layout position is the trusted one */
+        if (!calib_arrival_window(&rw, L->speakers[rs].pos, m, sos, CAL_FS, &rlo, &rhi)) rlo = rhi = 0;
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        MeasureResult rr[ZYLIA_MICS], rp;
+        int okr[ZYLIA_MICS] = { 0 }, nok = 0, dead = -1, q = CALIB_SWEEP_OUTSIDE;
+        calib_measure_zylia_rows(cap19 + CAL_LIVE_REF_GAP, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, rlo, rhi, rr, okr);
+        for (int j = 0; j < ZYLIA_MICS; ++j) nok += okr[j] != 0;
+        if (nok != ZYLIA_MICS || zylia_pressure_proxy(rr, CAL_FS, sos, &rp, &dead) != 1) snprintf(why, whycap, "no arrival");
+        else {
+            calib_pool_quality(rr, &rp);
+            q = calib_sweep_check(&rp, CALIB_SWEEP_MIN_SNR_DB);
+            if (q == CALIB_SWEEP_OK) { *arr_samples = (double)rp.delay_samples + rp.delay_frac; return 1; }
+            calib_sweep_why(&rp, q, CAL_FS, why, whycap);
+        }
+        if (q != CALIB_SWEEP_OUTSIDE || rhi <= rlo) break;      /* noise does not improve unwindowed */
+        rlo = rhi = 0;
+    }
+    return 0;
+}
+
 int calib_live_read(int spk, const Layout* L, const float center[3], double sos, int simulate,
                     const CalibSimOpts* sim, const float* lsweep, float* cap19, CalibLiveReading* out,
-                    const CalibWindow* win, const float* believed) {
+                    const CalibWindow* win, const float* believed, CalibLiveRef* ref) {
     memset(out, 0, sizeof *out);
     out->dead = -1;
+    const int rs = (ref && ref->spk >= 0 && ref->spk != spk && (uint32_t)ref->spk < L->count) ? ref->spk : -1;
+    out->ref = rs;
     if (simulate) {
         float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
         CalibSimOpts o; memset(&o, 0, sizeof o);
         if (sim) o = *sim;
-        o.nsweep = CAL_LIVE_NSWEEP; o.ncap = CAL_LIVE_CAPLEN;
+        o.nsweep = CAL_LIVE_NSWEEP; o.ncap = rs >= 0 ? CAL_LIVE_REF_CAPLEN : CAL_LIVE_CAPLEN;
         calib_sim_capture_zylia_ex(spk, L, center, caps, ZYLIA_MICS, sos, &o, cap19, CAL_CAPLEN);
+        if (rs >= 0) sim_live_ref(rs, L, center, caps, sos, &o, cap19);   /* the same ncap: one room-tail cache */
     }
 #ifdef BWA_HAVE_ASIO
-    else if (!calib_asio_capture_len(spk, lsweep, CAL_LIVE_NSWEEP, CAL_LIVE_CAPLEN)) return 0;
+    else if (!calib_asio_capture_pair(spk, rs, CAL_LIVE_REF_GAP, lsweep, CAL_LIVE_NSWEEP,
+                                      rs >= 0 ? CAL_LIVE_REF_CAPLEN : CAL_LIVE_CAPLEN)) return 0;
 #else
     else return 0;
 #endif
+    const float* m = believed ? believed : center;
+    /* The latency the windows are timed from: the caller's prior, or with a reference the last latency it
+     * measured (+/- CALIB_WIN_LAT_KNOWN_S), so the windows follow a latency that moves. */
+    CalibWindow w; memset(&w, 0, sizeof w);
+    int have_w = 0;
+    if (win) { w = *win; have_w = 1; }
+    if (!have_w || w.pos_m < 0.0) w.pos_m = CALIB_WIN_PLAN_M;
+    if (rs >= 0 && ref->have_prev) {
+        w.lat_s = ref->prev_lat_s; w.lat_early_s = w.lat_late_s = CALIB_WIN_LAT_KNOWN_S; have_w = 1;
+    }
+    /* The reference first: its arrival is THIS reading's latency, which then times the live speaker's
+     * window too. A reference that is not clean leaves the last good latency in charge of the windows. */
+    double rarr = 0.0;
+    char rwhy[160] = "";
+    int rlim = 0;                                      /* where the reference's direct sound can begin, its own axis */
+    if (rs >= 0) {
+        if (live_ref_arrival(rs, L, m, sos, lsweep, cap19, have_w ? &w : NULL, &rarr, rwhy, sizeof rwhy)) {
+            const float* p = L->speakers[rs].pos;
+            const double dx = (double)p[0] - m[0], dy = (double)p[1] - m[1], dz = (double)p[2] - m[2];
+            out->ref_lat_s = rarr / CAL_FS - sqrt(dx * dx + dy * dy + dz * dz) / sos;
+            out->ref_ok = 1;
+            w.lat_s = out->ref_lat_s; w.lat_early_s = w.lat_late_s = CALIB_WIN_LAT_KNOWN_S; have_w = 1;
+            rlim = (int)rarr - (int)(MEASURE_NOISE_GUARD_S * CAL_FS);
+        } else if (have_w) {
+            CalibWindow rw = w; int rhi = 0;
+            rw.pos_m = calib_window_pos_m(L, rs) + CALIB_WIN_ZM1_M;
+            if (!calib_arrival_window(&rw, L->speakers[rs].pos, m, sos, CAL_FS, &rlim, &rhi)) rlim = 0;
+        }
+        if (rlim < 0) rlim = 0;
+    }
     /* the window: the union of the as-built's and the plan's, the box moving from one toward the other */
     int lo = 0, hi = 0;
-    if (win) {
-        CalibWindow w = *win;
-        if (w.pos_m < 0.0) w.pos_m = CALIB_WIN_PLAN_M;
-        w.pos_m += CALIB_WIN_ZM1_M;
-        const float* m = believed ? believed : center;
+    if (have_w) {
+        CalibWindow lw = w;
+        lw.pos_m += CALIB_WIN_ZM1_M;
         int a0, a1, b0, b1;
-        const int ha = calib_arrival_window(&w, L->speakers[spk].pos, m, sos, CAL_FS, &a0, &a1);
-        const int hb = calib_arrival_window(&w, layout_plan_pos(L, (uint32_t)spk), m, sos, CAL_FS, &b0, &b1);
+        const int ha = calib_arrival_window(&lw, L->speakers[spk].pos, m, sos, CAL_FS, &a0, &a1);
+        const int hb = calib_arrival_window(&lw, layout_plan_pos(L, (uint32_t)spk), m, sos, CAL_FS, &b0, &b1);
         if (ha && hb) { lo = a0 < b0 ? a0 : b0; hi = a1 > b1 ? a1 : b1; }
     }
     /* the LIVE tilt bands (calib.h CALIB_LIVE_*, steeper near on-axis than --check-aim's): only the
@@ -904,7 +998,12 @@ int calib_live_read(int spk, const Layout* L, const float center[3], double sos,
     const double band[2] = { CALIB_LIVE_MID_HZ, CALIB_LIVE_HIGH_HZ };
     MeasureResult rj[ZYLIA_MICS];
     int okj[ZYLIA_MICS] = { 0 };
-    calib_measure_zylia_rows(cap19, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, lo, hi, rj, okj);
+    /* With a reference the live speaker's lags end ahead of the reference's direct sound AND of its
+     * harmonic products (orders 2..MEASURE_HARM_MAX lead it): they are expected, not interferers, and not
+     * this speaker's noise (measure_response_lim). */
+    const int lag_hi = rs < 0 ? 0 : CAL_LIVE_REF_GAP + rlim
+        - (int)measure_harmonic_lead(CAL_LIVE_NSWEEP, MEASURE_HARM_MAX, CAL_F1, CAL_F2) - (int)(MEASURE_HARM_GUARD_S * CAL_FS);
+    zylia_rows_lim(cap19, CAL_CAPLEN, CAL_LIVE_CAPLEN, lsweep, CAL_LIVE_NSWEEP, band, lo, hi, lag_hi, rj, okj);
     for (int j = 0; j < ZYLIA_MICS; ++j) if (!okj[j]) { out->dead = j; return 1; }
     int dead = -1;
     if (zylia_pressure_proxy(rj, CAL_FS, sos, &out->pooled, &dead) != 1) { out->dead = dead; return 1; }
@@ -914,6 +1013,34 @@ int calib_live_read(int spk, const Layout* L, const float center[3], double sos,
     for (int j = 0; j < ZYLIA_MICS; ++j) out->arr[j] = ((double)rj[j].delay_samples + rj[j].delay_frac) / CAL_FS;
     out->have_tilt = calib_direct_tilt_db(&out->pooled, &out->tilt_db);
     out->ok = 1;
+    if (rs < 0) return 1;
+    /* What the reference says about holding this reading. The live speaker's own reason, when it has
+     * one, stays on the line. */
+    int q = CALIB_SWEEP_OK;
+    char qwhy[200] = "";
+    if (!out->ref_ok) {
+        q = CALIB_LIVE_REF_BAD;
+        snprintf(qwhy, sizeof qwhy, "reference speaker %d: %s", rs, rwhy);
+    } else {
+        if (!ref->have_prev) {
+            /* nothing to compare with: a step inside this capture would be believed, so it only sets the baseline */
+            q = CALIB_LIVE_BASELINE;
+            snprintf(qwhy, sizeof qwhy, "baseline: the latency check starts with the next reading");
+        } else {
+            const double moved = (out->ref_lat_s - ref->prev_lat_s) * CAL_FS;
+            if (fabs(moved) > CAL_LIVE_LAT_MOVED_SAMPLES) {
+                out->lat_moved = 1; out->lat_moved_samples = (float)moved;
+                q = CALIB_LIVE_LAT_MOVED;
+                snprintf(qwhy, sizeof qwhy, "latency moved %+.1f samples (%+.0f mm at c) since the last reading, "
+                         "during this one or just before it", moved, moved / CAL_FS * sos * 1e3);
+            }
+        }
+        ref->prev_lat_s = out->ref_lat_s; ref->have_prev = 1;
+    }
+    if (q != CALIB_SWEEP_OK && out->quality == CALIB_SWEEP_OK) {
+        out->quality = q;
+        snprintf(out->why, sizeof out->why, "%s", qwhy);
+    }
     return 1;
 }
 
@@ -996,6 +1123,9 @@ extern AsioDrivers* asioDrivers;
 extern bool loadAsioDriver(char* name);
 
 namespace {
+/* The per-block logic (which output plays what, which input samples are kept) is calib_job.c, SDK-free
+ * and tested offline (calib_capture_block). This half keeps the atomics and the format conversion. */
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "req/done are read on the audio thread: they must not lock");
 struct Cal {
     long            bufsize;
     int             nspk;                     /* the layout's speaker count; inputs ride slots [nspk..] */
@@ -1004,41 +1134,30 @@ struct Cal {
     ASIOChannelInfo ci[BWA_MAX_CHANNELS + CAL_MAX_INPUTS];
     ASIOCallbacks   cb;
     const float*    sweep;                    /* the signal given at open */
-    const float*    play;                     /* what this capture plays: sweep, or a --verify signal */
-    int             play_len;
     float*          cap;                      /* [nin][CAL_CAPLEN] flat */
-    int             cap_len;                  /* samples this capture records per input (<= CAL_CAPLEN) */
-    std::atomic<int> active;                  /* output channel being measured, -1 = idle */
-    std::atomic<int> done;
-    int             play_pos, cap_pos;
+    CalibJob        job[2];                   /* filled by the control thread, published by req */
+    std::atomic<unsigned> req;                /* (sequence << 1) | slot of the capture to run; 0 = none */
+    std::atomic<unsigned> done;               /* the req the callback finished */
+    unsigned        seq;                      /* control thread: captures started */
+    CalibJobState   st;                       /* callback only */
 } g;
 
-static const float g_zero[1024] = { 0 };                     /* type-correct silence via asio_float_to_out */
+/* callback only: the block as planar float, [nspk][bufsize]. Static, not stack: 64 x 1024 floats is
+ * 256 KB, more than a driver's callback thread is known to have. bufsize <= 1024 enforced at open. */
+static float g_out[BWA_MAX_CHANNELS * 1024];
 
 void buffer_switch(long index, ASIOBool) {
-    int ac = g.active.load(std::memory_order_acquire);
-    long n = g.bufsize;
-    for (int c = 0; c < g.nspk; ++c) {
-        void* dst = g.bi[c].buffers[index];
-        if (c == ac && g.play_pos < g.play_len) {
-            float blk[1024];                                 /* bufsize <= 1024 enforced at open */
-            for (long i = 0; i < n; ++i) blk[i] = (g.play_pos + i < g.play_len) ? g.play[g.play_pos + i] : 0.f;
-            asio_float_to_out(dst, blk, n, g.ci[c].type);
-        } else {
-            asio_float_to_out(dst, g_zero, n, g.ci[c].type); /* NOT memset(n*4): a 2/3-byte buffer would overrun */
-        }
-    }
-    if (ac >= 0) {
-        int rem = g.cap_len - g.cap_pos;
-        long take = n < rem ? n : rem;
-        if (take > 0)
-            for (int j = 0; j < g.nin; ++j)
-                asio_in_to_float(g.cap + (size_t)j * CAL_CAPLEN + g.cap_pos,
-                                 g.bi[g.nspk + j].buffers[index], take, g.ci[g.nspk + j].type);
-        g.play_pos += (int)n;
-        g.cap_pos  += (int)n;
-        if (g.cap_pos >= g.cap_len) g.done.store(1, std::memory_order_release);
-    }
+    const unsigned r = g.req.load(std::memory_order_acquire);
+    const long n = g.bufsize;
+    int cap_at = 0, take = 0;
+    const int fin = calib_job_block(&g.st, r, g.job, g.nspk, n, g_out, &cap_at, &take);
+    /* silence goes through the converter too, never memset(n*4): a 2/3-byte buffer would overrun */
+    for (int c = 0; c < g.nspk; ++c)
+        asio_float_to_out(g.bi[c].buffers[index], g_out + (size_t)c * (size_t)n, n, g.ci[c].type);
+    for (int j = 0; take > 0 && j < g.nin; ++j)
+        asio_in_to_float(g.cap + (size_t)j * CAL_CAPLEN + cap_at,
+                         g.bi[g.nspk + j].buffers[index], take, g.ci[g.nspk + j].type);
+    if (fin) g.done.store(r, std::memory_order_release);
     ASIOOutputReady();
 }
 ASIOTime* buffer_switch_ti(ASIOTime* t, long index, ASIOBool pn) { buffer_switch(index, pn); return t; }
@@ -1078,18 +1197,25 @@ int calib_asio_open_multi(const char* driver, int in_first, int nin, int nspk, c
     if (nin < 1 || nin > CAL_MAX_INPUTS) { fprintf(stderr, "calib_capture: input count %d out of range (1..%d)\n", nin, CAL_MAX_INPUTS); return 1; }
     if (nspk < 1 || nspk > BWA_MAX_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
     if (!asio_session_acquire("the calibration sweep (Capture tab / bwa_calibrate)")) return 1;
-    memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.play = sweep; g.play_len = CAL_NSWEEP; g.cap = cap; g.cap_len = CAL_CAPLEN; g.nspk = nspk; g.nin = nin;
+    memset(&g, 0, sizeof g); g.sweep = sweep; g.cap = cap; g.nspk = nspk; g.nin = nin;
     if (!open_driver(driver, in_first, nin, nspk)) {
         fprintf(stderr, "calib_capture: no ASIO driver with >=%d out + %d input(s) from %d\n", nspk, nin, in_first);
         asio_session_release(); return 1; }
-    long bmin=0,bmax=0,bpref=0,bgran=0; ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
-    long bs = bpref > 1024 ? 1024 : bpref;                    /* prefer <=1024 (blk[] in buffer_switch is 1024) */
+    long bmin=0,bmax=0,bpref=0,bgran=0;
+    const ASIOError bse = ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
+    long bs = bpref > 1024 ? 1024 : bpref;                    /* prefer <=1024 (g_out's rows are 1024) */
     if (bs < bmin) bs = bmin;                                 /* honor the driver minimum ... */
-    if (bs > 1024) {                                          /* ... but the stack scratch can't exceed 1024 */
+    if (bse != ASE_OK || bs < 1) {                            /* a 0-frame block never advances a capture */
+        fprintf(stderr, "calib_capture: driver reported no usable buffer size (ASIOGetBufferSize error %ld, preferred %ld, min %ld)\n",
+                (long)bse, bpref, bmin);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1;
+    }
+    if (bs > 1024) {                                          /* ... but g_out's rows can't exceed 1024 */
         fprintf(stderr, "calib_capture: driver minimum buffer %ld samples exceeds the 1024 limit\n", bs);
         ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1;
     }
     g.bufsize = bs;
+    memset(g_out, 0, sizeof g_out);                           /* touch the pages here: no first-use page fault in the callback */
     if (ASIOCanSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK || ASIOSetSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK) {
         fprintf(stderr, "calib_capture: driver cannot run at %.0f Hz\n", CAL_FS); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     for (int c = 0; c < nspk; ++c) { g.bi[c].isInput=ASIOFalse; g.bi[c].channelNum=c; }
@@ -1129,41 +1255,35 @@ int calib_asio_latencies(long* in_frames, long* out_frames) {
 
 /* Capture one speaker: drive the sweep on output `ch`, record CAL_CAPLEN samples of every input. */
 int calib_asio_capture(int ch) {
-    g.play = g.sweep; g.play_len = CAL_NSWEEP;               /* idle (active == -1): the callback reads neither */
-    g.cap_len = CAL_CAPLEN;
-    g.play_pos = 0; g.cap_pos = 0;
-    g.done.store(0, std::memory_order_relaxed);
-    g.active.store(ch, std::memory_order_release);
-    for (int spins = 0; !g.done.load(std::memory_order_acquire); ++spins) {
-        Sleep(5);
-        if (spins > 2000) { g.active.store(-1, std::memory_order_release); return 0; }  /* ~10 s watchdog */
-    }
-    g.active.store(-1, std::memory_order_release);
-    return 1;
+    return calib_asio_capture_pair(ch, -1, 0, g.sweep, CAL_NSWEEP, CAL_CAPLEN);
 }
 
 int calib_asio_capture_signal(int ch, const float* sig, int nsig) {
-    return calib_asio_capture_len(ch, sig, nsig, CAL_CAPLEN);
+    return calib_asio_capture_pair(ch, -1, 0, sig, nsig, CAL_CAPLEN);
 }
 
 int calib_asio_capture_len(int ch, const float* sig, int nsig, int ncap) {
+    return calib_asio_capture_pair(ch, -1, 0, sig, nsig, ncap);
+}
+
+int calib_asio_capture_pair(int ch, int ch2, int gap, const float* sig, int nsig, int ncap) {
+    if (ch < 0 || ch >= g.nspk) {
+        fprintf(stderr, "calib_capture: output %d out of range (0..%d)\n", ch, g.nspk - 1); return 0; }
     if (ncap < 1 || ncap > CAL_CAPLEN) {
         fprintf(stderr, "calib_capture: capture length %d out of range (1..%d)\n", ncap, CAL_CAPLEN); return 0; }
     if (!sig || nsig < 1 || nsig > ncap) {
         fprintf(stderr, "calib_capture: play signal length %d out of range (1..%d)\n", nsig, ncap); return 0; }
-    g.play_pos = 0; g.cap_pos = 0;
-    g.cap_len = ncap;                                        /* idle: the callback reads it only once active */
-    g.play = sig; g.play_len = nsig;                         /* published by the release store below */
-    g.done.store(0, std::memory_order_relaxed);
-    g.active.store(ch, std::memory_order_release);
-    int ok = 1;
-    for (int spins = 0; !g.done.load(std::memory_order_acquire); ++spins) {
+    if (ch2 >= 0 && (ch2 == ch || ch2 >= g.nspk || gap < 0 || gap + nsig > ncap)) {
+        fprintf(stderr, "calib_capture: second output %d (gap %d) does not fit this capture\n", ch2, gap); return 0; }
+    const unsigned q = ++g.seq, slot = q & 1u, r = (q << 1) | slot;   /* slots alternate; r is never 0 */
+    CalibJob& J = g.job[slot];
+    J.ch = ch; J.ch2 = ch2 >= 0 ? ch2 : -1; J.gap2 = gap; J.play = sig; J.play_len = nsig; J.cap_len = ncap;
+    g.req.store(r, std::memory_order_release);               /* publishes J */
+    for (int spins = 0; g.done.load(std::memory_order_acquire) != r; ++spins) {
         Sleep(5);
-        if (spins > 2000) { ok = 0; break; }                 /* ~10 s watchdog */
+        if (spins > 2000) { g.req.store(0, std::memory_order_release); return 0; }   /* ~10 s watchdog */
     }
-    g.active.store(-1, std::memory_order_release);
-    g.play = g.sweep; g.play_len = CAL_NSWEEP; g.cap_len = CAL_CAPLEN;
-    return ok;
+    return 1;                                                /* the callback idles itself: nothing to reset */
 }
 
 void calib_asio_close(void) {

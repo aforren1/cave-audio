@@ -251,9 +251,11 @@ speaker more than 0.5 m from its plan is flagged with its arrival printed, not m
 Each IR's peak is held against its own noise floor (`MeasureResult.snr_db`). Where the floor is
 read follows from how `measure.c` deconvolves. The FFT is at least `ncap + nref` long, so the
 deconvolution is linear and nothing wraps onto the speaker's response. The IR's positive lags hold
-the direct sound and the room; the exponential sweep's harmonic-distortion products land at
-**negative** lags, which this deconvolution puts at the end of the buffer, past `ncap`. The floor is
-read from two positive-lag regions only:
+the direct sound and the room. The exponential sweep's harmonic-distortion products land **ahead**
+of the arrival: order k by `nref ln(k) / ln(f2 / f1)` samples, which is 150 ms for the 1.5 s
+sweep's second harmonic and 50 ms for the 0.5 s live sweep's. An arrival earlier than that puts
+the product at a negative lag, past `ncap` at the end of the buffer. The floor is read from two
+positive-lag regions only:
 
 - **before**: from lag 0 to 2 ms (`MEASURE_NOISE_GUARD_S`) before the window opens. Nothing of
   this speaker can arrive earlier, and the guard keeps the arrival's own band-edge ringing out.
@@ -262,10 +264,15 @@ read from two positive-lag regions only:
   sweep's low end overlaps the capture, so this region is a narrower band, and it is where a
   transient late in a capture shows.
 
-No negative lag is used: a harmonic product of some order can sit at any of them. The floor is the
+No negative lag is used: a harmonic product of some order can sit at any of them. A late arrival
+puts the low orders at positive lags too: the ZM-1 chain's 65 ms puts the live sweep's second
+harmonic 15 ms into the "before" region. So both regions leave out 5 ms either side of orders 2
+to 4 of the found arrival (`MEASURE_HARM_*`): a speaker's distortion is not the room's noise. No
+simulated capture arrives that late, so no simulated figure moved. The floor is the
 RMS of the **loudest** 20 ms block (`MEASURE_NOISE_BLOCK_S`) in the two regions, so one cough in an
-otherwise quiet capture reads as the cough. Live aiming's 0.25 s tail leaves no "after" region, so
-it reads the "before" one, which the ZM-1 chain's 60 ms of latency makes long.
+otherwise quiet capture reads as the cough. Plain live aiming's 0.25 s tail leaves no "after" region,
+so it reads the "before" one, which the ZM-1 chain's 60 ms of latency makes long. With `--live-ref`
+the 1.25 s capture gives the live speaker an "after" region before the reference arrives.
 
 A noise-free simulated capture reads 75 to 78 dB anechoic (the deconvolution's own residue) and 67
 to 76 dB with `--sim-room` (the simulated late tail). `CALIB_SWEEP_MIN_SNR_DB` is **40 dB**, 27 dB
@@ -2118,9 +2125,10 @@ That run is simulated, which is what the closing `true` field says; the rig prin
   (`zylia_doa`), distance from the arrival at the array center minus the system latency
   (`zylia_live_position`). The distance is exactly as good as the latency: 20 µs of latency
   error is 6.9 mm. Pass `--latency` (a loopback in meters at c), `--ref <spk> <m>` (one taped
-  distance, swept once before the loop) or `--ref-speakers <list>` (speakers whose positions are
-  measured, each swept once before the loop; see "The latency from measured speakers"). Without
-  one you get the direction only. `--ref-speakers` refuses the live speaker: its position is the
+  distance, swept once before the loop), `--ref-speakers <list>` (speakers whose positions are
+  measured, each swept once before the loop; see "The latency from measured speakers") or
+  `--live-ref <spk>` (one measured speaker, swept in every reading; see "The latency in every
+  reading"). Without one you get the direction only. `--ref-speakers` refuses the live speaker: its position is the
   one in question.
 - **Tilt, peak, below**: the direct-sound high-to-mid ratio (the gated `band_direct`, 10 kHz up
   against 3 to 10 kHz, pooled over the capsules by `zylia_pressure_proxy`), the held peak (see
@@ -2157,6 +2165,85 @@ That one is from the `calibrate_sweep_quality` ctest: an 18 dB click 0.48 s into
 its tilt by 0.49 dB, the reading is not held, and the peak stays the clean pair's. The window for
 live aiming spans both the as-built position and the plan, with the 0.5 m plan margin around each,
 since the box is moving from one toward the other.
+
+### The latency in every reading (`--live-ref`)
+
+The ZM-1 reaches the Digiface through Dante Via, and Via steps the system latency by 0.3 to 0.4 ms
+at random, then settles back over about 30 s (rig, 2026-11-17). `--latency`, `--ref` and
+`--ref-speakers` take the latency once, before the loop. Every step after that reads as 10 to 14 cm
+of distance. The direction does not move: the capsules share the latency.
+
+`--live-ref R` measures the latency inside each reading instead:
+
+```
+bwa_calibrate --layout as_built.json --live 7 --zylia --survey capsules.json --live-ref 3
+```
+
+Each reading plays the live sweep from the live speaker and, 0.5 s later, from speaker R, in one
+1.25 s capture (`CAL_LIVE_REF_GAP`, `CAL_LIVE_REF_CAPLEN`). The deconvolved response carries both
+direct sounds, 0.5 s apart. R's arrival, minus its layout distance from the ZM-1 over c, is the
+latency of that second, and the live speaker's distance uses it:
+
+```
+distance = |R's position - ZM-1 center| + c * (live arrival - (R's arrival - 0.5 s))
+```
+
+The direction and the tilt come from the live speaker's arrival only. R supplies timing and nothing
+else. The Aim tab has the same thing as its **latency reference** dropdown (None by default), and
+shows the reference and the latency under the position.
+
+- **The live speaker plays first.** A step that lands inside the capture then always reaches R's
+  sweep, so it shows in R's latency on the reading it spoiled.
+- **A moved latency is flagged.** When R's latency is more than 2 samples off the previous
+  reading's, the line says `NOT HELD: latency moved +16.8 samples (+120 mm at c)` and the peak does
+  not hold that reading. After a step between two readings the flagged distance is still right.
+  After a step inside the capture it is wrong by the step. You cannot tell the two apart from one
+  line, so read the next one.
+- **The first reading is the baseline.** It has no latency to compare with, so a step inside it
+  could not be flagged. Its line says `NOT HELD: baseline: the latency check starts with the next
+  reading`, and the peak needs readings 2 and 3.
+- **Each arrival has its own window and SNR check, and the windows follow the latency.** R is
+  measured first. Its window is timed from the last latency a clean reference gave, within 1 ms,
+  around its layout position. When the strongest tap lies outside that window, R is searched once
+  more over the whole response, so a step larger than the margin is found and flagged, not lost.
+  The live speaker's window is then timed from this reading's latency. A reading whose reference
+  is not clean prints `ref R: no latency`, gives no distance, is not held, and leaves the windows
+  on the last good latency.
+- **The gap is the sweep length, 0.5 s.** The live speaker needs a noise region after its own
+  arrival: 0.30 s for its room tail, ending before R's fourth harmonic product, which leads R's
+  arrival by 100 ms. That takes 0.41 s; 0.5 s leaves about 80 ms of region. R's own "before" region
+  is then the live speaker's tail 0.5 s on. The live speaker's lags stop ahead of R's harmonic
+  products, so they are neither its interferer nor its noise.
+- **It costs update rate.** The capture is 1.25 s against 0.75 s, and both arrivals are
+  deconvolved: expect about 0.6 to 0.7 readings a second on the rig against 1 to 1.2 without the
+  reference. Nobody has timed it there.
+- **While the latency settles**, it still moves during the 0.5 s between the two sweeps: about
+  20 µs, 7 mm, just after a step, by the rig's settling rate. Nobody has measured that on the rig.
+
+**R's position must be measured.** An error in R's distance from the ZM-1 moves the live speaker's
+distance by the same amount. The best reference is a camera-visible box that
+`bwa_speaker_survey --write --fields position` placed. A `--localize` position is next. The plan is
+not a measurement, and the run warns when R carries no `plan_position` or one equal to its
+position. `--live-ref` refuses the live speaker, a speaker the layout does not have, and a
+combination with `--ref` or `--ref-speakers`.
+
+**Every 4410A must use the same Dante receive latency.** The two arrivals are compared directly,
+so a difference between R's setting and the live speaker's reads as distance: 0.25 ms is 86 mm.
+`--ref-speakers` flags a box 0.1 ms off the others; run it once over the boxes you plan to use.
+
+**Turn ISS off for any calibration run.** The 4410A's ISS auto-standby threshold is -70 dBFS and
+the engine's silence is about -120 dBFS, so a box left unplayed past the ISS timeout sleeps, and it
+may still be waking when its next sweep arrives. In `--localize` and the trims each box sits silent
+while the others play. Turn ISS off in Smart IP Manager, or set a long timeout. A `--live-ref` run
+keeps its two boxes awake on its own: both play in every reading.
+
+The `calibrate_live_zylia` ctest steps the simulated latency (`--sim-latency-step N,ms`, or
+`N,ms,inside` for a step inside reading N's capture) with the box 72.8 mm further away than its
+layout position. Without the reference a 0.35 ms step moves the distance 120 mm. With it every
+reading stays within 2 mm of the truth through that step and through a -3 ms one, a step inside a
+capture is flagged on that reading, one inside the first reading is not held, and a reference
+under a noise burst gives no distance. Unverified on hardware: all of it, the two-output playback
+through the ASIO shell included.
 
 ### The move, in room words
 
@@ -2221,7 +2308,7 @@ reference from a speaker that passes through the same kind of screen as the ones
 ### Update rate
 
 The live mode plays its own shorter sweep: 0.5 s instead of 1.5 s, the same 20 Hz to 20 kHz, plus
-a 0.25 s tail (`CAL_LIVE_*` in `calib_capture.h`). The tail holds the ZM-1 chain's 60 ms of
+a 0.25 s tail (`CAL_LIVE_*` in `calib_capture.h`). With `--live-ref` the capture is 1.25 s. The tail holds the ZM-1 chain's 60 ms of
 latency with 190 ms to spare, and nothing past the direct-sound gate is read. That is 0.75 s of
 capture per reading plus the 19 deconvolutions, which run on up to 8 threads. A whole simulated
 reading, synthesis included, takes about 0.3 s on the development machine, so expect 1 to 1.2

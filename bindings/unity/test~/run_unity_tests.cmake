@@ -111,8 +111,10 @@ file(WRITE "${PROJECT_DIR}/Packages/manifest.json"
 ")
 
 # The tests themselves. Copied rather than symlinked so the scratch project stays a plain tree, and
-# copied EVERY run (copy_directory overwrites) so a scratch project kept from an earlier run cannot
-# hold a stale copy of a test.
+# into folders emptied first, so a scratch project kept from an earlier run can hold neither a stale
+# copy of a test nor a test that has since been deleted (which would still run, and count).
+file(REMOVE_RECURSE "${PROJECT_DIR}/Assets/Tests" "${PROJECT_DIR}/Assets/EditModeTests")
+file(MAKE_DIRECTORY "${PROJECT_DIR}/Assets/Tests")
 file(GLOB test_sources "${pkg_live}/test~/PlayMode/*.cs" "${pkg_live}/test~/PlayMode/*.asmdef")
 file(COPY ${test_sources} DESTINATION "${PROJECT_DIR}/Assets/Tests")
 # The EditMode assembly gets its own folder: an .asmdef governs its folder, and the two assemblies

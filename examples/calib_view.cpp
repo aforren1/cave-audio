@@ -2498,12 +2498,15 @@ struct AimData {                         /* everything worker and UI share; copi
     float move[3];                       /* simulate: the true position's offset from the AS-BUILT position (m) */
     float turn_deg, tilt_deg;            /* simulate: the true aim, turned about +y then tilted, off the as-built aim */
     float screen_db;                     /* simulate: a screen's HF loss on every path out of the box */
+    float step_ms;                       /* simulate: a latency step (a Dante Via re-sync), from the next reading on */
     int   n;                             /* readings published since Start */
     int   dead;                          /* the last reading's dead capsule, -1 = none */
     bool  have_pos; ZyliaLivePos lp;
     bool  have_tilt; float tilt_db, below_db;
     bool  clean;                         /* the last reading passed the window and the SNR floor */
     char  why[200];                      /* ... and why not, when it did not */
+    int   lref;                          /* the latency reference speaker the last reading used, -1 = none */
+    bool  lref_ok; float lref_lat_ms;    /* ... its arrival was clean, and the latency it gave that reading */
     CalibPeakHold pk;
     bool  have_ref; float tilt_ref;
     CalibAimAngle a_ref, a_file;
@@ -2519,6 +2522,8 @@ struct AimJob {
     bool  simulate, room;
     float center[3]; bool center_set; char center_for[512];
     float latency_ms; bool latency_set;  /* the rig's measured loop latency; simulate knows its own */
+    int   lref1;                         /* the in-capture latency reference (CalibLiveRef): speaker + 1, 0 = None */
+    int   r_lref;                        /* ... snapshotted at Start, -1 = none */
     char  driver[128]; int in_first;
     std::atomic<int>  state;             /* 0 idle / 1 running / 2 stopped / 3 failed */
     std::atomic<bool> stop;
@@ -2591,7 +2596,7 @@ static void aim_worker(void) {
 #ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
-            if (AJ.r_sim) calib_sim_set_room(0.f);
+            if (AJ.r_sim) { calib_sim_set_room(0.f); calib_sim_set_latency_step(0.0); }
             if (r == 1) { snprintf(AJ.msg, sizeof AJ.msg, "stopped"); AJ.state.store(2, std::memory_order_release); }
             else aim_fail(r == 2 ? "the tracker went away before the placement settled"
                                  : "placement timed out (300 s): the ZM-1 never sat in tolerance and still");
@@ -2610,6 +2615,8 @@ static void aim_worker(void) {
         if (sim_truth) memcpy(sim_at, tk.truth, sizeof sim_at);
     }
     int nread = 0;
+    CalibLiveRef lref; memset(&lref, 0, sizeof lref);
+    lref.spk = AJ.r_lref;
     while (!AJ.stop.load(std::memory_order_relaxed)) {
         CalibSimOpts o; memset(&o, 0, sizeof o);
         float tp[3], ta[3];
@@ -2618,6 +2625,7 @@ static void aim_worker(void) {
             for (int a = 0; a < 3; ++a) tp[a] = L->speakers[s].pos[a] + AJ.d.move[a];
             aim_truth(L, s, AJ.d.turn_deg, AJ.d.tilt_deg, ta);
             o.screen_db = AJ.d.screen_db;
+            if (AJ.r_sim) calib_sim_set_latency_step(AJ.d.step_ms * 1e-3);   /* set here, on the worker, between readings */
         }
         o.on_axis = 1; o.true_pos = tp; o.true_aim = ta;
         CalibLiveReading rd;
@@ -2626,19 +2634,23 @@ static void aim_worker(void) {
         CalibWindow aw;
         const int have_aw = calib_window_prior(AJ.r_sim, AJ.r_lat_known ? AJ.r_latency_s : -1.0, CALIB_WIN_PLAN_M, &aw, NULL, 0);
         if (!calib_live_read(s, L, sim_truth ? sim_at : AJ.r_center, C, AJ.r_sim, &o, lsweep, cap19, &rd,
-                             have_aw ? &aw : NULL, AJ.r_center)) {
+                             have_aw ? &aw : NULL, AJ.r_center, &lref)) {
 #ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
-            if (AJ.r_sim) calib_sim_set_room(0.f);
+            if (AJ.r_sim) { calib_sim_set_room(0.f); calib_sim_set_latency_step(0.0); }
             aim_fail("capture timed out (speaker not wired? see console)");
             return;
         }
         ZyliaLivePos lp;
+        /* with a reference the latency is this reading's own, or there is no distance */
+        const bool   lk = rd.ref >= 0 ? rd.ref_ok != 0 : AJ.r_lat_known;
+        const double lt = rd.ref >= 0 ? rd.ref_lat_s : AJ.r_latency_s;
         const bool have_pos = rd.ok && AJ.r_pos_ok &&
-                              zylia_live_position(rd.arr, AJ.r_center, AJ.r_lat_known, AJ.r_latency_s, C, layout_plan_pos(L, (uint32_t)s), &lp);
+                              zylia_live_position(rd.arr, AJ.r_center, lk, lt, C, layout_plan_pos(L, (uint32_t)s), &lp);
         ++nread;
-        const bool bumped = AJ.r_tracked && pl_after_capture(&tk, nread, CAL_LIVE_CAPLEN / CAL_FS, sim_truth ? sim_at : NULL);
+        const bool bumped = AJ.r_tracked && pl_after_capture(&tk, nread, (rd.ref >= 0 ? CAL_LIVE_REF_CAPLEN : CAL_LIVE_CAPLEN) / CAL_FS,
+                                                             sim_truth ? sim_at : NULL);
         {
             std::lock_guard<std::mutex> lk(AJ.mu);
             AimData& d = AJ.d;
@@ -2647,6 +2659,7 @@ static void aim_worker(void) {
             if (have_pos) d.lp = lp;
             d.have_tilt = rd.ok && rd.have_tilt;
             d.clean = rd.ok && rd.quality == CALIB_SWEEP_OK;
+            d.lref = rd.ref; d.lref_ok = rd.ref_ok != 0; d.lref_lat_ms = (float)(rd.ref_lat_s * 1e3);
             snprintf(d.why, sizeof d.why, "%s", rd.ok ? rd.why : "");
             if (d.have_tilt) {
                 d.tilt_db  = rd.tilt_db;
@@ -2665,7 +2678,7 @@ static void aim_worker(void) {
 #ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
-            if (AJ.r_sim) calib_sim_set_room(0.f);
+            if (AJ.r_sim) { calib_sim_set_room(0.f); calib_sim_set_latency_step(0.0); }
             char m[200];
             if (tk.turned)
                 snprintf(m, sizeof m, "BUMP: the ZM-1 turned %.2f deg after reading %d (limit %.2f deg): re-place it and start again",
@@ -2681,7 +2694,7 @@ static void aim_worker(void) {
 #ifdef BWA_HAVE_ASIO
     if (asio_up) calib_asio_close();
 #endif
-    if (AJ.r_sim) calib_sim_set_room(0.f);                       /* do not leak the room into the Capture tab */
+    if (AJ.r_sim) { calib_sim_set_room(0.f); calib_sim_set_latency_step(0.0); }                       /* do not leak the room into the Capture tab */
     snprintf(AJ.msg, sizeof AJ.msg, "stopped");
     AJ.state.store(2, std::memory_order_release);
 }
@@ -2691,6 +2704,7 @@ static void aim_start(void) {
     g_aim_L = V.A;
     snprintf(g_aim_from, sizeof g_aim_from, "%s", V.pathA);
     AJ.r_spk = AJ.spk; AJ.r_sim = AJ.simulate; AJ.r_room = AJ.room;
+    AJ.r_lref = (AJ.lref1 > 0 && AJ.lref1 - 1 != AJ.spk && AJ.lref1 <= (int)V.A.count) ? AJ.lref1 - 1 : -1;
     memcpy(AJ.r_center, AJ.center, sizeof AJ.center);
     AJ.r_tracked = pl_live();                                /* the worker takes the measured center */
     AJ.r_pos_ok = !AJ.r_tracked || PL.body_frame;            /* a tracked DOA needs the array's orientation */
@@ -2704,7 +2718,7 @@ static void aim_start(void) {
     AJ.layout_deg = directivity_off_axis_deg(layout_plan_pos(&g_aim_L, (uint32_t)AJ.spk), layout_plan_aim(&g_aim_L, (uint32_t)AJ.spk), AJ.center);
     {
         std::lock_guard<std::mutex> lk(AJ.mu);
-        AJ.d.n = 0; AJ.d.dead = -1; AJ.d.have_pos = AJ.d.have_tilt = false; AJ.d.nhist = 0;
+        AJ.d.n = 0; AJ.d.dead = -1; AJ.d.lref = -1; AJ.d.have_pos = AJ.d.have_tilt = false; AJ.d.nhist = 0;
         memset(&AJ.d.tk, 0, sizeof AJ.d.tk); AJ.d.waiting = false;
         calib_peak_reset(&AJ.d.pk);                              /* a new box: a new peak (the reference stays) */
         aim_estimates(AJ.d);
@@ -2773,6 +2787,26 @@ static void tab_aim(void) {
         ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
 #endif
     }
+    {   /* the in-capture latency reference (bwa_calibrate --live-ref) */
+        if (AJ.lref1 - 1 == AJ.spk || AJ.lref1 > (int)V.A.count) AJ.lref1 = 0;
+        char prev[32] = "None";
+        if (AJ.lref1 > 0) snprintf(prev, sizeof prev, "speaker %d", AJ.lref1 - 1);
+        ImGui::SetNextItemWidth(uiScaled(140));
+        if (ImGui::BeginCombo("latency reference##aim", prev)) {
+            if (ImGui::Selectable("None", AJ.lref1 == 0)) AJ.lref1 = 0;
+            for (int k = 0; k < (int)V.A.count; ++k) {
+                if (k == AJ.spk) continue;
+                char lb[32]; snprintf(lb, sizeof lb, "speaker %d", k);
+                if (ImGui::Selectable(lb, AJ.lref1 == k + 1)) AJ.lref1 = k + 1;
+            }
+            ImGui::EndCombo();
+        }
+        bwTip("A speaker whose position in layout A is MEASURED. Each reading then plays the live speaker and, 0.5 s\n"
+              "later in the same capture, this one, and takes the latency from its arrival: the distance no longer\n"
+              "follows the ZM-1's Dante Via latency steps (0.3 to 0.4 ms, 10 to 14 cm). An error in its position\n"
+              "moves the live speaker's distance by the same amount. The first reading only sets the baseline.\n"
+              "None = the latency above, taken once.");
+    }
     ImGui::EndDisabled();
     {   /* what the readout aims at: the plan when the file keeps one (docs/layout-schema.md) */
         const Speaker& ps = V.A.speakers[AJ.spk];
@@ -2824,6 +2858,10 @@ static void tab_aim(void) {
         ImGui::DragFloat("screen (dB)##aim", &AJ.d.screen_db, 0.05f, 0.f, 6.f, "%.2f");
         bwTip("a screen's high-frequency loss on every path out of the box (a shelf above 4 kHz). The peak and a "
               "stored reference do not care; the file's 0 deg tilt does");
+        ImGui::SetNextItemWidth(uiScaled(140));
+        ImGui::DragFloat("latency step (ms)##aim", &AJ.d.step_ms, 0.01f, -5.f, 5.f, "%.2f");
+        bwTip("a Dante Via latency step, from the next reading on: 0.35 ms reads as 120 mm of distance unless a "
+              "latency reference is picked");
     }
 
     AimData d;
@@ -2937,6 +2975,10 @@ static void tab_aim(void) {
             ImGui::TextDisabled("position: off (tracked with no body-frame survey: a direction needs the array's orientation)");
         else
             ImGui::TextDisabled("position: -");
+        if (d.n && d.lref >= 0) {
+            if (d.lref_ok) ImGui::TextDisabled("latency %.3f ms from reference speaker %d, this reading", d.lref_lat_ms, d.lref);
+            else ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.3f, 1.f), "reference speaker %d gave no latency: no distance", d.lref);
+        }
         if (d.tk.used && d.tk.turn_limit_deg > 0.f)    /* a direction run: how far the stand turned since the take */
             ImGui::Text("stand turned %.2f deg since the take (limit %.2f deg)", d.tk.last_turn_deg, d.tk.turn_limit_deg);
     }
@@ -4766,6 +4808,69 @@ static void register_tests(ImGuiTestEngine* e) {
         const double t1 = ImGui::GetTime();
         while (AJ.state.load() == 1 && ImGui::GetTime() - t1 < 30.0) ctx->Yield();
         IM_CHECK_EQ(AJ.state.load(), 2);
+    };
+
+    /* the latency reference (bwa_calibrate --live-ref): picked in the dropdown, it reaches calib_live_read
+     * (the reading says which speaker it used), and the distance holds through a 0.35 ms latency step the
+     * simulator takes mid-run, which the latency taken once at Start would read as 120 mm. The box stands
+     * 100 mm off its layout position, so a distance that echoed the layout would be 70 mm wrong; the truth
+     * is worked out here from the fixture. The step is queued in AimData and taken by the worker. */
+    t = IM_REGISTER_TEST(e, "aim", "sim_live_ref");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto wait_readings = [&](int more) {
+            int n0; { std::lock_guard<std::mutex> lk(AJ.mu); n0 = AJ.d.n; }
+            const double t0 = ImGui::GetTime();
+            for (;;) {
+                int n; { std::lock_guard<std::mutex> lk(AJ.mu); n = AJ.d.n; }
+                if (n >= n0 + more || AJ.state.load() != 1 || ImGui::GetTime() - t0 > 60.0) break;
+                ctx->Yield();
+            }
+        };
+        auto snap = [&]() { AimData d; std::lock_guard<std::mutex> lk(AJ.mu); d = AJ.d; return d; };
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/##A");
+        ctx->KeyCharsReplaceEnter(FIX_E);
+        ctx->ItemClick("**/Load A");
+        ctx->ItemClick("**/Aim");
+        ctx->Yield(2);
+        ctx->ItemInputValue("**/speaker##aim", 3);
+        ctx->ItemCheck("**/simulate##aim");
+        { std::lock_guard<std::mutex> lk(AJ.mu); AJ.d.move[0] = 0.1f; AJ.d.move[1] = AJ.d.move[2] = 0.f; AJ.d.turn_deg = AJ.d.tilt_deg = 0.f;
+          AJ.d.step_ms = 0.f; }
+        ctx->Yield(2);
+        const float* sp = V.A.speakers[3].pos;
+        const float want_mm = 1e3f * (sqrtf((sp[0] + 0.1f - AJ.center[0]) * (sp[0] + 0.1f - AJ.center[0]) + (sp[1] - AJ.center[1]) * (sp[1] - AJ.center[1]) +
+                                            (sp[2] - AJ.center[2]) * (sp[2] - AJ.center[2])) -
+                                      sqrtf((sp[0] - AJ.center[0]) * (sp[0] - AJ.center[0]) + (sp[1] - AJ.center[1]) * (sp[1] - AJ.center[1]) +
+                                            (sp[2] - AJ.center[2]) * (sp[2] - AJ.center[2])));
+        IM_CHECK_GT(fabsf(want_mm), 50.f);                        /* the move shows in the distance */
+        IM_CHECK_EQ(AJ.lref1, 0);                                 /* None by default */
+        /* by id: a combo reports no label to the engine; it shares the simulate checkbox's id scope */
+        ctx->ItemClick(ImHashStr("latency reference##aim", 0, ctx->ItemInfo("**/simulate##aim").ParentID));
+        ctx->Yield(2);
+        ctx->ItemClick("//$FOCUSED/speaker 1");
+        IM_CHECK_EQ(AJ.lref1, 2);
+        ctx->Yield(2);
+        ctx->ItemClick("**/Start##aim");
+        wait_readings(2);
+        AimData d = snap();
+        IM_CHECK_EQ(AJ.state.load(), 1);
+        IM_CHECK_EQ(d.lref, 1);                                   /* the reading used the picked speaker */
+        IM_CHECK(d.lref_ok && fabsf(d.lref_lat_ms - 1e3f * CAL_SIM_LATENCY_SAMPLES / (float)CAL_FS) < 0.01f);
+        IM_CHECK(d.have_pos && d.lp.have_distance && fabsf(d.lp.dist_err_mm - want_mm) < 3.f);
+        { std::lock_guard<std::mutex> lk(AJ.mu); AJ.d.step_ms = 0.35f; }   /* a Dante Via step, mid-run */
+        wait_readings(3);
+        d = snap();
+        { std::lock_guard<std::mutex> lk(AJ.mu); AJ.d.step_ms = 0.f; AJ.d.move[0] = 0.f; }
+        printf("aim test: latency reference %d: latency %.3f ms after a 0.35 ms step, distance %+.1f mm off the layout's (truth %+.1f)\n",
+               d.lref, d.lref_lat_ms, d.lp.dist_err_mm, want_mm);
+        IM_CHECK(d.lref_ok && fabsf(d.lref_lat_ms - 0.35f - 1e3f * CAL_SIM_LATENCY_SAMPLES / (float)CAL_FS) < 0.01f);
+        IM_CHECK(d.have_pos && d.lp.have_distance && fabsf(d.lp.dist_err_mm - want_mm) < 3.f);
+        ctx->ItemClick("**/Stop##aim");
+        const double t1 = ImGui::GetTime();
+        while (AJ.state.load() == 1 && ImGui::GetTime() - t1 < 30.0) ctx->Yield();
+        IM_CHECK_EQ(AJ.state.load(), 2);
+        AJ.lref1 = 0;                                             /* leave the tab as the other tests expect it */
     };
 
     /* ---- the Placement panel, on the simulated stand (mic_track's MIC_SIM_SCRIPT, wall clock): it walks

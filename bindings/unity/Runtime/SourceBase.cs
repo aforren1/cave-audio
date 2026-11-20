@@ -5,7 +5,6 @@
 // lands once instead of once per component. Subclasses mint their own kind of native source
 // (CreateSource) and add only their feed: Emitter the clip/play surface, PushEmitter the PCM push.
 using System;
-using System.Collections;
 using UnityEngine;
 
 namespace BwAudio
@@ -80,25 +79,78 @@ namespace BwAudio
         // under the new engine.
         protected IntPtr Eng => _owner != null && ReferenceEquals(Engine.Instance, _owner) ? _owner.Handle : IntPtr.Zero;
 
-        // Guard shorthand: the source exists and its engine is still the live one.
-        protected bool Live => _created && Eng != IntPtr.Zero;
+        // Guard shorthand: the source exists and its engine is still the live one. Between the first
+        // OnEnable and Start the voice does not exist yet, so the first call that needs it creates it
+        // here, with the fields as they are at that moment (see Start).
+        protected bool Live
+        {
+            get
+            {
+                if (!_created && !_startRan && Application.isPlaying && isActiveAndEnabled) TryInit();
+                return _created && Eng != IntPtr.Zero;
+            }
+        }
+
+        // Live without the create. For the binding's own pushes, above all OnValidate: the editor
+        // calls it from inside AddComponent, and a create there would freeze the fields at their
+        // initializers in the editor while a build honored the ones set afterwards.
+        protected bool Exists => _created && Eng != IntPtr.Zero;
 
         /// <summary>Is this source still producing audio? (AudioSource.isPlaying equivalent. For a push
         /// voice: true from create until a drained PushEnd, Stop, or a finished FadeOut.)</summary>
         public bool IsPlaying => Live && Bwa.bwa_source_is_playing(Eng, _src);
 
         // ---- lifecycle -------------------------------------------------------------------------------
+        //
+        // The FIRST enable leaves the voice to Start, which Unity runs before the first Update. So
+        // `AddComponent<Emitter>()` on an active object, followed by setting fields, plays what the
+        // fields say rather than what the field initializers said. A call made before Start that needs
+        // the voice (Play, Gain, Push, ...) creates it on the spot (Live). Every later enable creates it
+        // in OnEnable and auto-plays there, as it always has.
+        //
+        // A call before Start must not be undone by Start's auto-play. A Play* call REPLACES the
+        // auto-play. A playback-state call (Stop, FadeOut, Paused, and Emitter's StopAt, Seek*,
+        // SetRegion*, Queue) runs the auto-play FIRST and then acts on it (LiveForPlayback), which is
+        // the order these calls always met when the auto-play fired inside AddComponent.
+        bool _startRan;
+        bool _autoPlayDone;                    // this create's auto-play ran, or a Play* call replaced it
 
         void OnEnable()
         {
-            if (!TryInit()) StartCoroutine(InitWhenReady());   // create now, or retry until Engine is ready
+            if (_startRan) Init();
         }
 
-        // Wait out an init-order race (this component enabled before Engine finished starting) instead of
-        // permanently disabling. Unity stops the coroutine automatically when the component is disabled.
-        IEnumerator InitWhenReady()
+        void Start()
         {
-            while (!_created) { yield return null; TryInit(); }
+            _startRan = true;
+            if (_created) AutoPlay();          // created early by a call, so only the auto-play is left
+            else Init();
+        }
+
+        void AutoPlay()
+        {
+            if (_autoPlayDone) return;
+            _autoPlayDone = true;
+            OnSourceReady();
+        }
+
+        /// <summary>A Play* call: it takes the place of this create's auto-play.</summary>
+        protected void ReplaceAutoPlay() => _autoPlayDone = true;
+
+        /// <summary>Live, for a call that changes playback state: before Start it runs the auto-play
+        /// first, so the call acts on it instead of being undone by it.</summary>
+        protected bool LiveForPlayback()
+        {
+            if (!Live) return false;
+            AutoPlay();
+            return Exists;
+        }
+
+        // Create now, or retry each frame until the Engine is up (Engine.ForComponent decides when to
+        // give up). OnDisable stops the retry.
+        void Init()
+        {
+            if (!TryInit()) StartCoroutine(Engine.RetryEachFrame(TryInit));
         }
 
         /// <summary>Mint the native voice (bwa_source_create vs _create_push). 0 = failed.</summary>
@@ -111,22 +163,23 @@ namespace BwAudio
         /// <summary>Subclass settings pushed alongside the shared ones (e.g. Emitter's pitch).</summary>
         protected virtual void ApplyExtraSettings() {}
 
-        /// <summary>Runs once the fresh source is configured and positioned (e.g. play-on-enable).</summary>
+        /// <summary>Runs once the fresh source is configured and positioned, and Start has run
+        /// (play-on-enable).</summary>
         protected virtual void OnSourceReady() {}
 
         // Create the source + apply settings. Returns false (leaving _created false) if Engine isn't
-        // ready yet, so the caller retries. Create CAN fail (0 = a full voice pool / command ring): we
-        // log it and stop retrying (a fresh create won't help), and every op below then no-ops on the
-        // invalid handle until a re-enable.
+        // ready yet, so the caller retries, and true without creating anything on a process that does
+        // not own audio, so nothing waits forever. Create CAN fail (0 = a full voice pool / command
+        // ring): we log it and stop retrying (a fresh create won't help), and every op below then
+        // no-ops on the invalid handle until a re-enable.
         protected bool TryInit()
         {
             if (_created) return true;
-            var engine = Engine.Instance;
-            if (!engine || engine.Handle == IntPtr.Zero) return false;   // Engine not ready -> caller retries
+            var engine = Engine.ForComponent(out bool wait);
+            if (!engine) return !wait;
             _owner = engine;
             _src = CreateSource(engine.Handle);
             _created = true;
-            _paused = false;
             ResetPlaybackState();
             if (_src == 0)
             {
@@ -146,8 +199,10 @@ namespace BwAudio
             if (_channel != Bwa.CHANNEL_AUTO) Bwa.bwa_source_set_channel(engine.Handle, _src, _channel);
             ApplyExtraSettings();
             SyncTransform();
-            OnSourceReady();
+            // A Paused set before the voice existed is kept, not reset (OnDisable resets it).
+            if (_paused) Bwa.bwa_source_set_paused(engine.Handle, _src, true);
             engine.Register(this);
+            if (_startRan) AutoPlay();
             return true;
         }
 
@@ -155,7 +210,7 @@ namespace BwAudio
         /// called once per frame by Engine, before the listener + the single commit.</summary>
         public void SyncTransform()
         {
-            if (!Live) return;
+            if (!Exists) return;
             var p = Room.Pos(transform.position);
             Bwa.bwa_source_set_pos(Eng, _src, p.x, p.y, p.z);
             if (directivity != BwaDirectivity.Omni)
@@ -192,21 +247,23 @@ namespace BwAudio
 
         protected virtual void OnDisable()
         {
-            StopAllCoroutines();                 // cancel a pending InitWhenReady
-            if (Live)                            // owner gone (engine destroyed/replaced) -> Live is false:
+            StopAllCoroutines();                 // cancel a pending init retry
+            if (_created && Eng != IntPtr.Zero)  // owner gone (engine destroyed/replaced) -> Eng is Zero:
             {                                    // the stale handle never reaches a successor engine
                 _owner.Unregister(this);
                 Bwa.bwa_source_destroy(Eng, _src);
             }
             _created = false;
             _owner = null;
+            _autoPlayDone = false;               // a re-enable auto-plays again
+            _paused = false;                     // and starts un-paused
         }
 
         // ---- the source-generic control surface ------------------------------------------------------
 
         /// <summary>Stop this source — AudioSource.Stop equivalent, the click-free stop path (a push
         /// voice ends exactly like a drained PushEnd).</summary>
-        public virtual void Stop() { if (Live) Bwa.bwa_source_stop(Eng, _src); }
+        public virtual void Stop() { if (LiveForPlayback()) Bwa.bwa_source_stop(Eng, _src); }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
@@ -226,7 +283,7 @@ namespace BwAudio
 
         /// <summary>Fade to silence over `seconds`, then STOP the voice (the click-free stop path) — the
         /// one-call "fade this out and clean it up". One-way for a push voice, like PushEnd.</summary>
-        public void FadeOut(float seconds) { if (Live) Bwa.bwa_source_fade_out(Eng, _src, seconds); }
+        public void FadeOut(float seconds) { if (LiveForPlayback()) Bwa.bwa_source_fade_out(Eng, _src, seconds); }
 
         /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMeters when that is set. Setting
         /// this resets Extent to isotropic (spread and extent are the same knob — last call wins).</summary>
@@ -312,7 +369,7 @@ namespace BwAudio
         public bool Paused
         {
             get => _paused;
-            set { _paused = value; if (Live) Bwa.bwa_source_set_paused(Eng, _src, value); }
+            set { bool live = LiveForPlayback(); _paused = value; if (live) Bwa.bwa_source_set_paused(Eng, _src, value); }
         }
 
         /// <summary>Send this source out of exactly ONE output channel, with no spatial processing —
@@ -538,7 +595,7 @@ namespace BwAudio
         // too, so ticking `doppler` mid-play does what you'd expect.)
         protected virtual void OnValidate()
         {
-            if (!Application.isPlaying || !Live) return;
+            if (!Application.isPlaying || !Exists) return;
             var eng = Eng;
             Bwa.bwa_source_set_gain(eng, _src, gain);
             Bwa.bwa_source_set_priority(eng, _src, priority);

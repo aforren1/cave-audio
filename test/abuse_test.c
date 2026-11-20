@@ -1365,6 +1365,49 @@ static void refused_dynamic_transform(void) {
     bwa_destroy(e);
 }
 
+/* The header promises that bwa_scene_set_mesh_mat(NULL, 0, NULL, 0, NULL) CLEARS the static mesh,
+ * and engine.c's index check used to refuse exactly that shape as "empty", so the old wall kept
+ * occluding while the caller believed it gone (the Unity binding's disabled-door case). Both sides:
+ * the wall must occlude first, or a clear that "worked" would be indistinguishable from a wall that
+ * never reached the ray tracer. */
+static void static_mesh_clear(void) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    CHECK(e != NULL, "static mesh clear: probe engine create failed");
+    if (!e) return;
+
+    /* a 2x2 wall in the yz plane at x = 1.5, between a listener at x = 0 and a source at x = 3 */
+    static const float wv[4*3] = { 1.5f,0.5f,-1,  1.5f,2.5f,-1,  1.5f,2.5f,1,  1.5f,0.5f,1 };
+    static const int   wt[2*3] = { 0,1,2,  0,2,3 };
+    bwa_source s = bwa_source_create(e);
+    bwa_source_set_pos(e, s, 3.f, 1.5f, 0.f);
+    bwa_source_set_occlusion(e, s, true);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !s) { CHECK(0, "static mesh clear: probe setup"); bwa_destroy(e); return; }
+    render_blocks(e, 4);
+    clr(e);
+    bwa_scene_set_mesh_mat(e, wv, 4, wt, 2, NULL);
+    os_sleep_ms(OCC_SETTLE_MS);
+    const float occ_wall = bwa_source_get_occlusion(e, s);
+    if (bwa_last_error(e) == NULL && occ_wall > 0.999f) {   /* no SDK: no scene, so nothing to clear */
+        bwa_destroy(e); return;
+    }
+    CHECK(occ_wall < 0.5f, "the static wall must occlude before the clear (%g)", (double)occ_wall);
+
+    clr(e);
+    bwa_scene_set_mesh_mat(e, NULL, 0, NULL, 0, NULL);       /* the documented CLEAR */
+    CHECK(bwa_last_error(e) == NULL, "the documented clear must be accepted, not refused (%s)",
+          bwa_last_error(e) ? bwa_last_error(e) : "");
+    os_sleep_ms(OCC_SETTLE_MS);
+    const float occ_clear = bwa_source_get_occlusion(e, s);
+    CHECK(occ_clear > 0.9f, "the clear must remove the static wall (occlusion %g, was %g)",
+          (double)occ_clear, (double)occ_wall);
+
+    CHECK(render_blocks(e, 4) == 1, "renders finite across the clear");
+    bwa_destroy(e);
+}
+
 /* A triangle index outside [0, nverts) is not a wrong VALUE, it is an out-of-bounds read inside
  * phonon's BVH build, so it has to be refused before the geometry crosses the ABI. Both public mesh
  * entry points take caller data, and Godot's geometry node pushes scene meshes straight through.
@@ -1438,6 +1481,7 @@ static void nonfinite_and_boundary(void) {
     absurd_room_dims();
     refused_box_ray_traced_mesh();
     refused_dynamic_transform();
+    static_mesh_clear();
     bad_triangle_indices();
     nan_probe("NaN master gain", poison_master_nan);
     nan_probe("Inf master gain", poison_master_inf);

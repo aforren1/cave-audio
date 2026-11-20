@@ -1,6 +1,6 @@
 ## The rig scene and room_origin: addons/bw_audio/bwa_rig.tscn instanced, with its RoomOrigin
 ## pre-placed by this scene at (2, 0, 1) and yawed +90 degrees, and a ground plane enabled so
-## that something is baked through the registration at start.
+## that something is baked through the registration at start (and re-pushed when it moves).
 ##
 ##   godot --headless --path bindings/godot res://demo/rig.tscn
 ##
@@ -27,6 +27,7 @@
 extends Node3D
 
 const RIG := preload("res://addons/bw_audio/bwa_rig.tscn")
+const Tone := preload("res://demo/tone.gd")
 const O := Vector3(2, 0, 1)
 const P := Vector3(5, 0.5, 3)
 
@@ -83,17 +84,20 @@ func _ready() -> void:
 	_near(rig.to_room_position(P), Vector3(-2, 0.5, 3), "cleared room_origin keeps the last value")
 	_check(not rig.is_registration_stale(), "clearing room_origin changed nothing")
 
-	# --- re-pointing after start. The setter reads the node at once (no frame), and because
-	# the ground plane was baked through the old frame this is the change that must flag it.
+	# --- re-pointing after start. The setter reads the node at once (no frame). The ground
+	# plane is re-pushed through the new frame, so it alone must not flag anything stale.
 	rig.room_origin = NodePath("RoomOrigin")
 	_near(rig.to_room_position(P), Vector3(-3, 0.5, -2), "yaw 180 on re-set, same frame")
-	_check(rig.is_registration_stale(),
-		"room_origin re-pointed after start with a baked ground plane must read stale")
+	_check(not rig.is_registration_stale(),
+		"the ground plane follows the registration, so a re-point alone must not read stale")
 
-	# --- the registration follows a moved origin.
+	# --- the registration follows a moved origin. Extra listeners are still converted once,
+	# so with them set this move is the one that must flag it.
+	rig.set_extra_listeners(PackedVector3Array([P]))
 	origin.global_transform = Transform3D(Basis(Vector3.UP, PI / 2), O)
 	await _frames(2)
 	_near(rig.to_room_position(P), Vector3(-2, 0.5, 3), "yaw +90 after a move")
+	_check(rig.is_registration_stale(), "a moved origin with extra listeners set must read stale")
 
 	# Scale is ignored: the same pose scaled 2x gives the same room point, not half of it.
 	origin.global_transform = Transform3D(Basis(Vector3.UP, PI).scaled(Vector3(2, 2, 2)), O)
@@ -185,7 +189,56 @@ func _ready() -> void:
 		"a view added after the duplicate left found no engine (%d of %d speakers)"
 			% [late.get_speaker_count(), spk.size()])
 
+	await _test_ground_follows()
 	_done()
+
+
+## Polls until `cond` holds or `seconds` of wall time pass.
+func _until(cond: Callable, seconds: float) -> bool:
+	var end := Time.get_ticks_msec() + int(seconds * 1000.0)
+	while Time.get_ticks_msec() < end:
+		if cond.call():
+			return true
+		await get_tree().process_frame
+	return cond.call()
+
+
+## The ground plane follows a moved origin. Read through occlusion: with no other geometry the
+## plane's quad IS the static mesh, so it blocks a source under it from a head above it. Needs
+## the Steam Audio build. The origin is RAISED 2 m, because a yaw on the floor changes no room
+## height and so could not tell a re-pushed plane from a stale one.
+func _test_ground_follows() -> void:
+	var probe := BwaDynamicGeometry.new()
+	probe.mesh = BoxMesh.new()
+	add_child(probe)
+	var steam := probe.is_attached()
+	remove_child(probe)
+	probe.free()
+	if not steam:
+		print("rig: ground plane checks SKIPPED (no Steam Audio build)")
+		return
+	rig.room_origin = NodePath("RoomOrigin")
+	origin.global_transform = Transform3D.IDENTITY
+	listener.global_transform = Transform3D(Basis.IDENTITY, Vector3(0, 1.5, 0))
+	rig.listener = rig.get_path_to(listener)
+	var em := BwaEmitter.new()
+	em.clip = ProjectSettings.globalize_path(Tone.write_ping("rig_tone", 440.0, 2.0))
+	em.loop = true
+	em.occlusion = true
+	em.position = Vector3(0, -1, 3)   # under the plane at world y = 0
+	add_child(em)
+	_check(await _until(func(): return em.get_occlusion_factor() < 0.5, 3.0),
+		"the ground plane does not occlude a source under it: %f" % em.get_occlusion_factor())
+	em.position = Vector3(0, 0.5, 3)
+	_check(await _until(func(): return em.get_occlusion_factor() > 0.9, 3.0),
+		"a source above the ground reads occluded: %f" % em.get_occlusion_factor())
+	# One frame: raise the origin and drop the source under the plane again. Only a plane
+	# re-pushed to room y = -2 sits between the head (room -0.5) and the source (room -3).
+	origin.global_transform = Transform3D(Basis.IDENTITY, Vector3(0, 2, 0))
+	em.position = Vector3(0, -1, 3)
+	_check(await _until(func(): return em.get_occlusion_factor() < 0.5, 3.0),
+		"the ground plane did not follow a raised origin: %f" % em.get_occlusion_factor())
+	em.queue_free()
 
 
 ## The shipped scene as a user gets it, before any override: never added to the tree, so it

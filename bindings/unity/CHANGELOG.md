@@ -4,6 +4,90 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Fixed: clearing the static mesh did nothing (engine)
+
+- `bwa_scene_set_mesh_mat(e, NULL, 0, NULL, 0, NULL)` is the header's documented clear, and the
+  engine refused it as an empty mesh. The old mesh kept occluding. It now clears. `Engine` uses it
+  when the last `AcousticGeometry` goes, so this package needs the engine it ships with: against
+  an older engine, a cleared wall keeps occluding. `test_abuse` pins it through the occlusion
+  readback.
+
+### Godot addon
+
+- **`BwaEngine.room_origin` and `addons/bw_audio/bwa_rig.tscn`.** Point `room_origin` at a Node3D
+  at the CAVE's floor center, its blue arrow (+Z) toward the layout's front, and the registration
+  follows it. The rig scene is a `BwaEngine` with a `RoomOrigin` child already wired. Drag it in,
+  move `RoomOrigin`, and set `listener`. Both shipped in 0.21.0 without a note.
+- **Static `BwaAcousticGeometry` follows the tree.** A node added, removed, hidden or shown after
+  start rebuilds the static mesh once in the next frame. Hidden means not occluding, and hiding a
+  parent hides its subtree. The last one gone clears the mesh. A moved `room_origin` re-bakes it
+  too. Before, geometry was read once at start, so a late wall never occluded and a removed one
+  kept occluding. `BwaEngine.get_static_rebuilds()` counts rebuilds. Toggle-heavy props belong in
+  `BwaDynamicGeometry`, which now also follows a moved `room_origin`.
+- **Changed: `BwaBed.orientation` yaw is in scene terms** and follows a moved `room_origin`, as
+  Unity's `AmbisonicBed` does. Yaw 0 points the field's front along world +Z, which is behind a
+  default-facing Godot node: use `set_yaw_from_basis` to aim it from a node. With no
+  `room_origin` nothing changes. Under a 180-degree origin (Motive's +z on the back wall), use yaw
+  `PI` to keep the old front.
+- A re-pushed ground plane keeps a pressure-release mask set after start. Extra listeners, the
+  FDN decay direction and the room box's image-source room still do not follow a moved
+  `room_origin`, and `is_registration_stale()` says so.
+
+### Added: one node owns audio in a cluster
+
+- `Engine.ownsAudio` (on by default) and `Engine.OwnsAudioPredicate`, a static `Func<bool>` your
+  cluster glue sets before scene load. An `Engine` owns audio only when both say yes, decided
+  once in `Awake`. `Engine.OwnsAudio` reports it.
+- A non-owning `Engine` creates no native engine and opens no device, but still claims
+  `Engine.Instance`, survives scene loads and applies Room Origin, so `Room.FromRoom` agrees on
+  every node. Every component on that node is a silent no-op and stops waiting. `SpeakerView`
+  shows the array there from the layout file, unlit.
+- Ownership is decided once, in `Awake`. A predicate that throws is logged and read as false. The
+  predicate is cleared on every entry into Play mode.
+- An owner whose start fails now claims `Engine.Instance` too and keeps applying Room Origin.
+  Before, it left `Instance` free, so a later `Engine` could start in its place and components
+  waited on it forever.
+- New diagnostics: `Engine.ComponentWaitFrames`, `Engine.StaticRebuilds`.
+
+### Added
+
+- `Engine.AssetPath`: an absolute clip or layout path is used as it is. This was true by accident
+  of `Path.Combine`; it is now the contract, and the `[Clip]` field shows such a path instead of
+  "not found". There is no load from memory: use `PushEmitter` for generated audio.
+- `Engine` warns, at most every 30 s, when the fed listener sits more than 1 m outside the
+  speakers' bounding box (Cave, CaveSim, CaveBoth) or the room box (when on). Binaural without a
+  room box never warns. The check waits until the listener first moves or 5 s pass.
+
+### Changed
+
+- **The first create of a source, bed or dynamic mesh waits for `Start`**, so fields set right
+  after `AddComponent` on an active object take effect. A call that needs the voice before `Start`
+  creates it on the spot, and a `Play` before `Start` replaces the auto-play. A playback-state call
+  before `Start` (`Stop`, `FadeOut`, `Paused`, `StopAt`, `SeekFrames`, `SetRegionFrames`, `Queue`)
+  runs the auto-play first and then acts on it, so a `Stop` from a manager's `Start` still wins and
+  `Paused = true` starts paused. Later re-enables create and auto-play in `OnEnable`, as before.
+  Scene-placed components still play in their first frame.
+- **`Emitter.clip` and `AmbisonicBed.clip` default to empty** (were `sfx/footsteps.wav` and
+  `ambience.flac`). An added component plays nothing until you set one. Saved scenes keep their
+  values.
+- **`AmbisonicBed` waits for the `Engine`** like `Emitter` does. It used to set `enabled = false`
+  and stay off. `SourceBase`, `AmbisonicBed`, `DynamicAcousticGeometry` and `SpeakerView` share one
+  waiting rule.
+- **`AmbisonicBed` yaw is now consistently in scene terms.** Yaw 0 points the field along Unity
+  world +z and a moved Room Origin turns the bed with the scene. Before, a bed left at yaw, pitch
+  and roll 0 pushed nothing and faced the room's +z, any other value was in scene terms, and a
+  moved origin was never followed. Under an origin with a yaw, a bed at 0 now faces a different
+  way: set the yaw to the origin's Y angle to face the room's front.
+- **Static `AcousticGeometry` follows enable and disable.** Adding, enabling, disabling or
+  destroying one rebuilds the static mesh in the next `LateUpdate`, once per frame. Before, only a
+  scene load or a moved origin did, so a wall built at run time never occluded and a deactivated
+  one kept occluding. The scene-load hooks are gone: geometry reports itself. Rebuilds after the
+  load-time bake no longer log.
+- The Minimal orbit sample sets its gain through `PushEmitter.Gain`. The field write it used
+  never reached the voice.
+- The test driver empties the scratch project's test folders before copying, so a deleted test
+  no longer keeps running and counting.
+
 ## [0.21.0]
 
 ### Added: GameObject > BwAudio > CAVE Rig

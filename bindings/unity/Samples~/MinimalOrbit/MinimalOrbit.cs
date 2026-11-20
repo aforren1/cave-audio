@@ -37,7 +37,7 @@ namespace BwAudio.Samples
         void Start()
         {
             _emitter = GetComponent<PushEmitter>();
-            _emitter.gain = 0.8f;
+            _emitter.Gain = 0.8f;   // the property pushes; a field write alone would not reach the voice
 
             var engine = Engine.Instance;
             uint rate = engine != null ? engine.sampleRate : 48000u;

@@ -61,13 +61,17 @@ public:
 	void set_paused(bool p);
 	bool get_paused() const { return paused; }
 
-	/* Room-frame yaw/pitch/roll in RADIANS. Positive yaw turns the field from room +Z
-	 * toward +X; positive pitch tilts its front up; positive roll tilts its top toward
-	 * room -X. Glides at about one turn a second, so it is safe to animate. */
+	/* Yaw/pitch/roll in RADIANS, in SCENE terms. Yaw 0 puts the field's front along Godot
+	 * world +Z, and positive yaw turns it toward +X, the sense of Node3D.rotation.y. The field
+	 * is world-locked: a moved room_origin turns it with the scene. Positive pitch tilts its
+	 * front up; positive roll tilts its top toward its right. Pitch and roll pass through
+	 * unchanged, which is exact under a level origin. Under the default identity registration
+	 * this is the room-frame value it always was. Glides at about one turn a second, so it is
+	 * safe to animate. */
 	void set_orientation(const Vector3 &ypr);
 	Vector3 get_orientation() const { return orientation; }
-	/* Yaw for a Godot facing direction, through the coordinate seam — the shorthand that
-	 * keeps callers from passing a Godot euler angle straight in. */
+	/* Yaw that points the field's front where a node faces (its -Z), in scene terms. Resets
+	 * pitch and roll. */
 	void set_yaw_from_basis(const Basis &b);
 
 	void play();
@@ -136,6 +140,7 @@ protected:
 
 private:
 	bool begin(const String &p, bwa_sound *out);
+	void push_orientation();
 
 	BwaEngine *owner = nullptr;
 	bwa_bed bed = 0;
@@ -152,6 +157,7 @@ private:
 	bool paused = false;
 	Vector3 orientation;
 	Vector3 pushed_orientation;
+	uint32_t pushed_reg_gen = 0; /* the registration the last push went through */
 
 	/* `finished` has the SAME two feeds as BwaEmitter's, and for the same reason: the core
 	 * reports only one of the two ways a voice goes quiet. A bed that RAN OUT (a non-loop

@@ -228,6 +228,10 @@ check: no Motive data), 3 the tool's own check failed (flagged speakers, a disag
 
 ### Set up the session
 
+- [ ] **ISS off on every 4410A**: turn ISS off in Smart IP Manager, or set a long timeout. The
+      auto-standby threshold is -70 dBFS and the engine's silence is about -120 dBFS, so a box that
+      waits its turn through a localize or trims pass can sleep, and it may still be waking when
+      its sweep arrives.
 - [ ] **Projectors on, room warm.** Run them as long as a session would, read the air
       temperature, and leave them on for every step. Their fans are the noise floor the sweeps
       must clear; the 3 F of warming is under the survey's other errors
@@ -545,8 +549,17 @@ the capsule survey, and opens the first listed speaker.
 
 ```
 bwa_calibrate --layout as_built.json --live <spk> --zylia --survey capsules.json \
-              --latency <m> --aim-ref <reference spk>
+              --live-ref <measured spk> --aim-ref <reference spk>
 ```
+
+- [ ] **Pick a latency reference**: `--live-ref <spk>`, or the Aim tab's **latency reference**
+      dropdown. The ZM-1's Dante Via leg steps the latency 0.3 to 0.4 ms at random, and a latency
+      taken once (`--latency`) then reads 10 to 14 cm off in distance. The reference plays in every
+      reading and gives that reading its latency. Use a box whose position is measured: a
+      camera-visible one from step 1 is best, because its position error moves the live box's
+      distance by the same amount. It must have the same Dante receive latency as the box you aim.
+      A line marked `NOT HELD: latency moved` caught a step: read the next line. The first line is
+      always `NOT HELD: baseline`. Expect about 0.6 to 0.7 readings a second.
 
 - [ ] **Take a reference first**: a speaker the frame check showed within a degree or two of its
       plan aim, behind the same kind of screen as the boxes you aim. CLI: `--aim-ref <spk>`, or
@@ -572,7 +585,9 @@ bwa_calibrate --layout as_built.json --live <spk> --zylia --survey capsules.json
 - [ ] Record the reading rate: a CLI run ends with `live: N reading(s) in X s, Y per second`.
 
 On failure: `position: n/a (no body-frame survey)` means the tracked run has no body-frame
-capsule survey. The tilt meter still works. No `--latency`, `--ref` or `--ref-speakers`: direction only, no distance.
+capsule survey. The tilt meter still works. No `--latency`, `--ref`, `--ref-speakers` or
+`--live-ref`: direction only, no distance. `ref N: no latency` means the reference's arrival was
+not clean: check that it plays and that its layout position is right.
 [calibration.md: Live aiming](./calibration.md#live-aiming---live-n---zylia-the-aim-tab).
 
 ### Step 5: trims and the room report

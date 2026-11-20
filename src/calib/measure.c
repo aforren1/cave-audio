@@ -166,22 +166,41 @@ static int ir_peak(const float* ir, int from, int to) {        /* strongest |tap
 
 /* RMS of the loudest `blk`-sample block in ir[a, b) (a shorter tail block counts when it holds at
  * least MEASURE_NOISE_MIN_N samples); 0 and *n untouched for a region under that */
-static double loudest_block_rms(const float* ir, int a, int b, int blk, int* n) {
+/* ... leaving out the samples within `xg` of each of the `nx` lags in `x` (the arrival's own harmonic
+ * products); a block left with under MEASURE_NOISE_MIN_N samples does not count. */
+static double loudest_block_rms(const float* ir, int a, int b, int blk, const int* x, int nx, int xg, int* n) {
     if (b - a < MEASURE_NOISE_MIN_N) return 0.0;
     double best = 0.0;
     for (int s = a; s < b; s += blk) {
         const int e = s + blk < b ? s + blk : b;
         if (e - s < MEASURE_NOISE_MIN_N) break;
         double acc = 0.0;
-        for (int i = s; i < e; ++i) acc += (double)ir[i] * ir[i];
-        const double r = sqrt(acc / (double)(e - s));
+        int cnt = 0;
+        for (int i = s; i < e; ++i) {
+            int skip = 0;
+            for (int k = 0; k < nx; ++k) skip |= (i >= x[k] - xg && i <= x[k] + xg);
+            if (!skip) { acc += (double)ir[i] * ir[i]; ++cnt; }
+        }
+        if (cnt < MEASURE_NOISE_MIN_N) continue;
+        const double r = sqrt(acc / (double)cnt);
         if (r > best) best = r;
+        *n += cnt;
     }
-    *n += b - a;
     return best;
 }
 
+static double noise_floor_x(const float* ir, int ncap, int lo, int hi, double fs, const int* x, int nx, int* n);
+
 double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs, int* n) {
+    return noise_floor_x(ir, ncap, lo, hi, fs, NULL, 0, n);
+}
+
+double measure_harmonic_lead(int nref, int k, double f1, double f2) {
+    if (nref <= 0 || k < 1 || !(f1 > 0.0) || !(f2 > f1)) return 0.0;
+    return (double)nref * log((double)k) / log(f2 / f1);
+}
+
+static double noise_floor_x(const float* ir, int ncap, int lo, int hi, double fs, const int* x, int nx, int* n) {
     int nn = 0;
     if (n) *n = 0;
     if (!ir || ncap <= 0 || !(fs > 0.0)) return 0.0;
@@ -189,8 +208,9 @@ double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs,
     const int guard = (int)(MEASURE_NOISE_GUARD_S * fs), skip = (int)(MEASURE_NOISE_SKIP_S * fs);
     int b1 = lo - guard; if (b1 > ncap) b1 = ncap;
     int a2 = hi + skip;  if (a2 < 0) a2 = 0;
-    const double r1 = b1 > 0 ? loudest_block_rms(ir, 0, b1, blk, &nn) : 0.0;
-    const double r2 = a2 < ncap ? loudest_block_rms(ir, a2, ncap, blk, &nn) : 0.0;
+    const int xg = (int)(MEASURE_HARM_GUARD_S * fs);
+    const double r1 = b1 > 0 ? loudest_block_rms(ir, 0, b1, blk, x, nx, xg, &nn) : 0.0;
+    const double r2 = a2 < ncap ? loudest_block_rms(ir, a2, ncap, blk, x, nx, xg, &nn) : 0.0;
     if (n) *n = nn;
     return r1 > r2 ? r1 : r2;
 }
@@ -228,6 +248,14 @@ int measure_response_pick(const float* capture, int ncap, const float* ref, int 
                           double f1, double f2, double fs, const double band_hz[2],
                           int exp_lo, int exp_hi, int pick_lo, int pick_hi, MeasureResult* out,
                           float* win, int win_len, int pre, int* win_start) {
+    return measure_response_lim(capture, ncap, ref, nref, f1, f2, fs, band_hz, exp_lo, exp_hi, pick_lo, pick_hi, 0,
+                                out, win, win_len, pre, win_start);
+}
+
+int measure_response_lim(const float* capture, int ncap, const float* ref, int nref,
+                         double f1, double f2, double fs, const double band_hz[2],
+                         int exp_lo, int exp_hi, int pick_lo, int pick_hi, int lag_hi, MeasureResult* out,
+                         float* win, int win_len, int pre, int* win_start) {
     if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
     if (win && (win_len <= 0 || pre < 0 || !win_start)) return 0;
     /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
@@ -238,7 +266,8 @@ int measure_response_pick(const float* capture, int ncap, const float* ref, int 
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &e_full, &ir);
     if (!L) return 0;
     out->energy = (float)e_full;
-    const int npos = ncap < L ? ncap : L;                       /* the positive lags */
+    int npos = ncap < L ? ncap : L;                             /* the positive lags */
+    if (lag_hi > 0 && lag_hi < npos) npos = lag_hi;             /* ... up to a second sweep's arrival */
     const int pany = ir_peak(ir, 0, npos);                      /* the strongest tap anywhere */
     int lo = exp_lo < 0 ? 0 : exp_lo, hi = exp_hi > npos ? npos : exp_hi;
     const int windowed = exp_hi > exp_lo && hi > lo;
@@ -259,7 +288,11 @@ int measure_response_pick(const float* capture, int ncap, const float* ref, int 
         out->outside_db = (a > 0.0 && b > 0.0) ? (float)(20.0 * log10(b / a)) : 0.f;
         /* the floor around the window, or around the found arrival when there is none */
         int nn = 0;
-        const double fl = measure_noise_floor(ir, npos, windowed ? lo : p, windowed ? hi : p + 1, fs, &nn);
+        /* ... less the arrival's own harmonic products, which sit at positive lags once the arrival
+         * is later than their lead (measure.h) */
+        int hx[MEASURE_HARM_MAX - 1];
+        for (int k = 2; k <= MEASURE_HARM_MAX; ++k) hx[k - 2] = p - (int)measure_harmonic_lead(nref, k, f1, f2);
+        const double fl = noise_floor_x(ir, npos, windowed ? lo : p, windowed ? hi : p + 1, fs, hx, MEASURE_HARM_MAX - 1, &nn);
         out->floor_rms = (float)fl;
         out->noise_n = nn;
         out->snr_db = (nn > 0 && fl > 0.0 && a > 0.0) ? (float)(20.0 * log10(a / fl)) : (nn > 0 && a > 0.0 ? 300.f : 0.f);

@@ -131,7 +131,8 @@ The rest of the Runtime folder:
 - `AmbisonicBed`: a world-locked AmbiX soundfield component over `bwa_bed_*`.
 - `PushEmitter`: a positional source you feed PCM (see "Procedural (push) sources" below).
 - `AcousticGeometry` and `DynamicAcousticGeometry`: mark a mesh as occluding and reflecting
-  geometry with a material. `Engine` bakes the static ones into one engine mesh at load.
+  geometry with a material. `Engine` bakes the static ones into one engine mesh at load, and again
+  after any of them is enabled or disabled.
 - `MaterialAsset`: an acoustic material as a Project asset, an engine preset or custom 3-band
   coefficients.
 - `RoomConstraints`: draws the surveyed room (truss, screen cube, projectors) in the scene view,
@@ -350,7 +351,8 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
 Two seams a binding must not get wrong, both handled in `Room` (see below):
 `bwa_bed_set_orientation` takes a **room-frame** yaw, and the X mirror **reverses the
 sense of rotation**. Pass a Unity euler angle straight in and the soundfield
-spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
+spins the wrong way (`Room.YawRad` converts, registration included, and `AmbisonicBed`
+pushes it again whenever the registration moves). The FDN's decay direction is a
 **direction**, so it goes through `Room.Dir` (no registration translation), not
 `Room.Pos`.
 
@@ -420,10 +422,96 @@ What to know:
   scene that brings its own `Engine` with a Room Origin hands that origin to the surviving
   `Engine`. A new scene without one keeps the previous registration: if the old origin was
   destroyed with its scene, `Engine` warns once. Parent the origin under the `Engine` to keep it.
+- `AmbisonicBed` yaw is in scene terms, like every other angle you set in Unity: yaw 0 points the
+  field's front along Unity world +z, not along the room's +z. Under an origin turned 180 degrees,
+  yaw 0 faces the layout's -z, which is the screen you author against. The bed is world-locked: a
+  moved origin turns it with the scene. To face the room's front instead, set the yaw to the
+  origin's Y angle.
+- `Engine` warns when the listener sits more than 1 m outside the speakers' bounding box (the
+  array profiles) or the room box (when it is on). That is the symptom of a wrong Listener or Room
+  Origin. Binaural without a room box never warns: at a desk the head can be anywhere. The check
+  waits until the listener first moves or 5 s pass, so a head parked at the floor until tracking
+  connects does not warn.
 
 The math: `Room.UnityToRoom` becomes the inverse of the origin's position and rotation, which takes
 a Unity world point into the origin's local frame. `Room.Pos` then applies the X mirror, once. The
 origin's forward becomes room +z and its right becomes room -x.
+
+### Clusters
+
+A cluster runs the same scene on several render nodes, and exactly one of them may open the audio
+device. Keep the CAVE Rig in the scene on every node and let each node decide in `Engine.Awake`:
+
+- **`Engine.OwnsAudioPredicate`**: a static `Func<bool>`. Set it before the scene loads, from a
+  `[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]` method that asks
+  your cluster toolkit whether this node is the server. Null means own audio.
+- **`Engine.ownsAudio`**: the per-scene switch, on by default. An `Engine` owns audio only when
+  both say yes. `Engine.OwnsAudio` reports the decision.
+
+The decision is made once, in `Engine.Awake` (execution order -100), so your toolkit must know the
+node's role by then, and it cannot change while that `Engine` lives. A predicate that throws is
+logged and read as "not the owner". The predicate is cleared on every entry into Play mode.
+
+```csharp
+static class AudioOwner {
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void Install() => BwAudio.Engine.OwnsAudioPredicate = () => MyCluster.IsServer;
+}
+```
+
+A node that does not own audio:
+
+- creates no native engine and opens no device. `Engine.Ready` is false.
+- still claims `Engine.Instance`, survives scene loads, and applies **Room Origin** every frame.
+  The registration is the same on every node, so `Room.FromRoom` places visuals identically
+  everywhere. Do not skip the `Engine` on client nodes: without it `Room.UnityToRoom` stays
+  identity there.
+- leaves every component a silent no-op. Emitters, beds, push sources and geometry create nothing,
+  load nothing, log nothing, and stop waiting. `Engine.ComponentWaitFrames` stays flat there.
+- shows the array in `SpeakerView` from the layout file, unlit, because there are no levels to read.
+
+An owner whose start fails behaves the same way after its error: it stays the scene's `Engine` and
+keeps the registration, so the nodes never disagree on the room.
+
+The binding names no cluster toolkit. The one line that asks yours lives in your project.
+
+The ownership switch is Unity-only for now. Godot's `BwaEngine` always owns audio.
+
+### Creating things at run time
+
+Add components to an active object and set their fields in the same frame. The first create waits
+for `Start`, which runs before the next `Update`, so the fields you set after `AddComponent` are
+the ones that play:
+
+```csharp
+var em = go.AddComponent<Emitter>();
+em.clip = "sfx/door.wav";
+em.loop = false;     // plays once, at Start, with these values
+```
+
+- A call that needs the voice before `Start` (`Play`, `Gain`, `Push`) creates it on the spot,
+  with the fields as they are at that moment. A `Play` before `Start` replaces the auto-play.
+- A playback-state call before `Start` (`Stop`, `FadeOut`, `Paused`, `StopAt`, `SeekFrames`,
+  `SetRegionFrames`, `Queue`) runs the auto-play first and then acts on it, the order these calls
+  always had. So a `Stop` in a manager's `Start` stays stopped, and `Paused = true` starts paused.
+- Every later disable and enable creates and auto-plays in `OnEnable`, as before.
+- `Emitter.clip` and `AmbisonicBed.clip` default to empty, which plays nothing and logs nothing.
+- A component that comes up before the `Engine` waits for it, beds included.
+- `AcousticGeometry` added, enabled or disabled after start joins or leaves the static mesh in the
+  next `LateUpdate`, one rebuild per frame however many change. A disable and re-enable in the
+  same frame still rebuilds. Geometry added after start misses a baked reflection probe grid
+  (`bakeReflections`), which is computed at start.
+- A rebuild is not free. It runs `FindObjectsByType`, copies every static mesh's vertex and
+  triangle arrays on the main thread (about 0.5 ms at 2,000 triangles), and rebuilds the BVH on
+  the engine's sim thread. That suits a door or a wall that appears. A prop toggled every frame
+  makes on the order of 100 KB of garbage per frame. Give pooled or frequently toggled props
+  `DynamicAcousticGeometry`, or keep them out of the acoustic scene. `Engine.StaticRebuilds`
+  counts rebuilds, so churn shows.
+
+**Clip paths.** A relative path is relative to `StreamingAssets`. An absolute path is used as it
+is (`Engine.AssetPath`), so a clip your code generates can be written to
+`Application.temporaryCachePath` and played by its full path. The ABI has no load from memory. For
+audio you generate continuously, use `PushEmitter`.
 
 ### Bootstrap (centralized per-frame push)
 
@@ -750,23 +838,58 @@ What you get:
   origin +90 degrees and it is at `(-2, 0.5, 3)`. Yaw it 180 degrees and it is at
   `(-3, 0.5, -2)`. The `godot_rig` ctest pins the last two.
 - `BwaEngine` compares the origin once per frame and recomputes only when it moved.
-  `BwaSpeakerView` follows. Static acoustic geometry, the room box and the ground plane are
-  baked at start, and `set_extra_listeners` and the FDN decay direction are converted when
-  called. None of them follow a later registration change: the engine warns once and
-  `is_registration_stale()` reads true. This differs from Unity, which re-bakes.
+  `BwaSpeakerView` follows. So do the static mesh (`BwaAcousticGeometry` and the room box's
+  walls), the ground plane and `BwaDynamicGeometry`: the engine re-bakes the static mesh in the
+  same frame, one BVH rebuild, as Unity does. Do not animate the origin in a scene with static
+  geometry. Three things do not follow: `set_extra_listeners` and the FDN decay direction,
+  which are converted when called, and the room box's image-source reflections, which the
+  engine anchors at the room origin by size alone. With any of them present, a change warns
+  once and `is_registration_stale()` reads true.
+- `BwaBed.orientation` is yaw, pitch and roll in radians, in scene terms: yaw 0 points the
+  field's front along Godot world +Z, which is BEHIND a default Godot node (its forward is -Z).
+  So `orientation.x = cam.rotation.y` points the front at the camera's back. To face the field
+  where a node faces, call `set_yaw_from_basis(node.global_basis)`. The bed is world-locked, so
+  a moved origin turns it with the scene. Pitch and roll are about the field's own axes and pass
+  through unchanged, which is exact for a level origin. With no origin, this is the room-frame
+  value it always was. Under an origin turned 180 degrees, earlier releases pointed yaw 0 at the
+  room's front; set the yaw to `PI` to keep that. Unity's `AmbisonicBed` yaw works the same way.
 - Scale is ignored, and a tilt past 1 degree is reported. A mirrored origin (a negative scale)
   is refused, and the registration keeps its last value. Each warns once at run time and shows
   on the node's warning marker in the editor. An array profile with no layout path shows there
   too.
 - With `room_origin` empty, nothing changes. `registration` stays identity until code sets it.
 
-Put the rig in each scene that makes sound, or in a main scene that swaps child scenes under
-it. The engine reads the room box and the static geometry once, when it starts, so it must
-start with the scene that holds them. An Autoload rig (Project Settings > Globals) starts
-before any scene, so use one only for content with no `BwaRoomBox` and no static
-`BwaAcousticGeometry`. Only one `BwaEngine` runs: a second one is refused, logs an error and
-stays inert, and the first keeps its layout and room origin. Unity hands a new scene's origin
-to the surviving `Engine`. Godot does not.
+Static geometry follows the tree after start. A `BwaAcousticGeometry` that enters joins the
+static mesh, and one that leaves or is hidden drops out of it. Hidden means not occluding, the
+way a disabled object is in Unity. `BwaEngine` rebuilds at most once per frame, and only when
+the visible set differs from the one it last baked. When the last piece goes, it clears the
+mesh. Each rebuild is a BVH rebuild, so give a prop that toggles often a `BwaDynamicGeometry`.
+Moving a static piece, or changing its `mesh`, `source` or `material`, does not rebuild: the
+change waits for the next rebuild, and the piece then jumps. `get_static_rebuilds()` counts
+rebuilds, so churn shows.
+
+The room box is still read once, at start. The image-source room can be set but never removed,
+so a box that arrived late could not leave again. A `BwaRoomBox` added after start logs an
+error and is ignored.
+
+So an Autoload rig (Project Settings > Globals) now works for any content with no `BwaRoomBox`:
+the engine starts before the scene, and the scene's geometry joins when it loads. Put a room
+box in the rig itself, or put the rig in each scene that has one. Only one `BwaEngine` runs: a
+second one is refused, logs an error and stays inert, and the first keeps its layout and room
+origin. Unity hands a new scene's origin to the surviving `Engine`. Godot does not.
+
+To create a node at run time, set its properties before `add_child`. `_ready` reads them there,
+the Godot form of Unity's `AddComponent`-then-set pattern:
+
+```gdscript
+var em := BwaEmitter.new()
+em.clip = "user://door.wav"
+em.loop = false
+add_child(em)   # plays once, with these values
+```
+
+**Clip paths.** `res://` and `user://` paths are globalized. An absolute path is used as it is,
+so a clip your code generates can be written anywhere and played by its full path.
 
 ### The binding
 

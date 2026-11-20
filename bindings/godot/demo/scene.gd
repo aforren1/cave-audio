@@ -60,7 +60,20 @@ func _ready() -> void:
 		_test_geometry_merge()
 		_test_speaker_view()
 		await _test_audible()
+	_test_box_goes_stale()
 	_finish()
+
+
+## The box's image-source room is anchored at the room origin by size alone, so it cannot
+## follow a registration change and must flag it. Without the box the pillar re-bakes and the
+## same change flags nothing.
+func _test_box_goes_stale() -> void:
+	engine.registration = Transform3D(Basis.IDENTITY, Vector3(0, 0, 1))
+	if _with_room:
+		_check(engine.is_registration_stale(), "a moved registration with a room box must read stale")
+	else:
+		_check(not engine.is_registration_stale(),
+			"with no room box, static geometry follows and nothing should read stale")
 
 
 ## Did bwa_scene_set_box actually land?

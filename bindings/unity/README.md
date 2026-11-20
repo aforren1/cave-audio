@@ -105,7 +105,9 @@ Unity itself ignores any folder whose name ends in `~`.
 
 The engine loads files itself, so **do not** use Unity `AudioClip`. Everything it reads lives in
 `Assets/StreamingAssets/`. Every file field on a component is a path **relative to that folder**, and
-the `[Clip]` picker only lists what is actually there, so you never type a path by hand:
+the `[Clip]` picker only lists what is actually there, so you never type a path by hand. An
+**absolute** path is used as it is, so a clip your code generates can be written to
+`Application.temporaryCachePath` and played by its full path:
 
 ```
 Assets/
@@ -231,6 +233,12 @@ The manual steps, which are what the item does:
    listener, then one `bwa_commit`. The audio thread therefore never sees a half-moved frame, which
    is what makes the moving-observer case correct. Do not push from individual emitters.
 
+Components added from a script can be configured in the same frame: `AddComponent<Emitter>()`,
+then set `clip` and the rest, and the first play happens at `Start` with those values. A
+**cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
+the device. See [docs/integration.md: Clusters](../../docs/integration.md#clusters) and "Creating
+things at run time" below it.
+
 ### Ends and loop boundaries are events
 
 `onFinished` and `onLoop` come from the engine's own event rings, not from watching a playing flag.
@@ -313,10 +321,11 @@ Occlusion and reflections need the room's geometry. Three ways to author it:
 
 - **Simple box** - tick `Enable Room Box` on `Engine`, set the size (meters) and a material preset.
 - **Per-object meshes** - add **`AcousticGeometry`** to any object with a mesh (or set a low-poly
-  `Mesh Override`) and assign a **material**. `Engine` bakes every one of them (plus the box, if on)
-  into the engine's scene at startup, and again whenever a Unity scene loads or unloads (additive
-  scenes included). It transforms each mesh from Unity world into room space. The scene view draws
-  selected or `alwaysDrawGizmo` geometry as a cyan wireframe.
+  `Mesh Override`) and assign a **material**. `Engine` bakes every enabled one (plus the box, if on)
+  into the engine's scene at startup, and again in the frame after any of them is enabled or
+  disabled: spawned, toggled, or its scene loaded or unloaded. It transforms each mesh from Unity
+  world into room space. The scene view draws selected or `alwaysDrawGizmo` geometry as a cyan
+  wireframe.
 - **Moving meshes** - add **`DynamicAcousticGeometry`** instead, for a door, a lift, or a panel.
   It pushes position and rotation live (throttled by `positionEpsilon` and `angleEpsilon`), so
   occlusion and real-time reflections follow the mesh. It reads the scale once. Baked reflections
@@ -332,7 +341,7 @@ Reference one asset from many objects; it's minted once. No material = the engin
 > **Keep acoustic meshes SIMPLE** - tens to hundreds of triangles. The engine ray-traces them every
 > frame; render meshes (thousands of tris) are far too heavy. Use a low-poly proxy via `Mesh Override`
 > or a dedicated renderer-less object. `AcousticGeometry` is static: moving one does nothing until
-> the next scene load re-bakes it. Use `DynamicAcousticGeometry` for anything that moves.
+> the next rebuild. Use `DynamicAcousticGeometry` for anything that moves.
 
 ### Coordinate seam
 
@@ -353,7 +362,8 @@ See [docs/integration.md → Register the room](../../docs/integration.md#regist
   SPSC ring). `bwa_create`/`bwa_start`/`bwa_load_*` allocate/do I/O - they run once at startup.
 - **The reflection config and the FDN config are load-time** - `Engine` sets them between
   `bwa_create` and `bwa_start`. The engine rejects them after start (`bwa_last_error`). `Engine`
-  bakes the room box and static geometry at start and on each scene load, not when you edit them.
+  bakes the room box and static geometry at start and when an `AcousticGeometry` is enabled or
+  disabled, not when you edit one.
   It mints each material asset once and reuses it across scene loads, because the engine's
   material table holds 64 entries.
 - **Native plugins persist across Editor play sessions.** `Engine` guards its singleton and tears the

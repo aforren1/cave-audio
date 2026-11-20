@@ -12,6 +12,7 @@
  *   calibrate --zylia --trims --input 0 ... # the ZM-1 as the trim mic (bare --zylia = the position survey)
  *   calibrate --live 7 --zylia --latency 20.6 # live aiming: one speaker's position and off-axis angle
  *   calibrate --live 7 --zylia --ref-speakers 2,10,18,24   # ... the latency from measured speaker positions
+ *   calibrate --live 7 --zylia --live-ref 2                # ... the latency from speaker 2 in EVERY reading (Via steps)
  *   calibrate --localize rows.txt --zylia    # speaker positions from the ZM-1's center arrival (no survey)
  *   calibrate --capsule-survey s.json --zylia --mic 0 1.448 0   # the capsule table, swept from the speakers
  *   calibrate --aim-sheet aim.csv            # no audio: the installer's aiming sheet
@@ -119,7 +120,7 @@ static int       g_nchecks, g_nunchecked;
 static float     g_turn_limit;            /* this placement's turn limit (deg); 0 = a center-only mode */
 static float     g_max_turn, g_last_turn;
 
-static const double CAPTURE_S = CAL_CAPLEN / CAL_FS, LIVE_CAPTURE_S = CAL_LIVE_CAPLEN / CAL_FS;
+static const double CAPTURE_S = CAL_CAPLEN / CAL_FS;
 
 static void track_sim_sync(void) { if (g_track_sim) mic_track_sim_truth(&g_mt, g_sim_at); }
 
@@ -426,22 +427,22 @@ static int aim_sheet(const char* layout_path, const Layout& L, const char* csv) 
 /* The listed speakers whose positions look unmeasured: no plan_position at all (no survey ever wrote
  * one), or a plan_position equal to the position (no survey MOVED it; an aim-only --write records the
  * plan too). A warning, not a refusal: a measured position can land on its plan to the 0.1 mm. */
-static void refspk_plan_warnings(const Layout& L, const int* spk, int n, const char* tag) {
+static void refspk_plan_warnings(const Layout& L, const int* spk, int n, const char* tag, const char* flag = "--ref-speakers") {
     for (int k = 0; k < n; ++k) {
         const Speaker& s = L.speakers[spk[k]];
         if (!s.has_plan) {
-            printf("%s: WARNING --ref-speakers %d carries no plan_position, so no survey ever wrote its position: it is\n"
+            printf("%s: WARNING %s %d carries no plan_position, so no survey ever wrote its position: it is\n"
                    "%*s the plan or a typed value, and its placement error over c lands in its latency (1 cm is 29 us)\n",
-                   tag, spk[k], (int)strlen(tag) + 1, "");
+                   tag, flag, spk[k], (int)strlen(tag) + 1, "");
             continue;
         }
         float d2 = 0.f;
         for (int a = 0; a < 3; ++a) d2 += (s.pos[a] - s.plan_pos[a]) * (s.pos[a] - s.plan_pos[a]);
         if (d2 <= REFSPK_PLAN_EPS_M * REFSPK_PLAN_EPS_M)
-            printf("%s: WARNING --ref-speakers %d: its plan_position equals its position, so it was never measured\n"
+            printf("%s: WARNING %s %d: its plan_position equals its position, so it was never measured\n"
                    "%*s (bwa_speaker_survey --write --fields aim records the plan too). If it is the plan, its placement\n"
                    "%*s error over c lands in its latency (1 cm is 29 us).\n",
-                   tag, spk[k], (int)strlen(tag) + 1, "", (int)strlen(tag) + 1, "");
+                   tag, flag, spk[k], (int)strlen(tag) + 1, "", (int)strlen(tag) + 1, "");
     }
 }
 
@@ -525,6 +526,8 @@ struct LiveArgs {
     int     ref_spk; double ref_dist;   /* --ref (latency from a taped distance), ref_spk < 0 = none */
     const int* ref_spks; int nref_spks; /* --ref-speakers (latency from trusted positions), 0 = none */
     const char* center_what;            /* where mic came from, for the --ref-speakers report */
+    int     live_ref;           /* --live-ref: the in-capture latency reference (CalibLiveRef), -1 = none */
+    int     sim_step_reading; double sim_step_s; int sim_step_inside;   /* --sim-latency-step N,ms[,inside] */
     int     aim_ref_spk;        /* --aim-ref: sweep this speaker first, its tilt is the 0 deg reference */
     int     have_aim_ref_db; float aim_ref_db;   /* --aim-ref-db: a stored reference */
     int     sweeps;             /* 0 = until a key (the rig); simulate defaults to the step count or 4 */
@@ -547,17 +550,18 @@ static void live_true_aim(const Layout* L, int s, float deg, float out[3]) {
 static CalibWindow g_live_win;
 static int         g_live_have_win;
 
-static int live_sweep_one(const LiveArgs& A, int spk, float aim_err_deg, const float* lsweep, CalibLiveReading* r) {
+static int live_sweep_one(const LiveArgs& A, int spk, float aim_err_deg, const float* lsweep, CalibLiveReading* r,
+                          CalibLiveRef* ref = NULL, double ref_step_s = 0.0) {
     float tp[3], ta[3];
     CalibSimOpts o; memset(&o, 0, sizeof o);
-    o.on_axis = 1; o.screen_db = A.sim_screen_db;
+    o.on_axis = 1; o.screen_db = A.sim_screen_db; o.ref_step_s = ref_step_s;
     if (A.simulate && spk == A.spk) {                    /* only the live speaker is being moved and turned */
         for (int a = 0; a < 3; ++a) tp[a] = A.L->speakers[spk].pos[a] + A.sim_move[a];
         live_true_aim(A.L, spk, aim_err_deg, ta);
         o.true_pos = tp; o.true_aim = ta;
     }
     if (!calib_live_read(spk, A.L, A.sim_at ? A.sim_at : A.mic, A.sos, A.simulate, &o, lsweep, A.cap19, r,
-                         g_live_have_win ? &g_live_win : NULL, A.mic)) {
+                         g_live_have_win ? &g_live_win : NULL, A.mic, ref)) {
         fprintf(stderr, "\ncalibrate: capture timed out on speaker %d\n", spk); return 0;
     }
     if (!r->ok)
@@ -672,12 +676,27 @@ static int live_zylia(const LiveArgs& A) {
         live_window(lat_known, latency, 0);                  /* a measured loop now times the readings */
     } else if (A.known_latency_m >= 0.0)
         printf("live: system latency from --latency: %.3f ms (%.3f m at c)\n", latency * 1e3, A.known_latency_m);
-    else if (A.simulate)
+    else if (A.simulate && A.live_ref < 0)
         printf("live: system latency: the simulator's own %d samples\n", CAL_SIM_LATENCY_SAMPLES);
-    else
+    else if (A.live_ref < 0)
         printf("live: no --latency, --ref or --ref-speakers: direction only, no distance or position (--ref <spk> <m>\n"
                "      needs one tape, --ref-speakers <list> measured positions)\n");
 
+    CalibLiveRef lref; memset(&lref, 0, sizeof lref);
+    lref.spk = A.live_ref;
+    if (A.live_ref >= 0) {
+        const float* rp = L.speakers[A.live_ref].pos;
+        const double rx = rp[0] - A.mic[0], ry = rp[1] - A.mic[1], rz = rp[2] - A.mic[2];
+        printf("live: system latency from --live-ref %d in EVERY reading: the live speaker's sweep, then speaker %d's\n"
+               "      %.2f s later in the same %.2f s capture, from its layout position %.3f m from the ZM-1. An error in\n"
+               "      that distance moves the live speaker's by the same amount. The readings' distances no longer\n"
+               "      follow a Dante Via latency step.\n", A.live_ref, A.live_ref, CAL_LIVE_REF_GAP / FS,
+               CAL_LIVE_REF_CAPLEN / FS, sqrt(rx * rx + ry * ry + rz * rz));
+        refspk_plan_warnings(L, &A.live_ref, 1, "live", "--live-ref");
+    }
+    if (A.simulate && A.sim_step_reading)
+        printf("live: simulate: the latency steps %+.3f ms %s reading %d (--sim-latency-step)\n", A.sim_step_s * 1e3,
+               A.sim_step_inside ? "inside" : "before", A.sim_step_reading);
     int have_ref = 0; float tilt_ref = 0.f;
     if (A.have_aim_ref_db) { have_ref = 1; tilt_ref = A.aim_ref_db; printf("live: on-axis reference %+.2f dB (--aim-ref-db)\n", tilt_ref); }
     if (A.aim_ref_spk >= 0) {
@@ -708,14 +727,22 @@ static int live_zylia(const LiveArgs& A) {
             const float tq[3] = { bp[0] + A.sim_move[0], bp[1] + A.sim_move[1], bp[2] + A.sim_move[2] };
             true_deg = directivity_off_axis_deg(tq, tra, A.mic);
         }
-        if (!live_sweep_one(A, s, aim_err, lsweep, &rd)) return 1;
+        /* a simulated Via step: before this reading, or inside it (after the live speaker's sweep, so
+         * only the reference's carries it) and for every reading after */
+        const int step_now = A.simulate && A.sim_step_reading == t + 1;
+        if (step_now && !A.sim_step_inside) calib_sim_set_latency_step(A.sim_step_s);
+        if (!live_sweep_one(A, s, aim_err, lsweep, &rd, &lref, step_now && A.sim_step_inside ? A.sim_step_s : 0.0)) return 1;
+        if (step_now && A.sim_step_inside) calib_sim_set_latency_step(A.sim_step_s);
         ++done;
-        const int bump = track_after_capture(LIVE_CAPTURE_S, "live aiming", t + 1);
+        const int bump = track_after_capture((A.live_ref >= 0 ? CAL_LIVE_REF_CAPLEN : CAL_LIVE_CAPLEN) / FS, "live aiming", t + 1);
         if (bump) return bump;
         if (!rd.ok) continue;
         ZyliaLivePos lp;
         memset(&lp, 0, sizeof lp);
-        if (A.pos_ok) zylia_live_position(rd.arr, A.mic, lat_known, latency, C, tp, &lp);
+        /* with --live-ref the latency is this reading's own, or there is no distance */
+        const int    lk = A.live_ref >= 0 ? rd.ref_ok : lat_known;
+        const double lt = A.live_ref >= 0 ? rd.ref_lat_s : latency;
+        if (A.pos_ok) zylia_live_position(rd.arr, A.mic, lk, lt, C, tp, &lp);
         char line[1400]; size_t k = 0;
         k += snprintf(line + k, sizeof line - k, "  #%-3d", t + 1);
         if (lp.ok && lp.have_distance) {
@@ -752,6 +779,8 @@ static int live_zylia(const LiveArgs& A) {
         } else
             k += snprintf(line + k, sizeof line - k, " | tilt: no direct-sound level in a band");
         k += snprintf(line + k, sizeof line - k, " | %s %.1f deg", has_plan ? "plan" : "layout", plan_deg);
+        if (rd.ref >= 0 && rd.ref_ok) k += snprintf(line + k, sizeof line - k, " | ref %d latency %.3f ms", rd.ref, rd.ref_lat_s * 1e3);
+        else if (rd.ref >= 0)         k += snprintf(line + k, sizeof line - k, " | ref %d: no latency", rd.ref);
         if (A.simulate) k += snprintf(line + k, sizeof line - k, " | true %.1f deg", true_deg);
         if (g_tracked && g_turn_limit > 0.f) k += snprintf(line + k, sizeof line - k, " | turned %.2f deg", g_last_turn);
         printf("%s\n", line);
@@ -771,7 +800,8 @@ static int live_zylia(const LiveArgs& A) {
     }
     const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (pk.nrejected)
-        printf("live: %d reading(s) not held by the peak (outside the window or under the SNR floor)\n", pk.nrejected);
+        printf("live: %d reading(s) not held by the peak (outside the window, under the SNR floor, or the latency\n"
+               "      reference: its baseline reading, a latency that moved, an arrival that was not clean)\n", pk.nrejected);
     if (pk.peak_index) {
         printf("live: peak tilt %+.2f dB at reading %d", pk.peak_db, npk_at);
         if (A.simulate) printf(", where the true axis was %.1f deg off the mic", peak_true_deg);
@@ -1439,6 +1469,8 @@ int main(int argc, char** argv) {
     const char* ref_spk_list = NULL;                          /* --ref-speakers 2,6,18: measured positions -> latency */
     int    sim_lat_spk[8]; double sim_lat_s[8]; int nsim_lat = 0;   /* --sim-speaker-latency spk,ms (repeatable) */
     int    sim_step_row = 0; double sim_step_s = 0.0;               /* --sim-latency-step row,ms */
+    int    sim_step_inside = 0;                                     /* ... ,inside (live aiming) */
+    int    live_ref = -1; int live_ref_set = 0;                     /* --live-ref R */
     int    cdel_caps[CALIB_SIM_INTF_MAX]; int cdel_n = 0; double cdel_samples = 0.0, cdel_db = 0.0;   /* --sim-capture-delay */
     const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
     const char* ir_prefix = NULL;
@@ -1491,6 +1523,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
         else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters: --live absolute distance, --zylia distances */
         else if (!strcmp(argv[i],"--ref") && i+2<argc)    { ref_spk = atoi(argv[++i]); ref_dist = atof(argv[++i]); } /* --zylia: tape-measured center->speaker distance -> solves the latency */
+        else if (!strcmp(argv[i],"--live-ref") && i+1<argc) { live_ref = atoi(argv[++i]); live_ref_set = 1; }   /* --live N --zylia: the latency from this speaker in every reading */
         else if (!strcmp(argv[i],"--ref-speakers") && i+1<argc) ref_spk_list = argv[++i];   /* --zylia: measured positions -> the latency, their median */
         else if (!strcmp(argv[i],"--sim-speaker-latency") && i+1<argc) {   /* "3,0.5": speaker 3 plays 0.5 ms late */
             const char* q = argv[++i];
@@ -1511,11 +1544,13 @@ int main(int argc, char** argv) {
             char* end = NULL;
             const long row = strtol(q, &end, 10);
             double ms = 0.0;
-            int ok = end != q && *end == ',' && row >= 2 && row <= CALIB_LOC_MAX_ROWS;
-            if (ok) { q = end + 1; ms = strtod(q, &end); ok = end != q && *end == 0 && ms >= -20.0 && ms <= 20.0 && ms != 0.0; }
+            int ok = end != q && *end == ',' && row >= 1 && row <= CALIB_LOC_MAX_ROWS;
+            if (ok) { q = end + 1; ms = strtod(q, &end); ok = end != q && ms >= -20.0 && ms <= 20.0 && ms != 0.0; }
+            if (ok && !strcmp(end, ",inside")) sim_step_inside = 1;
+            else if (ok) ok = *end == 0 && row >= 2;         /* a step BEFORE row 1 is no step */
             if (!ok) {
                 fprintf(stderr, "calibrate: --sim-latency-step wants row,ms with row 2 or later (rows count from 1) and ms in\n"
-                                "           [-20, 20] and not 0 (got %s)\n", argv[i]); return 2; }
+                                "           [-20, 20] and not 0; --live also takes row,ms,inside, from row 1 (got %s)\n", argv[i]); return 2; }
             sim_step_row = (int)row; sim_step_s = ms * 1e-3;
         }
         else if (!strcmp(argv[i],"--sim-capture-delay") && i+1<argc) {  /* "1,7:2:0.5": captures 1 and 7, 2 samples later, 0.5 dB up */
@@ -1705,8 +1740,17 @@ int main(int argc, char** argv) {
                                "  with no unflagged majority nothing is used (exit 6). A layout speaker with no plan_position,\n"
                                "  or one equal to its position, is warned about: nothing ever measured it.\n"
                                "  --sim-speaker-latency spk,ms (simulate, repeatable): that speaker plays ms later than the rest.\n"
+                               "  --live-ref R (--live N --zylia): the latency from speaker R in EVERY reading. The ZM-1's Dante\n"
+                               "  Via leg steps the latency 0.3 to 0.4 ms at random, which a latency taken once reads as 10 to\n"
+                               "  14 cm of range. Each reading plays the live speaker and, 0.5 s later in the same capture,\n"
+                               "  speaker R from its MEASURED layout position; R's arrival gives that reading's latency. A\n"
+                               "  reading whose latency is more than 2 samples off the previous one's is marked and not held,\n"
+                               "  and so is the first reading, which has none to compare with.\n"
+                               "  Not with --ref or --ref-speakers.\n"
                                "  --sim-latency-step row,ms (simulate, --localize): from mic row `row` on (counted from 1), every\n"
                                "  speaker plays ms later: a Dante Via re-sync mid-run, which the per-row latency must absorb.\n"
+                               "  With --live N --zylia `row` is the reading; row,ms,inside puts the step inside that reading's\n"
+                               "  capture, after the live speaker's sweep (from reading 1; it needs --live-ref to be seen).\n"
                                "  --sim-capture-delay captures:samples[:dB] (simulate): on those 1-based captures the speaker\n"
                                "  plays that many samples later and dB louder, so two sweeps of one speaker disagree by a set\n"
                                "  amount.\n"
@@ -1875,9 +1919,18 @@ int main(int argc, char** argv) {
     if (nsim_lat && !simulate) {
         fprintf(stderr, "calibrate: --sim-speaker-latency is a --simulate knob: a real box's Dante latency is set in Dante\n"
                         "           Controller\n"); return 2; }
-    if (sim_step_row && (!simulate || !localize_file)) {
-        fprintf(stderr, "calibrate: --sim-latency-step is a --simulate knob for --localize: it steps the latency between\n"
-                        "           its mic rows\n"); return 2; }
+    if (sim_step_row && (!simulate || !(localize_file || (zylia && live_speaker >= 0)) || (sim_step_inside && localize_file))) {
+        fprintf(stderr, "calibrate: --sim-latency-step is a --simulate knob for --localize (it steps the latency between\n"
+                        "           its mic rows) and --live N --zylia (between its readings, or row,ms,inside one)\n"); return 2; }
+    if (live_ref_set && !(zylia && live_speaker >= 0)) {
+        fprintf(stderr, "calibrate: --live-ref names the reference speaker of --live N --zylia: it plays in every live\n"
+                        "           reading, and no other mode takes readings like that\n"); return 2; }
+    if (live_ref_set && (ref_spk >= 0 || ref_spk_list)) {
+        fprintf(stderr, "calibrate: --live-ref measures the latency in every reading, and --ref / --ref-speakers measure it once\n"
+                        "           before them: two latencies for one distance; pass one\n"); return 2; }
+    if (live_ref_set && live_ref == live_speaker) {
+        fprintf(stderr, "calibrate: --live-ref %d is the live speaker: its position is the one in question, so it cannot\n"
+                        "           time its own distance\n", live_ref); return 2; }
     if (drop_outliers && !csurvey_out) {
         fprintf(stderr, "calibrate: --drop-outliers drops the speakers the --capsule-survey's leave-one-out flags\n"); return 2; }
     if (track_sim_off_set && !track_sim) {
@@ -2120,6 +2173,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: --ref wants a speaker 0..%d and a distance >= 0.2 m (got %d, %.3f)\n",
                 n - 1, ref_spk, ref_dist); return 2;
     }
+    if (live_ref_set && (live_ref < 0 || live_ref >= n)) {
+        fprintf(stderr, "calibrate: --live-ref %d: the layout's speakers run 0..%d\n", live_ref, n - 1); return 2; }
     /* --ref-speakers: three or more distinct speakers, a center to measure their distances from, and never
      * the box live aiming is moving (its position is the one in question) */
     static int rs_spk[BWA_MAX_CHANNELS];
@@ -3149,6 +3204,15 @@ int main(int argc, char** argv) {
         A.L = &L; A.spk = live_speaker; memcpy(A.mic, mic, sizeof A.mic); A.sos = sos; A.simulate = simulate;
         A.known_latency_m = known_latency; A.ref_spk = ref_spk; A.ref_dist = ref_dist;
         A.ref_spks = rs_spk; A.nref_spks = rs_n;
+        A.live_ref = live_ref_set ? live_ref : -1;
+        A.sim_step_reading = sim_step_row; A.sim_step_s = sim_step_s; A.sim_step_inside = sim_step_inside;
+        {   /* a step past the last reading never happens, and the run would read as held */
+            const int nread = sweeps > 0 ? sweeps : (nsteps > 0 ? nsteps : 4);
+            if (sim_step_row > nread) {
+                fprintf(stderr, "calibrate: --sim-latency-step reading %d: this run takes %d reading(s) (--sweeps)\n", sim_step_row, nread);
+                return 2;
+            }
+        }
         A.center_what = g_tracked ? "the measured center" : (mic_set ? "--mic" : "the listening point (no --mic)");
         if (rs_n) refspk_plan_warnings(L, rs_spk, rs_n, "live");
         A.aim_ref_spk = aim_ref_spk; A.have_aim_ref_db = have_aim_ref_db; A.aim_ref_db = aim_ref_db;

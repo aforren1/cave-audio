@@ -389,6 +389,21 @@ src/
                          CALIB_LIVE_*_HZ (3-10 kHz against 10 kHz up), NOT --check-aim's 1-3 / 3 kHz up:
                          on the 4410A those fall 0.25 dB by 15 deg, under the 0.3 dB a reading is good to,
                          so a meter on them could not find the peak; the live pair falls 1.0 dB there.
+                         THE IN-CAPTURE LATENCY REFERENCE (`--live-ref R`, the Aim tab's dropdown, CalibLiveRef
+                         in calib_live_read): Via's 0.3-0.4 ms latency steps read as 10-14 cm of range against
+                         a latency taken once, so each reading plays the LIVE speaker and, CAL_LIVE_REF_GAP
+                         (0.5 s, the sweep length: what leaves the live speaker a noise region after its
+                         tail and ahead of R's harmonics) later in one 1.25 s capture, speaker R from its
+                         measured layout position (calib_asio_capture_pair); R's arrival is that reading's
+                         latency. The live speaker plays FIRST so a step inside the capture always reaches
+                         R's sweep; its lags end ahead of R's arrival and harmonic products
+                         (measure_response_lim), and R is the single-sweep measurement at a pointer offset,
+                         measured FIRST. The windows are timed from the last good reference latency, and an
+                         R outside its window is searched once more unwindowed, so a step past the margin
+                         is followed. The first reading is CALIB_LIVE_BASELINE (nothing to compare with);
+                         more than CAL_LIVE_LAT_MOVED_SAMPLES (2) off the previous reading's latency is
+                         CALIB_LIVE_LAT_MOVED; an unclean R is CALIB_LIVE_REF_BAD. None is held.
+                         `--sim-latency-step N,ms[,inside]` is its simulated step. Unverified on the rig.
                          The 0 deg tilt comes from a stored REFERENCE (a speaker known on-axis, like one
                          bwa_speaker_survey confirmed) or else the file's `on_axis_db`, which
                          clf_to_json.py now exports (byte 6456 of the 4410A CF2, self-checked, omitted
@@ -443,7 +458,9 @@ src/
                          after a survey placed the speaker, 0.50 m before; the peak is searched only inside it and
                          a stronger tap outside flags the capture), the IR SNR against a POSITIVE-lag floor
                          (measure_noise_floor: before the window and after the tail, never the negative lags where
-                         the sweep's harmonics sit; 40 dB, provisional), a re-sweep on either, and for the trims and
+                         the sweep's harmonics sit, and less 5 ms around orders 2-4 of the arrival, which a
+                         LATE arrival puts at positive lags: the 0.5 s live sweep's second harmonic leads by
+                         50 ms and the ZM-1 chain is 65 ms; 40 dB, provisional), a re-sweep on either, and for the trims and
                          verify TWO AGREEING SWEEPS (1 sample, 0.2 dB). --localize agrees at 3 samples, 1 dB
                          (CALIB_LOC_AGREE_*; pass_quality resets a pass to the trims' pair). Every mode gets
                          CALIB_SWEEP_MAX_TRIES 12 (the ZM-1's Via latency steps 0.3-0.4 ms and settles over ~30 s,

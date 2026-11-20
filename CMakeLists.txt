@@ -1217,6 +1217,11 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_placement PRIVATE bwa_core)
   add_test(NAME placement COMMAND test_placement)
 
+  # the calibration ASIO shell's per-block logic (examples/calib_job.c): pure, no SDK, every platform
+  add_executable(test_calib_capture_block test/calib_capture_block_test.c examples/calib_job.c)
+  target_include_directories(test_calib_capture_block PRIVATE examples)
+  add_test(NAME calib_capture_block COMMAND test_calib_capture_block)
+
   add_executable(test_valid test/valid_test.c)
   target_link_libraries(test_valid PRIVATE bwa_core)
   add_test(NAME valid COMMAND test_valid)
@@ -1281,7 +1286,7 @@ if(BWA_BUILD_TESTS)
       COMMAND ${CMAKE_COMMAND} -DUNITY_EXE=${BWA_UNITY_EXE}
               -DREPO=${CMAKE_SOURCE_DIR}
               -DPROJECT_DIR=${BWA_UNITY_TEST_PROJECT}
-              -DMIN_TESTS=31
+              -DMIN_TESTS=46
               -P ${CMAKE_SOURCE_DIR}/bindings/unity/test~/run_unity_tests.cmake)
     # The first run resolves packages and imports the project from scratch; later runs reuse its
     # Library cache. RUN_SERIAL because the editor takes an exclusive lock on that project.
@@ -1474,6 +1479,7 @@ if(BWA_BUILD_CALIBVIEW)
   # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
   # between them (they'd otherwise tear each other down).
   target_sources(bwa_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
+                                       examples/calib_job.c      # the capture shell's SDK-free block logic
                                        examples/asio_session.cpp
                                        examples/mic_track.cpp    # the Placement panel's tracked ZM-1
                                        examples/clicker_track.cpp    # the capsule survey's tracked clicker
@@ -1500,6 +1506,7 @@ endif()
 if(BWA_BUILD_CALIBRATE)
   enable_language(CXX)
   add_executable(bwa_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp
+                               examples/calib_job.c
                                examples/mic_track.cpp)
   target_link_libraries(bwa_calibrate PRIVATE bwa_core)
   bwa_tool_icon(bwa_calibrate)

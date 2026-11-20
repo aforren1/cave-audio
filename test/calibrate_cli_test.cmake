@@ -1180,6 +1180,113 @@ elseif(MODE STREQUAL "live_zylia")
     endif()
   endforeach()
 
+  # --live-ref: the latency from a reference speaker in EVERY reading, against a Dante Via latency step.
+  # The box really stands 100 mm along +x of its layout position, 72.8 mm further from the ZM-1 (2.1580 m
+  # against 2.0850 m), so a distance that only echoed the layout would read 0. The step is the simulator's.
+  # Each reading's distance error must sit in [lo, hi] mm.
+  function(live_dist name first last lo hi)
+    foreach(k RANGE ${first} ${last})
+      if(NOT "${${name}_OUT}" MATCHES "\n  #${k} [^\n]*dist [0-9.]+ m \\(([-+])([0-9]+)\\.[0-9] mm\\)")
+        message(FATAL_ERROR "calibrate_cli_test: ${name}: reading ${k} has no distance (log: ${WORK}/${name}.log)")
+      endif()
+      set(e "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+      if(e LESS ${lo} OR e GREATER ${hi})
+        message(FATAL_ERROR "calibrate_cli_test: ${name}: reading ${k} is ${e} mm off in distance, want ${lo} to ${hi} (log: ${WORK}/${name}.log)")
+      endif()
+    endforeach()
+    message(STATUS "${name}: readings ${first}-${last} within ${lo} to ${hi} mm of the layout distance")
+  endfunction()
+  set(STEP ${LIVE} --sim-move 0.1 0 0 --sweeps 6)
+  # one_flag(<run> <text>): `text` on exactly one line of the run
+  function(one_flag name text)
+    string(REGEX MATCHALL "${text}" hits "${${name}_OUT}")
+    list(LENGTH hits nh)
+    if(NOT nh EQUAL 1)
+      message(FATAL_ERROR "calibrate_cli_test: ${name}: '${text}' on ${nh} lines, want 1 (log: ${WORK}/${name}.log)")
+    endif()
+  endfunction()
+  # (a) the baseline: with the latency taken once, a 0.35 ms step before reading 4 is 120 mm of range
+  run(lstep 0 ${STEP} --sim-latency-step 4,0.35)
+  live_dist(lstep 1 3 71 74)
+  live_dist(lstep 4 6 191 194)
+  # (b) with the reference the distance holds through the step, and the reading after it says so. The
+  # first reading has no latency to compare with: it sets the baseline and is not held.
+  run(lref 0 ${STEP} --sim-latency-step 4,0.35 --live-ref 2)
+  expect(lref "system latency from --live-ref 2 in EVERY reading" "the reference is announced")
+  live_dist(lref 1 6 71 74)
+  expect(lref "\n  #1 [^\n]*NOT HELD: baseline: the latency check starts with the next reading" "the first reading only sets the baseline")
+  expect(lref "\n  #3 [^\n]*peak [-+][0-9][^\n]*ref 2 latency 10\\.66[0-9] ms" "readings 2 and 3 set the peak; the reference reads the simulator's latency (512 samples)")
+  expect(lref "\n  #4 [^\n]*NOT HELD: latency moved \\+16\\.[0-9] samples[^\n]*ref 2 latency 11\\.01[0-9] ms" "the step is reported on the reading it lands before")
+  one_flag(lref "NOT HELD: latency moved")
+  one_flag(lref "NOT HELD: baseline")
+  # (c) the step INSIDE reading 3's capture, after the live speaker's sweep: that reading's distance is
+  # wrong by the step (it must be, or the simulator's step did nothing), and it is flagged and not held
+  run(lin 0 ${STEP} --sim-latency-step 3,0.35,inside --live-ref 2)
+  live_dist(lin 1 2 71 74)
+  live_dist(lin 3 3 -49 -46)
+  live_dist(lin 4 6 71 74)
+  expect(lin "\n  #3 [^\n]*NOT HELD: latency moved \\+16\\.[0-9] samples" "a step inside the capture is flagged on that reading")
+  expect(lin "live: 2 reading\\(s\\) not held by the peak" "and the peak holds neither it nor the baseline")
+  one_flag(lin "NOT HELD: latency moved")
+  # ... and inside the FIRST reading, where nothing can flag it: that reading is the baseline, never held
+  run(lin1 0 ${STEP} --sim-latency-step 1,0.35,inside --live-ref 2)
+  live_dist(lin1 1 1 -49 -46)
+  live_dist(lin1 2 6 71 74)
+  expect(lin1 "\n  #1 [^\n]*NOT HELD: baseline" "a step inside the first reading is not held")
+  if(lin1_OUT MATCHES "latency moved")
+    message(FATAL_ERROR "calibrate_cli_test: lin1: readings after the baseline were flagged (log: ${WORK}/lin1.log)")
+  endif()
+  # A step far past the window's margin (-3 ms against +/- 1 ms), then a reference that cannot be measured
+  # (reading 5: a 12 dB noise burst over the reference's sweep only, 1.0 s into the capture). The windows
+  # follow the reference's latency, so every distance stays right; reading 5 has no latency and no distance,
+  # and its live speaker still reads clean, in a window timed from the last good latency.
+  run(lneg 0 ${STEP} --sim-latency-step 3,-3.0 --sim-interferer 5:1.0:12:noise --live-ref 10)
+  live_dist(lneg 1 4 71 74)
+  live_dist(lneg 6 6 71 74)
+  expect(lneg "\n  #3 [^\n]*NOT HELD: latency moved -144\\.[0-9] samples[^\n]*ref 10 latency 7\\.66[0-9] ms" "the negative step is followed and flagged")
+  expect(lneg "\n  #5 [^\n]*\\(no distance\\)[^\n]*NOT HELD: reference speaker 10: IR peak [0-9.]+ dB over its noise floor[^\n]*ref 10: no latency"
+         "a reference under the SNR floor gives no latency and no distance, and the live speaker's own arrival is still clean")
+  one_flag(lneg "NOT HELD: latency moved")
+  one_flag(lneg "NOT HELD: reference speaker")
+  one_flag(lneg "NOT HELD: baseline")
+  string(REGEX MATCHALL "NOT HELD" nh "${lneg_OUT}")
+  list(LENGTH nh nnh)
+  if(NOT nnh EQUAL 3)
+    message(FATAL_ERROR "calibrate_cli_test: lneg: ${nnh} readings not held, want 3: the baseline, the step, the bad reference (log: ${WORK}/lneg.log)")
+  endif()
+  # a reference LOUDER than the live speaker (speaker 10 is 1.50 m from the ZM-1, the moved box 2.16 m):
+  # its arrival is the capture's strongest tap, and it must not read as the live speaker's interferer
+  run(lnear 0 ${LIVE} --sim-move 0.1 0 0 --sweeps 3 --live-ref 10)
+  live_dist(lnear 1 3 71 74)
+  expect(lnear "\n  #3 [^\n]*peak [-+][0-9]" "two clean readings set the peak beside a louder reference")
+  one_flag(lnear "NOT HELD")
+  # a step past the last reading would never happen, and the run would read as held: refused
+  run(lpast 2 ${LIVE} --sweeps 2 --live-ref 10 --sim-latency-step 4,0.35)
+  file(READ "${WORK}/lpast.log" lg)
+  if(NOT lg MATCHES "--sim-latency-step reading 4: this run takes 2 reading")
+    message(FATAL_ERROR "calibrate_cli_test: lpast: refused, but not for the step past the run (log: ${WORK}/lpast.log)")
+  endif()
+  # (d) the refusals
+  run(lrself 2 ${LIVE} --sweeps 1 --live-ref 7)
+  run(lrrange 2 ${LIVE} --sweeps 1 --live-ref 26)
+  run(lrref 2 ${LIVE} --sweeps 1 --live-ref 2 --ref 2 2.5)
+  run(lrrefs 2 ${LIVE} --sweeps 1 --live-ref 2 --ref-speakers 2,10,18)
+  run(lrmode 2 --layout live_layout.json --zylia --simulate --trims --live-ref 2)
+  run(lrstep 2 --layout live_layout.json --zylia --simulate --trims --sim-latency-step 3,0.35)
+  foreach(pair "lrself|--live-ref 7 is the live speaker" "lrrange|--live-ref 26: the layout's speakers run 0..25"
+               "lrref|two latencies for one distance" "lrrefs|two latencies for one distance"
+               "lrmode|--live-ref names the reference speaker of --live N --zylia"
+               "lrstep|--sim-latency-step is a --simulate knob for --localize")
+    string(REPLACE "|" ";" pair "${pair}")
+    list(GET pair 0 nm)
+    list(GET pair 1 why)
+    file(READ "${WORK}/${nm}.log" lg)
+    string(FIND "${lg}" "${why}" at)
+    if(at LESS 0)
+      message(FATAL_ERROR "calibrate_cli_test: ${nm}: refused, but not with '${why}' (log: ${WORK}/${nm}.log)")
+    endif()
+  endforeach()
+
 elseif(MODE STREQUAL "sweep_quality")
   # The interferer is the SIMULATOR's (calib_capture.cpp counts the captures it lands on), so these
   # checks hold the tool against a truth it does not produce. A 250 ms noise burst at the sweep's own

@@ -34,6 +34,7 @@ namespace BwAudio.Tests
         public const string Long     = "bwa_test_long.wav";       // mono, 96000 frames = 2.0 s
         public const string BedShort = "bwa_test_bed_short.wav";  // 4-ch AmbiX, 64 frames
         public const string BedLong  = "bwa_test_bed_long.wav";   // 4-ch AmbiX, 12288 frames
+        public const string BedFront = "bwa_test_bed_front.wav";  // 4-ch AmbiX plane wave from the front, 12288 frames
 
         public const uint SubFrameFrames = 64;
         public const uint ShortFrames    = 12288;
@@ -51,12 +52,14 @@ namespace BwAudio.Tests
             WriteTone(Path.Combine(dir, Long),     LongFrames,     1);
             WriteTone(Path.Combine(dir, BedShort), SubFrameFrames, 4);
             WriteTone(Path.Combine(dir, BedLong),  ShortFrames,    4);
+            WriteTone(Path.Combine(dir, BedFront), ShortFrames,    4, front: true);
         }
 
         // A 16-bit PCM wav of a 440 Hz tone. channels = 1 for a point source; 4 writes an AmbiX
         // first-order soundfield (W carries the tone, XYZ silent = a diffuse field), which is the
-        // channel count bwa_load_ambix demands (4 / 9 / 16) and what the bed tests need.
-        static void WriteTone(string path, uint frames, int channels)
+        // channel count bwa_load_ambix demands (4 / 9 / 16) and what the bed tests need. `front` also
+        // puts the tone on X (ACN 3): an SN3D plane wave arriving from the field's front.
+        public static void WriteTone(string path, uint frames, int channels, bool front = false)
         {
             const double freq = 440.0, amp = 0.5;
             int dataBytes = (int)frames * channels * 2;
@@ -79,7 +82,7 @@ namespace BwAudio.Tests
                 {
                     short s = (short)(Math.Sin(2.0 * Math.PI * freq * i / SampleRate) * amp * 32767.0);
                     for (int ch = 0; ch < channels; ch++)
-                        w.Write(ch == 0 ? s : (short)0);        // W only: XYZ silent
+                        w.Write(ch == 0 || (front && ch == 3) ? s : (short)0);   // W (+ X): the rest silent
                 }
             }
         }
@@ -89,7 +92,9 @@ namespace BwAudio.Tests
         /// <summary>Stand up an Engine on the offline sink. Fields are set while the GameObject is
         /// INACTIVE so Awake sees them: an active AddComponent runs Awake immediately, against the
         /// inspector defaults (which include a layout file this project does not ship).</summary>
-        public static Engine CreateEngine()
+        /// <param name="configure">Runs on the inactive Engine, after the defaults above, so a test
+        /// can set what Awake reads (profile, roomOrigin, ownsAudio).</param>
+        public static Engine CreateEngine(Action<Engine> configure = null)
         {
             var go = new GameObject("bwa_test_engine");
             go.SetActive(false);
@@ -101,6 +106,7 @@ namespace BwAudio.Tests
             eng.blockSize = BlockSize;
             eng.feedListener = true;
             eng.listener = go.transform;             // assigned so Awake does not warn about a dead pose
+            configure?.Invoke(eng);
             go.SetActive(true);                      // -> Awake -> bwa_create + bwa_start
             return eng;
         }
@@ -179,6 +185,24 @@ namespace BwAudio.Tests
             }
             Array.Sort(samples);
             result(samples[n / 2]);
+        }
+
+        /// <summary>Every log line while it lives, as "Type: message". For asserting that something
+        /// did NOT log, which LogAssert cannot do for warnings.</summary>
+        public sealed class LogCapture : IDisposable
+        {
+            public readonly System.Collections.Generic.List<string> Lines = new System.Collections.Generic.List<string>();
+            public LogCapture() { Application.logMessageReceived += OnLog; }
+            void OnLog(string msg, string stack, LogType t) { Lines.Add(t + ": " + msg); }
+            public void Dispose() { Application.logMessageReceived -= OnLog; }
+            public int Count(string needle) { int n = 0; foreach (var l in Lines) if (l.Contains(needle)) n++; return n; }
+            /// <summary>Warnings, errors and exceptions, joined, or "" when there were none.</summary>
+            public string Problems()
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var l in Lines) if (!l.StartsWith("Log: ")) sb.AppendLine(l);
+                return sb.ToString();
+            }
         }
 
         /// <summary>Log line prefix, so a failure in a batchmode log is findable.</summary>

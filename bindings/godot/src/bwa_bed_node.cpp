@@ -6,6 +6,9 @@
 
 #include "bwa_engine_node.h"
 #include "bwa_guard.h"
+#include "bwa_room.h"
+
+#include <cmath>
 
 using namespace godot;
 
@@ -38,11 +41,7 @@ void BwaBed::_ready() {
 	if (paused) {
 		bwa_bed_set_paused(ENG, bed, true);
 	}
-	if (orientation != Vector3()) {
-		bwa_bed_set_orientation(
-				ENG, bed, (float)orientation.x, (float)orientation.y, (float)orientation.z);
-		pushed_orientation = orientation;
-	}
+	push_orientation(); /* always: yaw 0 is world +Z, which a turned origin moves in the room */
 
 	owner->register_client(this); // for the engine-freed-first teardown order
 	owner->register_bed(this);   // ...and for the completion / loop event route
@@ -54,14 +53,25 @@ void BwaBed::_ready() {
 
 /* The orientation setter can be called from anywhere (an animation, a tween); pushing it
  * from _process instead of the setter keeps it to one call per frame however often it was
- * written, and only when it actually changed. */
+ * written, and only when it or the registration actually changed. */
 void BwaBed::_process(double delta) {
 	(void)delta;
-	if (LIVE && orientation != pushed_orientation) {
-		bwa_bed_set_orientation(
-				ENG, bed, (float)orientation.x, (float)orientation.y, (float)orientation.z);
-		pushed_orientation = orientation;
+	if (LIVE && (orientation != pushed_orientation
+				|| owner->registration_generation() != pushed_reg_gen)) {
+		push_orientation();
 	}
+}
+
+/* Scene yaw -> room yaw: take the field's front (Godot world +Z turned by the yaw, the sense of
+ * Node3D.rotation.y) into the room and read its heading. Pitch and roll are about the field's
+ * own axes, so a level origin leaves them alone; a tilted one is warned against, not folded in. */
+void BwaBed::push_orientation() {
+	const Vector3 front = owner->to_room_direction(
+			Vector3(std::sin(orientation.x), 0.0f, std::cos(orientation.x)));
+	const float yaw = bwa_room_yaw_from_dir((float)front.x, (float)front.z);
+	bwa_bed_set_orientation(ENG, bed, yaw, (float)orientation.y, (float)orientation.z);
+	pushed_orientation = orientation;
+	pushed_reg_gen = owner->registration_generation();
 }
 
 void BwaBed::_exit_tree() {
@@ -318,10 +328,10 @@ void BwaBed::set_paused(bool p) {
 
 void BwaBed::set_orientation(const Vector3 &ypr) { orientation = ypr; }
 
+/* A node faces its -Z. Scene terms, so no registration here: the push adds it. */
 void BwaBed::set_yaw_from_basis(const Basis &b) {
-	if (owner) {
-		orientation = Vector3(owner->to_room_yaw(b), 0.0f, 0.0f);
-	}
+	const Vector3 facing = -b.get_column(2);
+	orientation = Vector3(bwa_room_yaw_from_dir((float)facing.x, (float)facing.z), 0.0f, 0.0f);
 }
 
 void BwaBed::fade_to(float target, float seconds) {

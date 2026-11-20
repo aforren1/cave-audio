@@ -1,6 +1,7 @@
 // ClipDrawer.cs — editor picker for [Clip] string fields. Lists the files actually present under
 // StreamingAssets (so you don't type paths by hand), flags a missing file in red, and offers a browse
-// button scoped to StreamingAssets. The stored value stays a StreamingAssets-relative path.
+// button scoped to StreamingAssets. The stored value stays a StreamingAssets-relative path, unless a
+// script stored an absolute one, which the field shows as it is.
 //
 // The extension set comes from the attribute ([Clip] = audio, [Clip(".json")] = the speaker
 // layout), so the file lists are cached per extension set rather than globally.
@@ -28,8 +29,10 @@ namespace BwAudio.EditorTools
             string cur = prop.stringValue ?? "";
             var opts = files.ToList();
             int idx = opts.IndexOf(cur);
-            bool missing = cur.Length > 0 && idx < 0;
-            if (idx < 0) { opts.Insert(0, cur.Length == 0 ? "(none)" : cur + "  — not found"); idx = 0; }
+            // An absolute path is a supported value (Engine.AssetPath) that no StreamingAssets list holds.
+            bool absolute = cur.Length > 0 && Path.IsPathRooted(cur) && File.Exists(cur);
+            bool missing = cur.Length > 0 && idx < 0 && !absolute;
+            if (idx < 0) { opts.Insert(0, cur.Length == 0 ? "(none)" : absolute ? cur : cur + "  — not found"); idx = 0; }
 
             const float browseW = 24f, gap = 2f;
             var popupR  = new Rect(pos.x, pos.y, pos.width - browseW - gap, pos.height);

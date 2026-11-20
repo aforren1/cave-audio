@@ -218,6 +218,32 @@ int main(void) {
         }
     }
 
+    /* --- the sweep's own distortion is not noise: a speaker with 20% second harmonic, arriving later than
+     * the harmonic's lead (4816 samples for this 1 s sweep), puts the product at a POSITIVE lag inside the
+     * "before" noise region. Counted, it costs the SNR about 30 dB (measured with the exclusion broken);
+     * left out (MEASURE_HARM_*), the capture is as clean as it is. The harmonic is 2 s^2 - 1 = -cos(2 phase), faded out before it would alias. --- */
+    {
+        const int Dh = 6000, nch = nref + 24000;
+        float* ch = (float*)calloc((size_t)nch, sizeof(float));
+        CHECK(ch != NULL, "alloc (harmonic)");
+        if (ch) {
+            const int stop = (int)(0.85 * nref), fade = 2000;
+            for (int i = 0; i < nref; ++i) {
+                const double pi = 3.14159265358979;
+                double h = i < stop ? 1.0 : (i < stop + fade ? 0.5 + 0.5 * cos(pi * (i - stop) / fade) : 0.0);
+                if (i < fade) h *= 0.5 - 0.5 * cos(pi * i / fade);
+                ch[i + Dh] = 0.4f * (sweep[i] + (float)(0.2 * h) * (2.f * sweep[i] * sweep[i] - 1.f));
+            }
+            MeasureResult hm;
+            CHECK(measure_response_ex(ch, nch, sweep, nref, f1, f2, fs, band_hz, Dh - 70, Dh + 70, &hm, NULL, 0, 0, NULL),
+                  "harmonic: measured");
+            printf("harmonic: 20%% second harmonic %d samples ahead of the arrival: snr %.1f dB\n",
+                   (int)measure_harmonic_lead(nref, 2, f1, f2), hm.snr_db);
+            CHECK(hm.delay_samples == Dh && hm.snr_db > 60.f, "harmonic: the sweep's own second harmonic is not read as noise");
+            free(ch);
+        }
+    }
+
     free(sweep);
 
     /* --- RT60: a synthetic exponential-decay tail with a known reverberation time --- */
