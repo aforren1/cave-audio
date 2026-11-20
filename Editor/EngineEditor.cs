@@ -137,7 +137,7 @@ namespace BwAudio.EditorTools
         {
             if (!string.IsNullOrEmpty(a.layoutFile))
             {
-                string full = Path.Combine(Application.streamingAssetsPath, a.layoutFile).Replace('\\', '/');
+                string full = Engine.AssetPath(a.layoutFile).Replace('\\', '/');
                 if (!File.Exists(full) && a.profile == BwaProfile.Binaural)
                     EditorGUILayout.HelpBox(
                         "No speaker layout at:\n\n" + full + "\n\nBinaural drives no speakers, so the " +
@@ -183,6 +183,10 @@ namespace BwAudio.EditorTools
         // out of the speakers at all?
         static void DrawLiveStatus(Engine a)
         {
+            if (Application.isPlaying && a == Engine.Instance && !a.OwnsAudio)
+                EditorGUILayout.HelpBox("This process does not own audio (Owns Audio off, or " +
+                    "Engine.OwnsAudioPredicate said no). No device is open and every BwAudio component " +
+                    "is silent. Room Origin still applies.", MessageType.Info);
             if (!Application.isPlaying || !a.Ready) return;
 
             EditorGUILayout.Space();

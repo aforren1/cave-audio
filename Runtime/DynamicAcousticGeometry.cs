@@ -10,7 +10,6 @@
 // reflections/pathing do NOT track movement (the bake froze the geometry); real-time reflections and
 // occlusion do. Needs the Steam Audio backend (a no-op otherwise).
 using UnityEngine;
-using System.Collections;
 
 namespace BwAudio
 {
@@ -51,20 +50,24 @@ namespace BwAudio
             return mf != null ? mf.sharedMesh : null;
         }
 
-        void OnEnable()
-        {
-            if (!TryRegister()) StartCoroutine(RegisterWhenReady());   // Engine may still be starting
-        }
+        // The first enable waits for Start, so a mesh or material set right after AddComponent is the
+        // one registered. Later enables register at once. Both wait for the Engine the same way every
+        // component does (Engine.ForComponent).
+        bool _startRan;
 
-        IEnumerator RegisterWhenReady()
+        void OnEnable() { if (_startRan) Register(); }
+        void Start()    { _startRan = true; Register(); }
+
+        void Register()
         {
-            while (_handle < 0 && isActiveAndEnabled) { if (TryRegister()) yield break; yield return null; }
+            if (!TryRegister()) StartCoroutine(Engine.RetryEachFrame(TryRegister));
         }
 
         bool TryRegister()
         {
-            var eng = Engine.Instance;
-            if (eng == null || !eng.Ready) return false;
+            if (_handle >= 0) return true;
+            var eng = Engine.ForComponent(out bool wait);
+            if (eng == null) return !wait;
             var mesh = ResolveMesh();
             if (mesh == null) { Debug.LogWarning("[bw_audio] DynamicAcousticGeometry with no mesh: " + name); return true; }  // stop retrying
             _handle = eng.AddDynamicMesh(mesh, transform, material);
@@ -85,6 +88,7 @@ namespace BwAudio
 
         void OnDisable()
         {
+            StopAllCoroutines();                 // a pending register retry: disabling alone does not stop it
             var eng = Owner;                     // owner gone -> the mesh died with its engine:
             if (_handle >= 0 && eng != null)     // never remove a successor's mesh by index
                 eng.RemoveDynamicMesh(_handle);

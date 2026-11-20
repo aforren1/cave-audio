@@ -1,6 +1,7 @@
-// AmbisonicBed.cs — a world-locked AmbiX soundfield (diffuse/ambient), decoded straight to the 26
-// speakers. NOT a positional source: there is no transform position (the field is fixed to the room;
-// the listener moving through it is handled by the real speakers + the binaural monitor's head-track).
+// AmbisonicBed.cs — a world-locked AmbiX soundfield (diffuse/ambient), decoded straight to the
+// speakers. NOT a positional source: there is no transform position (the field is centered on the
+// room; the listener moving through it is handled by the real speakers + the binaural monitor's
+// head-track). Its yaw is in scene terms and follows a moved Room Origin, like every Emitter does.
 // Use for room tone, ambience, or a music bed. Wraps bwa_bed_*.
 //
 // The clip must be a MULTICHANNEL B-format file (4 / 9 / 16 channels = ambisonic order 1 / 2 / 3); a
@@ -16,11 +17,14 @@ namespace BwAudio
     public sealed class AmbisonicBed : MonoBehaviour
     {
         [Header("AmbiX clip (under StreamingAssets; 4 / 9 / 16-ch)")]
-        [Clip] public string clip = "ambience.flac";
+        [Tooltip("A path relative to Assets/StreamingAssets, or an absolute path. Empty plays nothing.")]
+        [Clip] public string clip = "";
         [Tooltip("The clip is legacy FuMa B-format (.amb-style: WXYZ order, MaxN, W -3 dB) rather than " +
                  "AmbiX — converted at load, so everything downstream is identical.")]
         public bool fumaClip = false;
         public bool loop = true;
+        [Tooltip("Play the clip when the component starts, and again on every re-enable. The first play " +
+                 "waits for Start, so fields set right after AddComponent apply.")]
         public bool playOnEnable = true;
         [Tooltip("Decode the soundfield on the engine's loader thread instead of blocking this one. " +
                  "Play() returns immediately and the bed stays SILENT until the data lands, then starts " +
@@ -30,9 +34,10 @@ namespace BwAudio
                  "OFF for the CAVE's normal path, which is load-time and synchronous.")]
         public bool loadAsync = false;
         [Range(0f, 1f)] public float gain = 1f;
-        [Tooltip("Turn the soundfield about the vertical axis (degrees, Unity's sense) — line a recording " +
-                 "up with the scene, or spin it slowly for effect. Glides to the target (~1 turn/s), so it " +
-                 "is click-free live.")]
+        [Tooltip("Turn the soundfield about the vertical axis, in degrees, in SCENE terms: 0 puts the " +
+                 "field's front along Unity world +Z, like an object with no rotation, whatever Room Origin " +
+                 "says. The field stays world-locked when the origin moves. Glides to the target (~1 " +
+                 "turn/s), so it is click-free live.")]
         [Range(-180f, 180f)] public float yawDegrees = 0f;
         [Tooltip("Tilt the field's front upward (+) or downward (-) — LEVEL a capture that wasn't upright, " +
                  "or tilt it for effect. Same glide as yaw. Applied roll, then pitch, then yaw.")]
@@ -55,6 +60,9 @@ namespace BwAudio
         uint _pending;                         // an async asset bound to this bed but not yet decoded (0 = none)
         bool _watching;                        // a WatchPendingLoad coroutine is running
         Engine _owner;                         // the Engine this bed was created under
+        bool _startRan;                        // see SourceBase: the first create waits for Start
+        bool _autoPlayDone;                    // this create's auto-play ran, or a play call replaced it
+        int _roomRevision;                     // the Room.Revision the orientation was last pushed for
 
         // onFinished has the same two feeds as Emitter's, because a bed IS a voice and the engine
         // reports only one of the two ways one goes quiet. A bed that RAN OUT (a non-looping
@@ -76,22 +84,77 @@ namespace BwAudio
         // Zero, every op no-ops, and the next enable re-creates under the new engine.
         IntPtr Eng => _owner != null && ReferenceEquals(Engine.Instance, _owner) ? _owner.Handle : IntPtr.Zero;
 
-        // Guard shorthand: the bed exists and its engine is still the live one.
-        bool Live => _created && Eng != IntPtr.Zero;
+        // Guard shorthand: the bed exists and its engine is still the live one. Before Start, the
+        // first call that needs the bed creates it (SourceBase.Live, same rule).
+        bool Live
+        {
+            get
+            {
+                if (!_created && !_startRan && Application.isPlaying && isActiveAndEnabled) TryInit();
+                return _created && Eng != IntPtr.Zero;
+            }
+        }
 
+        // Live without the create, for the binding's own pushes (SourceBase.Exists: OnValidate runs
+        // inside AddComponent in the editor).
+        bool Exists => _created && Eng != IntPtr.Zero;
+
+        // The same lifecycle as SourceBase, and the same wait (Engine.ForComponent): the first enable
+        // leaves the create to Start, every later one creates in OnEnable, and a bed enabled before the
+        // Engine is up waits for it instead of switching itself off.
         void OnEnable()
         {
-            var engine = Engine.Instance;
-            if (!engine || engine.Handle == IntPtr.Zero) { enabled = false; return; }   // Engine not ready yet
+            if (_startRan) Init();
+        }
+
+        void Start()
+        {
+            _startRan = true;
+            if (_created) AutoPlay();
+            else Init();
+        }
+
+        void Init()
+        {
+            if (!TryInit()) StartCoroutine(Engine.RetryEachFrame(TryInit));
+        }
+
+        bool TryInit()
+        {
+            if (_created) return true;
+            var engine = Engine.ForComponent(out bool wait);
+            if (!engine) return !wait;           // true on a node that does not own audio: stop asking
             _owner = engine;
-            _bed = Bwa.bwa_bed_create(Eng);
+            _bed = Bwa.bwa_bed_create(engine.Handle);
             _created = true;
             _wasPlaying = false;                 // a recycled component never inherits a stale play edge
             _endFired = false;
-            Bwa.bwa_bed_set_gain(Eng, _bed, gain);
-            if (yawDegrees != 0f || pitchDegrees != 0f || rollDegrees != 0f) ApplyOrientation();
+            if (_bed == 0)
+            {
+                Debug.LogWarning("[AmbisonicBed] bed create failed on " + name + ": " + Bwa.LastError(engine.Handle));
+                return true;                     // don't retry a genuine failure forever
+            }
+            Bwa.bwa_bed_set_gain(engine.Handle, _bed, gain);
+            ApplyOrientation();                  // always: yaw 0 is world +Z, which a turned origin moves
             engine.RegisterBed(this);            // the completion / loop event route
+            if (_startRan) AutoPlay();
+            return true;
+        }
+
+        // SourceBase's rule: a play call before Start replaces the auto-play, and a playback-state call
+        // (Stop, StopAt, SetRegion*) runs it first and then acts on it (LiveForPlayback).
+        void AutoPlay()
+        {
+            if (_autoPlayDone) return;
+            _autoPlayDone = true;
             if (playOnEnable) Play();
+        }
+
+        bool LiveForPlayback()
+        {
+            if (!Live) return false;
+            AutoPlay();
+            return Exists;
         }
 
         // ---- the event feed, driven by Engine (see Engine.RegisterBed) -------------------------------
@@ -129,6 +192,10 @@ namespace BwAudio
         {
             if (!Live) return;
 
+            // A moved Room Origin turns the scene inside the room, so a world-locked field must turn
+            // with it. Revision moves only on a registration change, so a still origin costs nothing.
+            if (_roomRevision != Room.Revision) ApplyOrientation();
+
             // The explicit-halt fallback. Reading AFTER the drain is what keeps a natural end from
             // being reported twice: NotifyEnded has already cleared _wasPlaying by the time this runs,
             // so the fall to silence it left behind is not an edge any more. A play held on an async
@@ -145,9 +212,10 @@ namespace BwAudio
         // room-right, so both already mean what the engine means.
         void ApplyOrientation()
         {
-            if (Live)
-                Bwa.bwa_bed_set_orientation(Eng, _bed, Room.YawRad(yawDegrees),
-                                            pitchDegrees * Mathf.Deg2Rad, rollDegrees * Mathf.Deg2Rad);
+            if (!Exists) return;
+            _roomRevision = Room.Revision;
+            Bwa.bwa_bed_set_orientation(Eng, _bed, Room.YawRad(yawDegrees),
+                                        pitchDegrees * Mathf.Deg2Rad, rollDegrees * Mathf.Deg2Rad);
         }
 
         // The load flags ARE the bed's kind: the engine judges an async play against them (the asset
@@ -186,7 +254,7 @@ namespace BwAudio
 
         /// <summary>Scheduled stop on the same dsp clock as <see cref="PlayAt"/>: the bed takes the
         /// click-free stop path when Engine.DspTimeFrames reaches `stopSample`. Fires onFinished.</summary>
-        public void StopAt(ulong stopSample) { if (Live) Bwa.bwa_bed_stop_at(Eng, _bed, stopSample); }
+        public void StopAt(ulong stopSample) { if (LiveForPlayback()) Bwa.bwa_bed_stop_at(Eng, _bed, stopSample); }
 
         /// <summary>Bound playback to FRAMES [startFrame, endFrame) of the soundfield; endFrame 0 means
         /// the asset end. A looping bed wraps back to `startFrame` (and fires onLoop); a one-shot ENDS
@@ -199,7 +267,7 @@ namespace BwAudio
         /// as seconds to anyone arriving from AudioSource.time.</para></summary>
         public void SetRegionFrames(ulong startFrame, ulong endFrame)
         {
-            if (Live) Bwa.bwa_bed_set_region(Eng, _bed, startFrame, endFrame);
+            if (LiveForPlayback()) Bwa.bwa_bed_set_region(Eng, _bed, startFrame, endFrame);
         }
 
         /// <summary>The seconds twin of <see cref="SetRegionFrames"/> (converted at the engine's sample
@@ -223,6 +291,7 @@ namespace BwAudio
             if (!Live) return false;
             var engine = Engine.Instance;
             if (!engine) return false;
+            _autoPlayDone = true;
             var path = clipOverride ?? clip;
             bool held = false;
             if (loadAsync)
@@ -272,8 +341,9 @@ namespace BwAudio
 
         public void Stop()
         {
+            bool live = LiveForPlayback();       // before Start: the auto-play first, then this stop
             _pending = 0;                        // the engine cancels a held play on stop; stop watching it
-            if (Live) Bwa.bwa_bed_stop(Eng, _bed);
+            if (live) Bwa.bwa_bed_stop(Eng, _bed);
         }
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate FRAMES (latest-wins
@@ -293,7 +363,10 @@ namespace BwAudio
             set { gain = value; if (Live) Bwa.bwa_bed_set_gain(Eng, _bed, value); }
         }
 
-        /// <summary>Yaw of the soundfield in DEGREES, Unity's sense (positive = turn it to the right).
+        /// <summary>Yaw of the soundfield in DEGREES, in scene terms: 0 puts the field's front along
+        /// Unity world +Z, and positive turns it to the right, like a Transform's Y euler angle. It is
+        /// NOT relative to the room's front: under a Room Origin turned 180 degrees, yaw 0 faces the
+        /// layout's -z. The field is world-locked, so when the origin moves, the bed turns with the scene.
         /// Room.YawRad converts to the engine's frame — the X mirror reverses the sense of rotation, so a
         /// Unity angle handed straight to the engine would spin the field the wrong way.</summary>
         public float YawDegrees
@@ -320,7 +393,7 @@ namespace BwAudio
         // Inspector edits are audible in Play mode (the engine glides to the new orientation).
         void OnValidate()
         {
-            if (Application.isPlaying && Live)
+            if (Application.isPlaying && Exists)
             {
                 Bwa.bwa_bed_set_gain(Eng, _bed, gain);
                 ApplyOrientation();
@@ -329,11 +402,12 @@ namespace BwAudio
 
         void OnDisable()
         {
-            StopAllCoroutines();                 // cancel a running WatchPendingLoad
+            StopAllCoroutines();                 // cancel a running WatchPendingLoad or init retry
             _pending = 0; _watching = false;    // StopAllCoroutines never runs its exit line
             _wasPlaying = false;                 // never carry a stale play edge into a re-enable
             _endFired = false;
-            if (Live)                            // owner gone (engine destroyed/replaced) -> Live is false:
+            _autoPlayDone = false;               // a re-enable auto-plays again
+            if (_created && Eng != IntPtr.Zero)  // owner gone (engine destroyed/replaced) -> Eng is Zero:
             {                                    // the stale handle never destroys a successor's bed
                 _owner.UnregisterBed(this);
                 Bwa.bwa_bed_destroy(Eng, _bed);

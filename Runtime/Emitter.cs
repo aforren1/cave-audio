@@ -13,8 +13,13 @@ namespace BwAudio
     public sealed class Emitter : SourceBase
     {
         [Header("Clip (under StreamingAssets)")]
-        [Clip] public string clip = "sfx/footsteps.wav";
+        [Tooltip("A path relative to Assets/StreamingAssets, or an absolute path (a clip your code wrote " +
+                 "to Application.temporaryCachePath). Empty plays nothing.")]
+        [Clip] public string clip = "";
         public bool loop = true;
+        [Tooltip("Play the clip when the component starts, and again on every re-enable. The first play " +
+                 "waits for Start, so fields set right after AddComponent apply. A Play call before " +
+                 "then takes its place.")]
         public bool playOnEnable = true;
         [Tooltip("Decode the clip on the engine's loader thread instead of blocking this one. Play() " +
                  "returns immediately and the source stays SILENT until the data lands, then starts from " +
@@ -68,7 +73,10 @@ namespace BwAudio
 
         protected override void OnSourceReady()
         {
-            if (playOnEnable) Play();
+            if (!playOnEnable) return;
+            bool paused = _paused;           // Paused set before the voice existed: start paused
+            Play();
+            if (paused) Paused = true;
         }
 
         internal override void FrameSync() => Push();
@@ -159,6 +167,7 @@ namespace BwAudio
         public void Play(string clipOverride = null)
         {
             if (!Live) return;
+            ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
             Bwa.bwa_source_play(Eng, _src, snd, loop);
@@ -178,6 +187,7 @@ namespace BwAudio
         public void PlayAt(ulong startSample, string clipOverride = null)
         {
             if (!Live) return;
+            ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
             Bwa.bwa_source_play_at(Eng, _src, snd, loop, startSample);
@@ -194,6 +204,7 @@ namespace BwAudio
         public void PlayLoop(ulong loopBeg, ulong loopEnd, string clipOverride = null)
         {
             if (!Live) return;
+            ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
             Bwa.bwa_source_play_loop(Eng, _src, snd, loopBeg, loopEnd);
@@ -206,13 +217,13 @@ namespace BwAudio
         /// stopSample the source fades out over one block and ends — never a hard cut, so it can't pop.
         /// Block-granular (silence lands within ~one block of stopSample); a stopSample in the past
         /// stops now; a later Play/PlayAt/PlayLoop clears it. Same time base as PlayAt.</summary>
-        public void StopAt(ulong stopSample) { if (Live) Bwa.bwa_source_stop_at(Eng, _src, stopSample); }
+        public void StopAt(ulong stopSample) { if (LiveForPlayback()) Bwa.bwa_source_stop_at(Eng, _src, stopSample); }
 
         /// <summary>Stop, and drop any async load this source was waiting on. The engine cancels a held
         /// play on stop, so the decode can no longer start this source; watching it further would only
         /// warn later that the source "stays silent", which by then is what you asked for. Matches
         /// AmbisonicBed.Stop.</summary>
-        public override void Stop() { _pending = 0; base.Stop(); }
+        public override void Stop() { base.Stop(); _pending = 0; }   // after: a pre-Start auto-play may set it
 
         /// <summary>Gapless chaining: queue `clip` (or an override) to play the instant the current sound
         /// ends — no gap at the seam. Queue several for a sequence; a queued clip with loopTerminal = true
@@ -224,7 +235,7 @@ namespace BwAudio
         /// rather than silently dropping the chain.</para></summary>
         public void Queue(string clipOverride = null, bool loopTerminal = false)
         {
-            if (!Live) return;
+            if (!LiveForPlayback()) return;
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
             if (held)
@@ -238,7 +249,7 @@ namespace BwAudio
         }
 
         /// <summary>Drop the pending gapless chain queued with Queue.</summary>
-        public void ClearQueue() { if (Live) Bwa.bwa_source_clear_queue(Eng, _src); }
+        public void ClearQueue() { if (LiveForPlayback()) Bwa.bwa_source_clear_queue(Eng, _src); }
 
         /// <summary>Jump to <c>frame</c> (engine-rate frames) into the clip — AudioSource.timeSamples-set
         /// equivalent, click-free (ramp-out → jump → ramp-in). In-memory clips only; streamed clips
@@ -246,7 +257,7 @@ namespace BwAudio
         /// <para>Named for its unit: <c>AudioSource.time</c> is SECONDS, so a bare Seek would read as
         /// seconds to anyone coming from Unity's own API, and the two spellings differ by a factor of
         /// the sample rate. Same reason as <see cref="SetRegionFrames"/> below.</para></summary>
-        public void SeekFrames(ulong frame) { if (Live) Bwa.bwa_source_seek(Eng, _src, frame); }
+        public void SeekFrames(ulong frame) { if (LiveForPlayback()) Bwa.bwa_source_seek(Eng, _src, frame); }
 
         /// <summary>The seconds twin of <see cref="SeekFrames"/> (converted at the engine's sample
         /// rate). A negative position is ignored.</summary>
@@ -272,7 +283,7 @@ namespace BwAudio
         /// two spellings differ by a factor of the sample rate.</para></summary>
         public void SetRegionFrames(ulong startFrame, ulong endFrame)
         {
-            if (Live) Bwa.bwa_source_set_region(Eng, _src, startFrame, endFrame);
+            if (LiveForPlayback()) Bwa.bwa_source_set_region(Eng, _src, startFrame, endFrame);
         }
 
         /// <summary>The seconds twin of <see cref="SetRegionFrames"/> (converted at the engine's sample
@@ -300,7 +311,11 @@ namespace BwAudio
         /// so this is the only signal; Bwa.LastError says which it was.</summary>
         public bool PlayOneShot(string oneShotClip = null)
         {
-            if (Eng == IntPtr.Zero) return false;
+            // A one-shot owns no voice of this source's, so it needs only the live engine, not this
+            // source's create (which waits for Start).
+            var engine = Engine.ForComponent(out _);
+            if (!engine) return false;
+            var eng = engine.Handle;
             uint snd = Resolve(oneShotClip, out bool held);
             if (snd == 0) return false;
             // A one-shot owns no handle you could start later, so the engine refuses a not-ready one
@@ -313,14 +328,14 @@ namespace BwAudio
                 return false;
             }
             var p = Room.Pos(transform.position);
-            return Bwa.bwa_play_oneshot(Eng, snd, p.x, p.y, p.z, gain);
+            return Bwa.bwa_play_oneshot(eng, snd, p.x, p.y, p.z, gain);
         }
 
         // The shared OnValidate re-pushes every source-generic knob; pitch is the clip-only extra.
         protected override void OnValidate()
         {
             base.OnValidate();
-            if (!Application.isPlaying || !Live) return;
+            if (!Application.isPlaying || !Exists) return;
             Bwa.bwa_source_set_pitch(Eng, _src, pitch);
         }
     }

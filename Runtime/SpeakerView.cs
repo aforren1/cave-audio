@@ -48,7 +48,10 @@ namespace BwAudio
 
         IEnumerator BuildWhenReady()
         {
-            while (Engine.Instance == null || !Engine.Instance.Ready) yield return null;   // wait out init order
+            // Wait out init order: Engine.Awake always ends by claiming Instance. Without a running
+            // engine (a node that does not own audio, or a failed start) SpeakerPositions falls back to
+            // the layout file, so the markers still stand where the speakers are, unlit.
+            while (!Engine.Instance) yield return null;
             Build();
         }
 
@@ -95,7 +98,7 @@ namespace BwAudio
         {
             if (_renderers == null) return;
             var eng = Engine.Instance;
-            if (eng == null || !eng.Ready) return;
+            if (eng == null) return;
 
             // The marker positions bake the registration, so a moved Engine.roomOrigin re-places them.
             if (_roomRev != Room.Revision)
@@ -106,7 +109,7 @@ namespace BwAudio
                     _markers[i].position = Room.FromRoom(new Vector3(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]));
             }
 
-            float[] peaks = eng.BusLevels();
+            float[] peaks = eng.BusLevels();               // empty without an engine: the markers idle
             float decay = releasePerSecond * Time.deltaTime;
 
             for (int i = 0; i < _renderers.Length; i++)

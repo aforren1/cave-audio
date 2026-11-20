@@ -92,20 +92,22 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime`, `Editor` and `Samples~` only, and
 Unity itself ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Assets under StreamingAssets
 
 The engine loads files itself, so **do not** use Unity `AudioClip`. Everything it reads lives in
 `Assets/StreamingAssets/`. Every file field on a component is a path **relative to that folder**, and
-the `[Clip]` picker only lists what is actually there, so you never type a path by hand:
+the `[Clip]` picker only lists what is actually there, so you never type a path by hand. An
+**absolute** path is used as it is, so a clip your code generates can be written to
+`Application.temporaryCachePath` and played by its full path:
 
 ```
 Assets/
@@ -192,7 +194,7 @@ Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit 
 sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
 `Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
 Every other binding of this engine ships the same demo, which makes them comparable by ear (see
-`https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md`, "The minimal example").
+`https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md`, "The minimal example").
 
 Then set up your scene in one step: **GameObject > BwAudio > CAVE Rig**, then move **Room Origin**
 to the CAVE floor center. The same item is in the Hierarchy's right-click menu. It creates:
@@ -230,6 +232,12 @@ The manual steps, which are what the item does:
 3. `Engine` runs the **centralized per-frame push** in `LateUpdate`: all emitters, then the
    listener, then one `bwa_commit`. The audio thread therefore never sees a half-moved frame, which
    is what makes the moving-observer case correct. Do not push from individual emitters.
+
+Components added from a script can be configured in the same frame: `AddComponent<Emitter>()`,
+then set `clip` and the rest, and the first play happens at `Start` with those values. A
+**cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
+the device. See [docs/integration.md: Clusters](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#clusters) and "Creating
+things at run time" below it.
 
 ### Ends and loop boundaries are events
 
@@ -313,10 +321,11 @@ Occlusion and reflections need the room's geometry. Three ways to author it:
 
 - **Simple box** - tick `Enable Room Box` on `Engine`, set the size (meters) and a material preset.
 - **Per-object meshes** - add **`AcousticGeometry`** to any object with a mesh (or set a low-poly
-  `Mesh Override`) and assign a **material**. `Engine` bakes every one of them (plus the box, if on)
-  into the engine's scene at startup, and again whenever a Unity scene loads or unloads (additive
-  scenes included). It transforms each mesh from Unity world into room space. The scene view draws
-  selected or `alwaysDrawGizmo` geometry as a cyan wireframe.
+  `Mesh Override`) and assign a **material**. `Engine` bakes every enabled one (plus the box, if on)
+  into the engine's scene at startup, and again in the frame after any of them is enabled or
+  disabled: spawned, toggled, or its scene loaded or unloaded. It transforms each mesh from Unity
+  world into room space. The scene view draws selected or `alwaysDrawGizmo` geometry as a cyan
+  wireframe.
 - **Moving meshes** - add **`DynamicAcousticGeometry`** instead, for a door, a lift, or a panel.
   It pushes position and rotation live (throttled by `positionEpsilon` and `angleEpsilon`), so
   occlusion and real-time reflections follow the mesh. It reads the scale once. Baked reflections
@@ -332,7 +341,7 @@ Reference one asset from many objects; it's minted once. No material = the engin
 > **Keep acoustic meshes SIMPLE** - tens to hundreds of triangles. The engine ray-traces them every
 > frame; render meshes (thousands of tris) are far too heavy. Use a low-poly proxy via `Mesh Override`
 > or a dedicated renderer-less object. `AcousticGeometry` is static: moving one does nothing until
-> the next scene load re-bakes it. Use `DynamicAcousticGeometry` for anything that moves.
+> the next rebuild. Use `DynamicAcousticGeometry` for anything that moves.
 
 ### Coordinate seam
 
@@ -345,7 +354,7 @@ center, turn its forward (blue arrow) along the layout's +z, and assign it. `Eng
 layout was measured in the tracker's frame, so match that frame: if the layout's +z is the back
 wall, rotate the origin 180 degrees about Y. With no origin assigned, `Room.UnityToRoom` stays
 identity unless your code writes it. **Getting this wrong silently swaps front/back or left/right.**
-See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/integration.md#register-the-room).
+See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#register-the-room).
 
 ## Threading and lifecycle notes
 
@@ -353,7 +362,8 @@ See [docs/integration.md → Register the room](https://github.com/aforren1/cave
   SPSC ring). `bwa_create`/`bwa_start`/`bwa_load_*` allocate/do I/O - they run once at startup.
 - **The reflection config and the FDN config are load-time** - `Engine` sets them between
   `bwa_create` and `bwa_start`. The engine rejects them after start (`bwa_last_error`). `Engine`
-  bakes the room box and static geometry at start and on each scene load, not when you edit them.
+  bakes the room box and static geometry at start and when an `AcousticGeometry` is enabled or
+  disabled, not when you edit one.
   It mints each material asset once and reuses it across scene loads, because the engine's
   material table holds 64 entries.
 - **Native plugins persist across Editor play sessions.** `Engine` guards its singleton and tears the
@@ -405,7 +415,7 @@ zero count proves nothing.
 ### Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -426,7 +436,7 @@ release. On a tag it also creates the Release with the stamped version.
 
 **Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
 Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
-and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/build.md#continuous-integration) for the
+and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md#continuous-integration) for the
 rest.
 
 Locally:
