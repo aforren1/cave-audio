@@ -137,6 +137,16 @@ namespace BwAudio
         /// <summary>A Play* call: it takes the place of this create's auto-play.</summary>
         protected void ReplaceAutoPlay() => _autoPlayDone = true;
 
+        /// <summary>For a play or stop that found no voice. Between the Engine's Awake and its Start
+        /// (a script's Awake or OnEnable in the Engine's own scene) the native engine is not up yet,
+        /// so the call is held and made again once it is. False when there is nothing to wait for.
+        /// The other calls are no-ops in that window, as they are with no Engine at all.
+        /// <para>A held play takes the auto-play's place only when it RUNS. The Engine drops a held
+        /// call whose component is not active by then, and a latch set here would cost that
+        /// component its play-on-enable for good.</para></summary>
+        protected bool DeferToEngineStart(Action call, bool isPlay)
+            => Engine.DeferToStart(this, () => { if (isPlay) ReplaceAutoPlay(); TryInit(); call(); });
+
         /// <summary>Live, for a call that changes playback state: before Start it runs the auto-play
         /// first, so the call acts on it instead of being undone by it.</summary>
         protected bool LiveForPlayback()
@@ -263,7 +273,11 @@ namespace BwAudio
 
         /// <summary>Stop this source — AudioSource.Stop equivalent, the click-free stop path (a push
         /// voice ends exactly like a drained PushEnd).</summary>
-        public virtual void Stop() { if (LiveForPlayback()) Bwa.bwa_source_stop(Eng, _src); }
+        public virtual void Stop()
+        {
+            if (LiveForPlayback()) Bwa.bwa_source_stop(Eng, _src);
+            else DeferToEngineStart(Stop, false);
+        }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
@@ -432,7 +446,7 @@ namespace BwAudio
         /// and would overwrite this.</summary>
         public void SetOcclusionManual(float level, float[] bands = null)
         {
-            if (occlusion) { Debug.LogWarning("[" + GetType().Name + "] SetOcclusionManual on a source with `occlusion` ticked — the sim overwrites it: " + name); return; }
+            if (occlusion) { Debug.LogWarning("[" + GetType().Name + "] SetOcclusionManual on a source with `occlusion` ticked, so the sim overwrites it: " + name); return; }
             if (Live) Bwa.bwa_source_set_occlusion_manual(Eng, _src, level, bands);
         }
 
@@ -495,7 +509,7 @@ namespace BwAudio
         /// inspector fields, and push the lot in one call. This is also the source RESET the API had no
         /// way to express before — <c>ApplyPreset(BwaSourceKind.Default)</c>.
         /// <para>Nothing in the preset table is measured. A kind differs from Default only where a doc
-        /// already argues the case (https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md, "What each preset rests on"), so treat it as a starting
+        /// already argues the case (https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md, "What each preset rests on"), so treat it as a starting
         /// point and edit what you disagree with.</para></summary>
         public void ApplyPreset(BwaSourceKind kind)
         {

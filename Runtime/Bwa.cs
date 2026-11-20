@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md + https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md + https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -40,7 +40,7 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
     /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
-    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md, "What each preset rests on".</summary>
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md, "What each preset rests on".</summary>
     public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -86,7 +86,7 @@ namespace BwAudio
     /// open sets the device's rate or fails), and its buffer already is the engine block.
     /// DeepBuffer asks for a deeper output buffer. Only the browser sink uses it, so it is a no-op
     /// on every backend Unity reaches; it is here so the enum mirrors the ABI.
-    /// https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    /// https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
     public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4, DeepBuffer = 0x8 }
 
@@ -253,6 +253,9 @@ namespace BwAudio
         // concrete — Auto, Null and Manual report 0, and so does a backend this build does not carry. ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_device_count(BwaSinkType backend);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_name(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
+        // Is the device a (profile, sink, device) request would open LISTED on this machine.
+        // Engine-free, opens nothing. bw_audio.h has the rule; Engine.DevicePresent the summary.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_device_present(BwaProfile profile, BwaSinkType sink, [MarshalAs(UnmanagedType.LPUTF8Str)] string device);
         // The STABLE id: prefer it when persisting a choice, or when two devices share a friendly
         // name (a headset and a dock often do). ASIO reports the driver name for both.
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_id(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
@@ -533,14 +536,14 @@ namespace BwAudio
         // The engine's active channel count = the layout's speaker count (4..64, BWA_MAX_CHANNELS). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
-        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against
+        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Start compares it against
         // BoundVersion below and refuses to start on a major.minor mismatch.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
         // The BWA_VERSION these bindings were written against (bw_audio.h). The header guarantees enum
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. tools/release.ps1
         // rewrites this line with the header's defines, and CI fails a push where the two disagree.
-        public const uint BoundVersion = (0u << 16) | (22u << 8) | 0u;   // 0.22.0
+        public const uint BoundVersion = (0u << 16) | (23u << 8) | 1u;   // 0.23.1
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);

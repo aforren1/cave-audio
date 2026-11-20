@@ -4,6 +4,98 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.23.1]
+
+Test fixes.
+
+## [0.23.0]
+
+### Added: `bwa_device_present` (engine)
+
+- `bool bwa_device_present(bwa_profile profile, bwa_sink_type sink, const char* device)` says
+  whether the device that request would open is listed on this machine. It needs no engine and
+  opens nothing. Under Auto it walks the same backend order and applies the same exact match
+  `bwa_start` does, on the platform it runs on. See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md, "Is the device here".
+- `Engine.DevicePresent` and Godot's `BwaEngine.is_device_present` call it, so this package needs
+  the engine it ships with. The Python and MATLAB raw layers and the web ABI table carry it too
+  (`_bwa.device_present`, `bwa_mex('device_present', ...)`).
+- Auto's match of a named ASIO driver or WASAPI endpoint now reads the list once. It read it
+  once per entry before.
+- JACK, ALSA, AAudio or Worklet named as the sink with a device reads as present only in a build
+  that carries the backend. An ALSA scene opened on Windows is a missing device.
+- Fixed: each ASIO driver enumeration (`bwa_get_device_count`, `bwa_get_device_name`,
+  `bwa_get_asio_driver_count`) dropped one COM reference from a caller on a multithreaded
+  apartment. The thread's COM state is now left as it was.
+
+### Added: desk fallback for a rig scene
+
+- New `Engine` fields under **Desk fallback**: `fallbackProfile` (None, Binaural, CaveSim; None is
+  the default and means off), `fallbackSink`, `fallbackDevice`, `fallbackSinkFlags` and
+  `fallbackOnlyInDevBuilds` (on by default). When the primary device is not listed on the
+  machine, the `Engine` starts on the fallback instead. A scene set up for the rig then plays on
+  headphones at a desk with no setting changed. See the README, "Test a rig scene at your desk".
+- The decision is made once, in `Start`, before the native engine is created, from the device
+  lists. New static `Engine.DevicePresent(profile, sink, device)` is the check. It cannot see
+  whether a listed device will open: an installed ASIO driver with no hardware reads as present.
+- One `DESK FALLBACK` line names the missing device and the fallback: a warning in the Editor,
+  an error in a development build. `Engine.UsingFallback` says it took effect,
+  `Engine.ActiveProfile` is the profile that runs, and the inspector shows a banner in Play mode
+  and a notice before it.
+- A listed device that does not open is never a fallback. Under Auto that start is silent, and
+  with a fallback set the `Engine` now logs an error that says so and why.
+- On the fallback with `feedListener` off, the tracker is not connected. The listener follows
+  the `listener` Transform, or the main camera.
+- With `fallbackOnlyInDevBuilds` on, a release build never takes the fallback. Where the
+  fallback may run, a typo in `device` is a headphone fallback and not a failed start.
+- A node that does not own audio (`ownsAudio`, `Engine.OwnsAudioPredicate`) takes no fallback.
+- The start log line now names the profile: `started, profile=..., backend=..., channels=...`.
+
+### Godot addon
+
+- **Desk fallback on `BwaEngine`**, the same feature: `fallback_profile`, `fallback_sink`,
+  `fallback_device`, `fallback_sink_flags` and `fallback_only_in_editor` in a new **Device
+  Fallback** inspector group, `is_using_fallback()`, `get_active_profile()`, and the static
+  `BwaEngine.is_device_present(profile, sink, device)`. The gate is a run from the editor: an
+  export takes no fallback, a debug export included. The node's configuration warning says in
+  the editor when this machine will take the fallback, and when the check cannot tell (an array
+  profile with an empty `device`). A listed device that does not open under Auto logs an error.
+  New test scene `demo/fallback.tscn` (`godot_fallback`).
+- **Changed: Binaural starts without the layout file**, as Unity's `Engine` does. When `profile`
+  (or the fallback) is Binaural and the file at `layout_path` does not exist, `BwaEngine` prints
+  one line and runs the built-in default grid. Before, the start was refused. A file that exists
+  still has to load, and Cave, CaveSim and CaveBoth still refuse.
+- `sink`, `device` and `asio_driver` now refresh the node's configuration warnings when set.
+
+### Changed: the Engine decides ownership and starts in `Start`, not `Awake`
+
+- `Engine.Awake` now only claims `Engine.Instance` and applies Room Origin. The ownership decision
+  (`ownsAudio` and `Engine.OwnsAudioPredicate`), the native create and the start moved to
+  `Engine.Start`. Unity does not order two scripts with the same execution order, and a cluster
+  toolkit's manager can share the `Engine`'s -100 (MiddleVR's does) and learn the node's role in
+  its own `Awake`. The predicate was sometimes asked first. `Start` runs after every `Awake`.
+- New `Engine.Decided`: false between `Awake` and `Start`. While it is false, components keep
+  waiting instead of concluding that no engine is coming, and `SpeakerView` waits to build.
+- Room Origin is still applied in `Awake` on every node, owning audio or not.
+- What you can notice: `Engine.Ready` is false in any `Awake` or `OnEnable` of the scene that
+  loads the `Engine`, and in a `Start` with an execution order below -100. `Engine.Load` and the
+  other `Engine` calls return 0 or do nothing there. Move them to `Start`. `Play`, `PlayAt`,
+  `PlayLoop` and `Stop` on an `Emitter` or `AmbisonicBed` are held and run when the `Engine`
+  starts, so a `Play()` in your `Awake` still plays, a moment later. `PlayOneShot` returns false.
+  The first lost `Engine` call logs a warning that names it.
+- An `Engine` added from a script is not `Ready` in the same frame. Wait for `Engine.Decided`, or
+  call the new `Engine.StartNow()`.
+- New `Engine.StartNow()`: the decision and the bring-up, now. It runs once, and `Start` is a call
+  to it. Use it when your own `Awake` needs `Engine.Ready`. Do not call it from an `Awake` in a
+  cluster scene: it asks the predicate before the toolkit may know the role.
+- An `Engine` component that is disabled at load now starts when you enable it. Before, it
+  started in `Awake` anyway. Use this when your cluster toolkit learns the role after `Awake`.
+  Nothing is held while it is disabled: `Play` and `Stop` do nothing until it starts.
+- An exception during start is now logged and ends as a failed start: the native engine is
+  destroyed if it was created, `Engine.Ready` is false, and components stop waiting. Before, a
+  missing native library left components waiting forever.
+- `Engine.Paused = true` set before the engine is up now reaches it at start.
+- Console messages from the runtime scripts are ASCII: seven had an em dash.
+
 ## [0.22.0]
 
 ### Fixed: clearing the static mesh did nothing (engine)
@@ -465,7 +557,7 @@ binding's runtime behavior, and behavioral confidence was inference from the God
 the same C ABI through equivalent machinery. `bindings/unity/test~/` closes that: 20 PlayMode tests
 that drive the real components against the real `bw_audio.dll` on the offline sink, registered as the
 `unity_playmode` ctest behind `-DBWA_UNITY_EXE=<editor>`. Details and the feasibility notes are in
-`https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md` -> "Tests".
+`https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md` -> "Tests".
 
 What it pins, in the order the risk sits: a sub-frame clip fires `onFinished` exactly once (the case
 the drain replaced the `IsPlaying` edge for); a natural end fires once and not twice with both feeds
@@ -502,7 +594,7 @@ code, refusing a run that discovered fewer tests than expected or skipped any.
 
 Four additions in the same spirit, all of them control-thread sugar over calls that already existed.
 The C ABI sat one tier below what a client actually writes, so every client rebuilt the same three
-things by hand. `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md` gains an "API tiers" section that states the split and the guarantee
+things by hand. `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md` gains an "API tiers" section that states the split and the guarantee
 that goes with it: a convenience call writes the same command ring and lands in the same mixer, so
 nothing new reaches the audio thread and there is no second render path.
 
@@ -517,7 +609,7 @@ nothing new reaches the audio thread and there is no second render path.
   immediately and decodes on a lazily started loader thread, for content that arrives mid-session.
   A play issued against a not-yet-ready handle is held on the control thread and re-issued as an
   ordinary `CMD_PLAY` once the data lands, so playback starts from frame 0 with nothing skipped. The
-  audio thread never sees a reserved slot and gained no new branch. See `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/concurrency.md`,
+  audio thread never sees a reserved slot and gained no new branch. See `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/concurrency.md`,
   "Async asset staging".
 - **Source configuration: `bwa_source_desc` with `bwa_source_preset`, `bwa_source_create_desc`,
   `bwa_source_apply`, `bwa_source_get_desc`.** There were 24 per-source setters and readback for two
@@ -1026,7 +1118,7 @@ where matching a 3-vector is not, so the ITD comes out exact and stays exact as 
 - Not implemented: the published method's near-field ILD arm (one first-order filter per image). It
   needs per-speaker frequency-dependent gain, which would make this a render mode rather than a
   gain-vector modifier. The near-field proximity shelf and near-listener widening cover adjacent
-  ground. See https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
+  ground. See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
   and permits negative gains where this minimizes change from the seed and does not.
 
 ### Added: situation tuning (`bwa_tuning_preset` / `bwa_apply_tuning`)
@@ -1050,7 +1142,7 @@ sits or roams. `bwa_setup` names that, `bwa_tuning_preset` fills a complete `bwa
 - **Seated and roaming differ in exactly three fields** today (`panner`, `dual_band`,
   `dual_band_cap`), and `smoke` asserts that count. That is not an oversight, it is what the evidence
   supports: most knobs are still rig-day questions and are left at the engine default rather than
-  guessed. https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md carries a per-field evidence table marking each value as measured, design
+  guessed. https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md carries a per-field evidence table marking each value as measured, design
   intent, or unmeasured, so a preset cannot quietly become folklore.
 
 ### Fixed: a finite but un-normalized listener quaternion poisoned the render
@@ -1123,7 +1215,7 @@ tell, so all four are fixed at the C level and the workarounds can go.
 - **`bwa_source_is_playing` no longer lies about a RE-play.** The published word carries a play
   SEQUENCE now, because it alone cannot tell "not playing, before your play" from "after it": same
   generation, same 0 bit. A re-play on a handle whose voice already ended used to read false until
-  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md` claimed the opposite in as many words. Prefer
+  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md` claimed the opposite in as many words. Prefer
   `bwa_poll_ended` for completion regardless; is_playing still cannot see a clip shorter than your
   poll interval, and no sequence fixes that.
 - **Scene composition no longer needs a lie or a re-derivation.** `bwa_scene_set_mesh_mat` **clears**
@@ -1223,7 +1315,7 @@ sidelobes bend rE even at center, and the taper suppresses them.
 - This is the **diffuse layer only**. Point-source panning is untouched, and so is `BWA_PROFILE_BINAURAL`,
   where the taper is gated off anyway. What changes is ambisonic beds, the reflection bed and the FDN
   reverb's line render.
-- The rig trial in `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
+- The rig trial in `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
   disagrees, revert the default. Turn it off with `bwa_set_max_re(e, false)`.
 - `bwa_set_max_re_split` stays OFF. Nothing in the evidence speaks to the band split, so the broadband
   taper remains the incumbent.
@@ -1345,7 +1437,7 @@ routes, **was tried and made point-source localization worse**: rE direction err
 intended bearing rose from 14 degrees to 26 (routed to the rim) or 30 (share discarded) at 60 degrees
 below the horizon, and only the exact pole improved. An imaginary speaker is a triangulation vertex,
 so it claims a share of every direction in the hole and drags it poleward. No code change; the
-measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/spatialization.md so nobody repeats it.
+measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/spatialization.md so nobody repeats it.
 
 ### Added: SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
 
@@ -1430,7 +1522,7 @@ previous result and reporting before/after scores plus ear-plane occupancy.
   content wants (spherical uniformity), not only for the point-source panners.
   `epad` / `allrad` / `maxre` tokens (GUI: bed decode combo + max-rE checkbox)
   grade the decode the install actually ships.
-- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/layout-schema.md (pin-count trend, the
+- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/layout-schema.md (pin-count trend, the
   visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
   conditions express requirements, they are not accuracy shortcuts; DBAP gained
   nothing in the wedge from wedge-only optimization, VBAP's fixed solve did.
@@ -1479,7 +1571,7 @@ one in this ABI - frames and seconds are both real - so every time-valued name n
 Distances (meters), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
 stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
 A decibel value must say `_db`, since linear is the unmarked default. Stated in
-https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md → "Coordinates and units".
+https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md → "Coordinates and units".
 
 - **Three C symbols renamed** (the only frames-valued names that did not say so):
   `bwa_get_output_latency` → `bwa_get_output_latency_frames`, `bwa_source_get_playhead` →
@@ -1533,8 +1625,8 @@ interpreted. Both stayed invisible off-hardware, because the null sink returns t
   `Engine.AsioDrivers`. The count/name pair remains, but it was undocumented and had to be found by
   grepping the DLL's strings.
 - **The release artifacts no longer ship dangling doc pointers.** The 0.4.0 zip contained
-  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
-  `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
+  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
+  `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
   which rewrites every repo-doc reference in the staged tree to a permalink at the packed commit
   and then FAILS the pack if any relative `.md` reference is left that the stage cannot satisfy.
   The Unity tarball had the same bug and is fixed the same way.
@@ -1709,7 +1801,7 @@ with the ones a scene actually authors surfaced on the components:
   handle) - unified in `SourceBase.TryInit`.
 - **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
   reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
-- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md` "1:1" claims now name the two deliberately-unbound
+- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md` "1:1" claims now name the two deliberately-unbound
   calls instead of overclaiming. The README's live-A/B list gains SPECTRAL spread and max-rE, and
   its load-time list names the bed decoder as AllRAD / EPAD (sampling is no longer selectable).
 

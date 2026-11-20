@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md.
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -10,6 +10,11 @@ using UnityEngine;
 
 namespace BwAudio
 {
+    /// <summary>What <see cref="Engine.fallbackProfile"/> may name: a headphone profile to run when
+    /// the primary device is not on this machine. The values match <see cref="BwaProfile"/>, and
+    /// None takes the slot of Cave, which is never a desk fallback.</summary>
+    public enum BwaFallbackProfile : int { None = 0, Binaural = 1, CaveSim = 2 }
+
     [DefaultExecutionOrder(-100)]
     [DisallowMultipleComponent]   // one native engine per object; the singleton check covers the rest
     public sealed class Engine : MonoBehaviour
@@ -20,7 +25,7 @@ namespace BwAudio
         [Tooltip("Whether this process opens the audio device. Off: the Engine applies Room Origin and " +
                  "does nothing else. It creates no native engine, opens no device, and every BwAudio " +
                  "component is a silent no-op. In a cluster, set Engine.OwnsAudioPredicate from your " +
-                 "cluster toolkit instead and leave this on. Read once, in Awake.")]
+                 "cluster toolkit instead and leave this on. Read once, in Start.")]
         public bool ownsAudio = true;
 
         /// <summary>A process-wide answer to "does this process own the audio device", for a cluster
@@ -28,25 +33,36 @@ namespace BwAudio
         /// scene loads, for example from a
         /// <c>[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]</c> method
         /// that asks the cluster toolkit whether this node is the server. Null means own audio.
-        /// <para>Engine.Awake (execution order -100) calls it ONCE, so the toolkit must know the
-        /// node's role by then, and the answer cannot change for that Engine's lifetime. An Engine owns
-        /// audio only when both this and <see cref="ownsAudio"/> say so. A predicate that throws is
-        /// logged and read as false. It is cleared on every entry into Play mode.</para></summary>
+        /// <para>Engine.Start calls it ONCE. Start runs after every Awake and OnEnable of the scene,
+        /// whatever the script execution orders are, so a toolkit that learns the node's role in its
+        /// own Awake has it by then. The answer cannot change for that Engine's lifetime. A toolkit
+        /// that learns the role later than that: keep the Engine component disabled and enable it
+        /// when the role is known (Start waits for the enable). <see cref="StartNow"/> asks it
+        /// earlier, at the caller's risk. An Engine owns audio only when both
+        /// this and <see cref="ownsAudio"/> say so. A predicate that throws is logged and read as
+        /// false. It is cleared on every entry into Play mode.</para></summary>
         public static Func<bool> OwnsAudioPredicate;
 
         // With Domain Reload off, statics survive into the next Play session; a predicate captured
         // from the last one must not decide this one. Runs before BeforeSceneLoad, where it is set.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        static void ResetOnPlay() { OwnsAudioPredicate = null; ComponentWaitFrames = 0; }
+        static void ResetOnPlay() { OwnsAudioPredicate = null; ComponentWaitFrames = 0; EditorCheck = DebugBuildCheck = PresentCheck = null; }
 
         /// <summary>Frames that BwAudio components have spent waiting for an Engine, summed over all of
-        /// them. It rises while components exist and no Engine has finished Awake. It stays flat on a
+        /// them. It rises while components exist and no Engine has finished Start. It stays flat on a
         /// node that does not own audio, because nothing waits there. A diagnostic.</summary>
         public static long ComponentWaitFrames { get; private set; }
 
-        /// <summary>The ownership decision Awake made. False on a node that leaves the device to
-        /// another node: <see cref="Ready"/> stays false, and Room Origin still applies.</summary>
+        /// <summary>The ownership decision Start made. False on a node that leaves the device to
+        /// another node: <see cref="Ready"/> stays false, and Room Origin still applies. Also false
+        /// until <see cref="Decided"/>.</summary>
         public bool OwnsAudio { get; private set; }
+
+        /// <summary>Whether Start (or <see cref="StartNow"/>) has run: the ownership decision is made
+        /// and the native engine is up, declined, or failed. False between Awake and Start. Until
+        /// it is true, a false <see cref="Ready"/> means "not yet", and BwAudio components keep
+        /// waiting.</summary>
+        public bool Decided { get; private set; }
 
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
@@ -80,6 +96,82 @@ namespace BwAudio
                  "the smallest device buffer the backend can, trading dropout margin for latency. " +
                  "DeepBuffer affects only the browser sink, so it does nothing here.")]
         public BwaSinkFlags sinkFlags = BwaSinkFlags.None;
+
+        [Header("Desk fallback")]
+        [Tooltip("What to run when the primary device above is NOT on this machine: a rig scene " +
+                 "opened at a desk. CaveSim auditions the array as virtual speakers on headphones " +
+                 "(same layout file, room modeling kept). Binaural is the direct headphone render " +
+                 "(no speaker trims or correction filters). None = off: a missing device behaves " +
+                 "as the Sink field says. Decided once, in Start, before the engine is created, " +
+                 "from the device LISTS: a listed device that fails to open still fails the start " +
+                 "(or runs silent under Auto), and an installed driver with its hardware " +
+                 "unplugged reads as present.")]
+        public BwaFallbackProfile fallbackProfile = BwaFallbackProfile.None;
+        [Tooltip("Sink for the fallback. Auto with an empty Fallback Device opens the machine's " +
+                 "default stereo output.")]
+        public BwaSinkType fallbackSink = BwaSinkType.Auto;
+        [Tooltip("Device for the fallback, as in Device above. Empty = the backend's default.")]
+        public string fallbackDevice = "";
+        [Tooltip("Backend options for the fallback. The primary's Sink Flags do not carry over.")]
+        public BwaSinkFlags fallbackSinkFlags = BwaSinkFlags.None;
+        [Tooltip("On: the fallback is taken only in the Editor and in development builds. A " +
+                 "release build then behaves as if Fallback Profile were None, so a rig that " +
+                 "loses its device fails or goes silent as before and never plays to headphones. " +
+                 "Where the fallback is allowed, a typo in Device or an uninstalled driver is a " +
+                 "headphone fallback with one log line, not a failed start: do not run the rig " +
+                 "from a development build with a fallback set.")]
+        public bool fallbackOnlyInDevBuilds = true;
+
+        /// <summary>True while the engine runs on <see cref="fallbackProfile"/> because Start did
+        /// not find the primary device. False until the engine is <see cref="Ready"/>.</summary>
+        public bool UsingFallback => _fallbackTaken && Ready;
+        bool _fallbackTaken;
+
+        /// <summary>The profile the native engine was created with: <see cref="profile"/>, or the
+        /// fallback while the engine runs on it. It reads as profile before Start, after a start
+        /// that failed (the fallback's included), and after the Engine is destroyed.</summary>
+        public BwaProfile ActiveProfile => _fallbackTaken ? _activeProfile : profile;
+        BwaProfile _activeProfile;
+        // On the fallback with Feed Listener off: the Transform that stands in for the tracker.
+        Transform _fallbackListener;
+        // Unity feeds the pose: the scene asked for it, or the fallback replaced the tracker.
+        bool FeedsListener => feedListener || _fallbackTaken;
+
+        // Test seams, all null in use. EditorCheck and DebugBuildCheck stand in for
+        // Application.isEditor and Debug.isDebugBuild. PresentCheck replaces the device-list
+        // answer in Start only, for the one case no machine can stage: a primary that is listed
+        // and does not open.
+        internal static Func<bool> EditorCheck, DebugBuildCheck, PresentCheck;
+        static bool InEditor() => EditorCheck != null ? EditorCheck() : Application.isEditor;
+        static bool IsDevBuild()
+            => InEditor() || (DebugBuildCheck != null ? DebugBuildCheck() : Debug.isDebugBuild);
+
+        /// <summary>Whether a fallback set on this Engine may run in this build: the Editor or a
+        /// development build, or any build with <see cref="fallbackOnlyInDevBuilds"/> off.</summary>
+        public bool FallbackAllowed
+            => fallbackProfile != BwaFallbackProfile.None && (!fallbackOnlyInDevBuilds || IsDevBuild());
+
+        /// <summary>Whether the device a (profile, sink, device) triple asks for is LISTED on this
+        /// machine: <c>bwa_device_present</c>. Engine-free, and it opens nothing. It is the test
+        /// the desk fallback runs in Start.
+        /// <para>ASIO, WASAPI or CoreAudio with a device: that backend lists the exact name or id.
+        /// Any named backend with no device: it lists at least one. Auto: the same two questions,
+        /// asked of the backends the engine's Auto order tries on this platform for that
+        /// profile's width (Cave and CaveBoth are the array, the other two are stereo). Null and
+        /// Manual open no device and are always present.</para>
+        /// <para>JACK, ALSA, AAudio and Worklet named as the sink, with a device: present on a
+        /// platform whose engine library carries that backend. Those backends do not look a
+        /// device up in their own list (JACK takes a port pattern, ALSA any PCM string, AAudio a
+        /// numeric id), so the list cannot call one missing. Without the backend it is missing:
+        /// an ALSA scene on a Windows desk takes the fallback. CaveBoth: only the array's device
+        /// is checked, not the monitor's.</para>
+        /// <para>What it cannot see: whether a listed device will OPEN. An ASIO driver is listed
+        /// when it is installed, with or without its hardware. ALSA and CoreAudio list a default
+        /// device on any machine. A listed device with too few channels, the wrong rate, or
+        /// another owner reads as present too. Present and unopenable is a failed start under a
+        /// named sink, and the silent offline sink under Auto.</para></summary>
+        public static bool DevicePresent(BwaProfile profile, BwaSinkType sink, string device)
+            => Bwa.bwa_device_present(profile, sink, string.IsNullOrEmpty(device) ? null : device);
 
         /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>
         public string asioDriver { get { return device; } set { device = value; } }
@@ -279,9 +371,13 @@ namespace BwAudio
         bool _staticHasGeometry; // the static mesh holds AcousticGeometry, which bakes the registration (the box does not)
         bool _hasStaticMesh;     // whether a non-empty static mesh is currently pushed (so we know to clear it)
 
+        // Awake does only what must not wait and depends on nobody else: the singleton and the room.
+        // The ownership decision and the native engine are Start's. Unity does not order two scripts
+        // with the same execution order, so a cluster toolkit that learns the node's role in its own
+        // Awake may run after this one. Start runs after every Awake of the scene.
         void Awake()
         {
-            if (Instance != null)                                    // a working manager already owns the engine
+            if (Instance != null)                                    // a manager already holds the scene
             {
                 // This scene brought its own Engine, and its origin says where the room is in THIS
                 // scene. The survivor came from another scene and would keep that scene's registration.
@@ -289,15 +385,67 @@ namespace BwAudio
                 Destroy(gameObject); return;
             }
 
-            // Before anything reads the seam: the FDN decay direction and the static geometry bake
-            // below both go through Room. Before the ownership check too: every node of a cluster
-            // draws with Room.FromRoom, so the registration must not depend on who owns audio.
-            ApplyRoomOrigin();
+            // Claimed here, before Start decides: a second scene's Engine must find the survivor, and
+            // SpeakerView and Room users find the Engine. Components read Decided to know whether a
+            // not-Ready Engine is still coming up (ForComponent).
+            Instance = this;
+            DontDestroyOnLoad(gameObject);
 
+            // Every node of a cluster draws with Room.FromRoom from the first frame, so the
+            // registration must not depend on who owns audio, or wait for the answer.
+            ApplyRoomOrigin();
+        }
+
+        // Start, not Awake: see Awake. At -100 it still runs before every default-order Start, so a
+        // scene's Emitters create their voices in their own Start against a running engine.
+        void Start() => StartNow();
+
+        /// <summary>Make the ownership decision and bring the native engine up NOW, instead of
+        /// waiting for Unity to call Start. For a caller that needs <see cref="Ready"/> earlier than
+        /// the scene's Start: its own Awake or OnEnable, or the frame it added this Engine from a
+        /// script. Runs once. Every later call does nothing, Unity's own Start included. It also does
+        /// nothing before this Engine's Awake, and on a duplicate Engine that is about to destroy
+        /// itself. Check <see cref="Ready"/> afterwards: the node may not own audio, or the start
+        /// may have failed.
+        /// <para>In a cluster, do NOT call it from an Awake. It asks
+        /// <see cref="OwnsAudioPredicate"/> on the spot, and a toolkit that learns the node's role
+        /// in its own Awake may not have run yet. That is the ordering bug the wait for Start
+        /// exists to remove.</para></summary>
+        public void StartNow()
+        {
+            // A duplicate that Awake marked for destruction is still alive this frame. _bringUpBegun
+            // and not Decided: a predicate or a held call may call back in here mid-way.
+            if (Instance != this || _bringUpBegun) return;
+            _bringUpBegun = true;
+            // A throw in here (a missing native library, a scene bake that fails) must still end the
+            // components' wait, and must not leave a created engine that never started reading as
+            // Ready. So it ends as a failed start does: logged, no native engine, nothing held.
+            try { BringUp(); }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex, this);
+                if (_eng != IntPtr.Zero)
+                {
+                    var dead = _eng; _eng = IntPtr.Zero;
+                    try { if (_started) Bwa.bwa_stop(dead); Bwa.bwa_destroy(dead); }
+                    catch (Exception ex2) { Debug.LogException(ex2, this); }
+                }
+                _started = false;
+                _deferred.Clear();
+            }
+            finally { Decided = true; }
+            // A fallback that did not start is not in use: ActiveProfile reads as profile again.
+            if (!Ready) { _fallbackTaken = false; _fallbackListener = null; }
+            RunDeferred();
+        }
+        bool _started;           // bwa_start succeeded: what a failed bring-up has to stop before it destroys
+        bool _bringUpBegun;      // StartNow ran or is running: the bring-up happens once
+
+        void BringUp()
+        {
             OwnsAudio = ownsAudio && AskOwnsAudio();
             if (!OwnsAudio)
             {
-                Claim();
                 Debug.Log("[bw_audio] this process does not own audio: no device opened, no native " +
                           "engine. Room Origin still applies.");
                 return;
@@ -312,9 +460,9 @@ namespace BwAudio
             {
                 Debug.LogError("[bw_audio] ABI version mismatch: bw_audio.dll is " +
                                Bwa.VersionString(dllVersion) + ", this binding was built against " +
-                               Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start — restage " +
+                               Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start. Restage " +
                                "the DLL or update the package so they match.");
-                Claim(); return;
+                return;
             }
 
             // Struct-layout guard, same class of failure as the version check above and the one struct
@@ -327,9 +475,34 @@ namespace BwAudio
             {
                 Debug.LogError("[bw_audio] BwaSourceDesc layout mismatch: the DLL's bwa_source_desc is " +
                                Bwa.SourcePreset(BwaSourceKind.Default).structSize + " bytes, the binding " +
-                               "marshals " + descSize + ". Refusing to start — restage the DLL or update " +
+                               "marshals " + descSize + ". Refusing to start. Restage the DLL or update " +
                                "the package so they match.");
-                Claim(); return;
+                return;
+            }
+
+            // The desk fallback, decided here: after the ownership decision (a node that does not
+            // own audio never reaches this line) and before bwa_create, from the device lists.
+            // Never after a failed bwa_start: a device that is present and will not open is a rig
+            // fault, and the rig must say so.
+            var useProfile = profile; var useSink = sink; var useDevice = device; var useFlags = sinkFlags;
+            _fallbackTaken = false; _fallbackListener = null;
+            bool allowed = FallbackAllowed;
+            if (allowed && !(PresentCheck != null ? PresentCheck() : DevicePresent(profile, sink, device)))
+            {
+                useProfile = (BwaProfile)fallbackProfile; useSink = fallbackSink;
+                useDevice = fallbackDevice ?? ""; useFlags = fallbackSinkFlags;
+                _fallbackTaken = true; _activeProfile = useProfile;
+                string msg = "[bw_audio] DESK FALLBACK: the primary device is not on this machine (" +
+                             "profile " + profile + ", sink " + sink + ", device " +
+                             (device.Length > 0 ? "'" + device + "'" : "(default)") +
+                             "). Running profile " + useProfile + " on sink " + useSink + ", device " +
+                             (useDevice.Length > 0 ? "'" + useDevice + "'" : "(default)") +
+                             " instead. Engine.UsingFallback is true.";
+                // In a player this is a development build that may be standing on the rig, where
+                // the same line means a typo in Device or a driver that is not installed.
+                if (InEditor()) Debug.LogWarning(msg, this);
+                else Debug.LogError(msg + " This is a development build: if this machine is the rig, " +
+                                    "check Device and the driver.", this);
             }
 
             // Empty maps to layout_path = NULL, the ABI's only way to run the default grid, exactly
@@ -342,7 +515,7 @@ namespace BwAudio
             // ARRAY never pans over the wrong room, so a desk scene on the default profile must not
             // go silent for want of a file it does not need. A file that exists still has to load.
             // (On Android StreamingAssets sits inside the APK, which the engine cannot fopen either.)
-            if (layoutFull != null && profile == BwaProfile.Binaural && !File.Exists(layoutFull))
+            if (layoutFull != null && useProfile == BwaProfile.Binaural && !File.Exists(layoutFull))
             {
                 Debug.Log($"[bw_audio] Binaural: no layout at '{layoutFull}', so the diffuse bed decodes " +
                           "through the built-in default grid. The array profiles need the file.");
@@ -350,17 +523,17 @@ namespace BwAudio
             }
 
             var cfg = new BwaDesc {
-                profile = profile,
+                profile = useProfile,
                 layoutPath = layoutFull,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
-                sink = sink,
-                device = device.Length > 0 ? device : null,
-                sinkFlags = sinkFlags,
+                sink = useSink,
+                device = useDevice.Length > 0 ? useDevice : null,
+                sinkFlags = useFlags,
                 enablePathing = enablePathing,
                 bedDecoder = bedDecoder,
             };
             _eng = Bwa.bwa_create(in cfg);
-            if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); Claim(); return; }
+            if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); return; }
 
             // The layout resolves inside bwa_create, so the channel count is known before start — and it is
             // the LAYOUT's speaker count, not a constant. A failed EXPLICIT load leaves bwa_create usable
@@ -371,7 +544,7 @@ namespace BwAudio
             _channels = Bwa.bwa_get_channel_count(_eng);
             var loadErr = Bwa.LastError(_eng);
             if (loadErr != null)
-                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — bwa_start will REFUSE " +
+                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load, so bwa_start will REFUSE " +
                                $"to run this session (BWA_ERR_LAYOUT). Fix the file, or clear 'Layout File' " +
                                $"to run the built-in default {_channels}-speaker grid deliberately. " +
                                $"Reason: {loadErr}");
@@ -382,12 +555,45 @@ namespace BwAudio
             if (Bwa.bwa_start(_eng) != BwaResult.Ok)
             {
                 Debug.LogError("[bw_audio] bwa_start failed: " + Bwa.LastError(_eng));
-                Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero; Claim(); return;
+                Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero; return;
             }
+            _started = true;
+            // Paused is the one piece of standing state with no inspector field, so no settings push
+            // carries it: a pause set before Start would be stored and never reach the engine.
+            if (_paused) Bwa.bwa_set_paused(_eng, true);
 
+            // The fallback was set and allowed, the device lists said the primary is here, and
+            // Auto still ended on the offline sink: the device is listed and did not open. The
+            // check cannot see that, so the scene is silent, and that must not pass quietly.
+            if (allowed && !_fallbackTaken && sink != BwaSinkType.Null && sink != BwaSinkType.Manual &&
+                Bwa.bwa_get_sink_type(_eng) == BwaSinkType.Null)
+                Debug.LogError("[bw_audio] NO AUDIO, and the desk fallback did NOT trigger: the primary " +
+                               "device (profile " + profile + ", sink " + sink + ", device " +
+                               (device.Length > 0 ? "'" + device + "'" : "(default)") + ") is listed on " +
+                               "this machine but did not open, so the engine runs the silent offline " +
+                               "sink. Reason: " + (Bwa.LastError(_eng) ?? "none given") + ". The check " +
+                               "reads device lists: an installed driver with its hardware unplugged, " +
+                               "too few channels, a busy device or a wrong rate all read as present. " +
+                               "On the rig: fix the device. At a desk: set Profile to " + fallbackProfile +
+                               " by hand for this machine.", this);
+
+            // The fallback with internal tracking: the tracker is the rig's Motive, which a desk
+            // does not have, and a connect toward it would open a socket and report success. Feed
+            // the pose from Unity instead.
+            if (!feedListener && _fallbackTaken)
+            {
+                var cam = listener ? null : Camera.main;
+                _fallbackListener = listener ? listener : (cam ? cam.transform : null);
+                Debug.LogWarning("[bw_audio] DESK FALLBACK: Feed Listener is off, but the tracker is not " +
+                                 "connected on the fallback. The listener follows " +
+                                 (listener ? "the Listener Transform '" + listener.name + "'"
+                                  : _fallbackListener ? "the main camera '" + _fallbackListener.name + "'"
+                                  : "NOTHING (no Listener Transform and no main camera), so it stays " +
+                                    "at the array centroid") + ".", this);
+            }
             // Internal tracking: connect the engine to the NatNet stream itself (runtime call — no env
             // vars). Non-fatal: the engine keeps rendering from the committed/default pose, loudly.
-            if (!feedListener)
+            else if (!feedListener)
             {
                 var td = new BwaTrackerDesc { server = natnetServer.Length > 0 ? natnetServer : null };
                 if (natnetRigidBody.Length > 0)
@@ -402,22 +608,69 @@ namespace BwAudio
 
             // Static geometry follows scene loads by itself: AcousticGeometry reports its own enable
             // and disable (StaticGeometryChanged), and a scene load or unload is exactly that.
-            Claim();
-            Debug.Log($"[bw_audio] started, backend={Bwa.Backend(_eng)}, channels={_channels}");
+            Debug.Log($"[bw_audio] started, profile={useProfile}, backend={Bwa.Backend(_eng)}, channels={_channels}");
 
             // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
             // just stays at the array centroid and every source is panned for a head that never moves.
             if (feedListener && !listener)
-                Debug.LogWarning("[bw_audio] 'Feed Listener' is on but no listener Transform is assigned — " +
+                Debug.LogWarning("[bw_audio] 'Feed Listener' is on but no listener Transform is assigned: " +
                                  "the listener will never move from the array centroid. Assign the tracked " +
                                  "head (or turn Feed Listener off to let the engine read NatNet itself).");
         }
 
-        // Every way out of Awake claims the singleton: started, not owning audio, or failed. All three
-        // keep applying Room Origin and survive scene loads, so the nodes of a cluster never disagree
-        // on the room, and a component finding an Engine that is not Ready knows none is coming
-        // (ForComponent). A failed start therefore leaves no room for a second Engine to try.
-        void Claim() { Instance = this; DontDestroyOnLoad(gameObject); }
+        // Calls a component made between Awake and Start that need the native engine (Emitter.Play
+        // from a script's Awake or OnEnable). They used to land, when Awake brought the engine up, so
+        // they are held and run once Start has it. Dropped on a node that does not own audio or whose
+        // start failed, where the same call is a no-op at any time.
+        readonly List<(MonoBehaviour owner, Action call)> _deferred = new();
+
+        /// <summary>Hold `call` until the Engine's Start has brought the native engine up. False when
+        /// there is nothing to hold it for: no Engine, one that has already decided, or one whose
+        /// Start is not about to run. An Engine left disabled can wait minutes for its enable, and
+        /// calls held that long would all replay in one frame, so there they stay the no-ops they are
+        /// with no Engine at all.</summary>
+        internal static bool DeferToStart(MonoBehaviour owner, Action call)
+        {
+            var e = Instance;
+            // Not isActiveAndEnabled, which is still false while the scene's Awakes are running.
+            if (!e || e.Decided || !e.enabled || !e.gameObject.activeInHierarchy) return false;
+            e._deferred.Add((owner, call));
+            return true;
+        }
+
+        void RunDeferred()
+        {
+            try
+            {
+                for (int i = 0; i < _deferred.Count && Ready; i++)   // a call may destroy the Engine
+                {
+                    var (owner, call) = _deferred[i];
+                    if (!owner || !owner.isActiveAndEnabled) continue;
+                    // One caller's throw must not cost the others their play.
+                    try { call(); }
+                    catch (Exception ex) { Debug.LogException(ex, owner); }
+                }
+            }
+            finally { _deferred.Clear(); }
+        }
+
+        // An Engine call that needs the native engine, made between Awake and Start: a script's Awake
+        // or OnEnable in the Engine's own scene, where the engine used to be up. The call is lost,
+        // so say so, once per Engine. Not after Start: a node that does not own audio, or a failed
+        // start, is silent by design.
+        bool _earlyCallWarned;
+        bool ReadyFor(string call)
+        {
+            if (Ready) return true;
+            if (!Decided && !_earlyCallWarned)
+            {
+                _earlyCallWarned = true;
+                Debug.LogWarning("[bw_audio] Engine." + call + " was called before the Engine's Start, so " +
+                                 "it did nothing: the native engine comes up in Engine.Start. Call it from " +
+                                 "Start or later, or call Engine.StartNow() first. (Warns once.)", this);
+            }
+            return false;
+        }
 
         bool AskOwnsAudio()
         {
@@ -438,7 +691,7 @@ namespace BwAudio
         void ApplyLoadTimeSettings()
         {
             if (enableReflections && enableFdnReverb)
-                Debug.LogWarning("[bw_audio] both reverb beds enabled — they share ONE reverb tap. Using the " +
+                Debug.LogWarning("[bw_audio] both reverb beds enabled, and they share ONE reverb tap. Using the " +
                                  "FDN (it takes the tap) and ignoring the Steam bed; tick only one.");
 
             if (enableFdnReverb)
@@ -492,7 +745,7 @@ namespace BwAudio
             Bwa.bwa_set_early_reflections_gain(_eng, earlyReflectionGain);
             Bwa.bwa_set_limiter(_eng, limiter);
             Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling);
-            Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionS);   // internal tracking only
+            Bwa.bwa_set_pose_prediction(_eng, FeedsListener ? 0f : posePredictionS);   // internal tracking only
         }
 
         // ---- situation tuning (seated / roaming) ----------------------------------------------------
@@ -588,7 +841,7 @@ namespace BwAudio
         /// unload what you loaded.</para></summary>
         public uint Acquire(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
         {
-            if (!Ready || string.IsNullOrEmpty(clip)) return 0;
+            if (!ReadyFor("Load") || string.IsNullOrEmpty(clip)) return 0;
             var key = (uint)flags + "|" + clip;
             if (_loadFailed.Contains(key)) return 0;          // already logged; don't re-hit the disk
             uint s = Bwa.bwa_sound_acquire(_eng, AssetPath(clip), flags);
@@ -611,7 +864,7 @@ namespace BwAudio
         /// reports the reason.</para></summary>
         public uint AcquireAsync(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
         {
-            if (!Ready || string.IsNullOrEmpty(clip)) return 0;
+            if (!ReadyFor("AcquireAsync") || string.IsNullOrEmpty(clip)) return 0;
             var key = (uint)flags + "|" + clip;
             if (_loadFailed.Contains(key)) return 0;
             uint s = Bwa.bwa_sound_acquire_async(_eng, AssetPath(clip), flags);
@@ -668,13 +921,13 @@ namespace BwAudio
         // up instead of switching itself off, and one on a node that does not own audio stops asking.
 
         /// <summary>The Engine a component may create native objects under, or null. `wait` is true
-        /// while one may still come (no Engine has finished Awake yet), and false when none ever will:
-        /// Awake always claims Instance, so a claimed Engine that is not Ready does not own audio or
-        /// failed to start.</summary>
+        /// while one may still come (no Engine yet, or one whose Start has not decided), and false
+        /// when none ever will: a decided Engine that is not Ready does not own audio or failed to
+        /// start.</summary>
         internal static Engine ForComponent(out bool wait)
         {
             var e = Instance;
-            wait = !e;
+            wait = !e || !e.Decided;
             return e && e.Ready ? e : null;
         }
 
@@ -725,7 +978,7 @@ namespace BwAudio
 
         /// <summary>Mint one of the engine's built-in materials. Cached (minted once per preset), so
         /// calling it per scene load is safe — null-engine-safe too.</summary>
-        public uint MaterialPreset(BwaMaterialPreset preset) => Ready ? ResolvePreset(preset) : 0;
+        public uint MaterialPreset(BwaMaterialPreset preset) => ReadyFor("MaterialPreset") ? ResolvePreset(preset) : 0;
 
         /// <summary>Reverb wet level (linear), adjustable live — the reverb-send equivalent.</summary>
         public float ReverbGain
@@ -790,10 +1043,10 @@ namespace BwAudio
 
         /// <summary>Mix-group gain (group 0..7): ducks every emitter in the group — "quiet the SFX, keep the
         /// dialog" without touching each source. Ramped.</summary>
-        public void SetGroupGain(uint group, float linear) { if (Ready) Bwa.bwa_group_set_gain(_eng, group, linear); }
+        public void SetGroupGain(uint group, float linear) { if (ReadyFor("SetGroupGain")) Bwa.bwa_group_set_gain(_eng, group, linear); }
 
         /// <summary>Pause a whole mix group (0..7) — same click-free freeze as per-source pause.</summary>
-        public void SetGroupPaused(uint group, bool paused) { if (Ready) Bwa.bwa_group_set_paused(_eng, group, paused); }
+        public void SetGroupPaused(uint group, bool paused) { if (ReadyFor("SetGroupPaused")) Bwa.bwa_group_set_paused(_eng, group, paused); }
 
         /// <summary>Stop every voice in one mix group (0..7) — "kill the SFX, keep the dialog". Each voice
         /// takes the click-free stop path (a one-block fade, then end) and drops its pending Queue chain.
@@ -802,14 +1055,14 @@ namespace BwAudio
         /// <para>It also drops this group's plays that are still waiting on an async decode, which would
         /// otherwise start by themselves the moment their data landed. The group a still-decoding play
         /// belongs to is the one its source was in when the stop ran.</para></summary>
-        public void StopGroup(uint group) { if (Ready) Bwa.bwa_group_stop(_eng, group); }
+        public void StopGroup(uint group) { if (ReadyFor("StopGroup")) Bwa.bwa_group_stop(_eng, group); }
 
         /// <summary>Stop every voice in the engine, beds included — the one-call scene transition. Same
         /// click-free path and the same "does not reset the mixer" rule as <see cref="StopGroup"/>. It
         /// drops every play still waiting on an async decode, whatever group it was issued in.
         /// A PUSH voice stops like any other, but its feed ring is NOT ended — call PushEmitter.PushEnd
         /// yourself if you are done with it.</summary>
-        public void StopAll() { if (Ready) Bwa.bwa_stop_all(_eng); }
+        public void StopAll() { if (ReadyFor("StopAll")) Bwa.bwa_stop_all(_eng); }
 
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
         public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }
@@ -855,7 +1108,7 @@ namespace BwAudio
               if (Ready) Bwa.bwa_set_tracked_align_guards(_eng, deadZoneM, slewFramesPerSecond); }
         /// <summary>Lead the TRACKED pose by `seconds` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
-        public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
+        public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !FeedsListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
 
         // ---- readback (per-frame-safe: no locks, no allocation in the engine) -------------------------
         /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..64), NOT a constant.
@@ -1031,7 +1284,7 @@ namespace BwAudio
 
         /// <summary>Drive ONE raw output channel with a test tone — a speaker-check / wiring tool, injected
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
-        public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
+        public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (ReadyFor("TestSignal")) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
 
         // ---- device enumeration (engine-free: no handle, safe before the Engine exists) --------------
         /// <summary>Number of devices `backend` can offer — engine-free, so it works before an Engine
@@ -1099,7 +1352,7 @@ namespace BwAudio
         // bad mesh / table full). Call after the engine is Ready. Usually driven by DynamicAcousticGeometry.
         public int AddDynamicMesh(Mesh mesh, Transform t, MaterialAsset material)
         {
-            if (!Ready || mesh == null || t == null) return -1;
+            if (!ReadyFor("AddDynamicMesh") || mesh == null || t == null) return -1;
             var ls = t.lossyScale;
             var mv = mesh.vertices;
             var verts = new float[mv.Length * 3];
@@ -1180,7 +1433,7 @@ namespace BwAudio
         /// (the Lloyd's-mirror comb that makes near-surface sources sound thin).</summary>
         public void SceneSetGround(float worldY, MaterialAsset material = null, bool pressureRelease = false)
         {
-            if (!Ready) return;
+            if (!ReadyFor("SceneSetGround")) return;
             // Kept so a moved Room Origin can push the plane again (OnRegistrationChanged).
             _groundSet = true; _groundWorldY = worldY; _groundMaterial = material; _groundPressureRelease = pressureRelease;
             // The origin's HEIGHT only: a level plane has no single room height under a tilted registration.
@@ -1196,10 +1449,10 @@ namespace BwAudio
         /// every face.</summary>
         public void SceneSetPressureRelease(uint faceMask)
         {
-            if (Ready) Bwa.bwa_scene_set_pressure_release(_eng, faceMask);
+            if (ReadyFor("SceneSetPressureRelease")) Bwa.bwa_scene_set_pressure_release(_eng, faceMask);
         }
 
-        // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
+        // Load-time (Start) scene bake. The box-ONLY case uses the engine's own box helper, which also
         // seeds the ISM early-reflection room. The ABI takes it live too, but Engine only calls it here,
         // so it stays on this path. Any acoustic geometry goes through RebuildSceneMesh, which is
         // runtime-safe and shared with the live re-bake below.
@@ -1218,11 +1471,12 @@ namespace BwAudio
         }
 
         // Every AcousticGeometry that should occlude right now: on an active object, component enabled.
-        // Not isActiveAndEnabled, which stays false until a component's OnEnable has run, and Awake's
-        // bake runs before the scene's other components get theirs. Also records what this bake holds,
-        // which is what StaticGeometryChanged compares against.
+        // Not isActiveAndEnabled, which stays false until a component's OnEnable has run. Also records
+        // what this bake holds, which is what StaticGeometryChanged compares against, and takes any
+        // rebuild already asked for: geometry that enabled before Start's bake marked one.
         List<AcousticGeometry> CollectStaticGeometry()
         {
+            _rebakeStatic = false;
             _bakedGeometry.Clear();
             var live = new List<AcousticGeometry>();
             foreach (var g in FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None))
@@ -1233,8 +1487,9 @@ namespace BwAudio
 
         /// <summary>An AcousticGeometry was enabled or disabled (spawned, toggled, or its scene loaded or
         /// unloaded). Marks the static mesh for one rebuild in this frame's LateUpdate, however many
-        /// objects change. An enable the last bake already holds is skipped (the scene's own objects
-        /// enable right after Awake baked them); a disable and re-enable in one frame still rebuilds.</summary>
+        /// objects change. An enable the last bake already holds is skipped; a disable and re-enable
+        /// in one frame still rebuilds. Before Start's bake it only marks, and that bake collects
+        /// everything enabled by then.</summary>
         internal void StaticGeometryChanged(AcousticGeometry g, bool enabled)
         {
             if (_bakedGeometry.Contains(g) != enabled) _rebakeStatic = true;
@@ -1398,7 +1653,7 @@ namespace BwAudio
 
         bool ApplyRoomOrigin()
         {
-            // A duplicate Engine that Awake is about to destroy must not take the registration.
+            // A duplicate Engine that Awake marked for destruction must not take the registration.
             if (Application.isPlaying && Instance != null && Instance != this) return false;
             bool changed;
             if (roomOrigin)
@@ -1492,7 +1747,6 @@ namespace BwAudio
             RefreshClock();   // keep the wall↔dsp offset estimator warm even when no helper ran this frame
             if (_rebakeStatic)   // a scene loaded/unloaded since last frame -> re-collect static geometry once
             {
-                _rebakeStatic = false;
                 RebuildSceneMesh(CollectStaticGeometry());
             }
             // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
@@ -1501,10 +1755,11 @@ namespace BwAudio
             _pushBuf.Clear();
             _pushBuf.AddRange(_sources);
             foreach (var s in _pushBuf) if (s) s.FrameSync();      // all sources first...
-            if (feedListener && listener)
+            var head = feedListener ? listener : _fallbackListener;   // the second only on the fallback
+            if (head)
             {
-                var p = Room.Pos(listener.position);
-                var q = Room.Rot(listener.rotation);
+                var p = Room.Pos(head.position);
+                var q = Room.Rot(head.rotation);
                 Bwa.bwa_set_listener_pose(_eng, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
                 CheckListenerPlacement(p);
             }
@@ -1546,7 +1801,7 @@ namespace BwAudio
                 if (!_listenerArmed) return;
             }
             string what = null; float by = 0f;
-            if (profile != BwaProfile.Binaural)
+            if (ActiveProfile != BwaProfile.Binaural)
             {
                 if (!_speakerBoxValid)
                 {
@@ -1843,8 +2098,9 @@ namespace BwAudio
         void OnDestroy()
         {
             Room.ReleaseOrigin(this);   // no-op unless this Engine holds the registration
-            // Before the Ready check: an Engine that does not own audio claims Instance too.
+            // Before the Ready check: every Engine claims Instance in Awake, owning audio or not.
             if (Instance == this) Instance = null;
+            _fallbackTaken = false; _fallbackListener = null;
             if (!Ready) return;
             Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
         }

@@ -166,7 +166,7 @@ namespace BwAudio
         /// block its data lands.</summary>
         public void Play(string clipOverride = null)
         {
-            if (!Live) return;
+            if (!Live) { DeferToEngineStart(() => Play(clipOverride), true); return; }
             ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
@@ -186,7 +186,7 @@ namespace BwAudio
         /// arrives before the data does plays as soon as the data lands, not at `startSample`.</para></summary>
         public void PlayAt(ulong startSample, string clipOverride = null)
         {
-            if (!Live) return;
+            if (!Live) { DeferToEngineStart(() => PlayAt(startSample, clipOverride), true); return; }
             ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;
@@ -203,7 +203,7 @@ namespace BwAudio
         /// the seam is a hard wrap.</summary>
         public void PlayLoop(ulong loopBeg, ulong loopEnd, string clipOverride = null)
         {
-            if (!Live) return;
+            if (!Live) { DeferToEngineStart(() => PlayLoop(loopBeg, loopEnd, clipOverride), true); return; }
             ReplaceAutoPlay();
             uint snd = Resolve(clipOverride, out bool held);
             if (snd == 0) return;

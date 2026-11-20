@@ -35,7 +35,7 @@ namespace BwAudio.EditorTools
                     continue;
                 }
                 if (IsHidden(it.propertyPath, a)) continue;
-                if (it.propertyPath == "sink") { DrawSinkField(it); continue; }
+                if (it.propertyPath == "sink" || it.propertyPath == "fallbackSink") { DrawSinkField(it); continue; }
                 EditorGUILayout.PropertyField(it, true);
             }
 
@@ -109,11 +109,17 @@ namespace BwAudio.EditorTools
             switch (p)
             {
                 case "maxReSplit":        return !a.maxRe;            // the band split only means anything with max-rE on
-                case "listener":          return !a.feedListener;      // the engine tracks itself
+                // The engine tracks itself. On the desk fallback the tracker is not connected,
+                // and this Transform stands in for it, so it stays visible with a fallback set.
+                case "listener":          return !a.feedListener && a.fallbackProfile == BwaFallbackProfile.None;
                 case "natnetServer":                                   // NatNet connection: tracking-only
                 case "natnetRigidBody":
                 case "posePredictionS":   return a.feedListener;       // prediction is tracking-only
                 case "limiterCeiling":    return !a.limiter;
+                case "fallbackSink":                                   // the fallback's own settings
+                case "fallbackDevice":
+                case "fallbackSinkFlags":
+                case "fallbackOnlyInDevBuilds": return a.fallbackProfile == BwaFallbackProfile.None;
                 case "reverbSeconds":
                 case "reflectionOrder":
                 case "reverbGain":        return !a.enableReflections;
@@ -143,6 +149,12 @@ namespace BwAudio.EditorTools
                         "No speaker layout at:\n\n" + full + "\n\nBinaural drives no speakers, so the " +
                         "engine runs its built-in default grid for the diffuse bed. Cave, CaveSim and " +
                         "CaveBoth need the file, and refuse to start without it.", MessageType.Info);
+                else if (!File.Exists(full) && a.fallbackProfile == BwaFallbackProfile.Binaural)
+                    EditorGUILayout.HelpBox(
+                        "Speaker layout not found. The engine will look for it here:\n\n" + full +
+                        "\n\nOn the primary device this scene will NOT start: bwa_start refuses a " +
+                        "failed layout load (BWA_ERR_LAYOUT). The Binaural desk fallback runs without " +
+                        "the file, on the built-in default grid.", MessageType.Warning);
                 else if (!File.Exists(full))
                     EditorGUILayout.HelpBox(
                         "Speaker layout not found. The engine will look for it here:\n\n" + full +
@@ -158,6 +170,8 @@ namespace BwAudio.EditorTools
                     "Sink " + a.sink + " is not available on " + EditorUserBuildSettings.activeBuildTarget +
                     ". A named backend is a demand, so a build for that target fails to start. Use Auto " +
                     "for a project that ships to more than one platform.", MessageType.Warning);
+
+            DrawFallbackProblems(a);
 
             if (a.enableReflections && a.enableFdnReverb)
                 EditorGUILayout.HelpBox(
@@ -178,16 +192,65 @@ namespace BwAudio.EditorTools
                     MessageType.Info);
         }
 
+        // "Is the primary device on this machine", for the notice below. Asked again only when a
+        // field it depends on changes: the answer walks the registry and the endpoint list, and
+        // the inspector repaints on every mouse move. A device plugged in later shows on the next
+        // edit, selection change or domain reload.
+        static string _presentKey;
+        static bool _present;
+        static bool PrimaryPresent(Engine a)
+        {
+            string key = (int)a.profile + "|" + (int)a.sink + "|" + a.device;
+            if (key != _presentKey) { _presentKey = key; _present = Engine.DevicePresent(a.profile, a.sink, a.device); }
+            return _present;
+        }
+        void OnEnable() { _presentKey = null; }   // selecting the Engine asks afresh
+
+        static void DrawFallbackProblems(Engine a)
+        {
+            if (a.fallbackProfile == BwaFallbackProfile.None) return;
+
+            if (!SinkFitsTarget(a.fallbackSink))
+                EditorGUILayout.HelpBox(
+                    "Fallback Sink " + a.fallbackSink + " is not available on " +
+                    EditorUserBuildSettings.activeBuildTarget + ". A named backend is a demand, so the " +
+                    "fallback fails to start there. Auto opens the default stereo output.", MessageType.Warning);
+
+            bool array = a.profile == BwaProfile.Cave || a.profile == BwaProfile.CaveBoth;
+            if (array && string.IsNullOrEmpty(a.device) && a.sink != BwaSinkType.Null)
+                EditorGUILayout.HelpBox(
+                    "A fallback is set, but Device is empty on an array profile. The check then only " +
+                    "asks whether the backend lists ANY device (any installed ASIO driver on Windows), " +
+                    "which cannot tell a desk from the rig: a desk with a driver installed starts the " +
+                    "array, fails to open it, and is silent. Put the rig's device name in Device.",
+                    MessageType.Warning);
+
+            // Before the run, on this machine. In Play mode the live banner says what happened.
+            if (!Application.isPlaying && !PrimaryPresent(a))
+                EditorGUILayout.HelpBox(
+                    "The primary device" + (string.IsNullOrEmpty(a.device) ? "" : " '" + a.device + "'") +
+                    " is not listed on this machine, so Play mode here takes the desk fallback (" +
+                    a.fallbackProfile + ").", MessageType.Info);
+        }
+
         // The questions you actually ask while the scene is running: did I get a real audio device, or
         // did it silently fall back to the null sink? How many voices am I burning? Is anything coming
         // out of the speakers at all?
         static void DrawLiveStatus(Engine a)
         {
-            if (Application.isPlaying && a == Engine.Instance && !a.OwnsAudio)
+            if (Application.isPlaying && a == Engine.Instance && a.Decided && !a.OwnsAudio)
                 EditorGUILayout.HelpBox("This process does not own audio (Owns Audio off, or " +
                     "Engine.OwnsAudioPredicate said no). No device is open and every BwAudio component " +
                     "is silent. Room Origin still applies.", MessageType.Info);
             if (!Application.isPlaying || !a.Ready) return;
+
+            // First, and as a warning: everything below describes the fallback, not the rig.
+            if (a.UsingFallback)
+                EditorGUILayout.HelpBox(
+                    "DESK FALLBACK. The primary device (profile " + a.profile + ", sink " + a.sink +
+                    (string.IsNullOrEmpty(a.device) ? "" : ", device '" + a.device + "'") +
+                    ") is not on this machine, so the engine runs profile " + a.ActiveProfile +
+                    " instead. This is not the rig's render.", MessageType.Warning);
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Live", EditorStyles.boldLabel);
@@ -200,6 +263,7 @@ namespace BwAudio.EditorTools
                           backend == "manual" || backend.StartsWith("manual ") || backend == "none");
             var kind = live ? MessageType.Info : MessageType.Warning;
             EditorGUILayout.HelpBox(
+                $"profile: {a.ActiveProfile}\n" +
                 $"backend: {backend}{(live ? "" : "  (SILENT — no audio device)")}\n" +
                 $"channels: {a.ChannelCount}\n" +
                 $"active voices: {a.ActiveVoices}", kind);

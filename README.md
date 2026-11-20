@@ -92,14 +92,14 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime`, `Editor` and `Samples~` only, and
 Unity itself ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Assets under StreamingAssets
 
@@ -194,7 +194,7 @@ Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit 
 sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
 `Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
 Every other binding of this engine ships the same demo, which makes them comparable by ear (see
-`https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md`, "The minimal example").
+`https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md`, "The minimal example").
 
 Then set up your scene in one step: **GameObject > BwAudio > CAVE Rig**, then move **Room Origin**
 to the CAVE floor center. The same item is in the Hierarchy's right-click menu. It creates:
@@ -236,8 +236,73 @@ The manual steps, which are what the item does:
 Components added from a script can be configured in the same frame: `AddComponent<Emitter>()`,
 then set `clip` and the rest, and the first play happens at `Start` with those values. A
 **cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
-the device. See [docs/integration.md: Clusters](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#clusters) and "Creating
-things at run time" below it.
+the device. The `Engine` asks it in `Start`, after every `Awake` in the scene, so your cluster
+toolkit's own `Awake` has run by then. See
+[docs/integration.md: Clusters](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#clusters) and "Creating things at run
+time" below it.
+
+### Test a rig scene at your desk
+
+A scene set up for the CAVE names the rig's device. At a desk that device is missing, and the
+scene is silent (`sink` Auto) or fails to start (`sink` Asio). Do not edit the rig settings. Set
+the fallback instead:
+
+1. Keep `profile`, `sink` and `device` as the rig needs them. Put the rig's device name in
+   `device` (a string from `Engine.Devices(BwaSinkType.Asio)`, read on the rig).
+2. Set **Fallback Profile** to `CaveSim` or `Binaural`. Leave **Fallback Sink** on Auto and
+   **Fallback Device** empty to get the machine's default stereo output.
+3. Select the `Engine`. When the device is not listed on this machine, the inspector says that
+   Play mode here takes the fallback.
+4. Press Play. The console shows one `DESK FALLBACK` warning, the inspector shows a banner, and
+   `Engine.UsingFallback` is true. `Engine.ActiveProfile` is the profile that runs.
+
+On the rig the device is listed and nothing changes.
+
+- **CaveSim** plays the array as virtual speakers on headphones. It uses the same layout file and
+  keeps the room modeling (speaker distance, delay and directivity), so it needs the layout.
+- **Binaural** is the direct headphone render. It skips the per-speaker stage (trims, delays,
+  correction filters, room EQ) by design, and it starts without the layout file.
+- **The tracker does not carry over.** With `feedListener` off, the rig reads the head from
+  Motive. On the fallback the `Engine` does not connect the tracker. The listener follows the
+  `listener` Transform when one is assigned, and the main camera when none is. One warning says
+  which. Pose prediction is off there.
+- The primary's `sinkFlags` do not apply to the fallback. It has `fallbackSinkFlags`.
+- A cluster node that does not own audio opens nothing, the fallback included.
+- The decision is made once, in `Start`. There is no second try after a failed start.
+
+`Engine.DevicePresent(profile, sink, device)` is the check. It is the engine's
+`bwa_device_present`, so it uses the same rule Auto uses at start. What the check sees, and what it does not:
+
+- It reads the device lists, before the engine exists. It does not open anything.
+- ASIO, WASAPI, CoreAudio: the device is present when the backend lists that exact name or id.
+  With no name, the backend must list at least one device.
+- Auto: the same, for each backend Auto offers that profile. Auto never gives the array to
+  WASAPI, so a WASAPI endpoint does not count for Cave.
+- JACK, ALSA or AAudio named as the sink, with a device: present on a platform that has that
+  backend. Those backends open strings their list never held (a JACK port pattern, `hw:1,0`), so
+  the list cannot call one missing. On a platform without the backend (an ALSA scene on Windows)
+  the device is missing.
+- CaveBoth: only the array's device is checked, not the monitor's.
+- Null and Manual: always present.
+- It cannot see whether a listed device will open. An ASIO driver is listed when it is
+  installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
+  list a default device on every machine. Too few channels, a wrong rate, or a busy device read
+  as present too.
+- A listed device that does not open is not a fallback. Under a named sink the start fails.
+  Under Auto the engine runs the silent offline sink, and the binding logs an error that says
+  the fallback did not trigger and why. Set the profile by hand on that machine.
+- An array profile with an empty `device` only asks "is any driver installed". That cannot tell
+  a desk from the rig, and the inspector warns about it. Name the rig's device.
+
+Where the fallback may run:
+
+- **Fallback Only In Dev Builds** is on by default: the Editor and development builds only. A
+  release build behaves as if no fallback were set.
+- Where it may run, a missing device is no longer a failed start. A typo in `device`, or a
+  driver that is not installed, becomes a headphone fallback with one log line. In the Editor
+  that line is a warning. In a development build it is an error, because that build may be on
+  the rig. Do not run the rig from a development build with a fallback set.
+- Turning the toggle off allows the fallback in a release build, with the same trade.
 
 ### Ends and loop boundaries are events
 
@@ -354,7 +419,7 @@ center, turn its forward (blue arrow) along the layout's +z, and assign it. `Eng
 layout was measured in the tracker's frame, so match that frame: if the layout's +z is the back
 wall, rotate the origin 180 degrees about Y. With no origin assigned, `Room.UnityToRoom` stays
 identity unless your code writes it. **Getting this wrong silently swaps front/back or left/right.**
-See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/integration.md#register-the-room).
+See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#register-the-room).
 
 ## Threading and lifecycle notes
 
@@ -415,7 +480,7 @@ zero count proves nothing.
 ### Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -436,7 +501,7 @@ release. On a tag it also creates the Release with the stamped version.
 
 **Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
 Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
-and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/build.md#continuous-integration) for the
+and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md#continuous-integration) for the
 rest.
 
 Locally:
