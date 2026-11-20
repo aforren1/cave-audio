@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.22.0]
+
 ### Fixed: clearing the static mesh did nothing (engine)
 
 - `bwa_scene_set_mesh_mat(e, NULL, 0, NULL, 0, NULL)` is the header's documented clear, and the
