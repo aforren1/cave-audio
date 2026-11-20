@@ -51,10 +51,11 @@ def test_device_present():
         assert not _bwa.device_present(profile, bwa.SinkType.AUTO, nobody)
         assert not _bwa.device_present(profile, bwa.SinkType.ASIO, nobody)
         # ALSA opens any PCM string, so its list cannot call a named device missing: present
-        # wherever the build carries ALSA (Linux), missing where it does not. A Linux rig's
-        # "hw:1,0" on a Windows desk is not there.
-        assert _bwa.device_present(profile, bwa.SinkType.ALSA, "hw:1,0") == sys.platform.startswith("linux")
-        if sys.platform == "win32":
+        # wherever the build carries ALSA, missing where it does not. A Linux rig's "hw:1,0" on a
+        # Windows or Mac desk is not there. A Linux build carries ALSA only when CMake found the
+        # alsa-lib headers, so Linux pins nothing here: test_cave_both asks the build itself.
+        if sys.platform in ("win32", "darwin"):
+            assert not _bwa.device_present(profile, bwa.SinkType.ALSA, "hw:1,0")
             for backend in (bwa.SinkType.JACK, bwa.SinkType.AAUDIO, bwa.SinkType.WORKLET):
                 assert not _bwa.device_present(profile, backend, "0")
     # No name and an empty name are the same request: the backend's default device.

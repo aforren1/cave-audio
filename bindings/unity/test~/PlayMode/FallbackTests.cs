@@ -439,11 +439,17 @@ namespace BwAudio.Tests
                 // ...but only where the engine library carries the backend. An ALSA scene on a
                 // Windows desk is a missing device: that machine is not the rig, and bwa_start
                 // would fail there with "this build has no alsa backend".
-                bool carried = OnThisPlatform(b);
-                foreach (var p in new[] { BwaProfile.Cave, BwaProfile.Binaural })
-                    Assert.AreEqual(unlisted && carried, Engine.DevicePresent(p, b, NoDevice),
-                                    b + " with a device name its list does not hold");
-                if (unlisted) Assert.AreEqual(carried, Engine.DevicePresent(BwaProfile.Cave, b, "hw:1,0"), b + " and hw:1,0");
+                // A Linux library carries JACK and ALSA only when CMake found their headers, so
+                // there the answer is the build's, not the platform's: test_cave_both asks the
+                // build itself, and this pins only what the platform settles.
+                bool? carried = OnThisPlatform(b);
+                if (carried.HasValue)
+                {
+                    foreach (var p in new[] { BwaProfile.Cave, BwaProfile.Binaural })
+                        Assert.AreEqual(unlisted && carried.Value, Engine.DevicePresent(p, b, NoDevice),
+                                        b + " with a device name its list does not hold");
+                    if (unlisted) Assert.AreEqual(carried.Value, Engine.DevicePresent(BwaProfile.Cave, b, "hw:1,0"), b + " and hw:1,0");
+                }
                 uint n = Engine.DeviceCount(b);
                 // A named backend with no device name: present exactly when it lists something.
                 Assert.AreEqual(n > 0, Engine.DevicePresent(BwaProfile.Cave, b, ""), b + " with no device name");
@@ -481,14 +487,16 @@ namespace BwAudio.Tests
         }
 
         // The backends each platform's engine library carries, at the default build options.
-        static bool OnThisPlatform(BwaSinkType b)
+        // Whether this platform's engine library carries the backend; null where the build decides.
+        static bool? OnThisPlatform(BwaSinkType b)
         {
             switch (Application.platform)
             {
                 case RuntimePlatform.WindowsEditor: case RuntimePlatform.WindowsPlayer:
                     return b == BwaSinkType.Asio || b == BwaSinkType.Wasapi;
                 case RuntimePlatform.LinuxEditor: case RuntimePlatform.LinuxPlayer:
-                    return b == BwaSinkType.Jack || b == BwaSinkType.Alsa;
+                    if (b == BwaSinkType.Jack || b == BwaSinkType.Alsa) return null;
+                    return false;
                 case RuntimePlatform.OSXEditor: case RuntimePlatform.OSXPlayer:
                     return b == BwaSinkType.CoreAudio;
                 case RuntimePlatform.Android:

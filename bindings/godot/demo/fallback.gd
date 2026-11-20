@@ -197,14 +197,20 @@ func _test_rule() -> void:
 		"macOS": [BwaEngine.SINK_COREAUDIO],
 		"Android": [BwaEngine.SINK_AAUDIO],
 	}.get(OS.get_name(), [])
+	# A Linux library carries JACK and ALSA only when CMake found their headers, so there the
+	# answer is the build's, not the platform's: test_cave_both asks the build itself, and this
+	# pins only what the platform settles.
+	var build_decides: Array = [BwaEngine.SINK_JACK, BwaEngine.SINK_ALSA] \
+			if OS.get_name() == "Linux" else []
 	for s in array_backends + stereo_only:
-		var want: bool = s in unlisted and s in carried
-		for p in [cave, bin]:
-			_check(BwaEngine.is_device_present(p, s, NO_DEVICE) == want,
-					"sink %d with a device name its list does not hold" % s)
-		if s in unlisted:
-			_check(BwaEngine.is_device_present(cave, s, "hw:1,0") == (s in carried),
-					"sink %d and hw:1,0" % s)
+		if not s in build_decides:
+			var want: bool = s in unlisted and s in carried
+			for p in [cave, bin]:
+				_check(BwaEngine.is_device_present(p, s, NO_DEVICE) == want,
+						"sink %d with a device name its list does not hold" % s)
+			if s in unlisted:
+				_check(BwaEngine.is_device_present(cave, s, "hw:1,0") == (s in carried),
+						"sink %d and hw:1,0" % s)
 		var n := BwaEngine.get_device_count(s)
 		_check(BwaEngine.is_device_present(cave, s, "") == (n > 0),
 				"sink %d with no device name" % s)
