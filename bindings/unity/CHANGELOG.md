@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+Test fixes.
+
 ## [0.23.0]
 
 ### Added: `bwa_device_present` (engine)
