@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.23.0]
+
 ### Added: `bwa_device_present` (engine)
 
 - `bool bwa_device_present(bwa_profile profile, bwa_sink_type sink, const char* device)` says
