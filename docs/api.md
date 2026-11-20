@@ -85,6 +85,10 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   in the direct path) and an array-audition monitor (`BWA_PROFILE_CAVE_SIM`, the speaker bus
   through virtual speakers). Headphone correction EQ loads an AutoEq `ParametricEQ.txt` and
   swaps in click-free (`bwa_load_headphone_eq`).
+- Devices: every backend's devices listed with no engine (`bwa_get_device_count`,
+  `bwa_get_device_name`, `bwa_get_device_id`), and one call that says whether the device a
+  profile, sink and device name would open is listed on this machine (`bwa_device_present`).
+  The Unity and Godot desk fallback rides on that call.
 - Offline: the manual sink drops the audio thread and lets you pump blocks yourself
   (`bwa_render_block`), bit-identically on every platform. Use it to pre-render stimuli that
   play through something else.
@@ -1001,6 +1005,7 @@ margin that absorbs a late block, so expect dropouts on a loaded machine.
 uint32_t bwa_get_device_count(bwa_sink_type backend);
 bool     bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
 bool     bwa_get_device_id  (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+bool     bwa_device_present (bwa_profile profile, bwa_sink_type sink, const char* device);
 // the ASIO-only spelling, kept for existing callers:
 uint32_t bwa_get_asio_driver_count(void);
 bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
@@ -1028,6 +1033,52 @@ on `bwa_playground` and `bwa_minimal` lists every backend, and `bwa_playground` 
 `bwa_zylia_probe` are ASIO-only. `bwa_calibrate` lists drivers with `--list-drivers` and
 `bwa_zylia_probe` with `--list`. `bwa_validate` has no list flag; it takes `--driver`. The GUIs
 use picker dropdowns.
+
+### Is the device here: `bwa_device_present`
+
+`bwa_device_present(profile, sink, device)` answers one question before `bwa_create`: is the
+device this request would open listed on this machine. Control thread, no engine. It loads and
+opens nothing. It reads the ASIO and WASAPI lists in one pass; the other backends cost one
+enumeration per listed device. `device` is what you would put in
+`bwa_desc.device`; NULL and `""` both mean the backend's default.
+
+| Request | True when |
+|---|---|
+| `BWA_SINK_NULL`, `BWA_SINK_MANUAL` | always. They open no device |
+| ASIO, WASAPI or CoreAudio, with a device | that backend lists the exact name or id |
+| any named backend, no device | that backend lists at least one device |
+| JACK, ALSA, AAudio or Worklet, with a device | this build carries that backend |
+| `BWA_SINK_AUTO` | a backend that Auto tries on this platform, for this profile's width, lists the device (or lists any device, when you gave no name) |
+
+The Auto row is the engine's own rule when you give a device name. The call walks the same
+backend order `bwa_start` walks and applies the same exact match, so Auto skips a backend at
+start exactly when this call skips it. With no name `bwa_start` skips nothing: it tries each
+backend's default device. The call then asks only whether a backend in that order lists any
+device. `BWA_PROFILE_CAVE` and `BWA_PROFILE_CAVE_BOTH` take the array order (ASIO alone on
+Windows). `BWA_PROFILE_BINAURAL` and `BWA_PROFILE_CAVE_SIM` take the stereo order (WASAPI, then
+ASIO, on Windows). See [Sink policy](#sink-policy) for the order on each platform.
+
+`BWA_PROFILE_CAVE_BOTH` opens two devices. The call checks the primary one, the array. It does
+not check the monitor.
+
+JACK, ALSA, AAudio and the worklet sink do not look `device` up in their own list when you name
+them as the sink. JACK takes a port pattern, ALSA any PCM string (`hw:0,0`, `plughw:1`, an
+asoundrc name), AAudio a numeric id. Their lists cannot call such a device missing, so the answer
+is true wherever the build carries the backend. In a build without it the answer is false: a
+Linux rig's `hw:1,0` on a Windows desk is missing, and `bwa_start` fails there.
+
+False is exact: `bwa_start` cannot open that device. True is weaker. It means listed, and a
+listed device can still fail to open:
+
+- An ASIO driver is listed when it is installed, with or without its hardware.
+- ALSA lists `default` whenever the library loads. CoreAudio always has an output device.
+- Too few channels, a rate the device refuses, or another owner all read as listed.
+
+With a named sink that open fails `bwa_start`. With Auto the engine runs the silent offline
+sink and `bwa_get_sink_type` reports `BWA_SINK_NULL`. Check one of them after the start.
+
+Unity's `Engine.DevicePresent` and Godot's `BwaEngine.is_device_present` are this call. Their
+desk fallback (docs/integration.md, "Test a rig scene at your desk") asks it once, at start.
 
 The buffer you pass is yours to size. A name longer than `cap` is truncated to `cap - 1` bytes on a
 UTF-8 character boundary and still returns true, so a picker that sized for the common case gets a

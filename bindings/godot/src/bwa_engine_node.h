@@ -52,6 +52,10 @@ public:
 	/* Mirrors bwa_profile: BINAURAL is the direct per-source headphone render, CAVE_SIM the
 	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
 	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
+	/* What fallback_profile may name: a headphone profile to run when the primary device is not
+	 * on this machine. The values match Profile; NONE takes the slot of CAVE, which is never a
+	 * desk fallback. */
+	enum FallbackProfile { FALLBACK_NONE = 0, FALLBACK_BINAURAL = 1, FALLBACK_CAVE_SIM = 2 };
 	/* AUTO picks by channel count and platform. Windows: a headphone profile tries WASAPI then
 	 * ASIO, the array tries ASIO. Linux: JACK then ALSA. macOS: COREAUDIO, at any width the device
 	 * has outputs for. Android: AAUDIO, stereo only. Each falls back to the silent offline sink.
@@ -108,10 +112,15 @@ public:
 	/* --- device configuration (read at _ready) --- */
 	void set_profile(Profile p) {
 		profile = p;
+		warn_present_valid = false;
 		update_configuration_warnings(); /* the no-layout warning depends on it */
 	}
 	Profile get_profile() const { return profile; }
-	void set_sink(Sink s) { sink = s; }
+	void set_sink(Sink s) {
+		sink = s;
+		warn_present_valid = false;
+		update_configuration_warnings(); /* the fallback warning depends on it */
+	}
 	Sink get_sink() const { return sink; }
 	void set_layout_path(const String &p) {
 		layout_path = p;
@@ -121,12 +130,51 @@ public:
 	/* The device for whichever backend opens it: the exact name or id from get_devices(). Empty =
 	 * that backend's default. set_asio_driver is the old spelling of the same property, kept so
 	 * existing scenes and scripts keep working. */
-	void set_device(const String &d) { device = d; }
+	void set_device(const String &d) {
+		device = d;
+		warn_present_valid = false;
+		update_configuration_warnings();
+	}
 	String get_device() const { return device; }
-	void set_asio_driver(const String &d) { device = d; }
+	void set_asio_driver(const String &d) { set_device(d); }
 	String get_asio_driver() const { return device; }
 	void set_sink_flags(int f) { sink_flags = f; }
 	int get_sink_flags() const { return sink_flags; }
+
+	/* --- the desk fallback (read at _ready) ---
+	 * A rig scene opened on a machine without the rig's device. When fallback_profile is set and
+	 * is_device_present(profile, sink, device) says no, _ready creates the engine with the
+	 * fallback profile, sink, device and flags instead, and says so with one push_warning. The
+	 * decision is made BEFORE bwa_create, from the device lists: a device that is listed and
+	 * fails to open still fails the start (or runs silent under AUTO, with a push_error), which
+	 * is the right outcome on the rig.
+	 * fallback_only_in_editor (on by default) limits it to a run from the editor. An export then
+	 * behaves as if fallback_profile were NONE. It is NOT is_debug_build(): "Export With Debug"
+	 * is on by default, so a rig that runs a default export would have the gate open, and a typo
+	 * in `device` there would be a headphone fallback where a failed start belongs. */
+	void set_fallback_profile(FallbackProfile p) {
+		fallback_profile = p;
+		warn_present_valid = false;
+		update_configuration_warnings();
+	}
+	FallbackProfile get_fallback_profile() const { return fallback_profile; }
+	void set_fallback_sink(Sink s) { fallback_sink = s; }
+	Sink get_fallback_sink() const { return fallback_sink; }
+	void set_fallback_device(const String &d) { fallback_device = d; }
+	String get_fallback_device() const { return fallback_device; }
+	void set_fallback_sink_flags(int f) { fallback_sink_flags = f; }
+	int get_fallback_sink_flags() const { return fallback_sink_flags; }
+	void set_fallback_only_in_editor(bool on) {
+		fallback_only_in_editor = on;
+		update_configuration_warnings();
+	}
+	bool get_fallback_only_in_editor() const { return fallback_only_in_editor; }
+	/* True while the engine runs on the fallback. False with no engine running. */
+	bool is_using_fallback() const { return fallback_taken && eng != nullptr; }
+	/* The profile the engine was created with: `profile`, or the fallback while the engine runs
+	 * on it. It reads as `profile` before _ready, after a start that failed (the fallback's
+	 * included), and after the node left the tree. */
+	Profile get_active_profile() const { return fallback_taken ? active_profile : profile; }
 	void set_sample_rate(int r) { sample_rate = r; }
 	int get_sample_rate() const { return sample_rate; }
 	void set_block_size(int b) { block_size = b; }
@@ -488,6 +536,25 @@ public:
 	static int get_device_count(Sink backend);
 	static String get_device_name(Sink backend, int index);
 	static String get_device_id(Sink backend, int index);
+	/* Whether the device a (profile, sink, device) triple asks for is on this machine, from the
+	 * device lists alone. The test the desk fallback runs in _ready.
+	 *   a named backend + a device   that backend lists the exact name or id
+	 *   a named backend, no device   it lists at least one
+	 *   AUTO                         the same two questions, asked of every backend AUTO offers
+	 *                                that profile's width (CAVE and CAVE_BOTH are the array)
+	 *   NULL, MANUAL                 always present: they open no device
+	 *   JACK, ALSA, AAUDIO, WORKLET  named as the sink with a device: present where this build
+	 *                                carries the backend. They do not look a device up in their
+	 *                                own list (JACK takes a port pattern, ALSA any PCM string,
+	 *                                AAudio a numeric id), so the list cannot call one missing.
+	 *                                Without the backend it is missing: an ALSA scene on a
+	 *                                Windows desk takes the fallback.
+	 * CAVE_BOTH: only the array's device is checked, not the monitor's.
+	 * What it cannot see is whether a listed device will OPEN. An ASIO driver is listed when it
+	 * is installed, with or without its hardware. ALSA and CoreAudio list a default device on any
+	 * machine. Too few channels, a wrong rate or another owner read as present too. Present and
+	 * unopenable is a failed start under a named sink, and the silent offline sink under AUTO. */
+	static bool is_device_present(Profile profile, Sink sink, const String &device);
 	/* The ASIO-only spelling, kept because existing scenes call it: get_devices(SINK_ASIO). */
 	static PackedStringArray get_asio_drivers();
 	static int get_asio_driver_count();
@@ -616,6 +683,16 @@ private:
 	BedDecoder bed_decoder = DECODE_DEFAULT;
 	String layout_path;
 	String device;
+	FallbackProfile fallback_profile = FALLBACK_NONE;
+	Sink fallback_sink = SINK_AUTO;
+	int fallback_sink_flags = SINK_FLAG_NONE;
+	String fallback_device;
+	bool fallback_only_in_editor = true;
+	bool fallback_taken = false;            /* the RUNNING engine came from the fallback_* set */
+	Profile active_profile = PROFILE_BINAURAL;
+	/* _get_configuration_warnings' short-lived answer to "is the primary device here". */
+	mutable bool warn_present_valid = false; /* cleared by the setters the answer depends on */
+	mutable bool warn_present = true;
 	int sample_rate = 48000;
 	int block_size = 256;
 	bool embree = false;
@@ -684,6 +761,7 @@ private:
 } // namespace godot
 
 VARIANT_ENUM_CAST(godot::BwaEngine::Profile);
+VARIANT_ENUM_CAST(godot::BwaEngine::FallbackProfile);
 VARIANT_ENUM_CAST(godot::BwaEngine::Sink);
 VARIANT_ENUM_CAST(godot::BwaEngine::SinkFlags);
 VARIANT_ENUM_CAST(godot::BwaEngine::BedDecoder);

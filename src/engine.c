@@ -1016,6 +1016,13 @@ bool bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint3
 bool bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap) {
     return sink_device_id(backend, index, buf, cap);
 }
+/* The width is all the profile contributes: the array profiles open the layout's speaker count
+ * (4 at the least, so always the wide order), the headphone profiles two channels. cave_both's
+ * PRIMARY device is the array's; its monitor is a second open this does not describe. */
+bool bwa_device_present(bwa_profile profile, bwa_sink_type sink, const char* device) {
+    const bool array = profile == BWA_PROFILE_CAVE || profile == BWA_PROFILE_CAVE_BOTH;
+    return sink_device_present(sink, array ? BWA_MAX_CHANNELS : 2u, device);
+}
 
 /* Engine-free too, and for the same reason: the host clock is a property of the PROCESS, not of an
  * engine. Every backend that stamps bwa_timestamp.system_time_ns itself reads this same counter

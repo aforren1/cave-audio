@@ -36,7 +36,7 @@ namespace BwAudio.Tests
             _savedFrameRate = Application.targetFrameRate;
             Application.targetFrameRate = Harness.TargetFrameRate;
             _finished = _looped = 0;
-            _eng = Harness.CreateEngine();
+            _eng = Harness.CreateStartedEngine();
             Assert.IsTrue(_eng.Ready, "engine did not start: " + Bwa.LastError(_eng.Handle));
         }
 

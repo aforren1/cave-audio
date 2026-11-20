@@ -43,7 +43,7 @@ namespace BwAudio.Tests
 
         void StartEngine(System.Action<Engine> configure = null)
         {
-            _eng = Harness.CreateEngine(configure);
+            _eng = Harness.CreateStartedEngine(configure);
             Assert.IsTrue(_eng.Ready, "engine did not start: " + Bwa.LastError(_eng.Handle));
         }
 

@@ -236,8 +236,73 @@ The manual steps, which are what the item does:
 Components added from a script can be configured in the same frame: `AddComponent<Emitter>()`,
 then set `clip` and the rest, and the first play happens at `Start` with those values. A
 **cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
-the device. See [docs/integration.md: Clusters](../../docs/integration.md#clusters) and "Creating
-things at run time" below it.
+the device. The `Engine` asks it in `Start`, after every `Awake` in the scene, so your cluster
+toolkit's own `Awake` has run by then. See
+[docs/integration.md: Clusters](../../docs/integration.md#clusters) and "Creating things at run
+time" below it.
+
+### Test a rig scene at your desk
+
+A scene set up for the CAVE names the rig's device. At a desk that device is missing, and the
+scene is silent (`sink` Auto) or fails to start (`sink` Asio). Do not edit the rig settings. Set
+the fallback instead:
+
+1. Keep `profile`, `sink` and `device` as the rig needs them. Put the rig's device name in
+   `device` (a string from `Engine.Devices(BwaSinkType.Asio)`, read on the rig).
+2. Set **Fallback Profile** to `CaveSim` or `Binaural`. Leave **Fallback Sink** on Auto and
+   **Fallback Device** empty to get the machine's default stereo output.
+3. Select the `Engine`. When the device is not listed on this machine, the inspector says that
+   Play mode here takes the fallback.
+4. Press Play. The console shows one `DESK FALLBACK` warning, the inspector shows a banner, and
+   `Engine.UsingFallback` is true. `Engine.ActiveProfile` is the profile that runs.
+
+On the rig the device is listed and nothing changes.
+
+- **CaveSim** plays the array as virtual speakers on headphones. It uses the same layout file and
+  keeps the room modeling (speaker distance, delay and directivity), so it needs the layout.
+- **Binaural** is the direct headphone render. It skips the per-speaker stage (trims, delays,
+  correction filters, room EQ) by design, and it starts without the layout file.
+- **The tracker does not carry over.** With `feedListener` off, the rig reads the head from
+  Motive. On the fallback the `Engine` does not connect the tracker. The listener follows the
+  `listener` Transform when one is assigned, and the main camera when none is. One warning says
+  which. Pose prediction is off there.
+- The primary's `sinkFlags` do not apply to the fallback. It has `fallbackSinkFlags`.
+- A cluster node that does not own audio opens nothing, the fallback included.
+- The decision is made once, in `Start`. There is no second try after a failed start.
+
+`Engine.DevicePresent(profile, sink, device)` is the check. It is the engine's
+`bwa_device_present`, so it uses the same rule Auto uses at start. What the check sees, and what it does not:
+
+- It reads the device lists, before the engine exists. It does not open anything.
+- ASIO, WASAPI, CoreAudio: the device is present when the backend lists that exact name or id.
+  With no name, the backend must list at least one device.
+- Auto: the same, for each backend Auto offers that profile. Auto never gives the array to
+  WASAPI, so a WASAPI endpoint does not count for Cave.
+- JACK, ALSA or AAudio named as the sink, with a device: present on a platform that has that
+  backend. Those backends open strings their list never held (a JACK port pattern, `hw:1,0`), so
+  the list cannot call one missing. On a platform without the backend (an ALSA scene on Windows)
+  the device is missing.
+- CaveBoth: only the array's device is checked, not the monitor's.
+- Null and Manual: always present.
+- It cannot see whether a listed device will open. An ASIO driver is listed when it is
+  installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
+  list a default device on every machine. Too few channels, a wrong rate, or a busy device read
+  as present too.
+- A listed device that does not open is not a fallback. Under a named sink the start fails.
+  Under Auto the engine runs the silent offline sink, and the binding logs an error that says
+  the fallback did not trigger and why. Set the profile by hand on that machine.
+- An array profile with an empty `device` only asks "is any driver installed". That cannot tell
+  a desk from the rig, and the inspector warns about it. Name the rig's device.
+
+Where the fallback may run:
+
+- **Fallback Only In Dev Builds** is on by default: the Editor and development builds only. A
+  release build behaves as if no fallback were set.
+- Where it may run, a missing device is no longer a failed start. A typo in `device`, or a
+  driver that is not installed, becomes a headphone fallback with one log line. In the Editor
+  that line is a warning. In a development build it is an error, because that build may be on
+  the rig. Do not run the rig from a development build with a fallback set.
+- Turning the toggle off allows the fallback in a release build, with the same trade.
 
 ### Ends and loop boundaries are events
 

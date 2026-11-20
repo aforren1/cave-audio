@@ -56,6 +56,11 @@ namespace BwAudio.Tests
             QuarterTurnOrigin();
             Engine.OwnsAudioPredicate = () => false;
             _eng = Harness.CreateEngine(e => { e.roomOrigin = _origin.transform; e.layoutFile = Layout4; });
+            // Awake alone, before Start has asked anybody: the node already agrees on the room.
+            Assert.IsFalse(_eng.Decided, "Start ran inside the activate");
+            AssertQuarterTurnRegistration("in Awake, before the ownership decision");
+            Assert.AreSame(_eng, Engine.Instance, "Awake did not claim the scene's Engine");
+            yield return Harness.Started(_eng);
 
             Assert.IsFalse(_eng.OwnsAudio, "the predicate said no, and the Engine took the device anyway");
             Assert.IsFalse(_eng.Ready, "a non-owning Engine created a native engine");
@@ -106,21 +111,25 @@ namespace BwAudio.Tests
         }
 
         // The field is the per-scene switch, for a project with no cluster toolkit hook.
-        [Test]
-        public void OwnsAudioFieldOffDeclinesToo()
+        [UnityTest]
+        public IEnumerator OwnsAudioFieldOffDeclinesToo()
         {
             _eng = Harness.CreateEngine(e => e.ownsAudio = false);
+            yield return Harness.Started(_eng);
+            Assert.IsTrue(_eng.Decided, "the Engine never decided");
             Assert.IsFalse(_eng.OwnsAudio);
             Assert.IsFalse(_eng.Ready);
         }
 
         // A predicate that throws must not leave the node without an Engine: it reads as "not the owner".
-        [Test]
-        public void ThrowingPredicateReadsAsNotTheOwner()
+        [UnityTest]
+        public IEnumerator ThrowingPredicateReadsAsNotTheOwner()
         {
             Engine.OwnsAudioPredicate = () => throw new System.InvalidOperationException("toolkit not ready");
             LogAssert.Expect(LogType.Error, new Regex("OwnsAudioPredicate threw"));
             _eng = Harness.CreateEngine();
+            yield return Harness.Started(_eng);
+            Assert.IsTrue(_eng.Decided, "the Engine never decided");
             Assert.AreSame(_eng, Engine.Instance, "a throwing predicate left the node with no Engine");
             Assert.IsFalse(_eng.OwnsAudio);
             Assert.IsFalse(_eng.Ready);
@@ -156,6 +165,8 @@ namespace BwAudio.Tests
                 e.sink = BwaSinkType.Asio;
                 e.device = "bwa_test_no_such_device";
             });
+            yield return Harness.Started(_eng);
+            Assert.IsTrue(_eng.Decided, "the Engine never decided");
             Assert.IsTrue(_eng.OwnsAudio);
             Assert.IsFalse(_eng.Ready, "the start was expected to fail with a device that does not exist");
             Assert.AreSame(_eng, Engine.Instance, "a failed start left the node with no Engine");

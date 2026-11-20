@@ -4,6 +4,92 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: `bwa_device_present` (engine)
+
+- `bool bwa_device_present(bwa_profile profile, bwa_sink_type sink, const char* device)` says
+  whether the device that request would open is listed on this machine. It needs no engine and
+  opens nothing. Under Auto it walks the same backend order and applies the same exact match
+  `bwa_start` does, on the platform it runs on. See docs/api.md, "Is the device here".
+- `Engine.DevicePresent` and Godot's `BwaEngine.is_device_present` call it, so this package needs
+  the engine it ships with. The Python and MATLAB raw layers and the web ABI table carry it too
+  (`_bwa.device_present`, `bwa_mex('device_present', ...)`).
+- Auto's match of a named ASIO driver or WASAPI endpoint now reads the list once. It read it
+  once per entry before.
+- JACK, ALSA, AAudio or Worklet named as the sink with a device reads as present only in a build
+  that carries the backend. An ALSA scene opened on Windows is a missing device.
+- Fixed: each ASIO driver enumeration (`bwa_get_device_count`, `bwa_get_device_name`,
+  `bwa_get_asio_driver_count`) dropped one COM reference from a caller on a multithreaded
+  apartment. The thread's COM state is now left as it was.
+
+### Added: desk fallback for a rig scene
+
+- New `Engine` fields under **Desk fallback**: `fallbackProfile` (None, Binaural, CaveSim; None is
+  the default and means off), `fallbackSink`, `fallbackDevice`, `fallbackSinkFlags` and
+  `fallbackOnlyInDevBuilds` (on by default). When the primary device is not listed on the
+  machine, the `Engine` starts on the fallback instead. A scene set up for the rig then plays on
+  headphones at a desk with no setting changed. See the README, "Test a rig scene at your desk".
+- The decision is made once, in `Start`, before the native engine is created, from the device
+  lists. New static `Engine.DevicePresent(profile, sink, device)` is the check. It cannot see
+  whether a listed device will open: an installed ASIO driver with no hardware reads as present.
+- One `DESK FALLBACK` line names the missing device and the fallback: a warning in the Editor,
+  an error in a development build. `Engine.UsingFallback` says it took effect,
+  `Engine.ActiveProfile` is the profile that runs, and the inspector shows a banner in Play mode
+  and a notice before it.
+- A listed device that does not open is never a fallback. Under Auto that start is silent, and
+  with a fallback set the `Engine` now logs an error that says so and why.
+- On the fallback with `feedListener` off, the tracker is not connected. The listener follows
+  the `listener` Transform, or the main camera.
+- With `fallbackOnlyInDevBuilds` on, a release build never takes the fallback. Where the
+  fallback may run, a typo in `device` is a headphone fallback and not a failed start.
+- A node that does not own audio (`ownsAudio`, `Engine.OwnsAudioPredicate`) takes no fallback.
+- The start log line now names the profile: `started, profile=..., backend=..., channels=...`.
+
+### Godot addon
+
+- **Desk fallback on `BwaEngine`**, the same feature: `fallback_profile`, `fallback_sink`,
+  `fallback_device`, `fallback_sink_flags` and `fallback_only_in_editor` in a new **Device
+  Fallback** inspector group, `is_using_fallback()`, `get_active_profile()`, and the static
+  `BwaEngine.is_device_present(profile, sink, device)`. The gate is a run from the editor: an
+  export takes no fallback, a debug export included. The node's configuration warning says in
+  the editor when this machine will take the fallback, and when the check cannot tell (an array
+  profile with an empty `device`). A listed device that does not open under Auto logs an error.
+  New test scene `demo/fallback.tscn` (`godot_fallback`).
+- **Changed: Binaural starts without the layout file**, as Unity's `Engine` does. When `profile`
+  (or the fallback) is Binaural and the file at `layout_path` does not exist, `BwaEngine` prints
+  one line and runs the built-in default grid. Before, the start was refused. A file that exists
+  still has to load, and Cave, CaveSim and CaveBoth still refuse.
+- `sink`, `device` and `asio_driver` now refresh the node's configuration warnings when set.
+
+### Changed: the Engine decides ownership and starts in `Start`, not `Awake`
+
+- `Engine.Awake` now only claims `Engine.Instance` and applies Room Origin. The ownership decision
+  (`ownsAudio` and `Engine.OwnsAudioPredicate`), the native create and the start moved to
+  `Engine.Start`. Unity does not order two scripts with the same execution order, and a cluster
+  toolkit's manager can share the `Engine`'s -100 (MiddleVR's does) and learn the node's role in
+  its own `Awake`. The predicate was sometimes asked first. `Start` runs after every `Awake`.
+- New `Engine.Decided`: false between `Awake` and `Start`. While it is false, components keep
+  waiting instead of concluding that no engine is coming, and `SpeakerView` waits to build.
+- Room Origin is still applied in `Awake` on every node, owning audio or not.
+- What you can notice: `Engine.Ready` is false in any `Awake` or `OnEnable` of the scene that
+  loads the `Engine`, and in a `Start` with an execution order below -100. `Engine.Load` and the
+  other `Engine` calls return 0 or do nothing there. Move them to `Start`. `Play`, `PlayAt`,
+  `PlayLoop` and `Stop` on an `Emitter` or `AmbisonicBed` are held and run when the `Engine`
+  starts, so a `Play()` in your `Awake` still plays, a moment later. `PlayOneShot` returns false.
+  The first lost `Engine` call logs a warning that names it.
+- An `Engine` added from a script is not `Ready` in the same frame. Wait for `Engine.Decided`, or
+  call the new `Engine.StartNow()`.
+- New `Engine.StartNow()`: the decision and the bring-up, now. It runs once, and `Start` is a call
+  to it. Use it when your own `Awake` needs `Engine.Ready`. Do not call it from an `Awake` in a
+  cluster scene: it asks the predicate before the toolkit may know the role.
+- An `Engine` component that is disabled at load now starts when you enable it. Before, it
+  started in `Awake` anyway. Use this when your cluster toolkit learns the role after `Awake`.
+  Nothing is held while it is disabled: `Play` and `Stop` do nothing until it starts.
+- An exception during start is now logged and ends as a failed start: the native engine is
+  destroyed if it was created, `Engine.Ready` is false, and components stop waiting. Before, a
+  missing native library left components waiting forever.
+- `Engine.Paused = true` set before the engine is up now reaches it at start.
+- Console messages from the runtime scripts are ASCII: seven had an em dash.
+
 ## [0.22.0]
 
 ### Fixed: clearing the static mesh did nothing (engine)

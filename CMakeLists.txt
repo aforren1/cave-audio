@@ -1286,7 +1286,7 @@ if(BWA_BUILD_TESTS)
       COMMAND ${CMAKE_COMMAND} -DUNITY_EXE=${BWA_UNITY_EXE}
               -DREPO=${CMAKE_SOURCE_DIR}
               -DPROJECT_DIR=${BWA_UNITY_TEST_PROJECT}
-              -DMIN_TESTS=46
+              -DMIN_TESTS=77
               -P ${CMAKE_SOURCE_DIR}/bindings/unity/test~/run_unity_tests.cmake)
     # The first run resolves packages and imports the project from scratch; later runs reuse its
     # Library cache. RUN_SERIAL because the editor takes an exclusive lock on that project.

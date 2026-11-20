@@ -126,7 +126,16 @@ src/
     sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (Windows: 2-ch
                          requests try WASAPI then ASIO, wider ones ASIO only. Linux: JACK then ALSA at
                          every width. macOS: CoreAudio at every width) and the exact-match device
-                         rule. [M1/backends]
+                         rule. [M1/backends] The order lives in ONE place, auto_order(), which both
+                         bwa_sink_open and sink_device_present walk: bwa_device_present(profile, sink,
+                         device) is the pure "is the device this would open LISTED here" answer the
+                         bindings' desk fallback asks before bwa_create (opens nothing; a named
+                         JACK/ALSA/AAudio/Worklet device reads present only where that backend is
+                         compiled, since those backends never look the string up in a list; CaveBoth
+                         checks the array device only). LISTED is not ATTACHED: an installed ASIO
+                         driver with no hardware reads present. ASIO and WASAPI answer in one pass
+                         (sink_asio_has_driver / sink_wasapi_has_device); asio_driver_names balances
+                         the SDK's unchecked CoInitialize against an MTA caller. [desk fallback]
     sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
                          interleaved. Moved out of asio_sink.cpp so every backend shares one set of
                          clamp + NaN rules. [backends]
@@ -591,7 +600,21 @@ tools/xval/            gen_reference.py: cross-validation golden generator (scip
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
 bindings/
-  unity/               P/Invoke + Engine/Emitter (see docs/integration.md).
+  unity/               P/Invoke + Engine/Emitter (see docs/integration.md). The Engine (order -100)
+                       does only the duplicate check, the Instance claim and Room Origin in Awake;
+                       the cluster ownership decision (OwnsAudioPredicate) and the native bring-up
+                       run in Start (StartNow(), idempotent), because a cluster toolkit such as
+                       MiddleVR also wakes at -100 and Unity does not order a tie. Engine.Decided is
+                       the pending state components wait on (ForComponent); Play/PlayAt/PlayLoop/Stop
+                       made before Start are HELD and run at its end, only while the Engine is
+                       enabled. DESK FALLBACK (both bindings): fallbackProfile (None/Binaural/
+                       CaveSim) + its own sink/device/flags, taken only when bwa_device_present says
+                       the primary is not listed, never after a failed bwa_start, never on a
+                       non-owner, and gated to the Editor or a development build (Godot: the editor
+                       only, because "Export With Debug" defaults on). A listed device that lands on
+                       the silent null sink under AUTO logs an error saying the fallback did not
+                       trigger. Unity skips the NatNet connect on the fallback and follows the
+                       listener Transform or the main camera.
   godot/               GDExtension (godot-cpp, opt-in -DBWA_BUILD_GODOT=ON): addons/bw_audio/ is the
                        drop-in addon (which CONTAINS playground/, the Godot port of
                        examples/playground.cpp, so the demo ships with every install), demo/ the

@@ -253,6 +253,9 @@ namespace BwAudio
         // concrete — Auto, Null and Manual report 0, and so does a backend this build does not carry. ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_device_count(BwaSinkType backend);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_name(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
+        // Is the device a (profile, sink, device) request would open LISTED on this machine.
+        // Engine-free, opens nothing. bw_audio.h has the rule; Engine.DevicePresent the summary.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_device_present(BwaProfile profile, BwaSinkType sink, [MarshalAs(UnmanagedType.LPUTF8Str)] string device);
         // The STABLE id: prefer it when persisting a choice, or when two devices share a friendly
         // name (a headset and a dock often do). ASIO reports the driver name for both.
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_id(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
@@ -533,7 +536,7 @@ namespace BwAudio
         // The engine's active channel count = the layout's speaker count (4..64, BWA_MAX_CHANNELS). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
-        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against
+        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Start compares it against
         // BoundVersion below and refuses to start on a major.minor mismatch.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
         // The BWA_VERSION these bindings were written against (bw_audio.h). The header guarantees enum

@@ -348,6 +348,11 @@ default grid (26 speakers, `BWA_DEFAULT_GRID`) and only records the reason. `Bwa
 warning, and `bwa_start` refuses the fallback when a path was given, so a bad layout fails
 loudly instead of quietly changing the channel count.
 
+Binaural is the exception. It drives no speakers, so the layout only places the virtual speakers
+the diffuse bed decodes through. When `profile` is Binaural and the file at `layout_path` does
+not exist, `BwaEngine` prints one line and runs the default grid. A file that exists still has
+to load. Cave, CaveSim and CaveBoth refuse to start without the file.
+
 ## Asset paths
 
 The core loads audio and layout files itself, by OS path. It never goes through Godot's
@@ -476,14 +481,19 @@ core. It starts, it renders, it just sounds wrong:
 - source early reflections alongside the Steam reflection bed, which already contains
   early reflections, so they render twice;
 - `feed_listener` on with no listener node, so the listener never leaves the origin;
-- a `layout_path` that does not exist, or a `res://` one that will not survive export;
+- a `layout_path` that does not exist (under Binaural the marker says the default grid runs), or
+  a `res://` one that will not survive export;
 - an array profile (Cave, CaveSim, CaveBoth) with no `layout_path`, which renders the built-in
   26-speaker grid and not your room;
 - a `room_origin` that is not a Node3D, is mirrored, is scaled, or is tilted more than
   1 degree. The marker follows the origin as you move it in the editor;
 - ray-traced occlusion or pathing switched on without the SDK or without geometry;
 - `profile` set to Cave on a machine with no ASIO driver, which renders the speaker array
-  into nothing and is silent by design.
+  into nothing and is silent by design;
+- a `fallback_profile` on a machine that does not list the primary device: a run from the
+  editor here takes the fallback (this one replaces the line above);
+- a `fallback_profile` on an array profile with an empty `device`, where the check cannot tell
+  a desk from the rig.
 
 The split into three source classes is deliberate. The core genuinely *refuses*
 play/seek/pitch on a push voice, so a single node with a mode flag would leave those
@@ -651,6 +661,64 @@ Prefer the id (`get_device_id(backend, i)`) when you persist a choice: friendly 
 between a headset and its dock. The ASIO-only spelling (`get_asio_drivers()`,
 `get_asio_driver_count()`, `get_asio_driver_name(i)`) stays as a wrapper.
 
+### Test a rig scene at your desk
+
+A scene set up for the CAVE names the rig's device. At a desk that device is missing, and the
+scene is silent (`sink` Auto) or fails to start (`sink` ASIO). Do not edit the rig settings. Set
+the fallback instead, in the inspector's **Device Fallback** group:
+
+1. Keep `profile`, `sink` and `device` as the rig needs them. Put the rig's device name in
+   `device` (a string from `BwaEngine.get_devices(BwaEngine.SINK_ASIO)`, read on the rig).
+2. Set `fallback_profile` to CaveSim or Binaural. Leave `fallback_sink` on Auto and
+   `fallback_device` empty to get the machine's default stereo output.
+3. When the device is not listed on this machine, the node's warning marker says that a run
+   from the editor here takes the fallback.
+4. Run the scene from the editor. The engine pushes one `DESK FALLBACK` warning and
+   `is_using_fallback()` is true. `get_active_profile()` is the profile that runs.
+
+On the rig the device is listed and nothing changes.
+
+- **CaveSim** plays the array as virtual speakers on headphones. It uses the same layout file and
+  keeps the room modeling (speaker distance, delay and directivity), so it needs the layout.
+- **Binaural** is the direct headphone render. It skips the per-speaker stage (trims, delays,
+  correction filters, room EQ) by design, and it starts without the layout file.
+- The primary's `sink_flags` do not apply to the fallback. It has `fallback_sink_flags`.
+- The decision is made once, in `_ready`. There is no second try after a failed start.
+
+`BwaEngine.is_device_present(profile, sink, device)` is the check. It is the engine's
+`bwa_device_present`, so it uses the same rule Auto uses at start. What the check sees, and what it does not:
+
+- It reads the device lists, before the engine exists. It does not open anything.
+- ASIO, WASAPI, CoreAudio: the device is present when the backend lists that exact name or id.
+  With no name, the backend must list at least one device.
+- Auto: the same, for each backend Auto offers that profile. Auto never gives the array to
+  WASAPI, so a WASAPI endpoint does not count for Cave.
+- JACK, ALSA or AAudio named as the sink, with a device: present on a platform that has that
+  backend. Those backends open strings their list never held (a JACK port pattern, `hw:1,0`), so
+  the list cannot call one missing. On a platform without the backend (an ALSA scene on Windows)
+  the device is missing.
+- CaveBoth: only the array's device is checked, not the monitor's.
+- Null and Manual: always present.
+- It cannot see whether a listed device will open. An ASIO driver is listed when it is
+  installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
+  list a default device on every machine. Too few channels, a wrong rate, or a busy device read
+  as present too.
+- A listed device that does not open is not a fallback. Under a named sink the start fails.
+  Under Auto the engine runs the silent offline sink, and the binding logs an error that says
+  the fallback did not trigger and why. Set the profile by hand on that machine.
+- An array profile with an empty `device` only asks "is any driver installed". That cannot tell
+  a desk from the rig, and the warning marker says so. Name the rig's device.
+
+Where the fallback may run:
+
+- `fallback_only_in_editor` is on by default: a run from the editor only. An export behaves as
+  if no fallback were set. That includes a debug export. "Export With Debug" is on by default in
+  Godot, so a rig often runs a debug build, and the gate does not open for it.
+- Where it may run, a missing device is no longer a failed start. A typo in `device`, or a
+  driver that is not installed, becomes a headphone fallback with one warning.
+- Turning the toggle off allows the fallback in every build, with the same trade. Do not ship
+  that to the rig.
+
 For the headphone profiles, `load_headphone_eq(path)` loads an AutoEq `ParametricEQ.txt` as a
 correction EQ on the stereo output. Call it after the engine starts. `""` clears it.
 `set_headphone_eq(on)` switches the EQ without a click. It is on by default.
@@ -725,7 +793,7 @@ ctest --test-dir build-godot -C RelWithDebInfo -R godot_
   node's Godot forward equals the converted quaternion's room facing) rather than
   restating the conversion, over cardinal and random orientations. Pure float math, no
   godot-cpp, so it always builds.
-- **`godot_smoke`**, **`godot_frame`**, **`godot_rig`**, **`godot_follow`**, **`godot_minimal`**, **`godot_api_manual`**,
+- **`godot_smoke`**, **`godot_frame`**, **`godot_rig`**, **`godot_follow`**, **`godot_fallback`**, **`godot_minimal`**, **`godot_api_manual`**,
   **`godot_api_null`**, **`godot_scene`**, **`godot_scene_no_room`**, **`godot_playground`** - the demo scenes and
   the playground self-test, self-checking and headless. These need an editor binary, which is
   not a build dependency, so point CMake at one:

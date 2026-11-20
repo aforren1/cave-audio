@@ -209,7 +209,7 @@ namespace BwAudio.Tests
         [UnityTest]
         public IEnumerator EngineFollowsItsOriginAndReleasesOnDestroy()
         {
-            _eng = Harness.CreateEngine();
+            _eng = Harness.CreateStartedEngine();
             Assert.IsTrue(_eng.Ready, "engine did not start: " + Bwa.LastError(_eng.Handle));
             yield return null;
             Assert.IsTrue(Room.UnityToRoom.Equals(Matrix4x4.identity), "no origin assigned must leave identity");
@@ -247,9 +247,10 @@ namespace BwAudio.Tests
             Assert.IsTrue(Room.UnityToRoom.Equals(Matrix4x4.identity), "a destroyed Engine left its registration in the static");
         }
 
-        // The static geometry bake and the FDN direction read the seam inside Awake, so an origin
-        // assigned in the Inspector has to be applied there and not at the first LateUpdate. No frame
-        // is turned between the activate and the assert.
+        // Every node of a cluster draws with the registration from the first frame, and Start's
+        // static geometry bake and FDN direction read it. So an origin assigned in the Inspector is
+        // applied in Awake: before Start decides who owns audio, and not at the first LateUpdate.
+        // No frame is turned between the activate and the assert.
         [Test]
         public void OriginAssignedBeforeAwakeIsAppliedInAwake()
         {
@@ -265,7 +266,8 @@ namespace BwAudio.Tests
             _eng.listener = go.transform;
             _eng.roomOrigin = _origin.transform;
             go.SetActive(true);                                      // -> Awake
-            Assert.IsTrue(_eng.Ready, "engine did not start: " + Bwa.LastError(_eng.Handle));
+            Assert.IsFalse(_eng.Decided, "Start ran inside the activate, so this no longer shows Awake alone");
+            Assert.AreSame(_eng, Engine.Instance, "Awake did not claim the scene's Engine");
             AssertVec(new Vector3(0f, 0f, 1f), Room.Pos(new Vector3(2f, 0f, 2f)), "straight after Awake");
         }
 
@@ -276,7 +278,7 @@ namespace BwAudio.Tests
         public IEnumerator DuplicateEngineHandsItsOriginToTheSurvivor()
         {
             var first = new GameObject("scene A origin");
-            _eng = Harness.CreateEngine();
+            _eng = Harness.CreateStartedEngine();
             Assert.IsTrue(_eng.Ready, "engine did not start: " + Bwa.LastError(_eng.Handle));
             _eng.roomOrigin = first.transform;                       // identity pose
             yield return null;

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import bw_audio as bwa
 from bw_audio import _bwa
 
@@ -38,6 +40,30 @@ def test_every_concrete_backend_is_self_consistent():
         # One past the end answers None rather than an empty string.
         assert _bwa.get_device_name(backend, n) is None
         assert _bwa.get_device_id(backend, n) is None
+
+
+def test_device_present():
+    """The raw call, on the cases that need no device. test_cave_both carries the full rule."""
+    nobody = "bwa_test_no_such_device"
+    for profile in (bwa.Profile.CAVE, bwa.Profile.BINAURAL):
+        assert _bwa.device_present(profile, bwa.SinkType.NULL, None)
+        assert _bwa.device_present(profile, bwa.SinkType.MANUAL, nobody)
+        assert not _bwa.device_present(profile, bwa.SinkType.AUTO, nobody)
+        assert not _bwa.device_present(profile, bwa.SinkType.ASIO, nobody)
+        # ALSA opens any PCM string, so its list cannot call a named device missing: present
+        # wherever the build carries ALSA (Linux), missing where it does not. A Linux rig's
+        # "hw:1,0" on a Windows desk is not there.
+        assert _bwa.device_present(profile, bwa.SinkType.ALSA, "hw:1,0") == sys.platform.startswith("linux")
+        if sys.platform == "win32":
+            for backend in (bwa.SinkType.JACK, bwa.SinkType.AAUDIO, bwa.SinkType.WORKLET):
+                assert not _bwa.device_present(profile, backend, "0")
+    # No name and an empty name are the same request: the backend's default device.
+    for backend in (bwa.SinkType.ASIO, bwa.SinkType.WASAPI, bwa.SinkType.COREAUDIO):
+        listed = _bwa.get_device_count(backend) > 0
+        assert _bwa.device_present(bwa.Profile.CAVE, backend, None) == listed
+        assert _bwa.device_present(bwa.Profile.CAVE, backend, "") == listed
+        for i in range(_bwa.get_device_count(backend)):
+            assert _bwa.device_present(bwa.Profile.CAVE, backend, _bwa.get_device_name(backend, i))
 
 
 def test_the_asio_spelling_matches_the_general_one():

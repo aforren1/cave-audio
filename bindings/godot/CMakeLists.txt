@@ -143,7 +143,8 @@ if(BWA_BUILD_TESTS)
     set_tests_properties(godot_import PROPERTIES FIXTURES_SETUP godot_project TIMEOUT 300)
 
     # follow: static geometry and bed yaw keep following the tree and room_origin after start.
-    foreach(scene smoke frame rig follow)
+    # fallback: the desk fallback, a missing primary device against the offline sink.
+    foreach(scene smoke frame rig follow fallback)
       add_test(NAME godot_${scene}
         COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
                 "res://demo/${scene}.tscn")

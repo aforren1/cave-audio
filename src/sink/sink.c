@@ -159,11 +159,97 @@ static bool backend_compiled(bwa_sink_type t) {
  * rather than opening that backend's default device and playing into the wrong hardware. */
 static bool backend_has_device(bwa_sink_type backend, const char* device) {
     if (!device || !*device) return true;              /* no name = the backend's own default */
+    /* One enumeration where the backend has a one-pass answer: the generic loop below costs an
+     * enumeration per query, which for ASIO is a registry walk per name. */
+#ifdef BWA_HAVE_ASIO
+    if (backend == BWA_SINK_ASIO) return sink_asio_has_driver(device);
+#endif
+#ifdef BWA_HAVE_WASAPI
+    if (backend == BWA_SINK_WASAPI) return sink_wasapi_has_device(device);
+#endif
     const uint32_t n = sink_device_count(backend);
     char buf[256];
     for (uint32_t i = 0; i < n; ++i) {
         if (sink_device_name(backend, i, buf, sizeof buf) && strcmp(buf, device) == 0) return true;
         if (sink_device_id  (backend, i, buf, sizeof buf) && strcmp(buf, device) == 0) return true;
+    }
+    return false;
+}
+
+/* THE AUTO ORDER (docs/backends.md), in one place so the open and bwa_device_present read the
+ * same list. On Windows a 2-channel request is a headphone profile or the cave_both monitor, and
+ * the device the headphones are actually on is a WASAPI endpoint, not whichever ASIO driver
+ * happens to be registered first - the old auto-pick could land on the Digiface and play the
+ * monitor into Dante channels 1 and 2. Anything wider is the array, and the array's transport is
+ * a locked decision: ASIO, or nothing. Multichannel WASAPI is never chosen here, because reaching
+ * it means an exclusive-mode grab of a WDM device.
+ *
+ * Off Windows the width does not split the order, because nothing on those platforms carries the
+ * "this transport is the array's" decision: the same backend serves two channels and twenty-six.
+ * An entry whose backend this build does not carry (an option turned off) is skipped by
+ * backend_compiled. Returns the count; `order` holds at most 4. */
+static uint32_t auto_order(uint32_t channels, bwa_sink_type order[4]) {
+    uint32_t norder = 0;
+#if defined(_WIN32)
+    if (channels <= 2) order[norder++] = BWA_SINK_WASAPI;
+    order[norder++] = BWA_SINK_ASIO;
+#elif defined(__APPLE__)
+    /* CoreAudio at every width. A HAL device shows its raw channel count, so the same backend
+     * serves the headphones and, where the device has the outputs, the array. A desk Mac asked
+     * for an array it has no outputs for fails this open and lands on the offline sink, with the
+     * channel counts on the degradation channel. */
+    (void)channels;
+    order[norder++] = BWA_SINK_COREAUDIO;
+#elif defined(__EMSCRIPTEN__)
+    /* Before __linux__ and __APPLE__: Emscripten defines neither, but it DOES define __unix__ via
+     * its sysroot, and a plain elseif chain that reached a host-platform branch here would offer a
+     * backend no browser carries. A wider request falls straight through to the offline sink, the
+     * same answer Android gives for the same reason - a page has no array transport. */
+    if (channels <= 2) order[norder++] = BWA_SINK_WORKLET;
+#elif defined(__ANDROID__)
+    if (channels <= 2) order[norder++] = BWA_SINK_AAUDIO;
+#elif defined(__linux__)
+    /* JACK first on Linux, at EVERY width. It is the production path (a rig box runs a server, and
+     * a desktop's PipeWire answers the same libjack), and jack_client_open carries JackNoStartServer
+     * so a box with neither falls through to ALSA in about 4 ms (JACK2's own retry sleeps; tens of
+     * microseconds when libjack is not installed at all) instead of forking a jackd. Measured
+     * 2026-11-12 under WSL, JACK2 with no server. */
+    (void)channels;
+    order[norder++] = BWA_SINK_JACK;
+    order[norder++] = BWA_SINK_ALSA;
+#else
+    (void)channels; (void)order;
+#endif
+    return norder;
+}
+
+/* Named as the sink, these four hand `device` to something other than their own list: JACK to
+ * jack_get_ports as a pattern, ALSA to snd_pcm_open as any PCM string, AAudio as a decimal id,
+ * the browser sink as a context handle. Their lists therefore cannot call a named device missing,
+ * and the answer for one is "present" wherever the backend EXISTS. A build that does not carry
+ * the backend is not the rig that named it: a Linux rig's "hw:1,0" opened on a Windows desk is
+ * missing, and bwa_start there fails with "this build has no alsa backend".
+ * Under AUTO the list IS consulted for them (backend_has_device), so this is about the named
+ * sink only. */
+static bool opens_unlisted(bwa_sink_type t) {
+    return t == BWA_SINK_JACK || t == BWA_SINK_ALSA || t == BWA_SINK_AAUDIO || t == BWA_SINK_WORKLET;
+}
+
+/* bwa_device_present. For AUTO this is the open loop below with the open taken out: the same
+ * order, the same two skips. A named device asks backend_has_device; no device asks whether the
+ * backend lists anything at all, since "the backend's default" needs a device to be. */
+bool sink_device_present(bwa_sink_type sink, uint32_t channels, const char* device) {
+    const bool named = device && *device;
+    if (sink == BWA_SINK_NULL || sink == BWA_SINK_MANUAL) return true;
+    if (sink != BWA_SINK_AUTO) {
+        if (named && opens_unlisted(sink)) return backend_compiled(sink);
+        return named ? backend_has_device(sink, device) : sink_device_count(sink) > 0;
+    }
+    bwa_sink_type order[4];
+    const uint32_t norder = auto_order(channels, order);
+    for (uint32_t i = 0; i < norder; ++i) {
+        if (!backend_compiled(order[i])) continue;
+        if (named ? backend_has_device(order[i], device) : sink_device_count(order[i]) > 0) return true;
     }
     return false;
 }
@@ -257,45 +343,8 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
         return NULL;
     }
 
-    /* THE AUTO ORDER (docs/backends.md). On Windows a 2-channel request is a headphone profile or
-     * the cave_both monitor, and the device the headphones are actually on is a WASAPI endpoint,
-     * not whichever ASIO driver happens to be registered first — the old auto-pick could land on
-     * the Digiface and play the monitor into Dante channels 1 and 2. Anything wider is the array,
-     * and the array's transport is a locked decision: ASIO, or nothing. Multichannel WASAPI is
-     * never chosen here, because reaching it means an exclusive-mode grab of a WDM device.
-     *
-     * Off Windows the width does not split the order, because nothing on those platforms carries
-     * the "this transport is the array's" decision: the same backend serves two channels and
-     * twenty-six. An entry whose backend this build does not carry (an option turned off) is
-     * skipped by backend_compiled. */
     bwa_sink_type order[4];
-    uint32_t norder = 0;
-#if defined(_WIN32)
-    if (channels <= 2) order[norder++] = BWA_SINK_WASAPI;
-    order[norder++] = BWA_SINK_ASIO;
-#elif defined(__APPLE__)
-    /* CoreAudio at every width. A HAL device shows its raw channel count, so the same backend
-     * serves the headphones and, where the device has the outputs, the array. A desk Mac asked
-     * for an array it has no outputs for fails this open and lands on the offline sink below,
-     * with the channel counts on the degradation channel. */
-    order[norder++] = BWA_SINK_COREAUDIO;
-#elif defined(__EMSCRIPTEN__)
-    /* Before __linux__ and __APPLE__: Emscripten defines neither, but it DOES define __unix__ via
-     * its sysroot, and a plain elseif chain that reached a host-platform branch here would offer a
-     * backend no browser carries. A wider request falls straight through to the offline sink, the
-     * same answer Android gives for the same reason - a page has no array transport. */
-    if (channels <= 2) order[norder++] = BWA_SINK_WORKLET;
-#elif defined(__ANDROID__)
-    if (channels <= 2) order[norder++] = BWA_SINK_AAUDIO;
-#elif defined(__linux__)
-    /* JACK first on Linux, at EVERY width. It is the production path (a rig box runs a server, and
-     * a desktop's PipeWire answers the same libjack), and jack_client_open carries JackNoStartServer
-     * so a box with neither falls through to ALSA in about 4 ms (JACK2's own retry sleeps; tens of
-     * microseconds when libjack is not installed at all) instead of forking a jackd. Measured
-     * 2026-11-12 under WSL, JACK2 with no server. */
-    order[norder++] = BWA_SINK_JACK;
-    order[norder++] = BWA_SINK_ALSA;
-#endif
+    const uint32_t norder = auto_order(channels, order);   /* shared with sink_device_present */
 
     char first_err[256] = {0};
     bool tried = false;               /* did any backend get as far as an open attempt? */

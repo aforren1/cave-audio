@@ -25,6 +25,11 @@ if(NOT DEFINED MIN_EDIT_TESTS)        # DEFINED, so an explicit 0 is honored
   set(MIN_EDIT_TESTS 14)
 endif()
 
+# Forward slashes only: PROJECT_DIR goes into manifest.json as a `file:` path, and a backslash from
+# %LOCALAPPDATA% is a bad JSON escape there. Unity then resolves no packages and exits 1.
+file(TO_CMAKE_PATH "${PROJECT_DIR}" PROJECT_DIR)
+file(TO_CMAKE_PATH "${REPO}" REPO)
+
 set(pkg_live "${REPO}/bindings/unity")
 set(pkg      "${PROJECT_DIR}/pkg/com.brainworks.bw_audio")
 set(plugin   "${pkg_live}/Runtime/Plugins/x86_64/bw_audio.dll")

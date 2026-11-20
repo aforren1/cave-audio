@@ -157,6 +157,12 @@ namespace BwAudio
             return Exists;
         }
 
+        // SourceBase.DeferToEngineStart, same rule: a play or stop made between the Engine's Awake and
+        // its Start is held and made again once the native engine is up. A held play replaces the
+        // auto-play when it RUNS, not when it is held: a held call can be dropped.
+        bool Defer(System.Action call, bool isPlay)
+            => Engine.DeferToStart(this, () => { if (isPlay) _autoPlayDone = true; TryInit(); call(); });
+
         // ---- the event feed, driven by Engine (see Engine.RegisterBed) -------------------------------
 
         // The native handle, for Engine's handle -> component route. 0 when the create failed.
@@ -229,6 +235,7 @@ namespace BwAudio
         /// the block its data lands.</summary>
         public void Play(string clipOverride = null)
         {
+            if (!Live && Defer(() => Play(clipOverride), true)) return;
             if (Resolve(clipOverride, out uint snd)) Bwa.bwa_bed_play(Eng, _bed, snd, loop);
         }
 
@@ -241,6 +248,7 @@ namespace BwAudio
         /// </summary>
         public void PlayAt(ulong startSample, string clipOverride = null)
         {
+            if (!Live && Defer(() => PlayAt(startSample, clipOverride), true)) return;
             if (Resolve(clipOverride, out uint snd)) Bwa.bwa_bed_play_at(Eng, _bed, snd, loop, startSample);
         }
 
@@ -249,6 +257,7 @@ namespace BwAudio
         /// `loop` field does not apply here.</summary>
         public void PlayLoop(ulong loopBeg, ulong loopEnd, string clipOverride = null)
         {
+            if (!Live && Defer(() => PlayLoop(loopBeg, loopEnd, clipOverride), true)) return;
             if (Resolve(clipOverride, out uint snd)) Bwa.bwa_bed_play_loop(Eng, _bed, snd, loopBeg, loopEnd);
         }
 
@@ -344,6 +353,7 @@ namespace BwAudio
             bool live = LiveForPlayback();       // before Start: the auto-play first, then this stop
             _pending = 0;                        // the engine cancels a held play on stop; stop watching it
             if (live) Bwa.bwa_bed_stop(Eng, _bed);
+            else Defer(Stop, false);
         }
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate FRAMES (latest-wins

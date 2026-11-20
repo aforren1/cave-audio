@@ -3,6 +3,7 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -37,6 +38,7 @@ static String to_os_path(const String &p) {
 }
 
 void BwaEngine::_ready() {
+	fallback_taken = false; /* before every return below: a re-entered node starts clean */
 	if (Engine::get_singleton()->is_editor_hint()) {
 		editor_watch = true; // ...but do keep the room_origin warnings current
 		set_process(true);
@@ -63,18 +65,58 @@ void BwaEngine::_ready() {
 				BWA_VERSION_MINOR, BWA_VERSION_PATCH));
 	}
 
+	/* The desk fallback, decided here: before bwa_create, from the device lists. Never after a
+	 * failed bwa_start: a device that is present and will not open is a rig fault, and the rig
+	 * must say so. */
+	Profile use_profile = profile;
+	Sink use_sink = sink;
+	String use_device = device;
+	int use_flags = sink_flags;
+	/* The gate is the editor, not is_debug_build(): see the header. */
+	const bool fallback_allowed = fallback_profile != FALLBACK_NONE
+			&& (!fallback_only_in_editor || OS::get_singleton()->has_feature("editor"));
+	if (fallback_allowed && !is_device_present(profile, sink, device)) {
+		use_profile = (Profile)fallback_profile;
+		use_sink = fallback_sink;
+		use_device = fallback_device;
+		use_flags = fallback_sink_flags;
+		fallback_taken = true;
+		active_profile = use_profile;
+		UtilityFunctions::push_warning(vformat(
+				"BwaEngine: DESK FALLBACK: the primary device is not on this machine (profile %d, "
+				"sink %d, device %s). Running profile %d on sink %d, device %s instead. "
+				"is_using_fallback() is true.",
+				(int)profile, (int)sink,
+				device.is_empty() ? String("(default)") : String("'") + device + "'",
+				(int)use_profile, (int)use_sink,
+				use_device.is_empty() ? String("(default)") : String("'") + use_device + "'"));
+	}
+
+	/* Binaural drives no speakers: the layout only places the virtual speakers the diffuse bed
+	 * decodes through, and the default grid serves that. The refusal exists so the ARRAY never
+	 * pans over the wrong room, so a desk scene must not go silent for want of a file it does not
+	 * need, whether Binaural is the profile or the fallback. A file that exists still has to
+	 * load. Cave, CaveSim and CaveBoth pan over the layout and keep the refusal. */
+	bool pass_layout = !layout_path.is_empty();
+	if (pass_layout && use_profile == PROFILE_BINAURAL && !FileAccess::file_exists(layout_path)) {
+		UtilityFunctions::print(vformat(
+				"BwaEngine: Binaural: no layout at \"%s\", so the diffuse bed decodes through the "
+				"built-in default grid. The array profiles need the file.", layout_path));
+		pass_layout = false;
+	}
+
 	const CharString layout_utf8 = to_os_path(layout_path).utf8();
-	const CharString device_utf8 = device.utf8();
+	const CharString device_utf8 = use_device.utf8();
 
 	bwa_desc cfg = {};
-	cfg.profile = (bwa_profile)profile;
-	cfg.layout_path = layout_path.is_empty() ? nullptr : layout_utf8.get_data();
+	cfg.profile = (bwa_profile)use_profile;
+	cfg.layout_path = pass_layout ? layout_utf8.get_data() : nullptr;
 	cfg.hrtf_path = nullptr;
 	cfg.sample_rate = (uint32_t)sample_rate;
 	cfg.block_size = (uint32_t)block_size;
-	cfg.sink = (bwa_sink_type)sink;
-	cfg.device = device.is_empty() ? nullptr : device_utf8.get_data();
-	cfg.sink_flags = (uint32_t)sink_flags;
+	cfg.sink = (bwa_sink_type)use_sink;
+	cfg.device = use_device.is_empty() ? nullptr : device_utf8.get_data();
+	cfg.sink_flags = (uint32_t)use_flags;
 	cfg.embree = embree;
 	cfg.enable_pathing = enable_pathing;
 	cfg.bed_decoder = (bwa_bed_decoder)bed_decoder;
@@ -82,6 +124,7 @@ void BwaEngine::_ready() {
 	eng = bwa_create(&cfg);
 	if (!eng) {
 		UtilityFunctions::push_error("BwaEngine: bwa_create failed");
+		fallback_taken = false; /* a fallback that did not start is not in use */
 		return;
 	}
 	/* A failed layout load is NOT fatal — the core falls back to the 26-speaker default
@@ -114,10 +157,30 @@ void BwaEngine::_ready() {
 				err ? String(err) : String("no detail")));
 		bwa_destroy(eng);
 		eng = nullptr;
+		fallback_taken = false;
 		return;
 	}
 
 	singleton = this;
+
+	/* The fallback was set and allowed, the device lists said the primary is here, and AUTO still
+	 * ended on the offline sink: the device is listed and did not open. The check cannot see
+	 * that, so the scene is silent, and that must not pass quietly. */
+	if (fallback_allowed && !fallback_taken && sink != SINK_NULL && sink != SINK_MANUAL
+			&& bwa_get_sink_type(eng) == BWA_SINK_NULL) {
+		const char *why = bwa_last_error(eng);
+		UtilityFunctions::push_error(vformat(
+				"BwaEngine: NO AUDIO, and the desk fallback did NOT trigger: the primary device "
+				"(profile %d, sink %d, device %s) is listed on this machine but did not open, so "
+				"the engine runs the silent offline sink. Reason: %s. The check reads device "
+				"lists: an installed driver with its hardware unplugged, too few channels, a "
+				"busy device or a wrong rate all read as present. On the rig: fix the device. At "
+				"a desk: set profile to %s by hand for this machine.",
+				(int)profile, (int)sink,
+				device.is_empty() ? String("(default)") : String("'") + device + "'",
+				why ? String(why) : String("none given"),
+				fallback_profile == FALLBACK_BINAURAL ? "Binaural" : "CaveSim"));
+	}
 
 	/* Replay everything authored in the inspector before the engine existed. */
 	bwa_set_master_gain(eng, master_gain);
@@ -293,6 +356,7 @@ void BwaEngine::_exit_tree() {
 	if (singleton == this) {
 		singleton = nullptr;
 	}
+	fallback_taken = false; /* before the no-engine return: nothing runs on the fallback now */
 	if (!eng) {
 		return;
 	}
@@ -1493,6 +1557,14 @@ String BwaEngine::get_device_id(Sink backend, int index) {
 	return String::utf8(buf);
 }
 
+/* The engine's own answer (bwa_device_present): the rule, the AUTO order for this platform and
+ * the rule-10 match all live in src/sink/sink.c, next to the open they describe. */
+bool BwaEngine::is_device_present(Profile p_profile, Sink p_sink, const String &p_device) {
+	const CharString dev = p_device.utf8();
+	return bwa_device_present((bwa_profile)p_profile, (bwa_sink_type)p_sink,
+			p_device.is_empty() ? nullptr : dev.get_data());
+}
+
 PackedStringArray BwaEngine::get_devices(Sink backend) {
 	const int n = get_device_count(backend);
 	PackedStringArray out;
@@ -1616,8 +1688,39 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 	 * the one path whose transport is fixed to ASIO.
 	 * WINDOWS ONLY: elsewhere the array has no ASIO to miss. It opens through JACK, ALSA or
 	 * CoreAudio on any device with enough outputs, and the binding cannot count those from here. */
+	/* With a fallback set, the same machine is not silent: say what a run here will do. */
+	const bool has_fallback = fallback_profile != FALLBACK_NONE;
+	bool primary_here = true;
+	if (has_fallback) {
+		/* Asked again only when a property it depends on is set, never on a timer: the query
+		 * reads the registry (and opens a JACK probe client on Linux), and this function runs on
+		 * every step of a room_origin drag in the editor. A device plugged in later shows when
+		 * the scene is reopened or one of those properties is set. */
+		if (!warn_present_valid) {
+			warn_present_valid = true;
+			warn_present = is_device_present(profile, sink, device);
+		}
+		primary_here = warn_present;
+	}
+	if (has_fallback && !primary_here) {
+		w.push_back(vformat("The primary device%s is not listed on this machine, so a run from "
+							"the editor here takes the desk fallback (%s).%s",
+				device.is_empty() ? String() : String(" (\"") + device + "\")",
+				fallback_profile == FALLBACK_BINAURAL ? "Binaural" : "CaveSim",
+				fallback_only_in_editor ? " An export does not."
+										: " So does an export: a typo in Device on the rig then "
+										  "plays to headphones and does not fail the start."));
+	}
+	if (has_fallback && device.is_empty() && sink != SINK_NULL && sink != SINK_MANUAL
+			&& (profile == PROFILE_CAVE || profile == PROFILE_CAVE_BOTH)) {
+		w.push_back("A fallback is set, but Device is empty on an array profile. The check then "
+					"only asks whether the backend lists ANY device (any installed ASIO driver on "
+					"Windows), which cannot tell a desk from the rig: a desk with a driver "
+					"installed starts the array, fails to open it, and is silent. Put the rig's "
+					"device name in Device.");
+	}
 #ifdef _WIN32
-	if (profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
+	if (!has_fallback && profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
 			&& BwaEngine::get_asio_driver_count() == 0) {
 		w.push_back("Profile is Cave (the speaker-array rig) but no ASIO driver is installed, so "
 					"this machine will render the array to nothing and you will hear silence. "
@@ -1670,10 +1773,18 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 		/* A failed layout load is not fatal at create: the core falls back to the 26-speaker
 		 * grid, quietly changing the channel count on a smaller rig. bwa_start does refuse
 		 * the fallback, so this is about catching it before a run rather than after. */
-		if (!FileAccess::file_exists(layout_path)) {
-			w.push_back(vformat("Layout file not found: \"%s\". bwa_start will refuse to run "
-								"rather than fall back to the 26-speaker default grid.",
+		if (!FileAccess::file_exists(layout_path) && profile == PROFILE_BINAURAL) {
+			w.push_back(vformat("Layout file not found: \"%s\". Binaural drives no speakers, so "
+								"the engine runs the built-in default grid for the diffuse bed. "
+								"Cave, CaveSim and CaveBoth need the file and refuse to start "
+								"without it.",
 					layout_path));
+		} else if (!FileAccess::file_exists(layout_path)) {
+			w.push_back(vformat("Layout file not found: \"%s\". bwa_start will refuse to run "
+								"rather than fall back to the 26-speaker default grid.%s",
+					layout_path,
+					fallback_profile == FALLBACK_BINAURAL
+							? " The Binaural desk fallback runs without it." : ""));
 		} else if (layout_path.begins_with("res://")) {
 			w.push_back("The core opens files by OS path, not through Godot's virtual "
 						"filesystem. A res:// layout works in the editor but will not exist "
@@ -1706,6 +1817,12 @@ void BwaEngine::_bind_methods() {
 	M(set_device, "name"); M0(get_device);
 	M(set_asio_driver, "name"); M0(get_asio_driver);   /* the old spelling of set_device */
 	M(set_sink_flags, "flags"); M0(get_sink_flags);
+	M(set_fallback_profile, "profile"); M0(get_fallback_profile);
+	M(set_fallback_sink, "sink"); M0(get_fallback_sink);
+	M(set_fallback_device, "name"); M0(get_fallback_device);
+	M(set_fallback_sink_flags, "flags"); M0(get_fallback_sink_flags);
+	M(set_fallback_only_in_editor, "on"); M0(get_fallback_only_in_editor);
+	M0(is_using_fallback); M0(get_active_profile);
 	M(set_sample_rate, "hz"); M0(get_sample_rate);
 	M(set_block_size, "frames"); M0(get_block_size);
 	M(set_bed_decoder, "decoder"); M0(get_bed_decoder);
@@ -1828,6 +1945,9 @@ void BwaEngine::_bind_methods() {
 			&BwaEngine::get_device_name);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_device_id", "backend", "index"),
 			&BwaEngine::get_device_id);
+	ClassDB::bind_static_method("BwaEngine",
+			D_METHOD("is_device_present", "profile", "sink", "device"),
+			&BwaEngine::is_device_present);
 	ClassDB::bind_static_method(
 			"BwaEngine", D_METHOD("get_asio_drivers"), &BwaEngine::get_asio_drivers);
 	ClassDB::bind_static_method(
@@ -1871,6 +1991,30 @@ void BwaEngine::_bind_methods() {
 			"set_sink_flags", "get_sink_flags");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sample_rate"), "set_sample_rate", "get_sample_rate");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "block_size"), "set_block_size", "get_block_size");
+
+	/* The desk fallback: what a rig scene runs on a machine without the rig's device. Its own
+	 * group, so the rig's settings above read as the rig's and stay untouched. */
+	ADD_GROUP("Device Fallback", "fallback_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "fallback_profile", PROPERTY_HINT_ENUM,
+						 "None - off:0,"
+						 "Binaural - headphones, direct render:1,"
+						 "CaveSim - headphones, auditions the array:2"),
+			"set_fallback_profile", "get_fallback_profile");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "fallback_sink", PROPERTY_HINT_ENUM,
+						 "Auto:0,ASIO - the rig:1,Null - silent/offline:2,Manual - render_block:3,"
+						 "WASAPI - Windows endpoint:4,CoreAudio - macOS device:5,"
+						 "ALSA - Linux PCM:6,AAudio - Android stereo:7,JACK - Linux ports:8"),
+			"set_fallback_sink", "get_fallback_sink");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "fallback_device"), "set_fallback_device",
+			"get_fallback_device");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "fallback_sink_flags", PROPERTY_HINT_FLAGS,
+						 "Exclusive - take the device:1,"
+						 "ExactRate - fail rather than resample:2,"
+						 "TightBuffer - smallest device buffer:4,"
+						 "DeepBuffer - browser sink only:8"),
+			"set_fallback_sink_flags", "get_fallback_sink_flags");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "fallback_only_in_editor"),
+			"set_fallback_only_in_editor", "get_fallback_only_in_editor");
 
 	ADD_GROUP("Room", "");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "layout_path", PROPERTY_HINT_FILE, "*.json"),
@@ -1984,6 +2128,8 @@ void BwaEngine::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(PROFILE_CAVE); BIND_ENUM_CONSTANT(PROFILE_BINAURAL);
 	BIND_ENUM_CONSTANT(PROFILE_CAVE_SIM); BIND_ENUM_CONSTANT(PROFILE_CAVE_BOTH);
+	BIND_ENUM_CONSTANT(FALLBACK_NONE); BIND_ENUM_CONSTANT(FALLBACK_BINAURAL);
+	BIND_ENUM_CONSTANT(FALLBACK_CAVE_SIM);
 	BIND_ENUM_CONSTANT(SINK_AUTO); BIND_ENUM_CONSTANT(SINK_ASIO);
 	BIND_ENUM_CONSTANT(SINK_NULL); BIND_ENUM_CONSTANT(SINK_MANUAL);
 	BIND_ENUM_CONSTANT(SINK_WASAPI); BIND_ENUM_CONSTANT(SINK_COREAUDIO);

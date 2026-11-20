@@ -91,9 +91,12 @@ namespace BwAudio.Tests
 
         /// <summary>Stand up an Engine on the offline sink. Fields are set while the GameObject is
         /// INACTIVE so Awake sees them: an active AddComponent runs Awake immediately, against the
-        /// inspector defaults (which include a layout file this project does not ship).</summary>
+        /// inspector defaults. On return Awake has run and Start has NOT: the Engine holds
+        /// Instance and the room registration, and the native engine comes up in Start. Yield
+        /// <see cref="Started"/> before using it.</summary>
         /// <param name="configure">Runs on the inactive Engine, after the defaults above, so a test
-        /// can set what Awake reads (profile, roomOrigin, ownsAudio).</param>
+        /// can set what Awake and Start read (profile, roomOrigin, ownsAudio), and add components
+        /// that must wake in the same activation as the Engine.</param>
         public static Engine CreateEngine(Action<Engine> configure = null)
         {
             var go = new GameObject("bwa_test_engine");
@@ -105,10 +108,29 @@ namespace BwAudio.Tests
             eng.sampleRate = SampleRate;
             eng.blockSize = BlockSize;
             eng.feedListener = true;
-            eng.listener = go.transform;             // assigned so Awake does not warn about a dead pose
+            eng.listener = go.transform;             // assigned so Start does not warn about a dead pose
             configure?.Invoke(eng);
-            go.SetActive(true);                      // -> Awake -> bwa_create + bwa_start
+            go.SetActive(true);                      // -> Awake. Start (bwa_create + bwa_start) is Unity's to call
             return eng;
+        }
+
+        /// <summary>An Engine that is started on return (Engine.StartNow), for a test that only needs
+        /// a running engine. Tests about WHEN the engine starts use <see cref="CreateEngine"/> and
+        /// <see cref="Started"/>, which leave the start to Unity's own Start call.</summary>
+        public static Engine CreateStartedEngine(Action<Engine> configure = null)
+        {
+            var eng = CreateEngine(configure);
+            eng.StartNow();
+            return eng;
+        }
+
+        /// <summary>Turn frames until the Engine's Start has run (Engine.Decided). Unity calls Start
+        /// before the next Update, so this is one frame. Bounded, so a Start that never comes fails
+        /// the caller's next assert and does not hang the run.</summary>
+        public static IEnumerator Started(Engine eng)
+        {
+            var sw = Stopwatch.StartNew();
+            while (eng && !eng.Decided && sw.Elapsed.TotalSeconds < 10.0) yield return null;
         }
 
         /// <summary>Tear an Engine (and anything parented to it) down synchronously, so the next test

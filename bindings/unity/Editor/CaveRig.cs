@@ -100,8 +100,8 @@ namespace BwAudio.EditorTools
         {
             created = false;
             // AddComponent in Play mode runs Engine.Awake at once, before any field below is set:
-            // the native engine would start on the inspector defaults with no origin, and the whole
-            // rig would vanish on Stop.
+            // the Engine would register the room with no origin, and the whole rig would vanish on
+            // Stop.
             if (Application.isPlaying)
             {
                 Debug.Log("[bw_audio] CAVE Rig: not in Play mode. The Engine would start before it " +

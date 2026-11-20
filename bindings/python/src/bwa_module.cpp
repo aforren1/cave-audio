@@ -410,6 +410,11 @@ NB_MODULE(_bwa, m) {
         if (!bwa_get_device_id(b, i, buf, (uint32_t)sizeof buf)) return std::nullopt;
         return std::string(buf);
     }, "backend"_a, "index"_a, "The device's stable id, or None. Prefer it when you persist a choice.");
+    m.def("device_present", [](bwa_profile p, bwa_sink_type s, std::optional<std::string> device) {
+        return bwa_device_present(p, s, device && !device->empty() ? device->c_str() : nullptr);
+    }, "profile"_a, "sink"_a, "device"_a.none() = nb::none(),
+       "Is the device a (profile, sink, device) request would open LISTED on this machine. "
+       "Opens nothing. True is not 'it will open': an installed driver with no hardware is listed.");
     m.def("get_asio_driver_count", &bwa_get_asio_driver_count);
     m.def("get_asio_driver_name", [](uint32_t i) -> std::optional<std::string> {
         char buf[512];

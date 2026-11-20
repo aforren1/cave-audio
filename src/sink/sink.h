@@ -263,6 +263,11 @@ void         bwa_sink_get_health(bwa_sink* s, bwa_sink_health* out);
 uint32_t sink_device_count(bwa_sink_type backend);
 bool     sink_device_name (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
 bool     sink_device_id   (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+/* Behind bwa_device_present (bw_audio.h has the rule): is the device a bwa_sink_open with these
+ * arguments would look for LISTED. `channels` matters only under AUTO, where it picks the order
+ * (2 or fewer is the stereo order). It shares the AUTO order and the rule-10 match with
+ * bwa_sink_open, so the two cannot disagree about which backends a name reaches. Opens nothing. */
+bool     sink_device_present(bwa_sink_type sink, uint32_t channels, const char* device);
 
 /* Backend constructors used by bwa_sink_open. null is always present; asio only when
  * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
@@ -281,6 +286,9 @@ bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
  * it (the one place ASIO lives). */
 uint32_t sink_asio_driver_count(void);
 bool     sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
+/* Is `name` (UTF-8) a registered driver. ONE registry walk; the count/name pair costs one per
+ * call, so asking them about n drivers is n + 1 walks at about 40 ms each. */
+bool     sink_asio_has_driver(const char* name);
 #endif
 
 #ifdef BWA_HAVE_WASAPI
@@ -295,6 +303,9 @@ bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_size, uint32
 uint32_t sink_wasapi_device_count(void);
 bool     sink_wasapi_device_name(uint32_t index, char* buf, uint32_t cap);
 bool     sink_wasapi_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* Does a render endpoint carry `device` as its friendly name or its id (rule 10), on ONE
+ * enumerator: the resolve the open itself does. */
+bool     sink_wasapi_has_device(const char* device);
 /* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): the shared-mode underrun rule
  * is only armed when the endpoint's buffer is deeper than one period, so the sink test has to know
  * which of the two cases the machine it runs on presents. Control thread, on an open sink. */

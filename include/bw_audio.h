@@ -337,6 +337,36 @@ BWA_API bool     bwa_get_device_name(bwa_sink_type backend, uint32_t index, char
  * when you persist a choice, or when two devices share a friendly name (a headset and a dock
  * often do). ASIO has no separate id, so it reports the driver name. False = out of range. */
 BWA_API bool     bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+/* Is the device a (profile, sink, device) request would open LISTED on this machine? Control
+ * thread, no engine, and like the three calls above it loads, initializes and opens nothing: it
+ * reads the same lists. ASIO and WASAPI are read in one pass; the other backends cost one
+ * enumeration per listed device. `device` is bwa_desc.device (NULL or "" = the backend's
+ * default). The bindings' opt-in desk fallback asks this before bwa_create.
+ *   NULL, MANUAL                         true: they open no device.
+ *   ASIO, WASAPI, COREAUDIO + a device   that backend lists the exact name or id (rule 10).
+ *   any named backend, no device         that backend lists at least one device.
+ *   JACK, ALSA, AAUDIO, WORKLET + device true where this build carries that backend. Named as
+ *                                        the sink, these open strings their own list never held
+ *                                        (a JACK port pattern, an ALSA PCM such as hw:0,0, an
+ *                                        AAudio id), so the list cannot call one missing. False
+ *                                        in a build without the backend: that machine is not
+ *                                        the rig that named it.
+ *   AUTO                                 some backend AUTO would try on THIS platform for this
+ *                                        profile's width lists it (the name or id, or with no
+ *                                        device at least one device). CAVE and CAVE_BOTH are the
+ *                                        array width, BINAURAL and CAVE_SIM stereo. With a
+ *                                        device name this is the engine's own AUTO rule: the
+ *                                        same order and the same match, so bwa_start skips a
+ *                                        backend exactly when this does. With no name bwa_start
+ *                                        skips nothing (it tries each backend's default), and
+ *                                        this asks only whether there is a device to try.
+ * CAVE_BOTH opens two devices. This checks the primary (the array) only, never the monitor.
+ * A backend this build does not carry lists nothing and opens nothing, so it is never present.
+ * An unknown profile reads as stereo.
+ * True is NOT "it will open": an ASIO driver is listed when it is installed, with or without its
+ * hardware; ALSA and CoreAudio list a default device on any machine; too few channels, a wrong
+ * rate or another owner all read as listed. False is exact: bwa_start cannot open it. */
+BWA_API bool     bwa_device_present(bwa_profile profile, bwa_sink_type sink, const char* device);
 /* The ASIO-only spelling, kept because both bindings and the calibration tools call it: exactly
  * bwa_get_device_count/_name with backend = BWA_SINK_ASIO. */
 BWA_API uint32_t bwa_get_asio_driver_count(void);

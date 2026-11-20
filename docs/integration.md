@@ -292,7 +292,7 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   `bwa_get_bus_levels`, `bwa_set_test_signal`, `bwa_get_speakers` / `bwa_get_channel_count`
   (the layout's speaker count; see "Channel count" above; size meter/speaker
   arrays with it, never a hard-coded count); and the engine-free device enumeration
-  `bwa_get_device_count` / `bwa_get_device_name` / `bwa_get_device_id`
+  `bwa_get_device_count` / `bwa_get_device_name` / `bwa_get_device_id` / `bwa_device_present`
   (`Engine.DeviceCount` / `DeviceName` / `DeviceId` / `Devices`, and Godot's
   `BwaEngine.get_devices(backend)`; static, for a device picker before `bwa_create`).
   Pass a concrete backend: `BwaSinkType.Asio` for ASIO drivers, `BwaSinkType.Wasapi`
@@ -440,7 +440,7 @@ origin's forward becomes room +z and its right becomes room -x.
 ### Clusters
 
 A cluster runs the same scene on several render nodes, and exactly one of them may open the audio
-device. Keep the CAVE Rig in the scene on every node and let each node decide in `Engine.Awake`:
+device. Keep the CAVE Rig in the scene on every node and let each node decide in `Engine.Start`:
 
 - **`Engine.OwnsAudioPredicate`**: a static `Func<bool>`. Set it before the scene loads, from a
   `[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]` method that asks
@@ -448,9 +448,21 @@ device. Keep the CAVE Rig in the scene on every node and let each node decide in
 - **`Engine.ownsAudio`**: the per-scene switch, on by default. An `Engine` owns audio only when
   both say yes. `Engine.OwnsAudio` reports the decision.
 
-The decision is made once, in `Engine.Awake` (execution order -100), so your toolkit must know the
-node's role by then, and it cannot change while that `Engine` lives. A predicate that throws is
-logged and read as "not the owner". The predicate is cleared on every entry into Play mode.
+The decision is made once, in `Engine.Start`, and it cannot change while that `Engine` lives.
+`Start` runs after every `Awake` in the scene, whatever the script execution orders are. A toolkit
+that learns the node's role in its own `Awake` therefore has it in time, even when that `Awake`
+shares the `Engine`'s execution order of -100 (MiddleVR's manager does). A predicate that throws
+is logged and read as "not the owner". The predicate is cleared on every entry into Play mode.
+
+`Engine.Awake` does two things only: it claims `Engine.Instance` and applies **Room Origin**. So
+every node agrees on the room before the first `Start`, whoever owns audio. `Engine.Decided` turns
+true when `Start` has run. Until then `Engine.Ready` is false on every node, and components wait.
+
+If your toolkit learns the role later than `Awake`, save the scene with the `Engine` component
+disabled and enable it when the role is known. Unity holds `Start` until the enable, components
+keep waiting, and Room Origin is applied from `Awake` but not followed until then. Nothing is
+held while the `Engine` is disabled: a `Play` or `Stop` made then does nothing, as with no `Engine`
+in the scene. Auto-play still runs when the `Engine` starts.
 
 ```csharp
 static class AudioOwner {
@@ -497,6 +509,20 @@ em.loop = false;     // plays once, at Start, with these values
 - Every later disable and enable creates and auto-plays in `OnEnable`, as before.
 - `Emitter.clip` and `AmbisonicBed.clip` default to empty, which plays nothing and logs nothing.
 - A component that comes up before the `Engine` waits for it, beds included.
+- The `Engine` brings the native engine up in its `Start`, at execution order -100. A default-order
+  `Start` finds it running. An `Awake` or `OnEnable` in the same scene load does not:
+  `Engine.Ready` is false there, and `Engine.Load` returns 0. `Play`, `PlayAt`, `PlayLoop` and
+  `Stop` on an `Emitter` or `AmbisonicBed` are held and run when the `Engine` starts. A held call
+  whose component is inactive by then is dropped. Every other call is a no-op until then, as it is
+  with no `Engine` in the scene. Field values are kept and applied at create. `PlayOneShot` returns
+  false. An `Engine` call that is lost this way (`Load`, `SceneSetGround`, `SetGroupGain`) warns
+  once. `Engine.Paused` and the settings with an inspector field are kept and applied at start.
+- An `Engine` you add from a script is the same: `Ready` is false until its `Start`, which runs
+  before the next `Update`.
+- `Engine.StartNow()` brings the engine up at once, for code that needs `Ready` before the scene's
+  `Start`. It runs once: later calls do nothing, Unity's own `Start` included. Check `Ready`
+  afterwards. Do not call it from an `Awake` in a cluster scene. It asks `OwnsAudioPredicate` on
+  the spot, and your toolkit's `Awake` may not have run yet.
 - `AcousticGeometry` added, enabled or disabled after start joins or leaves the static mesh in the
   next `LateUpdate`, one rebuild per frame however many change. A disable and re-enable in the
   same frame still rebuilds. Geometry added after start misses a baked reflection probe grid
@@ -535,6 +561,10 @@ public sealed class Engine : MonoBehaviour {
     void Awake() {
         if (Instance != null) { Destroy(gameObject); return; }
         Instance = this; DontDestroyOnLoad(gameObject);
+    }
+    // Start, not Awake: the cluster ownership decision waits for every other Awake (see Clusters).
+    void Start() {
+        if (Instance != this) return;
         var cfg = new BwaDesc {
             profile = profile,
             layoutPath = System.IO.Path.Combine(Application.streamingAssetsPath, "cave_layout.json"),
@@ -1174,3 +1204,83 @@ the XR camera, and drive the same emitters and calls. In the CAVE: run `cave` (o
 `cave_both`) with `feedListener = false`. The core takes head pose straight from
 OptiTrack. Same build, same components, same control path; only the profile
 changes.
+
+### Test a rig scene at your desk
+
+You do not have to change the profile by hand. Both bindings carry an opt-in device fallback: a
+second profile, sink and device that the engine node uses when the primary device is not listed
+on the machine.
+
+| | Unity `Engine` | Godot `BwaEngine` |
+|---|---|---|
+| Fallback profile (None = off) | `fallbackProfile` | `fallback_profile` |
+| Its sink, device, flags | `fallbackSink`, `fallbackDevice`, `fallbackSinkFlags` | `fallback_sink`, `fallback_device`, `fallback_sink_flags` |
+| The gate (default on) | `fallbackOnlyInDevBuilds`: Editor and development builds | `fallback_only_in_editor`: a run from the editor |
+| Is it in use | `Engine.UsingFallback` | `is_using_fallback()` |
+| The profile that runs | `Engine.ActiveProfile` | `get_active_profile()` |
+| The check | `Engine.DevicePresent(profile, sink, device)` | `BwaEngine.is_device_present(profile, sink, device)` |
+
+Set the fallback profile to CaveSim or Binaural, leave its sink on Auto and its device empty, and
+keep the rig settings as they are. At a desk the node logs one `DESK FALLBACK` line and opens the
+default stereo output. On the rig nothing changes.
+
+The node decides before `bwa_create`, with one engine call: `bwa_device_present(profile, sink,
+device)` (docs/api.md, "Is the device here"). It reads the device lists and opens nothing. The
+primary device is present when:
+
+- **ASIO, WASAPI or CoreAudio, with a device name:** that backend lists the exact name or id.
+- **ASIO, WASAPI or CoreAudio, no device name:** that backend lists at least one device.
+- **JACK, ALSA, AAudio or Worklet, with a device name:** always, on a platform that has the
+  backend. These backends do not look the string up in their own list. JACK takes a port
+  pattern, ALSA any PCM string (`hw:0,0`, `plughw:1`, an asoundrc name), AAudio a numeric id. The
+  list cannot call such a device missing, and a rig must never read as a desk. On a platform
+  without the backend the device is missing: a Linux rig scene opened on a Windows desk takes the
+  fallback.
+- **JACK, ALSA, AAudio or Worklet, no device name:** the backend lists at least one device.
+- **Auto and a device name:** a backend that Auto offers this profile lists it, as the engine's
+  own Auto rule does. For Cave and CaveBoth that is ASIO on Windows, CoreAudio on macOS, JACK or
+  ALSA on Linux. A WASAPI endpoint does not count for the array, because Auto never gives the
+  array to WASAPI.
+- **Auto, no device name:** one of those backends lists at least one device.
+- **Null or Manual:** always. They open no device.
+
+CaveBoth opens two devices. Only the primary one, the array, is checked. The monitor is not.
+
+What the check cannot see:
+
+- **Whether the hardware is attached.** An ASIO driver is listed when it is installed. A laptop
+  with the RME driver and no Digiface reads as present. ALSA lists `default` whenever the library
+  loads, and CoreAudio always has an output device.
+- **Whether the device will open.** Too few channels, a wrong rate, or another owner all read as
+  present.
+- **Anything at all, with an empty device on an array profile.** The question is then "is any
+  driver installed". Both inspectors warn about that setup.
+
+A device that is listed and does not open is not a fallback. Under a named sink the start fails,
+as before. Under Auto the engine lands on the silent offline sink, as before, and the binding
+logs an error: the fallback did not trigger, the reason the open gave, and what to do (fix the
+device on the rig, or set the profile by hand at that desk). The node does not try the fallback
+after a failed `bwa_start`. On the rig a failed open is a fault you need to see.
+
+The gate, and what it costs:
+
+- Unity takes the fallback in the Editor and in development builds. Godot takes it only in a
+  run from the editor. Godot's gate is not `OS.is_debug_build()`, because "Export With Debug" is
+  on by default and a rig often runs such an export.
+- With the gate open, a missing device is no longer a failed start. A typo in `device`, or a
+  driver that is not installed, becomes a headphone fallback with one log line. Unity logs that
+  line as an error outside the Editor. Do not run the rig from a Unity development build with a
+  fallback set.
+- Clearing the toggle opens the gate in every build, with the same cost.
+
+What does not carry over:
+
+- Binaural skips the per-speaker align stage (trims, delays, correction filters, room EQ) by
+  design, and it runs without the layout file. CaveSim keeps the layout and models the room (each
+  speaker's distance, delay and directivity).
+- The primary's sink flags. The fallback has its own.
+- The tracker, in Unity. With `feedListener` off the rig reads the head from Motive. On the
+  fallback the `Engine` skips `bwa_tracker_connect`, and the listener follows the `listener`
+  Transform when one is assigned, or the main camera. One warning says which. In Godot a script
+  calls `tracker_connect` itself, so guard that call with `is_using_fallback()`.
+- A Unity cluster node that does not own audio opens nothing, the fallback included.

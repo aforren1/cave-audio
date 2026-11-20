@@ -34,6 +34,15 @@
 
 #include "os/os.h"          /* os_sleep_ms, os_fopen, os_remove */
 
+#if defined(_WIN32)
+#include <windows.h>        /* the COM-balance check: CoInitializeEx on the calling thread */
+#include <objbase.h>
+#undef small               /* rpcndr.h defines it as char, and this file has a buffer by that name */
+#if defined(_MSC_VER)
+#pragma comment(lib, "ole32.lib")
+#endif
+#endif
+
 #define SKIP_EXIT 77     /* ctest SKIP_RETURN_CODE; see CMakeLists.txt */
 #define LAYOUT    "bwa_cave_both_layout.json"
 
@@ -537,6 +546,175 @@ static int check_name_truncation(bwa_sink_type backend, const char* label) {
     return fail;
 }
 
+/* bwa_device_present, the whole rule through the public call. The fixed cases need no device and
+ * hold on every machine; the per-device ones run over whatever this box lists. NOBODY names a
+ * device no machine has. */
+#define NOBODY "bwa_test_no_such_device"
+
+/* Does this build carry `s`? Asked the only way the public ABI can say it: a named backend this
+ * build lacks fails bwa_start with "this build has no ..." (sink.c, try_backend). Independent of
+ * bwa_device_present, which is the thing under test. */
+static bool backend_in_build(bwa_sink_type s) {
+    bwa_desc d = { 0 };
+    d.profile = BWA_PROFILE_BINAURAL; d.sample_rate = 48000; d.block_size = 256; d.sink = s;
+    d.device = NOBODY;
+    bwa_engine* e = bwa_create(&d);
+    if (!e) return false;
+    bool in_build = true;
+    if (bwa_start(e) != BWA_OK) {
+        const char* why = bwa_last_error(e);
+        in_build = !(why && strstr(why, "this build has no"));
+    } else bwa_stop(e);
+    bwa_destroy(e);
+    return in_build;
+}
+
+#if defined(_WIN32)
+/* The ASIO SDK's driver list initializes COM apartment-threaded, ignores the failure on a thread
+ * that is already multithreaded, and uninitializes anyway. Unfixed, every ASIO enumeration drops
+ * one COM reference from an MTA caller (a WASAPI host, a multithreaded tool). So: make this
+ * thread MTA (one reference), enumerate, and ask whether the apartment is still there. A second
+ * initialize answers S_FALSE while it is, and S_OK once the calls have torn it down. */
+static int asio_com_balance_on_this_thread(void) {
+    if (bwa_get_device_count(BWA_SINK_ASIO) == 0) {
+        printf("       no ASIO driver listed: the COM balance is NOT exercised (the SDK list only "
+               "touches COM when it is non-empty)\n");
+        return 0;
+    }
+    const HRESULT first = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (first != S_OK) {
+        printf("       skip: this thread already has a COM apartment (0x%08lx)\n", (unsigned long)first);
+        if (SUCCEEDED(first)) CoUninitialize();
+        return 0;
+    }
+    char buf[64];
+    for (int i = 0; i < 4; ++i) {
+        bwa_get_device_count(BWA_SINK_ASIO);
+        bwa_get_device_name(BWA_SINK_ASIO, 0, buf, sizeof buf);
+        bwa_get_asio_driver_count();
+        bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_ASIO, NOBODY);
+        bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_AUTO, NOBODY);
+    }
+    const HRESULT again = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(again)) CoUninitialize();     /* the probe's reference */
+    if (again == S_FALSE) CoUninitialize();     /* ours, still held */
+    if (again != S_FALSE) {
+        fprintf(stderr, "FAIL: 20 ASIO enumerations on an MTA thread tore its COM apartment down "
+                        "(re-initialize returned 0x%08lx, want S_FALSE)\n", (unsigned long)again);
+        return 1;
+    }
+    printf("       20 ASIO enumerations on an MTA thread: the apartment is still initialized\n");
+    return 0;
+}
+/* On a thread of its own: the main thread already carries whatever apartment the earlier
+ * sections left it, and the check needs to own the one reference it counts. */
+static DWORD WINAPI asio_com_thread(LPVOID out) { *(int*)out = asio_com_balance_on_this_thread(); return 0; }
+static int check_asio_com_balance(void) {
+    int fail = 1;
+    HANDLE t = CreateThread(NULL, 0, asio_com_thread, &fail, 0, NULL);
+    if (!t) { fprintf(stderr, "FAIL: could not start the COM check thread\n"); return 1; }
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return fail;
+}
+#endif
+
+static int check_device_present(void) {
+    int fail = 0;
+#define WANT(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL: device_present: " __VA_ARGS__); \
+                                            fprintf(stderr, "\n"); fail = 1; } } while (0)
+    static const bwa_profile profiles[] = { BWA_PROFILE_CAVE, BWA_PROFILE_BINAURAL,
+                                            BWA_PROFILE_CAVE_SIM, BWA_PROFILE_CAVE_BOTH };
+    static const bwa_sink_type real[] = { BWA_SINK_ASIO, BWA_SINK_WASAPI, BWA_SINK_COREAUDIO,
+                                          BWA_SINK_ALSA, BWA_SINK_AAUDIO, BWA_SINK_JACK,
+                                          BWA_SINK_WORKLET };
+    for (size_t p = 0; p < sizeof profiles / sizeof *profiles; ++p) {
+        WANT(bwa_device_present(profiles[p], BWA_SINK_NULL, NULL),     "NULL needs no device");
+        WANT(bwa_device_present(profiles[p], BWA_SINK_NULL, NOBODY),   "NULL ignores the name");
+        WANT(bwa_device_present(profiles[p], BWA_SINK_MANUAL, ""),     "MANUAL needs no device");
+        WANT(!bwa_device_present(profiles[p], BWA_SINK_AUTO, NOBODY),  "AUTO found a device nobody has (profile %d)", (int)profiles[p]);
+    }
+    for (size_t b = 0; b < sizeof real / sizeof *real; ++b) {
+        const bwa_sink_type s = real[b];
+        /* JACK, ALSA, AAudio and the browser sink open strings their list never held, so a named
+         * device there is present wherever the build CARRIES the backend: the answer must never
+         * send a rig that names "hw:1,0" to headphones. In a build without the backend the same
+         * name is missing (that machine is a desk, and bwa_start would fail on it). The other
+         * three match the list. */
+        const bool unlisted = s == BWA_SINK_JACK || s == BWA_SINK_ALSA || s == BWA_SINK_AAUDIO ||
+                              s == BWA_SINK_WORKLET;
+        const bool in_build = backend_in_build(s);
+        const bool want_named = unlisted && in_build;
+        WANT(bwa_device_present(BWA_PROFILE_CAVE, s, NOBODY) == want_named, "sink %d + an unlisted name (in build: %d)", (int)s, (int)in_build);
+        WANT(bwa_device_present(BWA_PROFILE_BINAURAL, s, NOBODY) == want_named, "sink %d + an unlisted name, stereo", (int)s);
+        if (unlisted) WANT(bwa_device_present(BWA_PROFILE_CAVE, s, "hw:1,0") == in_build, "sink %d and hw:1,0 (in build: %d)", (int)s, (int)in_build);
+#if defined(_WIN32)
+        if (unlisted) WANT(!in_build, "a Windows build claims sink %d", (int)s);   /* pins the probe itself */
+#endif
+
+        const uint32_t n = bwa_get_device_count(s);
+        /* Every "its own name is present" check below sits inside the device loop, so with no
+         * device a matcher that always answered false would pass. Say so where it happens. */
+        if (n == 0 && s == BWA_SINK_ASIO)
+            printf("       no ASIO driver listed: the positive path (a listed name is present) is NOT exercised\n");
+        if (n == 0 && s == BWA_SINK_WASAPI)
+            printf("       no WASAPI endpoint listed: the positive path (a listed name is present) is NOT exercised\n");
+        WANT(bwa_device_present(BWA_PROFILE_CAVE, s, NULL) == (n > 0), "sink %d with no device (NULL)", (int)s);
+        WANT(bwa_device_present(BWA_PROFILE_CAVE, s, "")   == (n > 0), "sink %d with no device (\"\")", (int)s);
+        for (uint32_t i = 0; i < n; ++i) {
+            char name[256] = { 0 }, id[256] = { 0 }, longer[300];
+            if (!bwa_get_device_name(s, i, name, sizeof name) || !name[0]) continue;
+            bwa_get_device_id(s, i, id, sizeof id);
+            WANT(bwa_device_present(BWA_PROFILE_CAVE, s, name), "sink %d misses its own '%s'", (int)s, name);
+            if (id[0]) WANT(bwa_device_present(BWA_PROFILE_CAVE, s, id), "sink %d misses its own id '%s'", (int)s, id);
+            /* Exact: a listed name with more text after it is another device. */
+            snprintf(longer, sizeof longer, "%s_bwa_test_suffix", name);
+            if (!unlisted) WANT(!bwa_device_present(BWA_PROFILE_CAVE, s, longer), "sink %d matched a prefix", (int)s);
+#if defined(_WIN32)
+            /* The Windows AUTO order: WASAPI then ASIO for stereo, ASIO alone for the array. So an
+             * ASIO driver is present for both widths, and a WASAPI endpoint for stereo only
+             * (unless an ASIO driver carries the same string). */
+            if (s == BWA_SINK_ASIO) {
+                WANT(bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_AUTO, name),      "AUTO array misses ASIO '%s'", name);
+                WANT(bwa_device_present(BWA_PROFILE_CAVE_BOTH, BWA_SINK_AUTO, name), "AUTO cave_both misses ASIO '%s'", name);
+                WANT(bwa_device_present(BWA_PROFILE_CAVE_SIM, BWA_SINK_AUTO, name),  "AUTO stereo misses ASIO '%s'", name);
+            }
+            if (s == BWA_SINK_WASAPI) {
+                WANT(bwa_device_present(BWA_PROFILE_BINAURAL, BWA_SINK_AUTO, name),  "AUTO stereo misses WASAPI '%s'", name);
+                if (!bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_ASIO, name))
+                    WANT(!bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_AUTO, name), "AUTO hands the array to WASAPI '%s'", name);
+            }
+#endif
+        }
+    }
+#if defined(_WIN32)
+    {
+        const bool asio = bwa_get_device_count(BWA_SINK_ASIO) > 0, wasapi = bwa_get_device_count(BWA_SINK_WASAPI) > 0;
+        WANT(bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_AUTO, NULL) == asio,                 "AUTO array, no device");
+        WANT(bwa_device_present(BWA_PROFILE_BINAURAL, BWA_SINK_AUTO, NULL) == (asio || wasapi), "AUTO stereo, no device");
+    }
+#endif
+    /* The answer and the open agree. AUTO with a name nobody has is "not present", and bwa_start
+     * then runs the offline sink. A named backend with that name is "not present", and bwa_start
+     * fails (or the build has no such backend, which fails too). */
+    {
+        bwa_desc d = { 0 };
+        d.profile = BWA_PROFILE_BINAURAL; d.sample_rate = 48000; d.block_size = 256;
+        d.sink = BWA_SINK_AUTO; d.device = NOBODY;
+        bwa_engine* e = bwa_create(&d);
+        if (!e || bwa_start(e) != BWA_OK) { WANT(0, "AUTO with an unlisted device did not start on the offline sink"); }
+        else WANT(bwa_get_sink_type(e) == BWA_SINK_NULL, "AUTO opened sink %d for a device reported missing", (int)bwa_get_sink_type(e));
+        if (e) { bwa_stop(e); bwa_destroy(e); }
+        d.sink = BWA_SINK_WASAPI;
+        e = bwa_create(&d);
+        WANT(e && bwa_start(e) != BWA_OK, "a named backend started on a device reported missing");
+        if (e) { bwa_stop(e); bwa_destroy(e); }
+    }
+#undef WANT
+    if (!fail) printf("       rule holds over this machine's lists\n");
+    return fail;
+}
+
 int main(void) {
     const uint32_t n_asio   = bwa_get_device_count(BWA_SINK_ASIO);
     const uint32_t n_wasapi = bwa_get_device_count(BWA_SINK_WASAPI);
@@ -553,6 +731,13 @@ int main(void) {
         fail |= check_name_truncation(BWA_SINK_COREAUDIO, "coreaudio");
         if (fail) return 1;
     }
+
+    printf("  -- bwa_device_present --\n");
+    if (check_device_present() != 0) return 1;
+#if defined(_WIN32)
+    printf("  -- ASIO enumeration leaves the caller's COM apartment alone --\n");
+    if (check_asio_com_balance() != 0) return 1;
+#endif
 
     printf("  -- device-free (the exception clause: an offline render stays offline) --\n");
     if (run_offline() != 0) return 1;

@@ -307,12 +307,34 @@ const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, s
  * nothing touches the SDK's loaded-driver global (the calib/zylia capture shells use the same
  * pattern). Enumeration only READS the list: nothing is loaded, initialized, or opened, so it is
  * safe alongside a live sink. Control thread only, like all lifecycle calls. */
+/* ASIO_ENUM_MAX bounds what the enumeration REPORTS (count, names, sink_asio_has_driver). The
+ * open does not go through it: loadAsioDriver searches the SDK's whole registry list. So on a
+ * machine with more than 32 registered drivers, the 33rd opens by name and still reads as not
+ * listed here. */
 enum { ASIO_ENUM_MAX = 32 };
+/* THE one place a throwaway AsioDrivers is built, because the SDK's list is careless with COM: its
+ * constructor calls CoInitialize(0) (apartment-threaded) and ignores the result, and its
+ * destructor calls CoUninitialize whenever the list is non-empty (asiolist.cpp). On a thread that
+ * is already multithreaded the initialize FAILS (RPC_E_CHANGED_MODE) and takes no reference, and
+ * the destructor drops one anyway: each enumeration cost the caller's thread one COM reference,
+ * which tears the apartment down under a host that set it up (a WASAPI sink's own ComScope, an
+ * MTA host). So probe the thread first, and when it is MTA hand the destructor a reference of
+ * its own to consume. On any other thread the SDK's pair balances itself and only the probe has
+ * to be undone. */
 static long asio_driver_names(char names[ASIO_ENUM_MAX][32]) {
-    AsioDrivers list;
-    char* ptrs[ASIO_ENUM_MAX];
-    for (int i = 0; i < ASIO_ENUM_MAX; ++i) ptrs[i] = names[i];
-    return list.getDriverNames(ptrs, ASIO_ENUM_MAX);
+    const HRESULT probe = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    long n;
+    {
+        AsioDrivers list;
+        char* ptrs[ASIO_ENUM_MAX];
+        for (int i = 0; i < ASIO_ENUM_MAX; ++i) ptrs[i] = names[i];
+        n = list.getDriverNames(ptrs, ASIO_ENUM_MAX);
+        /* asioGetNumDev, not n: the destructor's test is the whole list, not the capped count. */
+        if (probe == RPC_E_CHANGED_MODE && list.asioGetNumDev() > 0)
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);     /* consumed by ~AsioDriverList */
+    }
+    if (SUCCEEDED(probe)) CoUninitialize();                    /* the probe's own reference */
+    return n;
 }
 
 /* The SDK's asiolist reads driver names from the registry with the ANSI (-A) APIs, so its bytes are
@@ -347,6 +369,18 @@ extern "C" bool sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap) {
     if ((long)index >= (n < 0 ? 0 : n)) return false;
     acp_to_utf8(names[index], buf, (int)cap);
     return true;
+}
+
+extern "C" bool sink_asio_has_driver(const char* name) {
+    if (!name || !*name) return false;
+    char names[ASIO_ENUM_MAX][32];
+    const long n = asio_driver_names(names);            /* the one registry walk */
+    char utf8[256];
+    for (long i = 0; i < n; ++i) {
+        acp_to_utf8(names[i], utf8, (int)sizeof utf8);
+        if (strcmp(utf8, name) == 0) return true;
+    }
+    return false;
 }
 
 /* Load + init driver `name` and confirm it has >= `channels` outputs. On success the driver

@@ -48,10 +48,11 @@ namespace BwAudio
 
         IEnumerator BuildWhenReady()
         {
-            // Wait out init order: Engine.Awake always ends by claiming Instance. Without a running
-            // engine (a node that does not own audio, or a failed start) SpeakerPositions falls back to
-            // the layout file, so the markers still stand where the speakers are, unlit.
-            while (!Engine.Instance) yield return null;
+            // Wait out init order: until the Engine's Start has decided, a not-Ready Engine is still
+            // coming up, and the layout file is not what it will pan over. Once decided without a
+            // running engine (a node that does not own audio, or a failed start) SpeakerPositions
+            // falls back to the layout file, so the markers still stand where the speakers are, unlit.
+            while (!Engine.Instance || !Engine.Instance.Decided) yield return null;
             Build();
         }
 
@@ -66,7 +67,7 @@ namespace BwAudio
             _material = MakeUnlitMaterial();
             if (_material == null)
             {
-                Debug.LogWarning("[SpeakerView] no unlit shader found for this render pipeline — no markers drawn.");
+                Debug.LogWarning("[SpeakerView] no unlit shader found for this render pipeline, so no markers are drawn.");
                 return;
             }
             _mpb = new MaterialPropertyBlock();

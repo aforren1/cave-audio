@@ -592,6 +592,19 @@ GEN_E_RET_DBL(get_sink_type)
 
 /* ------------------------------------------------------------------ device query (no engine) */
 
+/* device_present(profile, sink, device): is that device LISTED on this machine. [] or '' for
+ * device is the backend's default. Opens nothing. */
+CMD(device_present)
+{
+    const char* cmd = "device_present";
+    char* dev;
+    (void)nlhs; need(nrhs, 3, cmd);
+    dev = get_str_or_null(prhs[2], cmd);
+    plhs[0] = ret_bool(bwa_device_present((bwa_profile)(int)get_u32(prhs[0], cmd),
+                                          (bwa_sink_type)(int)get_u32(prhs[1], cmd), dev));
+    if (dev) mxFree(dev);
+}
+
 CMD(get_device_count)
 {
     const char* cmd = "get_device_count";
@@ -1798,7 +1811,7 @@ static const bwa_cmd_entry g_cmds[] = {
     ENT(create), ENT(start), ENT(stop), ENT(destroy), ENT(last_error), ENT(get_version),
     ENT(get_audio_backend), ENT(get_sample_rate), ENT(get_block_size), ENT(get_sink_type),
     /* device query */
-    ENT(get_device_count), ENT(get_device_name), ENT(get_device_id),
+    ENT(get_device_count), ENT(get_device_name), ENT(get_device_id), ENT(device_present),
     ENT(get_asio_driver_count), ENT(get_asio_driver_name),
     /* assets */
     ENT(load_sound), ENT(load_sound_streaming), ENT(load_ambix), ENT(load_fuma),

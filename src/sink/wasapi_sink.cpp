@@ -595,6 +595,17 @@ extern "C" bool sink_wasapi_device_id(uint32_t index, char* buf, uint32_t cap) {
     return ok;
 }
 
+extern "C" bool sink_wasapi_has_device(const char* device) {
+    if (!device || !*device) return false;
+    ComScope com;
+    IMMDeviceEnumerator* en = make_enumerator();
+    if (!en) return false;
+    IMMDevice* d = resolve_endpoint(en, device);        /* the open's own rule-10 match */
+    if (d) d->Release();
+    en->Release();
+    return d != nullptr;
+}
+
 /* ---- open -------------------------------------------------------------------------------- */
 
 extern "C" bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
