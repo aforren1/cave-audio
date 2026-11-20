@@ -83,15 +83,14 @@ The origin must match the tracker's frame, not the wall you call the front. Moti
 points at the CAVE's back wall, and the measured layout inherits it. The symptom: sources come
 from behind when they should be ahead. Rotate `RoomOrigin` 180 degrees. Do not move the camera.
 
-Put the rig in each scene that makes sound. The engine reads the scene's `BwaRoomBox` and
-static `BwaAcousticGeometry` once, when it starts, so it must start with the scene. To keep one
-engine across content changes, put the rig in a main scene and swap child scenes under it. The
-same limit applies: geometry in a child scene loaded later misses the bake.
+Static `BwaAcousticGeometry` follows the tree after start (see "Geometry is collected, not
+pushed"), so a child scene loaded later brings its geometry with it. The `BwaRoomBox` does not:
+the engine reads it once, when it starts. Put the rig in each scene that has a room box, or put
+the box in the rig.
 
-An Autoload rig (Project Settings > Globals) works only for content with no room box and no
-static geometry. An Autoload starts before the scene exists. A `BwaRoomBox` that arrives later
-logs an error and is ignored. Late `BwaAcousticGeometry` warns and occludes nothing. If you do
-use one:
+An Autoload rig (Project Settings > Globals) works for any content with no room box of its own.
+An Autoload starts before the scene exists, so a `BwaRoomBox` that arrives later logs an error
+and is ignored. If you use one:
 
 - Autoload a configured copy saved outside `addons/`, so an addon update cannot overwrite it.
 - Keep `BwaEngine` out of the scenes.
@@ -155,6 +154,15 @@ Two consequences worth knowing, both places Unity's advice does *not* carry over
 
 - `bwa_bed_set_orientation` takes a room-frame yaw, and because there is no mirror the
   **sense of rotation is preserved**. Unity's binding has to reverse it; this one does not.
+  `BwaBed.orientation` is in **scene** terms: yaw 0 points the field's front along Godot world
+  +Z, which is **behind** a default Godot node (its forward is -Z), and the binding adds the
+  registration. So `orientation.x = cam.rotation.y` points the front at the camera's back. To
+  face the field where a node faces, call `set_yaw_from_basis(node.global_basis)`. The bed is
+  world-locked, so a moved `room_origin` turns it with the scene. Pitch and roll are about the
+  field's own axes and pass through unchanged, which is exact under a level origin.
+- **Changed:** with no origin, `orientation` is the room-frame value it always was. Under a
+  turned origin, earlier releases pushed it raw, in room terms. Under a 180 degree Motive
+  origin, set the yaw to `PI` to keep the old front.
 - Positions need no axis flip at all. If a source ends up mirrored, the registration
   transform is wrong - not the handedness conversion.
 
@@ -183,13 +191,15 @@ What to know:
 - The engine compares the origin's global transform once per frame, before it pushes the
   sources and the listener, and recomputes only when it changed. A moved origin takes effect
   on the next frame. `BwaSpeakerView` follows it, in world space, under any parent.
-- Five things are converted through the registration once and do not follow a later change:
-  static `BwaAcousticGeometry`, the `BwaRoomBox` and the ground plane (at start),
-  `set_extra_listeners` positions and the FDN decay direction (when you call them). The first
-  registration change after start with any of them present warns once, and
-  `is_registration_stale()` reads true from then on. This covers a moved origin, a
-  `room_origin` set or re-pointed after start, and a write to `registration`. Place the
-  origin before you press play.
+- The static mesh (`BwaAcousticGeometry` and the `BwaRoomBox` walls), the ground plane and
+  `BwaDynamicGeometry` follow a change: the engine re-bakes the static mesh in the same frame.
+  That is a BVH rebuild, so do not animate the origin in a scene with static geometry.
+- Three things do not follow: `set_extra_listeners` positions and the FDN decay direction,
+  which are converted when you call them, and the room box's image-source reflections, which
+  the engine anchors at the room origin by size alone. With any of them present, the first
+  registration change after start warns once, and `is_registration_stale()` reads true from
+  then on. This covers a moved origin, a `room_origin` set or re-pointed after start, and a
+  write to `registration`. Call `set_extra_listeners` again after a change.
 - Scale is ignored, the origin's own and any parent's. Room meters are Godot meters. The engine
   warns once.
 - A mirrored origin is refused. A negative scale on the origin or on a parent makes its
@@ -217,7 +227,9 @@ loudly instead of quietly changing the channel count.
 ## Asset paths
 
 The core loads audio and layout files itself, by OS path. It never goes through Godot's
-virtual filesystem. `res://` paths are globalized for you, but in an **exported** build
+virtual filesystem. `res://` and `user://` paths are globalized for you, and an absolute path
+is used as it is, so a clip your code generates can be played by its full path. In an
+**exported** build
 `res://` lives inside the `.pck` and that path will not exist. Ship those files beside the
 executable, or stage them into `user://` at startup. (Same trap as Unity's
 `StreamingAssets`, one layer down.)
@@ -310,6 +322,25 @@ reflections without touching the static mesh, then the box's own 12 inward-facin
 triangles join the merge like any other occluder. Otherwise the walls would vanish the
 instant any other occluder existed. (`bwa_scene_set_box` still does both at once, for the
 case where the box **is** the whole scene.)
+
+After start the merge keeps following the tree:
+
+- A `BwaAcousticGeometry` that enters joins, and one that leaves or is hidden drops out.
+  Hidden means not occluding, the way a disabled object is in Unity, and hiding a parent takes
+  its subtree out.
+- `BwaEngine` re-merges at most once per frame, in its `_process`, and only when the visible
+  set differs from the one it last baked. A hide and show in one frame cost nothing. When the
+  last piece goes, it clears the static mesh.
+- Each re-merge copies every static mesh and rebuilds the BVH on the engine's sim thread.
+  That suits a door or a wall that appears. Give a prop that toggles often a
+  `BwaDynamicGeometry`. `get_static_rebuilds()` counts rebuilds, the start bake included.
+- Moving a static piece, or changing its `mesh`, `source` or `material`, does not re-merge
+  until the next rebuild, when the piece jumps. Use `BwaDynamicGeometry` for anything that
+  moves.
+- The room box is read once, at start. The image-source room can be set but never removed, so
+  a box that arrived late could not leave again. A late `BwaRoomBox` logs an error and is
+  ignored.
+- A merge replaces a mesh you set with `scene_set_mesh`. Use one or the other.
 
 ### Warnings for the settings that fail quietly
 
@@ -457,7 +488,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -474,7 +505,7 @@ what the engine is rendering.
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:

@@ -949,7 +949,7 @@ class ReverbBed extends Base:
 
 
 ## ============================ 8. Underwater (medium boundary) ============================
-## The https://github.com/aforren1/cave-audio/blob/e61fd5a52eb8/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
+## The https://github.com/aforren1/cave-audio/blob/29688fa88688/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
 ## the surface gets the interface loss + the water's transmission EQ (manual occlusion) and
 ## goes diffuse (spread), the FDN retunes LIVE (the tail keeps ringing, only its slope
 ## changes) and the speed of sound glides to the medium's — Doppler is what makes that
