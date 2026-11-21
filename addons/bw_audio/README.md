@@ -498,7 +498,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -515,7 +515,7 @@ what the engine is rendering.
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
@@ -579,11 +579,22 @@ On the rig the device is listed and nothing changes.
   installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
   list a default device on every machine. Too few channels, a wrong rate, or a busy device read
   as present too.
+- A stereo profile under Auto with an empty `device` needs a Windows output device. An installed
+  ASIO driver alone does not count there.
+- Windows lists output devices for the session a process runs in. An editor or player started
+  outside the interactive desktop (from a remote shell, a service or a scheduled task) can list
+  none, likely for that reason, and then reads as missing on a machine that has outputs. The
+  start line in the log names the device that opened.
 - A listed device that does not open is not a fallback. Under a named sink the start fails.
   Under Auto the engine runs the silent offline sink, and the binding logs an error that says
   the fallback did not trigger and why. Set the profile by hand on that machine.
 - An array profile with an empty `device` only asks "is any driver installed". That cannot tell
   a desk from the rig, and the warning marker says so. Name the rig's device.
+- The fallback can end silent too. If its sink is Auto and nothing opens (no output on this
+  machine, or a fallback device name that nothing lists), the engine pushes a second error,
+  `DESK FALLBACK has NO AUDIO either`, with the reason. Connect headphones or another output, or
+  pick a fallback device this machine has. A fallback on the Null sink is silent on purpose and
+  logs no error.
 
 Where the fallback may run:
 
