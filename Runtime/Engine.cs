@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/integration.md.
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -576,6 +576,19 @@ namespace BwAudio
                                "too few channels, a busy device or a wrong rate all read as present. " +
                                "On the rig: fix the device. At a desk: set Profile to " + fallbackProfile +
                                " by hand for this machine.", this);
+
+            // The other silent ending: the fallback was taken and IT did not open (Auto with no
+            // output on this machine, or a Fallback Device nobody has). The start line would say
+            // backend=null and nothing else, after a warning that promised the fallback.
+            if (_fallbackTaken && useSink != BwaSinkType.Null && useSink != BwaSinkType.Manual &&
+                Bwa.bwa_get_sink_type(_eng) == BwaSinkType.Null)
+                Debug.LogError("[bw_audio] DESK FALLBACK has NO AUDIO either: the fallback (profile " +
+                               useProfile + ", sink " + useSink + ", device " +
+                               (useDevice.Length > 0 ? "'" + useDevice + "'" : "(default)") +
+                               ") did not open, so the engine runs the silent offline sink. Reason: " +
+                               (Bwa.LastError(_eng) ?? "none given") + ". Connect headphones or " +
+                               "another output, or set Fallback Device to a device this machine has " +
+                               "(Engine.Devices lists them; empty is the default output).", this);
 
             // The fallback with internal tracking: the tracker is the rig's Motive, which a desk
             // does not have, and a connect toward it would open a socket and report success. Feed

@@ -92,14 +92,14 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is not registered, because
 Unity is not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime`, `Editor` and `Samples~` only, and
 Unity itself ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Assets under StreamingAssets
 
@@ -194,7 +194,7 @@ Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit 
 sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
 `Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
 Every other binding of this engine ships the same demo, which makes them comparable by ear (see
-`https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md`, "The minimal example").
+`https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/integration.md`, "The minimal example").
 
 Then set up your scene in one step: **GameObject > BwAudio > CAVE Rig**, then move **Room Origin**
 to the CAVE floor center. The same item is in the Hierarchy's right-click menu. It creates:
@@ -238,7 +238,7 @@ then set `clip` and the rest, and the first play happens at `Start` with those v
 **cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
 the device. The `Engine` asks it in `Start`, after every `Awake` in the scene, so your cluster
 toolkit's own `Awake` has run by then. See
-[docs/integration.md: Clusters](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#clusters) and "Creating things at run
+[docs/integration.md: Clusters](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/integration.md#clusters) and "Creating things at run
 time" below it.
 
 ### Test a rig scene at your desk
@@ -288,11 +288,22 @@ On the rig the device is listed and nothing changes.
   installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
   list a default device on every machine. Too few channels, a wrong rate, or a busy device read
   as present too.
+- A stereo profile under Auto with an empty `device` needs a Windows output device. An installed
+  ASIO driver alone does not count there.
+- Windows lists output devices for the session a process runs in. An editor or player started
+  outside the interactive desktop (from a remote shell, a service or a scheduled task) can list
+  none, likely for that reason, and then reads as missing on a machine that has outputs. The
+  start line in the log names the device that opened.
 - A listed device that does not open is not a fallback. Under a named sink the start fails.
   Under Auto the engine runs the silent offline sink, and the binding logs an error that says
   the fallback did not trigger and why. Set the profile by hand on that machine.
 - An array profile with an empty `device` only asks "is any driver installed". That cannot tell
   a desk from the rig, and the inspector warns about it. Name the rig's device.
+- The fallback can end silent too. If its sink is Auto and nothing opens (no output on this
+  machine, or a fallback device name that nothing lists), the console shows a second error,
+  `DESK FALLBACK has NO AUDIO either`, with the reason. Connect headphones or another output, or
+  pick a fallback device this machine has. A fallback on the Null sink is silent on purpose and
+  logs no error.
 
 Where the fallback may run:
 
@@ -419,7 +430,7 @@ center, turn its forward (blue arrow) along the layout's +z, and assign it. `Eng
 layout was measured in the tracker's frame, so match that frame: if the layout's +z is the back
 wall, rotate the origin 180 degrees about Y. With no origin assigned, `Room.UnityToRoom` stays
 identity unless your code writes it. **Getting this wrong silently swaps front/back or left/right.**
-See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/integration.md#register-the-room).
+See [docs/integration.md → Register the room](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/integration.md#register-the-room).
 
 ## Threading and lifecycle notes
 
@@ -480,7 +491,7 @@ zero count proves nothing.
 ### Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -501,7 +512,7 @@ release. On a tag it also creates the Release with the stamped version.
 
 **Two release assets matter here**: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the
 Windows engine on its own (`bw_audio-win64-<tag>.zip` - dll/lib/header/tools, for C/C++ consumers
-and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/a0a6b728cff6/docs/build.md#continuous-integration) for the
+and the CAVE machine). See [docs/build.md](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/build.md#continuous-integration) for the
 rest.
 
 Locally:
