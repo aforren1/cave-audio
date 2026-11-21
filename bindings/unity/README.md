@@ -288,11 +288,22 @@ On the rig the device is listed and nothing changes.
   installed, so a laptop with the RME driver and no Digiface reads as present. ALSA and CoreAudio
   list a default device on every machine. Too few channels, a wrong rate, or a busy device read
   as present too.
+- A stereo profile under Auto with an empty `device` needs a Windows output device. An installed
+  ASIO driver alone does not count there.
+- Windows lists output devices for the session a process runs in. An editor or player started
+  outside the interactive desktop (from a remote shell, a service or a scheduled task) can list
+  none, likely for that reason, and then reads as missing on a machine that has outputs. The
+  start line in the log names the device that opened.
 - A listed device that does not open is not a fallback. Under a named sink the start fails.
   Under Auto the engine runs the silent offline sink, and the binding logs an error that says
   the fallback did not trigger and why. Set the profile by hand on that machine.
 - An array profile with an empty `device` only asks "is any driver installed". That cannot tell
   a desk from the rig, and the inspector warns about it. Name the rig's device.
+- The fallback can end silent too. If its sink is Auto and nothing opens (no output on this
+  machine, or a fallback device name that nothing lists), the console shows a second error,
+  `DESK FALLBACK has NO AUDIO either`, with the reason. Connect headphones or another output, or
+  pick a fallback device this machine has. A fallback on the Null sink is silent on purpose and
+  logs no error.
 
 Where the fallback may run:
 

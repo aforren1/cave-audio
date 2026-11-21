@@ -691,7 +691,31 @@ static int check_device_present(void) {
     {
         const bool asio = bwa_get_device_count(BWA_SINK_ASIO) > 0, wasapi = bwa_get_device_count(BWA_SINK_WASAPI) > 0;
         WANT(bwa_device_present(BWA_PROFILE_CAVE, BWA_SINK_AUTO, NULL) == asio,                 "AUTO array, no device");
-        WANT(bwa_device_present(BWA_PROFILE_BINAURAL, BWA_SINK_AUTO, NULL) == (asio || wasapi), "AUTO stereo, no device");
+        /* Stereo AUTO with no name is WASAPI's default endpoint alone: an installed ASIO driver
+         * is not an output. (The open still tries ASIO after WASAPI; the answer is stricter on
+         * purpose. test_audio_sink pins the rule itself with WASAPI's answer stubbed.) Here it
+         * is the real lookup against a real WASAPI open of the default endpoint: the same lookup,
+         * then the open. An open that succeeds means the endpoint is there, so that direction is
+         * hard. Present without an open is possible (another application holds the endpoint
+         * exclusively), so it is printed. */
+        {
+            const bool here = bwa_device_present(BWA_PROFILE_BINAURAL, BWA_SINK_AUTO, NULL);
+            bwa_desc d = { 0 };
+            d.profile = BWA_PROFILE_BINAURAL; d.sample_rate = 48000; d.block_size = 256; d.sink = BWA_SINK_WASAPI;
+            bwa_engine* e = bwa_create(&d);
+            const bool opened = e && bwa_start(e) == BWA_OK;
+            if (e) { if (opened) bwa_stop(e); bwa_destroy(e); }
+            printf("       stereo AUTO, no device: %s; a WASAPI open of the default endpoint %s\n",
+                   here ? "present" : "missing", opened ? "succeeded" : "failed");
+            WANT(!opened || here, "the default endpoint opened and stereo AUTO with no device says missing");
+            if (here && !opened)
+                printf("       note: present and not opened (the endpoint is held by another application, or "
+                       "this build has no WASAPI)\n");
+            WANT(!here || wasapi || !backend_in_build(BWA_SINK_WASAPI), "stereo AUTO reads present with no WASAPI endpoint listed");
+            if (!wasapi && !asio)
+                printf("       no WASAPI endpoint and no ASIO driver: the stereo rule is NOT exercised here "
+                       "(counting ASIO would answer missing too)\n");
+        }
     }
 #endif
     /* The answer and the open agree. AUTO with a name nobody has is "not present", and bwa_start

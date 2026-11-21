@@ -4,6 +4,25 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Fixed: a stereo Auto request read as present with no output device (engine)
+
+- On Windows, `bwa_device_present` for a stereo profile under Auto with no device name counted
+  an installed ASIO driver. A process that listed zero WASAPI endpoints still got true, so
+  `Engine.DevicePresent(Binaural, Auto, "")` was true with nothing to hear. That case is now true
+  only when WASAPI has a default render endpoint. The array profiles, named devices and ASIO
+  named as the sink are unchanged, and so is `bwa_start`.
+
+### Added: an error when the desk fallback has no audio either
+
+- When the fallback is taken and its own open lands on the silent offline sink, `Engine` now logs
+  `DESK FALLBACK has NO AUDIO either`, with the reason and what to do. Before, the start line
+  said `backend=null` and nothing else. A fallback whose sink is Null logs no error.
+
+### Godot addon
+
+- `BwaEngine` pushes the same `DESK FALLBACK has NO AUDIO either` error when the fallback does
+  not open.
+
 ## [0.23.1]
 
 Test fixes.

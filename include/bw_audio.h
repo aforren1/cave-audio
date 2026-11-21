@@ -360,6 +360,16 @@ BWA_API bool     bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* 
  *                                        backend exactly when this does. With no name bwa_start
  *                                        skips nothing (it tries each backend's default), and
  *                                        this asks only whether there is a device to try.
+ *                                        ONE CASE IS STRICTER THAN THE OPEN. On Windows, a stereo
+ *                                        profile under AUTO with no device is true only when
+ *                                        WASAPI has a default render endpoint. An installed ASIO
+ *                                        driver does not count there, although bwa_start still
+ *                                        tries ASIO after WASAPI: the driver list is the
+ *                                        registry, which says nothing about an output this
+ *                                        process can reach, and most ASIO hardware registers
+ *                                        render endpoints too. Where it does not, name the
+ *                                        device. The array width still counts ASIO, and so does
+ *                                        any request with a device name.
  * CAVE_BOTH opens two devices. This checks the primary (the array) only, never the monitor.
  * A backend this build does not carry lists nothing and opens nothing, so it is never present.
  * An unknown profile reads as stereo.

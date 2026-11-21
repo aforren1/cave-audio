@@ -595,6 +595,18 @@ extern "C" bool sink_wasapi_device_id(uint32_t index, char* buf, uint32_t cap) {
     return ok;
 }
 
+/* The endpoint an open with no device name would take (resolve_endpoint's NULL branch:
+ * GetDefaultAudioEndpoint(eRender, eConsole)). */
+extern "C" bool sink_wasapi_has_default_output(void) {
+    ComScope com;
+    IMMDeviceEnumerator* en = make_enumerator();
+    if (!en) return false;
+    IMMDevice* d = resolve_endpoint(en, nullptr);
+    if (d) d->Release();
+    en->Release();
+    return d != nullptr;
+}
+
 extern "C" bool sink_wasapi_has_device(const char* device) {
     if (!device || !*device) return false;
     ComScope com;

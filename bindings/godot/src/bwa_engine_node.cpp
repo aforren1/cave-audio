@@ -182,6 +182,22 @@ void BwaEngine::_ready() {
 				fallback_profile == FALLBACK_BINAURAL ? "Binaural" : "CaveSim"));
 	}
 
+	/* The other silent ending: the fallback was taken and IT did not open (AUTO with no output on
+	 * this machine, or a fallback_device nobody has). The start line would say "null" and nothing
+	 * else, after a warning that promised the fallback. */
+	if (fallback_taken && use_sink != SINK_NULL && use_sink != SINK_MANUAL
+			&& bwa_get_sink_type(eng) == BWA_SINK_NULL) {
+		const char *why = bwa_last_error(eng);
+		UtilityFunctions::push_error(vformat(
+				"BwaEngine: DESK FALLBACK has NO AUDIO either: the fallback (profile %d, sink %d, "
+				"device %s) did not open, so the engine runs the silent offline sink. Reason: %s. "
+				"Connect headphones or another output, or set fallback_device to a device this "
+				"machine has (BwaEngine.get_devices lists them; empty is the default output).",
+				(int)use_profile, (int)use_sink,
+				use_device.is_empty() ? String("(default)") : String("'") + use_device + "'",
+				why ? String(why) : String("none given")));
+	}
+
 	/* Replay everything authored in the inspector before the engine existed. */
 	bwa_set_master_gain(eng, master_gain);
 	bwa_set_reverb_gain(eng, reverb_gain);

@@ -268,6 +268,13 @@ bool     sink_device_id   (bwa_sink_type backend, uint32_t index, char* buf, uin
  * (2 or fewer is the stereo order). It shares the AUTO order and the rule-10 match with
  * bwa_sink_open, so the two cannot disagree about which backends a name reaches. Opens nothing. */
 bool     sink_device_present(bwa_sink_type sink, uint32_t channels, const char* device);
+/* TEST HOOK (defined in sink.c; not in bw_audio.h and NOT exported, since it changes a public
+ * answer for the whole process: only a test that compiles sink.c in can reach it, which is
+ * test_audio_sink). Replaces WASAPI's "has a default render endpoint" answer inside
+ * sink_device_present: 0 = none, 1 = one, anything else = ask WASAPI. It exists for the one
+ * machine no test box is: a Windows process that sees no render endpoint. It changes the ANSWER
+ * only, never an open. Plain int, control thread only, like the call it steers. */
+extern int sink_wasapi_default_override;
 
 /* Backend constructors used by bwa_sink_open. null is always present; asio only when
  * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
@@ -306,6 +313,10 @@ bool     sink_wasapi_device_id  (uint32_t index, char* buf, uint32_t cap);
 /* Does a render endpoint carry `device` as its friendly name or its id (rule 10), on ONE
  * enumerator: the resolve the open itself does. */
 bool     sink_wasapi_has_device(const char* device);
+/* Is there a default render endpoint: what an open with no device name resolves. WASAPI lists
+ * endpoints for the calling process's session, so this can be false on a machine that has
+ * outputs (a process started outside the interactive desktop). */
+bool     sink_wasapi_has_default_output(void);
 /* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): the shared-mode underrun rule
  * is only armed when the endpoint's buffer is deeper than one period, so the sink test has to know
  * which of the two cases the machine it runs on presents. Control thread, on an open sink. */

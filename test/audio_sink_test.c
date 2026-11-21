@@ -2248,6 +2248,50 @@ static int test_dl_unavailable(void) {
 }
 #endif /* BWA_HAVE_JACK || BWA_HAVE_ALSA */
 
+#ifdef BWA_HAVE_WASAPI
+/* The Windows stereo rule of sink_device_present, with WASAPI's answer STUBBED (the internal hook
+ * in sink.h; this test compiles sink.c in, which is the only way to reach it). The process that
+ * showed the defect listed no render endpoint and still read present, because the stereo AUTO
+ * order goes on to ASIO and ASIO's list is installed drivers. No test box is that process, so the
+ * answer is replaced; the lists and the opens stay real. Gated on WASAPI being compiled, not on
+ * the platform: a Windows build without WASAPI has no such rule. */
+static int test_stereo_auto_rule(void) {
+    int ok = 1;
+#define RULE(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAIL: stereo AUTO rule: %s\n", msg); ok = 0; } } while (0)
+    const uint32_t n_wasapi = sink_device_count(BWA_SINK_WASAPI);
+    const bool array_real = sink_device_present(BWA_SINK_AUTO, BWA_CHANNELS, NULL);   /* ASIO, where compiled */
+
+    sink_wasapi_default_override = 0;                    /* no default render endpoint */
+    RULE(!sink_device_present(BWA_SINK_AUTO, 2, NULL), "no endpoint, and stereo AUTO with no device reads present");
+    RULE(!sink_device_present(BWA_SINK_AUTO, 2, ""),   "no endpoint, and stereo AUTO with \"\" reads present");
+    RULE(!sink_device_present(BWA_SINK_AUTO, 1, NULL), "no endpoint, and mono AUTO reads present");
+    /* Only the no-name stereo AUTO case takes the stub. The array width, a named device and
+     * WASAPI named as the sink all read exactly what they read without it. */
+    RULE(sink_device_present(BWA_SINK_AUTO, BWA_CHANNELS, NULL) == array_real, "the stub moved the array width");
+    RULE(sink_device_present(BWA_SINK_AUTO, 3, NULL) == array_real,            "the stub moved a 3-channel request");
+    RULE(sink_device_present(BWA_SINK_WASAPI, 2, NULL) == (n_wasapi > 0),      "the stub moved WASAPI named as the sink");
+    if (n_wasapi > 0) {
+        char name[256] = {0};
+        sink_device_name(BWA_SINK_WASAPI, 0, name, sizeof name);
+        RULE(sink_device_present(BWA_SINK_AUTO, 2, name), "no default endpoint, and a NAMED endpoint is not found under stereo AUTO");
+    }
+
+    sink_wasapi_default_override = 1;                    /* a default render endpoint */
+    RULE(sink_device_present(BWA_SINK_AUTO, 2, NULL), "an endpoint, and stereo AUTO with no device reads missing");
+    RULE(sink_device_present(BWA_SINK_AUTO, BWA_CHANNELS, NULL) == array_real, "a WASAPI endpoint counted for the array width");
+
+    sink_wasapi_default_override = -1;                   /* the real lookup again */
+    RULE(!sink_device_present(BWA_SINK_AUTO, 2, NULL) || n_wasapi > 0, "present with no endpoint listed");
+#undef RULE
+    if (n_wasapi == 0)
+        printf("stereo AUTO rule: no WASAPI endpoint listed, so the stubbed 'none' pin is NOT exercised "
+               "(without the rule the answer is 'missing' here too)\n");
+    else if (ok)
+        printf("stereo AUTO rule OK: stubbed to no endpoint it reads missing (%u real endpoint(s) listed)\n", n_wasapi);
+    return ok;
+}
+#endif
+
 int main(void) {
     Probe p;
     probe_init(&p, BWA_CHANNELS);
@@ -2293,6 +2337,9 @@ int main(void) {
     if (!test_injected_drop()) return 1;
     if (!test_manual_unmeasured()) return 1;
     if (!test_stamp_select())  return 1;
+#ifdef BWA_HAVE_WASAPI
+    if (!test_stereo_auto_rule()) return 1;
+#endif
 
     printf("audio sink OK: backend=%s blocks=%lu last_sample_pos=%llu last_ns=%llu\n",
            backend, blocks, (unsigned long long)p.last_sample_pos, (unsigned long long)p.last_ns);

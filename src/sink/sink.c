@@ -238,9 +238,29 @@ static bool opens_unlisted(bwa_sink_type t) {
 /* bwa_device_present. For AUTO this is the open loop below with the open taken out: the same
  * order, the same two skips. A named device asks backend_has_device; no device asks whether the
  * backend lists anything at all, since "the backend's default" needs a device to be. */
+int sink_wasapi_default_override = -1;   /* test hook (sink.h): 0 = none, 1 = one, else ask WASAPI */
+
 bool sink_device_present(bwa_sink_type sink, uint32_t channels, const char* device) {
     const bool named = device && *device;
     if (sink == BWA_SINK_NULL || sink == BWA_SINK_MANUAL) return true;
+#ifdef BWA_HAVE_WASAPI
+    /* THE ONE PLACE THIS IS STRICTER THAN THE OPEN. A stereo AUTO request with no name is "play
+     * to this machine's output", and on Windows that output is a render endpoint. ASIO sits
+     * behind WASAPI in the stereo order, and its list is INSTALLED DRIVERS, read from the
+     * registry, which every process can read whether or not it can reach a device. Most ASIO
+     * hardware registers render endpoints too, so a process that sees a driver and NO endpoint
+     * most likely has nothing to hear. Not all of it does (Dante Virtual Soundcard in ASIO mode
+     * registers none, and a stopped Windows audio service hides every endpoint): on such a
+     * machine this reads missing where the open would have reached ASIO, and naming the device
+     * is the way to keep it. Found from a Unity Editor started from a shell that listed zero WASAPI endpoints
+     * and still read present. bwa_sink_open still tries ASIO after WASAPI there, and an open that
+     * lands is used. The array width keeps ASIO (its only transport), and so does every NAMED
+     * request and ASIO named as the sink. */
+    if (sink == BWA_SINK_AUTO && !named && channels <= 2)
+        return sink_wasapi_default_override == 0 ? false
+             : sink_wasapi_default_override == 1 ? true
+             : sink_wasapi_has_default_output();
+#endif
     if (sink != BWA_SINK_AUTO) {
         if (named && opens_unlisted(sink)) return backend_compiled(sink);
         return named ? backend_has_device(sink, device) : sink_device_count(sink) > 0;

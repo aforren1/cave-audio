@@ -1058,6 +1058,18 @@ device. `BWA_PROFILE_CAVE` and `BWA_PROFILE_CAVE_BOTH` take the array order (ASI
 Windows). `BWA_PROFILE_BINAURAL` and `BWA_PROFILE_CAVE_SIM` take the stereo order (WASAPI, then
 ASIO, on Windows). See [Sink policy](#sink-policy) for the order on each platform.
 
+One case is stricter than the open. On Windows, for a stereo profile under Auto with no device
+name, the call is true only when WASAPI has a default render endpoint. It does not count ASIO.
+`bwa_start` still tries an ASIO driver after WASAPI for that request, so the open can succeed
+where the call said false. The reason: the ASIO list is installed drivers, read from the
+registry. It says nothing about an output this process can reach, and most ASIO hardware
+registers Windows render endpoints too. So a process that sees a driver and no endpoint most
+likely has nothing to hear. Some setups have a driver and no endpoint on purpose (Dante Virtual
+Soundcard in ASIO mode, or a machine whose Windows audio service is stopped). There the call says
+false and the open would have reached ASIO. Pass the driver's name as the device and the call
+checks the ASIO list as before. The array profiles still count ASIO, and so does any request
+with a device name.
+
 `BWA_PROFILE_CAVE_BOTH` opens two devices. The call checks the primary one, the array. It does
 not check the monitor.
 

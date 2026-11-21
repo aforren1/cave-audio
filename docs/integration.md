@@ -1241,7 +1241,12 @@ primary device is present when:
   own Auto rule does. For Cave and CaveBoth that is ASIO on Windows, CoreAudio on macOS, JACK or
   ALSA on Linux. A WASAPI endpoint does not count for the array, because Auto never gives the
   array to WASAPI.
-- **Auto, no device name:** one of those backends lists at least one device.
+- **Auto, no device name:** one of those backends lists at least one device. A stereo profile
+  on Windows is narrower: WASAPI must have a default render endpoint, and an installed ASIO
+  driver does not count. The consequence: on a machine with ASIO only (no Windows output
+  device), a scene whose primary profile is stereo with no device named now takes the fallback,
+  although the start would have reached the ASIO driver. Name the driver in `device` to keep
+  the primary.
 - **Null or Manual:** always. They open no device.
 
 CaveBoth opens two devices. Only the primary one, the array, is checked. The monitor is not.
@@ -1253,6 +1258,12 @@ What the check cannot see:
   loads, and CoreAudio always has an output device.
 - **Whether the device will open.** Too few channels, a wrong rate, or another owner all read as
   present.
+- **Outputs that this process cannot see.** WASAPI lists endpoints for the session the process
+  runs in. A process started outside the interactive desktop (from a remote shell, a service or
+  a scheduled task) can list none, likely for that reason. A stereo Auto request then reads as
+  missing although the machine has outputs. The start line in the log names the device that
+  opened (`backend=wasapi:<endpoint name>` in Unity, the same string in Godot), so compare it
+  with a run started from the desktop.
 - **Anything at all, with an empty device on an array profile.** The question is then "is any
   driver installed". Both inspectors warn about that setup.
 
@@ -1261,6 +1272,12 @@ as before. Under Auto the engine lands on the silent offline sink, as before, an
 logs an error: the fallback did not trigger, the reason the open gave, and what to do (fix the
 device on the rig, or set the profile by hand at that desk). The node does not try the fallback
 after a failed `bwa_start`. On the rig a failed open is a fault you need to see.
+
+The fallback can end silent too. When its own sink is Auto and nothing opens (no output on the
+machine, or a fallback device name that nothing lists), the engine runs the offline sink. The
+binding then logs a second error, `DESK FALLBACK has NO AUDIO either`, with the reason and what
+to do: connect headphones or another output, or pick a fallback device the machine has. A
+fallback whose sink is Null is silent on purpose and logs no error.
 
 The gate, and what it costs:
 

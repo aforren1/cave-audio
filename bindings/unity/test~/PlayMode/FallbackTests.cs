@@ -338,6 +338,46 @@ namespace BwAudio.Tests
                                "), not at " + Room.Pos(head.position) + ": nothing feeds it on the fallback");
         }
 
+        // The fallback can end silent too: Auto, with a Fallback Device no backend lists, lands
+        // on the offline sink. The warning promised a fallback, so the silence is an error.
+        [UnityTest]
+        public IEnumerator FallbackThatDoesNotOpenSaysItHasNoAudio()
+        {
+            LogAssert.Expect(LogType.Warning, new Regex("DESK FALLBACK: the primary device"));
+            LogAssert.Expect(LogType.Error, new Regex("DESK FALLBACK has NO AUDIO either.*CaveSim.*Auto.*" + NoDevice + "_2"));
+            _eng = Harness.CreateEngine(e =>
+            {
+                RigPrimary(e);
+                e.fallbackProfile = BwaFallbackProfile.CaveSim;
+                e.fallbackSink = BwaSinkType.Auto;
+                e.fallbackDevice = NoDevice + "_2";
+            });
+            yield return Harness.Started(_eng);
+            Assert.IsTrue(_eng.Ready, "Auto did not land on the offline sink");
+            Assert.IsTrue(_eng.UsingFallback);
+            Assert.AreEqual(BwaSinkType.Null, Bwa.bwa_get_sink_type(_eng.Handle));
+        }
+
+        // A fallback that ASKED for the offline sink is silent on purpose: nothing to report.
+        [UnityTest]
+        public IEnumerator FallbackOnTheOfflineSinkOnPurposeIsNotAnError()
+        {
+            using (var log = new Harness.LogCapture())
+            {
+                _eng = Harness.CreateEngine(e =>
+                {
+                    RigPrimary(e);
+                    e.fallbackProfile = BwaFallbackProfile.CaveSim;
+                    e.fallbackSink = BwaSinkType.Null;
+                    e.fallbackDevice = NoDevice + "_2";
+                });
+                yield return Harness.Started(_eng);
+                Assert.IsTrue(_eng.UsingFallback);
+                Assert.AreEqual(1, log.Count("DESK FALLBACK: the primary device"));
+                Assert.AreEqual(0, log.Count("NO AUDIO"), "a fallback on the Null sink was reported as a failure");
+            }
+        }
+
         // A cluster node that does not own audio opens nothing: not the primary, not the fallback.
         [UnityTest]
         public IEnumerator NonOwnerTakesNoFallback()
