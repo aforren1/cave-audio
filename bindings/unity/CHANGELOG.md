@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.23.2]
+
 ### Fixed: a stereo Auto request read as present with no output device (engine)
 
 - On Windows, `bwa_device_present` for a stereo profile under Auto with no device name counted
