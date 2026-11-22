@@ -311,7 +311,9 @@ turns that plane into a water surface seen from below (the Lloyd's-mirror comb).
 **`BwaSpeakerView : Node3D`** - one gizmo per speaker, lit by that channel's live output
 level. It reads the geometry back from the engine, so it draws the array the engine is
 *actually* panning with: a layout that failed to load and fell back to the default grid
-looks wrong immediately instead of sounding wrong later.
+looks wrong immediately instead of sounding wrong later. The levels are the speaker bus's
+(`get_bus_levels`). In the binaural profile point sources and beds bypass that bus, so the gizmos
+stay dark under a dry source you can hear, and only reverb lights them.
 
 ### Geometry is collected, not pushed
 
@@ -498,7 +500,7 @@ print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine neede
 
 The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
 name what a source **is**. Nothing in the table is measured: a kind differs from the default
-only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/api.md) argues the case, and every other field sits at the
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/5885fc659412/docs/api.md) argues the case, and every other field sits at the
 engine default.
 
 Position, orientation, and playback state are deliberately **out**. Position and orientation
@@ -515,7 +517,7 @@ what the engine is rendering.
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/52ad83fb7b5e/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/5885fc659412/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
