@@ -196,6 +196,26 @@ namespace BwAudio
             _pending = held ? snd : 0;      // a READY play supersedes a still-pending earlier one
         }
 
+        /// <summary>Scheduled play against a HOST time instead of a dsp sample: the sound is HEARD when
+        /// the video frame whose buffer swap happens at <paramref name="swapHostTimeNs"/> is SEEN.
+        /// Nanoseconds on <see cref="Engine.HostTimeNs"/>'s clock. The Engine converts it
+        /// (<see cref="Engine.TryDspTimeFramesForHostTime"/>): plus Engine.displayLatencySeconds,
+        /// minus the device's output latency, then <see cref="PlayAt"/>.
+        /// <para>For a cluster, where every node draws the flash on a synchronized frame and only
+        /// this node has the sample clock: predict that frame's swap time, call this on the node
+        /// that owns audio. Schedule ahead by more than the output latency plus a block, or the
+        /// start is already past and the sound plays at once, late.</para>
+        /// <para>False, and nothing plays, while the engine has no clock yet (the first blocks after
+        /// Start) and on a node that does not own audio. True means the play was scheduled; a clip
+        /// that does not load still reports through its own warning.</para></summary>
+        public bool PlayAtHostTime(ulong swapHostTimeNs, string clipOverride = null)
+        {
+            var engine = Engine.Instance;
+            if (!engine || !Live || !engine.TryDspTimeFramesForHostTime(swapHostTimeNs, out ulong start)) return false;
+            PlayAt(start, clipOverride);
+            return true;
+        }
+
         /// <summary>Play with an intro→loop region: the intro <c>[0, loopBeg)</c> plays once, then the
         /// body <c>[loopBeg, loopEnd)</c> loops forever (wraps at loopEnd back to loopBeg, not the clip
         /// end). Frames are engine-rate (seconds × Engine.sampleRate). loopEnd 0 = the clip end. Always

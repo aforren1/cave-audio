@@ -62,6 +62,7 @@ namespace BwAudio
         Engine _owner;                         // the Engine this bed was created under
         bool _startRan;                        // see SourceBase: the first create waits for Start
         bool _autoPlayDone;                    // this create's auto-play ran, or a play call replaced it
+        bool _paused;                          // SourceBase._paused, same life: kept across the create, cleared by a play and by OnDisable
         int _roomRevision;                     // the Room.Revision the orientation was last pushed for
 
         // onFinished has the same two feeds as Emitter's, because a bed IS a voice and the engine
@@ -136,6 +137,8 @@ namespace BwAudio
             }
             Bwa.bwa_bed_set_gain(engine.Handle, _bed, gain);
             ApplyOrientation();                  // always: yaw 0 is world +Z, which a turned origin moves
+            // A Paused set before the bed existed is kept, not reset (OnDisable resets it).
+            if (_paused) Bwa.bwa_bed_set_paused(engine.Handle, _bed, true);
             engine.RegisterBed(this);            // the completion / loop event route
             if (_startRan) AutoPlay();
             return true;
@@ -147,7 +150,10 @@ namespace BwAudio
         {
             if (_autoPlayDone) return;
             _autoPlayDone = true;
-            if (playOnEnable) Play();
+            if (!playOnEnable) return;
+            bool paused = _paused;               // Paused set before the bed existed: start paused
+            Play();
+            if (paused) Paused = true;
         }
 
         bool LiveForPlayback()
@@ -252,6 +258,18 @@ namespace BwAudio
             if (Resolve(clipOverride, out uint snd)) Bwa.bwa_bed_play_at(Eng, _bed, snd, loop, startSample);
         }
 
+        /// <summary>Scheduled play against a HOST time: the soundfield is HEARD when the video frame
+        /// whose buffer swap happens at <paramref name="swapHostTimeNs"/> is SEEN. The bed twin of
+        /// <see cref="Emitter.PlayAtHostTime"/>, same conversion and the same rules. False, and
+        /// nothing plays, while the engine has no clock yet and on a node that does not own audio.</summary>
+        public bool PlayAtHostTime(ulong swapHostTimeNs, string clipOverride = null)
+        {
+            var engine = Engine.Instance;
+            if (!engine || !Live || !engine.TryDspTimeFramesForHostTime(swapHostTimeNs, out ulong start)) return false;
+            PlayAt(start, clipOverride);
+            return true;
+        }
+
         /// <summary>Intro then looping body inside one soundfield file: FRAMES [0, loopBeg) play once,
         /// then [loopBeg, loopEnd) repeats. 0/0 loops the whole asset. The region IS the loop, so the
         /// `loop` field does not apply here.</summary>
@@ -310,6 +328,7 @@ namespace BwAudio
             }
             else snd = engine.Acquire(path, LoadFlags);                // blocking decode; rejects mono
             if (snd == 0) return false;
+            _paused = false;                    // a play restarts un-paused, as Emitter.Play does
             // Only a play that BINDS voids the previous end's duplicate suppression. A play HELD on an
             // async decode has not bound: the engine bumps its per-slot play counter at bind time, and
             // that counter is the gate that drops a completion straggling in from the PREVIOUS play, so
@@ -355,6 +374,31 @@ namespace BwAudio
             if (live) Bwa.bwa_bed_stop(Eng, _bed);
             else Defer(Stop, false);
         }
+
+        /// <summary>Pause in place. Click-free (the engine ramps out over one block); a paused bed
+        /// still reads as <see cref="IsPlaying"/> and its playhead holds. The bed twin of
+        /// SourceBase.Pause.</summary>
+        public void Pause() { Paused = true; }
+
+        /// <summary>Resume from exactly where Pause landed.</summary>
+        public void UnPause() { Paused = false; }
+
+        /// <summary>Paused state, with SourceBase.Paused's rules: set-driven, and any play restarts
+        /// un-paused. Set before Start, the auto-play runs first and the bed starts paused. Set
+        /// before the bed exists (no Engine yet), it is kept and applied at the create. A disable
+        /// clears it. On a node that does not own audio it only stores the value.</summary>
+        public bool Paused
+        {
+            get => _paused;
+            set { bool live = LiveForPlayback(); _paused = value; if (live) Bwa.bwa_bed_set_paused(Eng, _bed, value); }
+        }
+
+        /// <summary>Is this bed still producing audio? The same read as <see cref="SourceBase.IsPlaying"/>
+        /// and the same rules: true from a play until the soundfield ends or is stopped, a looping
+        /// bed until it is stopped, and a PAUSED bed still reads as playing. A play held on an async
+        /// decode reads false until the data lands. False on a node that does not own audio. For
+        /// completion, prefer onFinished: a soundfield shorter than a frame is never seen playing.</summary>
+        public bool IsPlaying => Live && Bwa.bwa_bed_is_playing(Eng, _bed);
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate FRAMES (latest-wins
         /// readback, ~one audio block of lag; freezes while the bed is paused). 0 while idle.
@@ -417,6 +461,7 @@ namespace BwAudio
             _wasPlaying = false;                 // never carry a stale play edge into a re-enable
             _endFired = false;
             _autoPlayDone = false;               // a re-enable auto-plays again
+            _paused = false;                     // and starts un-paused
             if (_created && Eng != IntPtr.Zero)  // owner gone (engine destroyed/replaced) -> Eng is Zero:
             {                                    // the stale handle never destroys a successor's bed
                 _owner.UnregisterBed(this);

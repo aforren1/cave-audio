@@ -178,7 +178,9 @@ namespace BwAudio.EditorTools
                     "Both reverb beds are enabled, and they share ONE reverb tap. The FDN takes it and " +
                     "the Steam Audio bed is ignored. Tick only one.", MessageType.Warning);
 
-            if (a.feedListener && a.listener == null)
+            // A listener bound at run time (Listener Name, Engine.ListenerProvider) is empty here on purpose.
+            if (a.feedListener && a.listener == null && string.IsNullOrEmpty(a.listenerName) &&
+                Engine.ListenerProvider == null)
                 EditorGUILayout.HelpBox(
                     "Feed Listener is on but no listener Transform is assigned — the listener will never " +
                     "move from the array centroid, and every source will be panned for a head that never " +
