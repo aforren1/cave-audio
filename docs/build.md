@@ -702,7 +702,13 @@ available when packing fails, because the job that built each one uploads it.
   a version it isn't. See [Releasing](#releasing).
 - **The Godot addon packs every run** as `godot-addon-<ver>-r<N>` and, on a tag, as its own
   release asset. A tag also updates the `unity` and `godot` distribution branches (installable
-  git refs; see `bindings/godot/README.md` and the workflow header).
+  git refs; see `bindings/godot/README.md` and the workflow header) and tags the commit it
+  published on each: `unity/v<version>` and `godot/v<version>`. Those tags are what pins a
+  release, because the `v*` tag points at `main`. For Unity:
+  `https://github.com/aforren1/cave-audio.git#unity/v<version>`. The tags start with the first
+  release after 0.23.2. Re-running the failed jobs of a release leaves an existing tag alone. A
+  full rebuild makes different binaries and so a different commit, and the publish step then
+  fails before it pushes: a published tag is never moved.
 - **The MATLAB toolbox** is assembled as `bw_audio-matlab/`: `+bwa`, the examples, the README,
   the licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that platform's two
   MEX files plus the one engine library both of them load. The job asserts all six MEX files are

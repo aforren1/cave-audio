@@ -197,6 +197,12 @@ cosmetic. **The Asset Library downloads a repo archive at a specific commit**, n
 asset, so the binaries have to be committed somewhere. Keeping them on their own branch
 leaves `main` source-only and its existing "no binaries in the tree" rule intact.
 
+Each publish is also tagged `godot/v<version>`, so a release's addon tree has a name as well as
+a hash. The tags start with the first release after 0.23.2. The script checks the tag before it
+pushes. Re-running the failed jobs of a release is a no-op, because the staged tree is the same.
+A full rebuild makes different binaries, so a different commit, and the tag that already names
+the first one stops the publish. That is intended: a published tag is never moved.
+
 Publishes are ordinary commits, never a force-push. An Asset Library entry pins a commit
 hash, and rewriting history would eventually orphan a published one. The standing cost is
 that the branch grows by roughly the addon's size per release; that is inherent to in-repo
@@ -435,7 +441,9 @@ turns that plane into a water surface seen from below (the Lloyd's-mirror comb).
 **`BwaSpeakerView : Node3D`** - one gizmo per speaker, lit by that channel's live output
 level. It reads the geometry back from the engine, so it draws the array the engine is
 *actually* panning with: a layout that failed to load and fell back to the default grid
-looks wrong immediately instead of sounding wrong later.
+looks wrong immediately instead of sounding wrong later. The levels are the speaker bus's
+(`get_bus_levels`). In the binaural profile point sources and beds bypass that bus, so the gizmos
+stay dark under a dry source you can hear, and only reverb lights them.
 
 ### Geometry is collected, not pushed
 

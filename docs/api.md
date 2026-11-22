@@ -2355,7 +2355,7 @@ Why each non-default value:
 ```c
 typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2 } bwa_test_kind;
 void     bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain);
-uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);  // last block's per-channel output peak
+uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);  // last block's per-channel speaker-bus peak
 uint32_t bwa_get_active_voices(bwa_engine* e);                           // last block's active voice count
 bool     bwa_get_health(bwa_engine* e, bwa_health* out);                 // xruns + load; see below
 uint64_t bwa_get_xruns(bwa_engine* e);                                   // device dropouts, one line
@@ -2433,9 +2433,13 @@ content on that Digiface channel and speaker; `cave_sim` HRTFs that bus channel 
 speaker; `binaural` renders the voice as a point source AT that speaker's surveyed position, dry,
 because point voices never reach the bus there. That is the same thing your ears get in `cave_sim`.
 
-`bwa_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
-(linear), measured at the very end of the render, after align, the test signal, and the limiter.
-That is exactly what the device channel received. It fills up to `cap` floats and returns the
+`bwa_get_bus_levels` is the matching **readback**: each speaker-bus channel's last-block peak
+`|sample|` (linear), measured at the very end of the render, after align, the test signal, and the
+limiter. In `cave` and `cave_both` that is exactly what the device channel received. In `cave_sim`
+it is the virtual speakers, before the HRTF decode: the device receives the stereo, which this
+does not meter. In `binaural` point voices and beds never reach the bus, so it holds only the
+reverb and diffuse taps and reads 0 under a dry source or a bed that is audible. Nothing meters
+the headphone stereo. It fills up to `cap` floats and returns the
 count filled (`bwa_get_channel_count()` when `cap` allows). Per-frame-safe (relaxed atomic reads, no
 locks); levels read 0 until audio is
 running. Drive channel meters or a speaker-activity display with it; the playground lights each

@@ -1277,9 +1277,13 @@ BWA_API void     bwa_source_set_channel(bwa_engine* e, bwa_source s, int32_t cha
  * auditioning the geometry the engine is actually panning with. Control thread; safe any time. */
 BWA_API uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap);
 
-/* Per-channel output meter: fills `peaks` with up to `cap` channels' LAST-BLOCK peak |sample|
+/* Per-channel SPEAKER-BUS meter: fills `peaks` with up to `cap` channels' LAST-BLOCK peak |sample|
  * (linear), measured at the very end of the render: after align, the test signal, and the limiter.
- * That is exactly what each device channel received. Returns the count filled. Control thread,
+ * In the array profiles (CAVE, CAVE_BOTH) that is exactly what each device channel received. In
+ * CAVE_SIM it is the virtual speakers ahead of the HRTF decode; the device receives the stereo,
+ * which this does not meter. In BINAURAL point voices and beds bypass the bus, so it carries only
+ * the reverb/diffuse taps and reads 0 under an audible dry source or bed. Nothing meters the
+ * headphone stereo. Returns the count filled. Control thread,
  * per-frame-safe (relaxed atomic reads; no locks/alloc) - drive channel meters or a speaker-activity
  * display (the playground lights each speaker gizmo with it). Reads 0 until audio is running. */
 BWA_API uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);

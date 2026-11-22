@@ -35,6 +35,7 @@ namespace BwAudio.Tests
         public const string BedShort = "bwa_test_bed_short.wav";  // 4-ch AmbiX, 64 frames
         public const string BedLong  = "bwa_test_bed_long.wav";   // 4-ch AmbiX, 12288 frames
         public const string BedFront = "bwa_test_bed_front.wav";  // 4-ch AmbiX plane wave from the front, 12288 frames
+        public const string BedTwoSec = "bwa_test_bed_2s.wav";    // 4-ch AmbiX, 96000 frames = 2.0 s
 
         public const uint SubFrameFrames = 64;
         public const uint ShortFrames    = 12288;
@@ -53,6 +54,7 @@ namespace BwAudio.Tests
             WriteTone(Path.Combine(dir, BedShort), SubFrameFrames, 4);
             WriteTone(Path.Combine(dir, BedLong),  ShortFrames,    4);
             WriteTone(Path.Combine(dir, BedFront), ShortFrames,    4, front: true);
+            WriteTone(Path.Combine(dir, BedTwoSec), LongFrames,    4);
         }
 
         // A 16-bit PCM wav of a 440 Hz tone. channels = 1 for a point source; 4 writes an AmbiX

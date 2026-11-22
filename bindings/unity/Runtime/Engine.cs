@@ -43,10 +43,28 @@ namespace BwAudio
         /// false. It is cleared on every entry into Play mode.</para></summary>
         public static Func<bool> OwnsAudioPredicate;
 
+        /// <summary>A process-wide source for the listener Transform, for a head that does not exist
+        /// when the scene is saved: a VR toolkit that creates its head node at run time. While
+        /// <see cref="listener"/> is unassigned (or was destroyed), the Engine calls this a few times
+        /// a second until it returns a live Transform, assigns that to <see cref="listener"/>, and
+        /// stops asking. <see cref="listenerName"/> is tried after it. Return null for "not yet".
+        /// <para>Static for the reason <see cref="OwnsAudioPredicate"/> is: the code that knows the
+        /// toolkit runs before the scene loads and has no Engine to hold, and the Engine is a
+        /// singleton that outlives scenes, so a per-instance hook would have nothing to add. Set it
+        /// from the same bootstrap method. Asked only on the node that owns audio, and only while
+        /// Unity feeds the pose (<see cref="feedListener"/>, or the desk fallback). A provider that
+        /// throws is logged once and read as null. Cleared on every entry into Play mode.</para></summary>
+        public static Func<Transform> ListenerProvider;
+
         // With Domain Reload off, statics survive into the next Play session; a predicate captured
         // from the last one must not decide this one. Runs before BeforeSceneLoad, where it is set.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        static void ResetOnPlay() { OwnsAudioPredicate = null; ComponentWaitFrames = 0; EditorCheck = DebugBuildCheck = PresentCheck = null; }
+        static void ResetOnPlay()
+        {
+            OwnsAudioPredicate = null; ListenerProvider = null; ComponentWaitFrames = 0;
+            EditorCheck = DebugBuildCheck = PresentCheck = null;
+            OutputLatencyCheck = null; ListenerSearchWarnS = ListenerSearchWarnDefaultS;
+        }
 
         /// <summary>Frames that BwAudio components have spent waiting for an Engine, summed over all of
         /// them. It rises while components exist and no Engine has finished Start. It stays flat on a
@@ -190,6 +208,12 @@ namespace BwAudio
         [Tooltip("The tracked head: your OptiTrack rigid body, or the XR camera at a desk. Required " +
                  "when Feed Listener is on — without it the listener never moves from the array centroid.")]
         public Transform listener;          // OptiTrack head rigid body, or the XR camera at a desk
+        [Tooltip("Find the listener by GameObject name while Listener is empty: for a head node that a " +
+                 "VR toolkit creates at run time, after the scene starts. Looked up a few times a " +
+                 "second until it exists, then assigned to Listener. Looked up again if that object is " +
+                 "destroyed. A '/' makes it a hierarchy path (Rig/Head). Empty = off. " +
+                 "Engine.ListenerProvider is the code route and is tried first.")]
+        public string listenerName = "";
         public bool feedListener = true;    // false => the core reads NatNet itself (cave/both)
         [Tooltip("Internal tracking only (Feed Listener off): the Motive host IP, for the command " +
                  "handshake and rigid-body names. Empty = multicast-only (no handshake).")]
@@ -207,6 +231,14 @@ namespace BwAudio
                  "motion-to-ears latency, in SECONDS (typically 0.02-0.04 s). Too much lead overshoots on " +
                  "direction changes. 0 = off.")]
         [Range(0f, 0.2f)] public float posePredictionS = 0f;
+
+        [Header("AV sync")]
+        [Tooltip("The MEASURED time from a frame's buffer swap to its light leaving the display or " +
+                 "projector, in seconds. PlayAtHostTime adds it, so a sound scheduled for a frame is " +
+                 "heard when that frame is SEEN, not when it is swapped. Measure it once per display " +
+                 "(a photodiode against a loopback of the audio). 0 = unknown, treated as none. " +
+                 "Negative counts as 0 and anything over 10 s as 10 s.")]
+        [Min(0f)] public float displayLatencySeconds = 0f;
 
         [Header("Output")]
         [Tooltip("One ramped scalar over the whole mix — applied before the per-speaker trims (which stay " +
@@ -436,6 +468,8 @@ namespace BwAudio
             finally { Decided = true; }
             // A fallback that did not start is not in use: ActiveProfile reads as profile again.
             if (!Ready) { _fallbackTaken = false; _fallbackListener = null; }
+            // On every node, the ones without audio included: they all draw with this registration.
+            LogRegistration();
             RunDeferred();
         }
         bool _started;           // bwa_start succeeded: what a failed bring-up has to stop before it destroys
@@ -590,6 +624,10 @@ namespace BwAudio
                                "another output, or set Fallback Device to a device this machine has " +
                                "(Engine.Devices lists them; empty is the default output).", this);
 
+            // A late-bound head that exists already: bind it now, ahead of the fallback's choice of a
+            // stand-in and ahead of the missing-listener warning.
+            if (FeedsListener) ResolveListener(force: true);
+
             // The fallback with internal tracking: the tracker is the rig's Motive, which a desk
             // does not have, and a connect toward it would open a socket and report success. Feed
             // the pose from Unity instead.
@@ -625,10 +663,106 @@ namespace BwAudio
 
             // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
             // just stays at the array centroid and every source is panned for a head that never moves.
-            if (feedListener && !listener)
+            // A late-bound listener (Listener Name, ListenerProvider) is expected to be missing here:
+            // the search in LateUpdate has its own warning, once, when nothing turns up.
+            if (feedListener && !listener && !ListenerExpected)
                 Debug.LogWarning("[bw_audio] 'Feed Listener' is on but no listener Transform is assigned: " +
                                  "the listener will never move from the array centroid. Assign the tracked " +
                                  "head (or turn Feed Listener off to let the engine read NatNet itself).");
+        }
+
+        // ---- the late-bound listener ------------------------------------------------------------------
+        //
+        // A VR toolkit can create its head node after the scene starts, so `listener` cannot always be
+        // wired in the inspector. While it is empty the Engine asks ListenerProvider, then looks
+        // listenerName up, on a timer: GameObject.Find walks every root object, which is too slow for
+        // every frame and fast enough for four times a second. Once the warning has fired the name is
+        // probably wrong, and a wrong name would otherwise cost a scene walk four times a second for
+        // the whole session, on the node whose frames a cluster is locked to: it drops to once a
+        // second. A destroyed listener reads as empty
+        // again (Unity's null), so the same search re-binds it after a toolkit rebuilds its rig.
+        // Only where the pose is used: the owner, while Unity feeds it. A node that does not own
+        // audio has nothing to feed, and under internal tracking the engine reads the tracker itself.
+        const float ListenerSearchEveryS = 0.25f;
+        const float ListenerSearchSlowEveryS = 1f;
+        const float ListenerSearchWarnDefaultS = 10f;
+        internal static float ListenerSearchWarnS = ListenerSearchWarnDefaultS;   // a test seam: the wait, shortened
+        float _listenerSearchNext, _listenerSearchSince = -1f;
+        bool _listenerSearchWarned, _listenerProviderThrew;
+
+        bool ListenerExpected => ListenerProvider != null || !string.IsNullOrEmpty(listenerName);
+
+        /// <summary>How many times the late-bound listener search has run. It stops rising once
+        /// <see cref="listener"/> is bound. A diagnostic.</summary>
+        public int ListenerSearches { get; private set; }
+
+        void ResolveListener(bool force = false)
+        {
+            if (listener) { _listenerSearchSince = -1f; return; }
+            if (!ListenerExpected) return;
+            float now = Time.realtimeSinceStartup;
+            if (_listenerSearchSince < 0f) { _listenerSearchSince = now; _listenerSearchWarned = false; force = true; }
+            if (!force && now < _listenerSearchNext) return;
+            _listenerSearchNext = now + (_listenerSearchWarned ? ListenerSearchSlowEveryS : ListenerSearchEveryS);
+            ListenerSearches++;
+
+            Transform found = null;
+            if (ListenerProvider != null)
+            {
+                try { found = ListenerProvider(); }
+                catch (Exception ex)
+                {
+                    if (!_listenerProviderThrew) { _listenerProviderThrew = true; Debug.LogException(ex, this); }
+                }
+            }
+            if (!found && !string.IsNullOrEmpty(listenerName))
+            {
+                // Active objects only: an inactive head has no pose to follow. A '/' in the name is
+                // a hierarchy path to Find, which is how two heads with one name are told apart.
+                var go = GameObject.Find(listenerName);
+                if (go) found = go.transform;
+            }
+            if (found)
+            {
+                listener = found;
+                if (_fallbackTaken && !feedListener) _fallbackListener = found;   // it replaces the camera stand-in
+                _listenerSearchSince = -1f;
+                _listenerSeen = _listenerArmed = false;      // a new head gets its own placement grace
+                // Not during BringUp: its own registration line follows and already names the head.
+                if (Decided) LogRegistration();
+                return;
+            }
+            if (!_listenerSearchWarned && now - _listenerSearchSince > ListenerSearchWarnS)
+            {
+                _listenerSearchWarned = true;
+                Debug.LogWarning("[bw_audio] no listener after " + ListenerSearchWarnS.ToString("F0", System.Globalization.CultureInfo.InvariantCulture) + " s: " +
+                                 (ListenerProvider != null ? "Engine.ListenerProvider returns null" : "") +
+                                 (ListenerProvider != null && !string.IsNullOrEmpty(listenerName) ? " and " : "") +
+                                 (!string.IsNullOrEmpty(listenerName)
+                                      ? "no active GameObject is named '" + listenerName + "'" : "") +
+                                 ". The listener stays at the array centroid. Still looking, once a " +
+                                 "second.", this);
+            }
+        }
+
+        // One line that makes a wrong Room Origin visible in the log: where the room frame sits in the
+        // scene, and where that puts the head. Compare the second against where the head really is.
+        // Printed once Start has decided, on every node, and each time a late-bound listener binds.
+        void LogRegistration()
+        {
+            // Invariant: a log line somebody compares against a layout file must not print "1,448".
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string V(Vector3 v) => "(" + v.x.ToString("F3", inv) + ", " + v.y.ToString("F3", inv) + ", " +
+                                   v.z.ToString("F3", inv) + ")";
+            var o = roomOrigin;
+            var head = feedListener ? listener : _fallbackListener;
+            string origin = o ? "Room Origin '" + o.name + "' at world " + V(o.position) + ", yaw " +
+                                o.eulerAngles.y.ToString("F1", inv) + " deg"
+                              : "no Room Origin (the room frame is Unity world, x mirrored)";
+            string where = !Ready ? "no listener is fed on this node"
+                         : head ? "listener '" + head.name + "' at room " + V(Room.Pos(head.position))
+                         : FeedsListener ? "no listener Transform yet" : "listener from the tracker";
+            Debug.Log("[bw_audio] registration: " + origin + "; " + where + ".", this);
         }
 
         // Calls a component made between Awake and Start that need the native engine (Emitter.Play
@@ -1129,9 +1263,15 @@ namespace BwAudio
         public uint ChannelCount => _channels;
         uint _channels;
 
-        /// <summary>Last block's peak |sample| per output channel (linear), as the device received it —
-        /// after the trims, the test signal, and the limiter. Drives channel meters / a speaker-activity
-        /// display. The array is reused; it is ChannelCount long.</summary>
+        /// <summary>Last block's peak |sample| per channel of the SPEAKER BUS (linear), after the trims,
+        /// the test signal, and the limiter. Drives channel meters / a speaker-activity display. The
+        /// array is reused; it is ChannelCount long.
+        /// <para>What that is depends on the profile. Cave and CaveBoth: exactly what each device
+        /// channel received. CaveSim: the virtual speakers, before the HRTF decode that makes the
+        /// stereo the headphones receive. Binaural: point sources and beds bypass the bus (they are
+        /// rendered straight to the HRTF), so it carries only the reverb and diffuse taps and reads
+        /// ZERO while a dry source or a bed is plainly audible. Nothing here meters the headphone
+        /// stereo. For "is anything playing" use ActiveVoices or IsPlaying, not these levels.</para></summary>
         public float[] BusLevels()
         {
             if (!Ready) return Array.Empty<float>();
@@ -1255,13 +1395,89 @@ namespace BwAudio
             RefreshClock();
             double fs = sampleRate;
             if (!_clkValid)
-            {
-                double f = (double)DspTimeFrames + (realtime - Time.realtimeSinceStartupAsDouble) * fs;
-                return f > 0 ? (ulong)f : 0;
-            }
-            double dsp = _clkSampleD + (realtime + _clkOffset - _clkHostSec) * fs;
-            return dsp > 0 ? (ulong)dsp : 0;
+                return Advance(DspTimeFrames, (realtime - Time.realtimeSinceStartupAsDouble) * fs);
+            return Advance(_clkSample, (realtime + _clkOffset - _clkHostSec) * fs);
         }
+
+        // The one place a (pair sample, frames ahead of it) becomes a dsp sample, for DspTimeFramesAt
+        // and the host-time helpers alike: round to nearest, and clamp at sample 0. Two helpers that
+        // rounded differently would name different samples for the same instant.
+        static ulong Advance(ulong pairDspSample, double aheadFrames)
+        {
+            if (!(Math.Abs(aheadFrames) < 9e18)) return pairDspSample;        // NaN or absurd: no move
+            if (aheadFrames >= 0.0) return pairDspSample + (ulong)(aheadFrames + 0.5);
+            ulong back = (ulong)(-aheadFrames + 0.5);
+            return back < pairDspSample ? pairDspSample - back : 0;
+        }
+
+        /// <summary>The longest display latency the host-time helpers accept, in seconds. A larger
+        /// value is a unit error (milliseconds typed as seconds), and is clamped to this.</summary>
+        public const double MaxDisplayLatencySeconds = 10.0;
+
+        /// <summary>The dsp sample to hand to PlayAt so that a sound is HEARD when a video frame is
+        /// SEEN, given the HOST time of that frame's buffer swap. Pure arithmetic, so the rule lives
+        /// in one place:
+        /// <c>pairDspSample + (swapHostTimeNs + displayLatency - pairHostTimeNs) * rate - outputLatency</c>.
+        /// (<paramref name="pairDspSample"/>, <paramref name="pairHostTimeNs"/>) is a
+        /// <see cref="GetClock"/> pair. The display latency moves the target LATER (light leaves the
+        /// display after the swap); the output latency moves the start EARLIER (a sample scheduled
+        /// for T is heard at T + latency). Rounded to the nearest sample; a result before sample 0
+        /// clamps to 0.
+        /// <para>The arithmetic is exact. The answer is as good as the pair and the rate you pass:
+        /// a block stamp carries the driver's stamp jitter (<see cref="GetClockModel"/>'s
+        /// <c>jitter_ns</c>), and a nominal rate drifts from the device's by its ppm.</para>
+        /// <para>A display latency that is negative or not a number counts as 0, and one above
+        /// <see cref="MaxDisplayLatencySeconds"/> as that. A rate that is not a positive finite
+        /// number returns 0: there is nothing to schedule against.</para></summary>
+        public static ulong DspTimeFramesForHostTime(ulong pairDspSample, ulong pairHostTimeNs, double rateHz,
+                                                     ulong swapHostTimeNs, double displayLatencySeconds,
+                                                     uint outputLatencyFrames)
+        {
+            // Written as negations so NaN fails each test: Math.Max(0, NaN) is NaN, and a NaN cast
+            // to ulong is an unspecified sample number that PlayAt would take.
+            if (!(rateHz > 0.0) || double.IsInfinity(rateHz)) return 0;
+            if (!(displayLatencySeconds >= 0.0)) displayLatencySeconds = 0.0;
+            if (displayLatencySeconds > MaxDisplayLatencySeconds) displayLatencySeconds = MaxDisplayLatencySeconds;
+            // The stamps are subtracted as integers, so the span is exact at any uptime, and the
+            // sign is taken by hand because the target may precede the pair.
+            double aheadNs = swapHostTimeNs >= pairHostTimeNs ? (double)(swapHostTimeNs - pairHostTimeNs)
+                                                            : -(double)(pairHostTimeNs - swapHostTimeNs);
+            return Advance(pairDspSample, (aheadNs * 1e-9 + displayLatencySeconds) * rateHz - outputLatencyFrames);
+        }
+
+        /// <summary>The cluster onset helper: the dsp sample at which to start a sound so that it is
+        /// heard when the frame swapped at <paramref name="swapHostTimeNs"/> is seen. Host time is
+        /// <see cref="HostTimeNs"/>'s clock (QPC on Windows), in nanoseconds. It adds
+        /// <see cref="displayLatencySeconds"/> and subtracts <see cref="OutputLatencyFrames"/>.
+        /// <para>It is the same mapping as <see cref="DspTimeFramesAt"/>: the same block pair, read
+        /// by the same refresh, and the same rounding, so the two name the same sample for the same
+        /// instant. What DspTimeFramesAt adds is its estimate of the offset between Unity's clock
+        /// and the host clock, which a host time does not need. Neither smooths the block stamps:
+        /// the result is as good as the engine's clock stamps, and
+        /// <see cref="GetClockModel"/>'s <c>jitter_ns</c> says how good that is on this driver.
+        /// The rate is the nominal one. For a target minutes away, use GetClockModel's fitted rate
+        /// with <see cref="DspTimeFramesForHostTime"/>.</para>
+        /// <para>False, with nothing to schedule, until the engine has a host-stamped block
+        /// (<see cref="GetClock"/>): before Start, for the first blocks after it, and always on a
+        /// node that does not own audio. The manual sink's stamps are SYNTHESIZED from the sample
+        /// position, so once it is pumped this returns true and the mapping means nothing against
+        /// a real host time: it is for arithmetic tests only.</para>
+        /// <para>It does not refuse a time already past. PlayAt starts such a sound at once, which
+        /// is late: compare the result with <see cref="DspTimeFrames"/> when the margin matters.</para></summary>
+        public bool TryDspTimeFramesForHostTime(ulong swapHostTimeNs, out ulong startSample)
+        {
+            startSample = 0;
+            RefreshClock();
+            double fs = sampleRate;
+            if (!_clkValid || !(fs > 0.0)) return false;
+            uint lat = OutputLatencyCheck != null ? OutputLatencyCheck() : OutputLatencyFrames;
+            startSample = DspTimeFramesForHostTime(_clkSample, _clkHostNs, fs, swapHostTimeNs,
+                                                   displayLatencySeconds, lat);
+            return true;
+        }
+        // A test seam, null in use: the offline sink has no device and reports a latency of 0, and 0
+        // would leave the subtraction above unexercised.
+        internal static Func<uint> OutputLatencyCheck;
 
         /// <summary>Inverse of DspTimeFramesAt: the Time.realtimeSinceStartupAsDouble moment at which a
         /// dsp sample is RENDERED (add OutputLatencySeconds for when it is heard) — for firing visuals
@@ -1291,9 +1507,9 @@ namespace BwAudio
                 _clkOffset = cand;                                   // first pair / restart / epoch change
             else
                 _clkOffset = Math.Max(cand, _clkOffset - 2e-6);      // decaying max (covers clock drift)
-            _clkSample = cs; _clkSampleD = cs; _clkHostSec = hostSec; _clkValid = true;
+            _clkSample = cs; _clkSampleD = cs; _clkHostNs = ct; _clkHostSec = hostSec; _clkValid = true;
         }
-        bool _clkValid; ulong _clkSample; double _clkSampleD, _clkHostSec, _clkOffset;
+        bool _clkValid; ulong _clkSample, _clkHostNs; double _clkSampleD, _clkHostSec, _clkOffset;
 
         /// <summary>Drive ONE raw output channel with a test tone — a speaker-check / wiring tool, injected
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
@@ -1768,13 +1984,14 @@ namespace BwAudio
             _pushBuf.Clear();
             _pushBuf.AddRange(_sources);
             foreach (var s in _pushBuf) if (s) s.FrameSync();      // all sources first...
+            if (FeedsListener) ResolveListener();                  // a late-bound head: a timer check, then nothing
             var head = feedListener ? listener : _fallbackListener;   // the second only on the fallback
             if (head)
             {
                 var p = Room.Pos(head.position);
                 var q = Room.Rot(head.rotation);
                 Bwa.bwa_set_listener_pose(_eng, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
-                CheckListenerPlacement(p);
+                CheckListenerPlacement(p, head);
             }
             PushExtraListeners();                                 // ...the other occupants (commit-gated too)...
             Bwa.bwa_commit(_eng);                                    // ...then one atomic snapshot
@@ -1804,7 +2021,7 @@ namespace BwAudio
         float _listenerWarnAfter, _listenerFirstSeenAt;
         Vector3 _speakerLo, _speakerHi, _listenerFirstPos;
 
-        void CheckListenerPlacement(Vector3 p)
+        void CheckListenerPlacement(Vector3 p, Transform head)
         {
             if (!_listenerArmed)
             {
@@ -1840,7 +2057,7 @@ namespace BwAudio
             if (outside && !_listenerOutside && Time.realtimeSinceStartup >= _listenerWarnAfter)
             {
                 _listenerWarnAfter = Time.realtimeSinceStartup + ListenerWarnEveryS;
-                Debug.LogWarning($"[bw_audio] Listener '{listener.name}' is at room ({p.x:F2}, {p.y:F2}, " +
+                Debug.LogWarning($"[bw_audio] Listener '{head.name}' is at room ({p.x:F2}, {p.y:F2}, " +
                                  $"{p.z:F2}), {by:F1} m outside {what}. Every source is panned for a head " +
                                  "that is not in the room. Check Engine > Listener and Room Origin.", this);
             }

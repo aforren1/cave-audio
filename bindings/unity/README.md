@@ -56,14 +56,26 @@ installing a downloaded package: `xattr -dr com.apple.quarantine <the imported p
 **Package Manager → `+` → Add package from git URL…**, then:
 
 ```
+https://github.com/aforren1/cave-audio.git#unity/v<version>
+```
+
+That pins one release. Put the release you want in place of `<version>`: the tag is `unity/v`
+plus the release number. To track the latest release instead, use the branch:
+
+```
 https://github.com/aforren1/cave-audio.git#unity
 ```
 
 `unity` is a distribution branch whose **root** is the package: `package.json` at the top level, with
-every platform's engine library already in it. That is the only layout UPM's git installer accepts. CI republishes the
-branch on every `v*` tag, as one commit named `unity <version>`. The `v*` tags themselves point at
-`main`, where `package.json` is not at the root, so a tag ref does not work. To pin a release
-instead of tracking the branch, use that commit's hash as the ref (`#<commit>`).
+every platform's engine library already in it. That is the only layout UPM's git installer accepts.
+CI republishes the branch on every `v*` tag, as one commit named `unity <version>`, and tags that
+commit `unity/v<version>`. The plain `v*` tags point at `main`, where `package.json` is not at the
+root, so `#v<version>` does not work and `#unity/v<version>` does. The tags start with the first
+release after 0.23.2. Release 0.23.2 and older have no `unity/` tag: pin those by the commit's
+hash (`#<commit>`).
+
+Pin a release on a cluster. Every node must load the same package, and a branch ref resolves to
+whatever was newest when each machine last fetched.
 
 ### From a release tarball
 
@@ -164,6 +176,10 @@ dark, so the color computed is the color seen, and there is no lighting rig to s
 instant attack with a slow release, because the engine reports a per-*block* peak that strobes too fast
 to read raw.
 
+It shows the speaker bus. In the Binaural profile point sources and beds do not use that bus, so
+the markers stay dark under a sound you can hear, and light only for reverb. That is expected. Use
+it with Cave, CaveBoth or CaveSim.
+
 Pair it with `Engine.TestSignal(channel, kind, gain)` for wiring checks: drive one raw output channel
 and confirm the speaker that lights up is the one that makes noise.
 
@@ -224,6 +240,9 @@ The manual steps, which are what the item does:
    device; `Engine.Devices(backend)` lists the exact strings `device` accepts. To let the engine
    read NatNet itself instead of following a transform, turn `feedListener` off and set
    `natnetServer` and `natnetRigidBody`. `Engine.TrackerStatus` reports whether poses arrive.
+   A head that a VR toolkit creates at run time cannot be dragged in: leave `listener` empty and
+   set **Listener Name** (`listenerName`) or `Engine.ListenerProvider`. The `Engine` looks a few
+   times a second until the head exists, and again if it is destroyed.
 2. Add **`Emitter`** to each sound source. Set the `clip`, `loop`, `gain`, and the spatial toggles
    (`occlusion`, `reflections`, `directivity`). Its transform drives the source position every frame.
    The inspector's **Preset** and **Apply** fill every field from one of the engine's source
@@ -234,12 +253,47 @@ The manual steps, which are what the item does:
    is what makes the moving-observer case correct. Do not push from individual emitters.
 
 Components added from a script can be configured in the same frame: `AddComponent<Emitter>()`,
-then set `clip` and the rest, and the first play happens at `Start` with those values. A
-**cluster** keeps the rig on every node and sets `Engine.OwnsAudioPredicate` so that one node owns
-the device. The `Engine` asks it in `Start`, after every `Awake` in the scene, so your cluster
-toolkit's own `Awake` has run by then. See
-[docs/integration.md: Clusters](../../docs/integration.md#clusters) and "Creating things at run
-time" below it.
+then set `clip` and the rest, and the first play happens at `Start` with those values. See
+"Creating things at run time" in [docs/integration.md](../../docs/integration.md#creating-things-at-run-time).
+
+### On a cluster
+
+A cluster runs the same scene on several render nodes. Keep the rig on every node and set
+`Engine.OwnsAudioPredicate` so that exactly one node opens the device. The `Engine` asks it in
+`Start`, after every `Awake` in the scene, so your cluster toolkit's own `Awake` has run by then.
+The binding names no toolkit: the lines that ask yours live in your project.
+[docs/integration.md: Clusters](../../docs/integration.md#clusters) has the detail for each point
+below.
+
+- **The owner is the node with the audio interface.** That is not always the cluster server. Ask
+  the toolkit for the role, or ask for the device:
+  `Engine.OwnsAudioPredicate = () => Engine.DevicePresent(profile, sink, device);`. Copy `device`
+  from `Engine.Devices(sink)` on the machine that has the interface. That check
+  reads device lists, so a node with the driver installed and no hardware answers true (see the
+  list under "Test a rig scene at your desk" below). Exactly one node must answer true.
+- **Audio state exists on the owner only.** On every other node `IsPlaying` is false, the
+  playheads, `DspTimeFrames` and `BusLevels` read zero, and `onFinished` and `onLoop` never fire.
+  Never drive visuals or trial flow from them. On the owner, forward the event through your
+  toolkit's synchronized channel, and let every node act on the forwarded event.
+- **Onsets.** Every node draws the flash on a synchronized frame, and only the owner has the
+  sample clock. The owner predicts the host time at which that frame swaps and calls
+  `Emitter.PlayAtHostTime(swapHostTimeNs)`. Host time is nanoseconds on `Engine.HostTimeNs`'s
+  clock, which is QPC on Windows: a `Stopwatch` timestamp converts as
+  `ticks * 1e9 / Stopwatch.Frequency`. The call adds
+  `Engine.displayLatencySeconds` (measured: swap to light), subtracts the output latency, and
+  schedules the play. It returns false, and plays nothing, on the other nodes and while the
+  engine has no clock yet. Schedule three or more frames ahead.
+- **Room Origin is the toolkit's tracking origin.** Assign the Transform your tracked devices are
+  children of (in MiddleVR, the system center node). A wrong one rotates or offsets every source
+  and nothing reports it. The `Engine` logs `registration: ...` at start on every node with the
+  origin's pose, and on the owner the listener's room position. Check that position against the layout while you stand on a
+  known spot. [Match the tracking origin](../../docs/integration.md#match-the-tracking-origin) has
+  the full check.
+- **The head is usually created at run time.** Use Listener Name or `Engine.ListenerProvider`
+  (step 1 above). Only the owner looks for it. A `/` in the name is a hierarchy path
+  (`Rig/Head`).
+- **Pin the package.** Install from `#unity/v<version>`, not `#unity`, so every node has the same
+  release.
 
 ### Test a rig scene at your desk
 
@@ -321,7 +375,10 @@ Where the fallback may run:
 Watching the flag cannot work: `IsPlaying` is a per-block readback, so a clip shorter than a frame
 may never once read as playing, and a looping voice never ends at all. `Engine` drains
 `bwa_poll_ended` and `bwa_poll_looped` once per `LateUpdate`, right after the commit that fills
-them, and routes each handle to the component that owns it. `AmbisonicBed` has both events too.
+them, and routes each handle to the component that owns it. `AmbisonicBed` has both events too,
+and the same `IsPlaying` read as an `Emitter`: true from a play until the soundfield ends or is
+stopped, and still true while paused. `Paused`, `Pause()` and `UnPause()` work as they do on an
+`Emitter`.
 
 `Engine` is the **only** caller of either drain. Both are engine-wide and destructive, so a second
 caller would eat events belonging to other components and their UnityEvents would never fire. Read
@@ -473,15 +530,21 @@ the bed *decoder* (AllRAD / EPAD / Layout, the layout file's imported `bed_decod
 the room box, and the static acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
-speaker count - **size meter arrays with it, never hard-code a speaker count**), `BusLevels()` (per-channel output
-peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
+speaker count - **size meter arrays with it, never hard-code a speaker count**), `BusLevels()` (per-channel
+speaker-bus peaks: what the device received in the array profiles, the virtual speakers in CaveSim,
+and only the reverb taps in Binaural, where it reads zero under a dry source or a bed),
+`SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
 checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
 for the rest.
 
 For AV sync, `DspTimeFramesAt(realtime)` and `RealtimeAt(dspSample)` map between the dsp clock and
 `Time.realtimeSinceStartupAsDouble`. `HostTimeNs` reads the engine's host clock, and
-`OutputLatencyFrames` / `OutputLatencySeconds` give the device latency. For dropouts, `GetHealth`
+`OutputLatencyFrames` / `OutputLatencySeconds` give the device latency.
+`Emitter.PlayAtHostTime` and `AmbisonicBed.PlayAtHostTime` schedule against a host time and fold
+in `displayLatencySeconds` and the output latency; `Engine.TryDspTimeFramesForHostTime` is the
+conversion alone. It is the same mapping as `DspTimeFramesAt`, and both are as good as the
+engine's clock stamps: `GetClockModel` reports their jitter. For dropouts, `GetHealth`
 returns the counters and `Xruns` is the short form. `GetHealth` returns false when nothing can
 observe a dropout (not started, the manual sink, a driver with no valid sample position). Then a
 zero count proves nothing.

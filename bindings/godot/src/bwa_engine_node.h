@@ -518,6 +518,10 @@ public:
 	int get_resolved_sample_rate() const;
 	int get_resolved_block_size() const;
 	int get_active_voices() const;
+	/* The SPEAKER BUS's last-block peaks, after trims, test signal and limiter. What the device
+	 * received in the array profiles; the virtual speakers in CAVE_SIM. In BINAURAL point voices
+	 * and beds bypass the bus, so this reads 0 under an audible dry source or bed: only the
+	 * reverb and diffuse taps are on it. Nothing meters the headphone stereo. */
 	PackedFloat32Array get_bus_levels() const;
 	PackedVector3Array get_speakers() const;
 	/* The focus value spcap_focus = 0 reverts to, derived from the active layout's geometry. Read

@@ -4,6 +4,78 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: a pinnable git URL
+
+- CI now tags each published commit of the `unity` branch `unity/v<version>`, so a project can
+  install one release: `https://github.com/aforren1/cave-audio.git#unity/v<version>`. The plain
+  `v*` tags point at `main` and never worked as a UPM ref. The `godot` branch gets
+  `godot/v<version>` the same way. The tags start with this release: 0.23.2 and older have none.
+- Re-running the failed jobs of a release does nothing when the tag is already on the commit it
+  would publish. A full rebuild of the same release produces different binaries, so a different
+  commit: the publish then stops before it pushes anything, because a published tag is never
+  moved.
+
+### Added: onset sync for a cluster
+
+- `Engine.displayLatencySeconds` (inspector: AV sync): the measured time from a frame's swap to
+  light on the display or projector. Default 0.
+- `Emitter.PlayAtHostTime(swapHostTimeNs)` and `AmbisonicBed.PlayAtHostTime`: play so that the
+  sound is heard when the frame that swaps at that host time (`Engine.HostTimeNs`) is seen. Plus
+  the display latency, minus the output latency, then `PlayAt`. False, and nothing plays, until
+  the engine has a clock, and on a node that does not own audio.
+- `Engine.TryDspTimeFramesForHostTime` is the conversion alone, and the static
+  `Engine.DspTimeFramesForHostTime` is its arithmetic. It is the same mapping as
+  `DspTimeFramesAt` (one block pair, one rounding), so the two agree. A display latency that is
+  negative or NaN counts as 0, and one above 10 s as 10 s.
+- `DspTimeFramesAt` now rounds to the nearest sample. It truncated before.
+
+### Added: `AmbisonicBed.IsPlaying` and `AmbisonicBed.Paused`
+
+- `IsPlaying` is the same read as `Emitter.IsPlaying`: true from a play until the soundfield ends
+  or is stopped, and still true while paused.
+- `Paused`, `Pause()` and `UnPause()` pause one bed, with `Emitter.Paused`'s rules: the playhead
+  holds, a play restarts un-paused, a value set before `Start` survives the auto-play, and a
+  disable clears it.
+
+### Added: a listener bound at run time
+
+- `Engine.listenerName` (inspector: Listener Name) and the static `Engine.ListenerProvider`
+  (`Func<Transform>`) find a head node that a VR toolkit creates after the scene starts. While
+  `listener` is empty the `Engine` asks the provider, then looks the name up, four times a
+  second, and assigns the first live Transform. It looks again if that object is destroyed. A `/`
+  in the name is a hierarchy path.
+- The "no listener Transform is assigned" warning no longer fires at start while a name or a
+  provider is set. If nothing resolves in 10 seconds, one warning says so and the search goes on
+  at once a second.
+- Only the node that owns audio looks, and only while Unity feeds the pose.
+
+### Added: a registration line in the log
+
+- `Engine` logs `registration: Room Origin '<name>' at world (...), yaw N deg; listener '<name>'
+  at room (...)` at start, on every node, and again when a late-bound listener binds. A node that
+  does not own audio prints the origin and `no listener is fed on this node`. A wrong Room Origin shows
+  there as a wrong room position for a head on a known spot.
+
+### Fixed
+
+- The listener-placement warning threw on the desk fallback when the
+  main camera stood in for an unassigned `listener`. It names the Transform that is fed now.
+- `Engine.BusLevels`, `bwa_get_bus_levels` and `SpeakerView` documented the meter as "what the
+  device received". That holds for the array profiles only. In Binaural point sources and beds
+  bypass the speaker bus, so the meter reads zero under an audible dry source or bed. The docs
+  say so now. No behavior changed.
+
+### Docs
+
+- Clusters: the owner need not be the server (`Engine.DevicePresent` as the predicate, and its
+  limits), audio state exists on the owner only, the onset pattern, and how to match Room Origin
+  to the toolkit's tracking origin and verify it on the rig.
+
+### Godot addon
+
+- `BwaEngine.get_bus_levels` carries the same doc correction. `BwaBed.is_playing` and
+  `BwaBed.paused` already existed. The onset helper and the late-bound listener are Unity-only for now.
+
 ## [0.23.2]
 
 ### Fixed: a stereo Auto request read as present with no output device (engine)

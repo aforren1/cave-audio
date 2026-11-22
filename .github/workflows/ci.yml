@@ -1098,7 +1098,10 @@ jobs:
 
           Download ``com.brainworks.bw_audio-*.tgz`` below, then in Unity:
           **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
-          (Or install from a git URL: ``https://github.com/aforren1/cave-audio.git#unity``.)
+          (Or install from a git URL, pinned to this release:
+          ``https://github.com/aforren1/cave-audio.git#unity/$tag``. That tag is made by the last
+          step of the release run, after these notes: if it does not resolve, the publish step has
+          not finished or has failed, and ``#unity`` is the branch it would have tagged.)
 
           The package ships the native engine for every platform it supports - ``bw_audio.dll``
           (Windows), ``libbw_audio.so`` (Linux, Android) and ``libbw_audio.dylib`` (macOS, universal),
@@ -1216,6 +1219,8 @@ jobs:
       #   unity  ->  package.json at the root, so UPM takes a git URL directly:
       #                Package Manager > "+" > "Add package from git URL..."
       #                https://github.com/aforren1/cave-audio.git#unity
+      #              and, pinned to one release (the tag this step puts on the published commit):
+      #                https://github.com/aforren1/cave-audio.git#unity/v<version>
       #   godot  ->  addons/bw_audio/ at the root, for the Asset Library — which downloads a repo
       #              ARCHIVE at a specific commit, so the binaries must be IN the tree. A release
       #              asset cannot serve that entry, which is why this branch exists at all.
@@ -1223,6 +1228,14 @@ jobs:
       # Normal commits, never a force-push: an Asset Library entry pins a commit hash, and rewriting
       # history would eventually orphan a published one. The branches therefore grow by roughly the
       # addon's size per release, which is the standing cost of in-repo distribution.
+      #
+      # Each publish is also TAGGED `<branch>/<release tag>`, because the v* tag itself points at
+      # main and so cannot be an install ref. The script checks the tag before it pushes anything:
+      # re-running this job with the SAME pack inputs (re-run failed jobs) finds the tag on the
+      # commit it would publish and does nothing, and a rerun of an OLDER release fails without
+      # touching the branch. A FULL rebuild of the same tag makes different binaries, so a different
+      # commit, and fails here too. That is intended: a published tag is never moved. These tags do not match the
+      # `v*` trigger above, and a push made with the workflow token starts no run anyway.
       - name: Publish distribution branches
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -1235,8 +1248,8 @@ jobs:
           # (the script's default) yields an unauthenticated URL and the push would fail. The
           # script never echoes it, and Actions masks the token in logs regardless.
           $remote = "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
-          ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
+          ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote -Tag "unity/v$v"
+          ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote -Tag "godot/v$v"
 
       # ---- prune the handoff artifacts ------------------------------------------------------------
       # The four `*-pack-input` and three `*-engine-sdk` artifacts exist only to move files between

@@ -9,6 +9,11 @@
 // as geometry. Unlit means the color you compute IS the color you see, so a hot channel glows.
 //
 // It reads levels and draws; it never writes audio state. Deleting it changes nothing you can hear.
+//
+// The levels are the SPEAKER BUS's (Engine.BusLevels), so the view means what it says in the array
+// profiles and in CaveSim, whose virtual speakers are that bus. In Binaural it does not: point
+// sources and beds bypass the bus there, so the markers show only the reverb and diffuse taps and
+// stay dark under a dry source that is plainly audible. That is the bus being empty, not a fault.
 using System;
 using System.Collections;
 using UnityEngine;

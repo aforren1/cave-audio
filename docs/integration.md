@@ -437,10 +437,50 @@ The math: `Room.UnityToRoom` becomes the inverse of the origin's position and ro
 a Unity world point into the origin's local frame. `Room.Pos` then applies the X mirror, once. The
 origin's forward becomes room +z and its right becomes room -x.
 
+### Match the tracking origin
+
+Room Origin must be the Transform whose pose is the tracking system's origin in the scene. Then a
+head the tracker reports at room position `p` stands at `Room.FromRoom(p)` in Unity, and
+`Room.Pos(head.position)` gives `p` back to the engine.
+
+A VR toolkit already has that Transform: the node its tracked devices are children of. Use it, or a
+child of it with a zero local pose. In MiddleVR it is the system center node. Do not use the head,
+a screen, or an object you placed by eye. If your application moves the user through the virtual
+world by moving that node, Room Origin follows it, which is correct: the room travels with the user.
+
+Nothing fails when the origin is wrong. The audio is rotated or offset against the picture, the
+same amount for every source, and it still sounds like spatial audio. Check it on the rig:
+
+1. **Read the start line.** `Engine` logs one line at start on every node:
+   `registration: Room Origin '<name>' at world (x, y, z), yaw N deg; listener '<name>' at room
+   (x, y, z).` The origin's pose must be the same on every node. The listener part is the owner's:
+   that room position is what the engine pans for, and the line is logged again when a late-bound
+   listener binds. Other nodes print `no listener is fed on this node`.
+2. **Stand on a known spot.** Stand at the layout's listening point, or hold the tracked head
+   against a speaker. Log `Room.Pos(head.position)` and compare it with the layout file: the
+   listening point is `listening_point_m` (the array centroid when the file has none), a speaker
+   is its `position`. They agree to a few centimeters. An
+   offset that is the same everywhere is a misplaced origin. A sign flip in x or z, or x and z
+   swapped, is a yaw error of 180 or 90 degrees.
+3. **Walk the axes.** Step toward the room's front: z grows. Step to your right while you face the
+   front: x falls, because room-right is -x. Raise the head: y grows.
+4. **Listen to one speaker.** Put an `Emitter` at `Room.FromRoom(p)`, with `p` one speaker's
+   `position` from the layout. Play a click or noise. It comes from that box and from no other
+   direction. Do it for a front speaker and a side speaker: one speaker cannot show a mirror.
+5. **Look at the array.** Turn `SpeakerView` on and look through the glasses or the headset. Each
+   marker sits on its physical speaker. A marker cloud that is turned or shifted against the real
+   boxes shows the error directly.
+
+Do steps 2 to 5 on the node that owns audio. Step 5 works on every node, and it should: every node
+applies the same registration.
+
 ### Clusters
 
 A cluster runs the same scene on several render nodes, and exactly one of them may open the audio
-device. Keep the CAVE Rig in the scene on every node and let each node decide in `Engine.Start`:
+device. Install the package from a pinned ref on every node
+(`https://github.com/aforren1/cave-audio.git#unity/v<version>`; the tags start with the first
+release after 0.23.2), so the nodes cannot end up on different releases. Keep the CAVE Rig in the
+scene on every node and let each node decide in `Engine.Start`:
 
 - **`Engine.OwnsAudioPredicate`**: a static `Func<bool>`. Set it before the scene loads, from a
   `[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]` method that asks
@@ -471,6 +511,29 @@ static class AudioOwner {
 }
 ```
 
+The owner does not have to be the cluster server. The audio interface can be attached to another
+machine. Then ask for the device instead of the role:
+
+```csharp
+static class AudioOwner {
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void Install() => BwAudio.Engine.OwnsAudioPredicate =
+        () => BwAudio.Engine.DevicePresent(BwAudio.BwaProfile.Cave, BwAudio.BwaSinkType.Asio, "<your ASIO driver name>");
+}
+```
+
+Pass the same profile, sink and device the scene's `Engine` uses. Do not guess the device string:
+the match is exact. Log `Engine.Devices(BwaSinkType.Asio)` on the machine that has the interface
+and copy the name from there. Two cautions:
+
+- **It reads device lists.** An ASIO driver is listed when it is installed, with or without its
+  hardware. A render node with the RME driver installed and no Digiface answers true. See "What
+  the check cannot see" under [Test a rig scene at your desk](#test-a-rig-scene-at-your-desk). Name
+  the device, and do not install the driver on nodes that have no interface.
+- **Exactly one node must answer true.** Two owners play everything twice. No owner is a silent
+  session. The binding cannot see the other nodes, so it cannot check this. Log `Engine.OwnsAudio`
+  on every node once and read the logs.
+
 A node that does not own audio:
 
 - creates no native engine and opens no device. `Engine.Ready` is false.
@@ -481,11 +544,146 @@ A node that does not own audio:
 - leaves every component a silent no-op. Emitters, beds, push sources and geometry create nothing,
   load nothing, log nothing, and stop waiting. `Engine.ComponentWaitFrames` stays flat there.
 - shows the array in `SpeakerView` from the layout file, unlit, because there are no levels to read.
+- does not look for a late-bound listener (see below).
 
 An owner whose start fails behaves the same way after its error: it stays the scene's `Engine` and
 keeps the registration, so the nodes never disagree on the room.
 
-The binding names no cluster toolkit. The one line that asks yours lives in your project.
+#### Audio state exists on the owner only
+
+Everything the engine reports is zero, false or silent on a node that does not own audio:
+
+- `IsPlaying`, `PlayheadFrames` and `PlayheadSeconds` on every `Emitter`, `PushEmitter` and
+  `AmbisonicBed`.
+- `Engine.DspTimeFrames` and `DspTimeSeconds`, `GetClock`, `ActiveVoices`, `BusLevels`.
+- `onFinished` and `onLoop`. They never fire there.
+- `PlayOneShot` and `PlayAtHostTime` return false.
+
+So never drive visuals or trial flow from audio state on a cluster. A script that waits for
+`onFinished` to start the next trial advances on one node and hangs on the others. A progress bar
+drawn from a playhead moves on one wall.
+
+Read the state on the owner and send it through your cluster toolkit's synchronized channel: the
+call that delivers an event to every node on the same frame. Every node, the owner included, then
+acts on the delivered event and not on the local one.
+
+```csharp
+// On every node. Only the owner's Emitter ever fires onFinished.
+void Start() => emitter.onFinished.AddListener(() => MyCluster.SendToAllNodes("trial-sound-done"));
+
+// On every node, when the cluster delivers the event.
+void OnClusterEvent(string what) { if (what == "trial-sound-done") NextTrial(); }
+```
+
+#### Land a sound on a synchronized frame
+
+At a desk the process that draws the flash owns the sample clock, and `DspTimeFramesAt` maps its
+own frame time to a dsp sample. On a cluster every node draws the flash, on a frame the toolkit
+keeps in step, and one node has the sample clock. That node must predict when the target frame
+reaches the display and schedule the sound for that moment.
+
+Two things on `Engine`:
+
+- **`displayLatencySeconds`**: the measured time from a frame's buffer swap to light leaving the
+  display or projector. Default 0. Measure it once per display.
+- **`Emitter.PlayAtHostTime(swapHostTimeNs)`** and the same call on `AmbisonicBed`: play so that
+  the sound is heard when the frame that swaps at that host time is seen. The call adds
+  `displayLatencySeconds`, subtracts the device's output latency, and schedules with `PlayAt`.
+  `Engine.TryDspTimeFramesForHostTime` is the conversion by itself.
+
+Host time is nanoseconds on the clock `Engine.HostTimeNs` reads: QPC on Windows,
+`mach_absolute_time` on macOS, `CLOCK_MONOTONIC` on Linux and Android. On Windows a
+`System.Diagnostics.Stopwatch` timestamp is on that clock:
+`ns = Stopwatch.GetTimestamp() * 1e9 / Stopwatch.Frequency`. A timestamp from your toolkit must be
+on the same clock. If it is on another one, map it: read that clock and `Engine.HostTimeNs` back
+to back, keep the difference, and add it.
+
+The pattern:
+
+1. Every node decides, from the cluster's synchronized frame counter, that the flash is on frame
+   `N + k`. Render nodes draw it on that frame and do nothing else.
+2. The owner predicts the host time at which frame `N + k` swaps. With swap-locked nodes that is
+   the last swap plus `k` frame periods.
+3. The owner calls `PlayAtHostTime` with that time. It returns false on the other nodes and plays
+   nothing there, so the same script runs everywhere.
+
+```csharp
+ulong _lastSwapNs;
+
+IEnumerator StampSwaps() {                    // start once, on every node
+    var endOfFrame = new WaitForEndOfFrame();
+    for (;;) { yield return endOfFrame; _lastSwapNs = BwAudio.Engine.HostTimeNs; }
+}
+
+// Call from Update on the frame the cluster calls frame N. The flash is drawn on frame
+// N + framesAhead. The stamp is frame N - 1's, so the target is framesAhead + 1 periods after it.
+void ScheduleBeep(int framesAhead, double refreshHz) {
+    ulong swap = _lastSwapNs + (ulong)((framesAhead + 1) * 1e9 / refreshHz);
+    if (!beep.PlayAtHostTime(swap) && BwAudio.Engine.Instance.OwnsAudio)
+        Debug.LogWarning("the audio clock is not running yet");
+}
+```
+
+What to know:
+
+- **Use the toolkit's swap time when it has one.** The end-of-frame stamp above is a stand-in. It
+  runs before the swap, at a point that moves with the frame's render time, and that movement is
+  jitter in the onset.
+- **A constant error is absorbed by the measurement.** Measure `displayLatencySeconds` with the
+  whole chain running: a photodiode on the screen and a microphone at the listening point, on one
+  scope. Change the value until the two edges meet. Whatever your swap estimate is off by, the
+  same amount every frame, is then inside that number. So is the travel time from the speakers
+  to the microphone, about 3 ms per meter, which the device's output latency does not include.
+- **Schedule far enough ahead.** The start must still be in the future after the output latency
+  is subtracted. Lead by more than `Engine.OutputLatencySeconds` plus one audio block. Three or
+  more frames at 60 Hz covers a Dante rig. A start already past plays at once, which is late, and
+  nothing reports it. Compare `TryDspTimeFramesForHostTime`'s result with `Engine.DspTimeFrames`
+  when you need to know.
+- **False means no clock.** The call returns false, and plays nothing, until the engine has
+  rendered its first stamped block, and always on a node that does not own audio.
+- **It is as good as the clock stamps.** The conversion is the same mapping `DspTimeFramesAt`
+  uses: the last block's (sample, host time) pair, the nominal rate, and the same rounding, so
+  the two helpers agree. Neither smooths the stamps. `Engine.GetClockModel` reports their quality
+  on your driver as `jitter_ns`: microseconds when the driver stamps from its hardware, more
+  when the stamp is taken at callback entry.
+- **Not on the manual sink.** Its stamps are made from the sample position, not read from a
+  clock, so a host time means nothing against them.
+- **The prediction is the part you own.** The binding names no toolkit and cannot know your swap
+  period. A dropped frame between the prediction and the flash moves the picture and not the
+  sound.
+
+#### A listener that exists only at run time
+
+A VR toolkit can create its head node after the scene starts, so you cannot drag it into
+**Listener**. Leave Listener empty and use one of:
+
+- **`Engine.listenerName`** (inspector: Listener Name): the head node's GameObject name. `Engine`
+  looks it up until an active object has that name.
+- **`Engine.ListenerProvider`**: a static `Func<Transform>`. Return the head, or null while there
+  is none. Set it where you set `OwnsAudioPredicate`. It is static for the same reason: the code
+  that knows the toolkit runs before any `Engine` exists.
+
+```csharp
+BwAudio.Engine.ListenerProvider = () => MyToolkit.Head ? MyToolkit.Head.transform : null;
+```
+
+How it behaves:
+
+- The provider is tried first, then the name. The first live Transform is assigned to
+  `Engine.listener`, and the search stops.
+- The search runs four times a second, not every frame. `GameObject.Find` walks the scene.
+- The name goes to `GameObject.Find`, which reads a `/` as a hierarchy path. `Rig/Head` finds
+  `Head` under `Rig`, and a name that itself contains a `/` is not found by name: use the provider.
+- If the bound object is destroyed, the search starts again.
+- The warning about a missing listener does not fire at start while a name or a provider is set.
+  If nothing resolves within 10 seconds, `Engine` warns once and keeps looking, once a second
+  from then on. A misspelled name therefore costs one scene walk a second, not four.
+- It runs on the node that owns audio only, and only while Unity feeds the pose (Feed Listener on,
+  or the desk fallback). Other nodes feed no listener, so `Engine.listener` stays empty there.
+  Do not read the head from `Engine.listener` in code that runs on every node.
+- A name that two objects share binds whichever Unity finds first. Use the provider then.
+
+The binding names no cluster toolkit. The lines that ask yours live in your project.
 
 The ownership switch is Unity-only for now. Godot's `BwaEngine` always owns audio.
 

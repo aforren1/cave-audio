@@ -6,6 +6,9 @@
  *
  * The count comes from the layout, never from a constant. BWA_MAX_CHANNELS (64) is the
  * compile-time capacity; a 24-speaker rig loads into the same binary.
+ *
+ * The levels are the SPEAKER BUS's (get_bus_levels). In PROFILE_BINAURAL point voices and beds
+ * bypass that bus, so the gizmos stay dark under an audible dry source: only reverb lights them.
  */
 #pragma once
 
