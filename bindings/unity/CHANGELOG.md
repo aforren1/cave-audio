@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.23.3]
+
 ### Added: a pinnable git URL
 
 - CI now tags each published commit of the `unity` branch `unity/v<version>`, so a project can
