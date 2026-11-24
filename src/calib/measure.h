@@ -97,13 +97,70 @@ typedef struct {
 /* Room characterization from the captured impulse response — a treatment diagnostic, NOT a model to
  * match (matching would double-count: the engine renders the virtual room AND the real room adds its
  * own). RT60 tells you how live the room is (and the floor on what you can render); the early
- * reflections tell you which nearby surfaces to treat to protect localization. */
+ * reflections tell you which nearby surfaces to treat to protect localization.
+ *
+ * The decay is read per OCTAVE BAND, because treatment is chosen per band: a room that rings at
+ * 125 Hz needs bass traps, one that rings at 2 kHz needs absorption on its walls, and one broadband
+ * number cannot tell them apart. Every figure is T20 (the line through the decay curve from -5 to
+ * -25 dB) scaled to 60 dB, the existing convention.
+ *
+ * A figure is only as good as the decay above the noise. `range_db` is how far the decay curve falls
+ * from its start before the noise floor takes over (the curve's level where the decay crosses the
+ * floor), or before the IR ends when the decay is still above the noise there. T20 ends at -25 dB and wants the floor 10 dB under that, so a band with less than
+ * MEASURE_RT_MIN_RANGE_DB of range reports rt60 = 0 beside its range: no reading, never a guess.
+ *
+ * rt60 = 0 with range_db = 0 means there was NOTHING TO MEASURE, which is not the same as too
+ * noisy: no decay follows the direct sound in that band (an anechoic capture: what is left after
+ * the arrival is more than 30 dB under the band's whole energy, or it dies in under 30 ms or two
+ * periods of the bandwidth), a non-finite sample, or a band the sweep does not cover.
+ *
+ * THE 0 dB REFERENCE IS THE REVERBERANT ONSET, not the direct sound. The bands (and the broadband
+ * figure of measure_rt60_ex and measure_room) are filtered backward in time, which moves the
+ * direct sound's band energy ahead of the arrival, out of the curve. In a room that leaves T20
+ * alone (a backward filter turns an exponential into the same exponential), but range_db is then
+ * counted from the reverberation's start and reads 10 log10(1 + D/R) under the ISO figure that
+ * counts from the direct sound. Plain measure_rt60 filters nothing for its broadband figure, so
+ * that one figure keeps the direct sample. */
+#define MEASURE_RT_BANDS         8
+#define MEASURE_RT_MIN_RANGE_DB  35.0
+/* the octave-band centers, Hz (ISO 3382 / IEC 61260 nominal): 63 ... 8000 */
+extern const float measure_rt_band_hz[MEASURE_RT_BANDS];
+
 typedef struct {
-    float rt60;            /* broadband reverberation time (s), 0 if the decay never reaches the fit range */
+    float rt60;            /* broadband reverberation time (s), 0 = no reading (range_db says why). Read
+                            * over the valid band [f_lo, f_hi] when one is given (measure_room,
+                            * measure_rt60_ex), not over the raw IR: a sweep's deconvolution raises noise
+                            * 3 dB per octave, so the part above f_hi was most of the floor. */
+    float range_db;        /* the broadband decay's usable range, dB (capped at 99 = not noise-limited) */
+    /* The same two per octave band. A band whose edges (fc / sqrt 2, fc sqrt 2) leave the valid
+     * measurement band reads 0 and 0: with the tools' 20 Hz to 20 kHz sweep that band is
+     * [40 Hz, 10 kHz], which holds 63 Hz to 4 kHz and leaves 8 kHz out (its top edge is 11.3 kHz). */
+    float band_rt60[MEASURE_RT_BANDS];
+    float band_range_db[MEASURE_RT_BANDS];
     int   er_count;        /* number of early reflections found (<= 8) */
     int   er_delay[8];     /* each reflection's delay in samples AFTER the direct arrival */
     float er_level[8];     /* each reflection's level relative to the direct (linear) */
 } RoomResult;
+
+/* Whether measure_room reads the octave band at fc: both edges (fc / sqrt 2, fc sqrt 2) inside the
+ * valid band [f_lo, f_hi], and the top edge under 0.45 fs (fs <= 0 skips that limit). For a sweep from
+ * f1 to f2 the valid band is [2 f1, f2 / 2]. measure_room applies this rule, and a report lists exactly
+ * these bands: a covered band with no reading at all (0 s, 0 dB) must still show, or it reads as a band
+ * the sweep never covered. */
+int measure_rt_band_covered(double fc, double f_lo, double f_hi, double fs);
+
+/* The room's figures over several speakers' RoomResults. A MEDIAN over the speakers with a reading
+ * (rt60 > 0), so one speaker in a corner, or one capture with a door slam in it, does not move the
+ * room's figure, and a speaker with no reading is not a reading of 0 s. An even count takes the mean of
+ * the middle two. A band or broadband no speaker read is 0 s with a count of 0. */
+typedef struct {
+    int   speakers;                          /* rows summarized (n) */
+    float rt60;                              /* broadband median (s), 0 = no speaker gave a reading */
+    int   count;                             /* speakers with a broadband reading */
+    float band_rt60[MEASURE_RT_BANDS];       /* the same per octave band */
+    int   band_count[MEASURE_RT_BANDS];
+} RoomSummary;
+void measure_room_summary(const RoomResult* rows, int n, RoomSummary* out);
 
 /* Fill out[n] with an exponential sine sweep from f1 to f2 Hz at fs, with short raised-cosine fades
  * at both ends (no click). This is the signal to play out a speaker; the SAME array is the reference
@@ -171,7 +228,8 @@ double measure_harmonic_lead(int nref, int k, double f1, double f2);
 double measure_noise_floor(const float* ir, int ncap, int lo, int hi, double fs, int* n);
 
 /* Room report: deconvolve as measure_response, then characterize the room from the IR (Schroeder RT60
- * + early reflections). If `ir_out` is non-NULL, the deconvolved impulse response from the direct
+ * + early reflections). The bands and the broadband figure are limited to [2 f1, f2 / 2], and each
+ * decay is read only over the lags the capture still covered its band at. If `ir_out` is non-NULL, the deconvolved impulse response from the direct
  * arrival onward is copied into it (up to `ir_cap` samples) — the room-preview convolution kernel, so
  * one capture serves trims, this report, AND a future headphone room simulator. Returns 1 / 0. */
 /* The deconvolved IR around its strongest tap, with `pre` samples ahead of it (zero-padded at the start), so
@@ -184,9 +242,23 @@ int measure_ir_around(const float* capture, int ncap, const float* ref, int nref
 int measure_room(const float* capture, int ncap, const float* ref, int nref,
                  double f1, double f2, double fs, RoomResult* out, float* ir_out, int ir_cap);
 
-/* Schroeder RT60 + early reflections directly from an impulse response (pure; `direct_idx` is the
- * direct-arrival sample). Used by measure_room and unit-tested on synthetic IRs. */
+/* Schroeder RT60 (broadband and per octave band) + early reflections directly from an impulse
+ * response (pure; `direct_idx` is the direct-arrival sample). Each decay curve is cut where the
+ * decay meets the IR's noise floor, with the noise's energy subtracted and the cut-off part of the
+ * decay added back, so a long noisy tail does not read as reverberation. Every band whose top edge
+ * is under 0.45 fs is read (all eight at 48 kHz). Allocates internally (two buffers a call): control thread or offline only. Used by
+ * measure_room and unit-tested on synthetic IRs. */
 void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out);
+
+/* measure_rt60 for an IR that is only valid over [f_lo, f_hi] Hz (a sweep's measurement band): an
+ * octave band that does not lie wholly inside reads 0, and the broadband figure is read through a
+ * band-pass over [f_lo, f_hi] (a side is left open at f_lo = 0 or f_hi >= 0.45 fs). */
+void measure_rt60_ex(const float* ir, int nir, int direct_idx, double fs, double f_lo, double f_hi, RoomResult* out);
+
+/* The band filter the decay analysis uses, exposed so its response can be tested against the
+ * Butterworth formula: a 6th-order high-pass at f_hp into a 6th-order low-pass at f_lp, x in place,
+ * a side at 0 left out. The report runs it backward in time (the caller reverses x). */
+void measure_rt_bandpass(double* x, int n, double f_hp, double f_lp, double fs);
 
 /* Design a per-speaker correction FIR from a measured impulse response. The IR is GATED to the direct
  * sound — `gate_len` samples from `direct`, chosen to end before the first reflection — so the filter

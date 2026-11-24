@@ -34,6 +34,39 @@ void calib_write_wav_f32(const char* path, const float* x, int n, int fs) {
     fwrite("data",1,4,f); fwrite(&ds,4,1,f); fwrite(x,4,(size_t)n,f); fclose(f);
 }
 
+int calib_rt_band_covered(double fc) { return measure_rt_band_covered(fc, 2.0 * CAL_F1, 0.5 * CAL_F2, CAL_FS); }
+
+static void sum_put(char* buf, size_t cap, size_t* k, const char* fmt, ...) {
+    if (*k + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(buf + *k, cap - *k, fmt, ap);
+    va_end(ap);
+    if (w > 0) *k = (*k + (size_t)w < cap) ? *k + (size_t)w : cap - 1;
+}
+
+void calib_room_summary_text(const RoomResult* rows, int n, char* buf, size_t cap) {
+    if (!buf || !cap) return;
+    buf[0] = 0;
+    RoomSummary s;
+    measure_room_summary(rows, n, &s);
+    size_t k = 0;
+    if (s.count)
+        sum_put(buf, cap, &k, "room: median RT60 ~ %.3f s over %d of %d speakers (the floor on renderable reverb; treat the room to lower it)\n",
+                s.rt60, s.count, s.speakers);
+    else
+        sum_put(buf, cap, &k, "room: no broadband RT60: no speaker gave a reading (no decay after the direct sound, or under %.0f dB of it above the noise)\n",
+                MEASURE_RT_MIN_RANGE_DB);
+    sum_put(buf, cap, &k, "room: median RT60 by octave, Hz=s (speakers with a reading, of %d):", s.speakers);
+    for (int b = 0; b < MEASURE_RT_BANDS; ++b) {
+        const double fc = measure_rt_band_hz[b];
+        if (!calib_rt_band_covered(fc)) continue;
+        if (s.band_count[b]) sum_put(buf, cap, &k, "  %.0f=%.2f (%d)", fc, s.band_rt60[b], s.band_count[b]);
+        else                 sum_put(buf, cap, &k, "  %.0f=- (0)", fc);
+    }
+    sum_put(buf, cap, &k, "\n");
+}
+
 static float g_sim_aim_err_deg = 0.f;
 void calib_sim_set_aim_error(float deg) { g_sim_aim_err_deg = (deg == deg) ? deg : 0.f; }
 

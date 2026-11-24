@@ -382,6 +382,13 @@ int calib_live_read(int spk, const Layout* L, const float center[3], double sos,
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);
 
+/* The room report's two summary lines over n speakers' RoomResults (measure_room_summary over the bands
+ * this sweep covers), each ending in a newline. ONE wording for bwa_calibrate --room and the Capture tab,
+ * so the two tools cannot describe the same room differently. Truncates to cap - 1; always terminated. */
+void calib_room_summary_text(const RoomResult* rows, int n, char* buf, size_t cap);
+/* the room report's octave bands: whether this sweep (CAL_F1 to CAL_F2 at CAL_FS) covers the band at fc */
+int  calib_rt_band_covered(double fc);
+
 /* Registered-driver enumeration (ungated: without the ASIO SDK the count is 0 and list says so).
  * A fresh registry read each call; loads nothing, needs no session slot — safe while a capture
  * or the engine has a driver open. Feeds the CLI's --list-drivers and the station's pickers. */

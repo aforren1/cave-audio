@@ -603,8 +603,13 @@ bwa_calibrate --layout as_built.json --out trims.json --zylia --trims --room --s
 - [ ] Pass: exit 0, gate `OK` within 10 mm, no bump, no `aimed > 30 deg off the listening point`
       in the directivity report, and no `the mic is ... from the layout's listening point`
       WARNING.
-- [ ] Read `room: mean RT60`. It is how live the room is, a floor on renderable reverb. Do not
-      copy it into the engine's reverb.
+- [ ] Read `room: median RT60` and the `by octave` line under it. They say how live the room is
+      and at which frequencies: a floor on renderable reverb. Do not copy them into the engine's
+      reverb. Record both lines. A band that prints `-` had under 35 dB of decay above the noise.
+- [ ] Open item: the ZM-1 mean above 2 kHz. The room report reads the mean of the 19 capsules,
+      which is not the center pressure above about 2 kHz. Save the IRs from one capsule and from
+      the mean for a few speakers, and compare the 2 kHz and 4 kHz band RT60 and range. Until
+      that is done, treat those two bands as approximate.
 - [ ] Record every speaker's `snr=` and the `background:` line.
 
 `--eq` and `--room-eq` are refused with the ZM-1.

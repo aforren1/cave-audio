@@ -2289,7 +2289,9 @@ int main(int argc, char** argv) {
     MeasureResult* res = (MeasureResult*)calloc((size_t)n, sizeof(MeasureResult));
     if (!sweep || !cap || !res) { fprintf(stderr, "calibrate: out of memory\n"); return 1; }
     measure_sweep(sweep, NSWEEP, F1, F2, FS);
-    double rt60_sum = 0.0; int rt60_n = 0;                     /* room-report aggregate */
+    /* room-report aggregate: every reported speaker's result, for calib_room_summary_text */
+    static RoomResult rt_rows[BWA_MAX_CHANNELS];
+    int rt_spk = 0;
 
     float* cap19 = NULL;                                       /* --zylia: [19][CAL_CAPLEN], one row per capsule */
     if (zylia) {
@@ -3740,10 +3742,23 @@ int main(int argc, char** argv) {
             int want_ir = (ir_prefix || eq || rq_grid);
             measure_room(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, &rr, want_ir ? irbuf : NULL, want_ir ? IR_LEN : 0);
             if (room) {
-                printf("            RT60=%.3f s  early reflections:", rr.rt60);
+                if (rr.rt60 > 0.f) printf("            RT60=%.3f s", rr.rt60);
+                else               printf("            RT60=- (%.0f dB of decay)", rr.range_db);
+                printf("  early reflections:");
                 for (int e = 0; e < rr.er_count; ++e) printf(" %.1fms/%.2f", rr.er_delay[e] * 1000.0 / FS, rr.er_level[e]);
                 printf("%s\n", rr.er_count ? "" : " (none)");
-                if (rr.rt60 > 0.f) { rt60_sum += rr.rt60; ++rt60_n; }
+                /* a band with no reading shows its range, so "too noisy" reads apart from "too short".
+                 * Only a band the sweep does not cover is left out: a covered band with no range at
+                 * all still prints, as -(0dB), or it would look uncovered. */
+                printf("            RT60 by octave (Hz=s):");
+                for (int b = 0; b < MEASURE_RT_BANDS; ++b) {
+                    const double fc = measure_rt_band_hz[b];
+                    if (!calib_rt_band_covered(fc)) continue;
+                    if (rr.band_rt60[b] > 0.f) printf(" %.0f=%.2f", fc, rr.band_rt60[b]);
+                    else                       printf(" %.0f=-(%.0fdB)", fc, rr.band_range_db[b]);
+                }
+                printf("\n");
+                if (rt_spk < BWA_MAX_CHANNELS) rt_rows[rt_spk++] = rr;
             }
             if (ir_prefix) {
                 char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); calib_write_wav_f32(p, irbuf, IR_LEN, (int)FS);
@@ -3786,7 +3801,11 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (room && rt60_n) printf("room: mean RT60 ~ %.3f s (the floor on renderable reverb; treat the room to lower it)\n", rt60_sum / rt60_n);
+    if (room && rt_spk) {
+        char sum[1024];
+        calib_room_summary_text(rt_rows, rt_spk, sum, sizeof sum);
+        fputs(sum, stdout);
+    }
     sweep_report("trims");
 #ifdef BWA_HAVE_ASIO
     if (asio_up) calib_asio_close();

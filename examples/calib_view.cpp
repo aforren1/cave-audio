@@ -859,6 +859,12 @@ struct CapJob {
     std::atomic<bool> cancel;
     std::atomic<int>  n;                             /* speaker count (worker sets; UI reads concurrently) */
     float    arrival_ms[BWA_MAX_CHANNELS], level[BWA_MAX_CHANNELS], rt60[BWA_MAX_CHANNELS];
+    RoomResult room[BWA_MAX_CHANNELS];                        /* the whole report behind rt60: the cell's tooltip */
+    /* The worker ran measure_room on this run's rows. Snapshotted by the worker ahead of row 0, so it
+     * rides done_count's publication; the checkboxes can change once the run ends. Without it an all-zero
+     * row (an anechoic capture) cannot be told from a row nobody measured. */
+    bool     room_ran;
+    char     room_sum[1024];                          /* the room summary the tab shows (UI thread) */
     int      sweeps[BWA_MAX_CHANNELS];                /* sweeps each speaker took (2 = clean and agreeing) */
     float    snr_db[BWA_MAX_CHANNELS];                /* the accepted sweep's IR SNR (sweep quality, calib.h) */
     char     win_desc[300];                           /* the run's arrival window, as calib_window_prior says it */
@@ -953,6 +959,7 @@ static void cap_worker(void) {
     }
     const bool do_eq = J.do_eq && !zy && !verify;                /* the CLI refuses --eq with the ZM-1 */
     const bool do_room = J.do_room && !verify, do_irs = J.do_irs && !verify;
+    J.room_ran = do_room || do_eq || do_irs;
 
     CapScope sc;
     /* the Placement panel was live at Run: wait for its gate, then the measured center IS the mic */
@@ -1057,12 +1064,14 @@ static void cap_worker(void) {
         J.level[i]      = res[i].level;
         J.spread_db[i]  = zy ? mi.capsule_spread_db : 0.f;
         J.rt60[i]       = 0.f;
+        memset(&J.room[i], 0, sizeof J.room[i]);
         J.eqlen[i]      = 0;
         if (do_room || do_eq || do_irs) {                        /* the ZM-1: `cap` is the capsules' mean */
             RoomResult rr;
             int want_ir = (do_eq || do_irs);
             measure_room(cap, CAL_CAPLEN, sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS, &rr, want_ir ? irbuf : NULL, want_ir ? CAL_IRLEN : 0);
             J.rt60[i] = rr.rt60;
+            J.room[i] = rr;
             if (do_irs && J.irprefix[0]) { char p[600]; snprintf(p, sizeof p, "%s_%02d.wav", J.irprefix, i); calib_write_wav_f32(p, irbuf, CAL_IRLEN, (int)CAL_FS); }
             if (do_eq) {                                         /* gate to before the first reflection, invert */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
@@ -1117,6 +1126,56 @@ static void cap_worker(void) {
     snprintf(J.msg, sizeof J.msg, "wrote %s%s%s", J.ran_out, do_eq ? " (trims + eq)" : " (trims)",
              zy ? ", the ZM-1's 19 capsules pooled" : "");
     J.state.store(2, std::memory_order_release);
+}
+
+/* The rt60 cell's tooltip: the octave bands behind the one broadband figure, which is what says where
+ * a room rings. Every band the sweep covers is listed, the bwa_calibrate --room rule: a covered band
+ * with no decay at all must not vanish, or it reads as a band the sweep missed. A band with no reading
+ * shows its usable decay range, so "too noisy to say" reads apart from "nothing to measure". The lines
+ * are built apart from the drawing so the tests read what a hover shows; none = the room was not
+ * measured, so no tooltip. */
+struct CapTipLine { bool dim; char s[128]; };
+enum { CAP_TIP_MAX = MEASURE_RT_BANDS + 3 };
+static int cap_room_tip_lines(const RoomResult& r, bool measured, CapTipLine* out) {
+    if (!measured) return 0;
+    int n = 0;
+    bool any = r.rt60 > 0.f || r.range_db > 0.f;
+    for (int b = 0; b < MEASURE_RT_BANDS; ++b)
+        if (calib_rt_band_covered(measure_rt_band_hz[b])) any = any || r.band_rt60[b] > 0.f || r.band_range_db[b] > 0.f;
+    out[n].dim = false;
+    snprintf(out[n++].s, sizeof out->s, "RT60 by octave band (T20 x 3)");
+    if (!any) {
+        out[n].dim = false;
+        snprintf(out[n++].s, sizeof out->s, "no decay after the direct sound in any band: nothing to measure (an anechoic capture)");
+    }
+    for (int b = 0; b < MEASURE_RT_BANDS; ++b) {
+        const double fc = measure_rt_band_hz[b];
+        if (!calib_rt_band_covered(fc)) continue;
+        out[n].dim = !(r.band_rt60[b] > 0.f);
+        if (r.band_rt60[b] > 0.f)          snprintf(out[n].s, sizeof out->s, "%5.0f Hz  %5.2f s   %2.0f dB of decay", fc, r.band_rt60[b], r.band_range_db[b]);
+        else if (r.band_range_db[b] > 0.f) snprintf(out[n].s, sizeof out->s, "%5.0f Hz      -     %2.0f dB of decay: under the %.0f dB T20 needs",
+                                                    fc, r.band_range_db[b], MEASURE_RT_MIN_RANGE_DB);
+        else                               snprintf(out[n].s, sizeof out->s, "%5.0f Hz      -     no decay after the direct sound", fc);
+        ++n;
+    }
+    out[n].dim = !(r.rt60 > 0.f);
+    if (r.rt60 > 0.f)          snprintf(out[n].s, sizeof out->s, "broadband %5.2f s   %2.0f dB of decay", r.rt60, r.range_db);
+    else if (r.range_db > 0.f) snprintf(out[n].s, sizeof out->s, "broadband     -     %2.0f dB of decay: under the %.0f dB T20 needs",
+                                        r.range_db, MEASURE_RT_MIN_RANGE_DB);
+    else                       snprintf(out[n].s, sizeof out->s, "broadband     -     no decay after the direct sound");
+    return ++n;
+}
+
+/* Call right after the cell's item. */
+static void cap_room_tip(const RoomResult& r, bool measured) {
+    CapTipLine ln[CAP_TIP_MAX];
+    const int n = cap_room_tip_lines(r, measured, ln);
+    if (!n || !ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) || !ImGui::BeginTooltip()) return;
+    for (int k = 0; k < n; ++k) {
+        if (ln[k].dim) ImGui::TextDisabled("%s", ln[k].s);
+        else           ImGui::TextUnformatted(ln[k].s);
+    }
+    ImGui::EndTooltip();
 }
 
 static void tab_capture(void) {
@@ -1181,6 +1240,7 @@ static void tab_capture(void) {
     ImGui::BeginDisabled(J.pass == 1);                           /* verify writes nothing and keeps nothing */
     ImGui::SameLine(); ImGui::Checkbox("room report", &J.do_room);
     bwTip("Schroeder RT60 + early reflections per speaker - tells you how live the room is. "
+          "Hover a speaker's rt60 cell for the octave bands: which frequencies ring. "
           "Treat the room if it's too live; don't copy the RT60 into your engine reverb. "
           "With the ZM-1 it reads the capsules' mean: trust it below about 2 kHz");
     ImGui::BeginDisabled(J.zylia);
@@ -1317,6 +1377,16 @@ static void tab_capture(void) {
               "a sweep with a stronger tap elsewhere, or an IR too close to its noise floor (CALIB_SWEEP_MIN_SNR_DB), is\n"
               "re-swept, and a value counts once two sweeps agree within a sample and 0.2 dB. The thresholds are provisional.");
     }
+    /* the room summary over the rows published so far, bwa_calibrate --room's two lines */
+    J.room_sum[0] = 0;
+    if (dc > 0 && !vrun && J.room_ran) {                     /* dc first: room_ran is the worker's until row 0 */
+        calib_room_summary_text(J.room, dc, J.room_sum, sizeof J.room_sum);
+        const size_t len = strlen(J.room_sum);
+        ImGui::PushTextWrapPos(0.f);
+        ImGui::TextUnformatted(J.room_sum, J.room_sum + (len && J.room_sum[len - 1] == '\n' ? len - 1 : len));
+        ImGui::PopTextWrapPos();
+        bwTip("medians over the speakers that gave a reading; hover a speaker's rt60 cell for its bands");
+    }
     const int ncol = 8 + (J.ran_zylia ? 1 : 0);                  /* spk, arrival, level, [spread], sweeps, snr, three per pass */
     if (ImGui::BeginTable("capt", ncol, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("spk"); ImGui::TableSetupColumn("arrival (ms)"); ImGui::TableSetupColumn("level");
@@ -1352,6 +1422,7 @@ static void tab_capture(void) {
                 else ImGui::TextDisabled(st == 2 ? "ok" : "...");
             } else {
                 ImGui::TableNextColumn(); if (J.rt60[i] > 0.f) ImGui::Text("%5.2f", J.rt60[i]); else ImGui::TextDisabled("-");
+                cap_room_tip(J.room[i], J.room_ran);
                 ImGui::TableNextColumn(); if (st == 2) ImGui::Text("%+6.2f", J.gain_db[i]); else ImGui::TextDisabled("...");
                 ImGui::TableNextColumn(); if (st == 2) ImGui::Text("%7.3f", J.trim_ms[i]); else ImGui::TextDisabled("...");
             }
@@ -4098,6 +4169,35 @@ static void ta_wait(ImGuiTestContext* ctx, double secs) {
 }
 
 /* the Capture tests' helpers: click Run (trims or verify) and wait for the worker on the wall clock */
+/* The room summary the Capture tab must show for these rows, built here with a local sort and the
+ * covered bands written out (63 Hz to 4 kHz for the 20 Hz to 20 kHz sweep, measure.h), never through
+ * measure_room_summary or calib_rt_band_covered: a check that shared them could not catch them. */
+static void cap_expected_room_sum(const RoomResult* rows, int n, char* buf, size_t cap) {
+    float med[MEASURE_RT_BANDS + 1];
+    int   cnt[MEASURE_RT_BANDS + 1];
+    for (int b = 0; b <= MEASURE_RT_BANDS; ++b) {
+        float v[BWA_MAX_CHANNELS];
+        int m = 0;
+        for (int i = 0; i < n; ++i) {
+            const float x = b < MEASURE_RT_BANDS ? rows[i].band_rt60[b] : rows[i].rt60;
+            if (x > 0.f) v[m++] = x;
+        }
+        std::sort(v, v + m);
+        cnt[b] = m;
+        med[b] = m == 0 ? 0.f : (m % 2) ? v[m / 2] : 0.5f * (v[m / 2 - 1] + v[m / 2]);
+    }
+    int k = cnt[MEASURE_RT_BANDS]
+          ? snprintf(buf, cap, "room: median RT60 ~ %.3f s over %d of %d speakers (the floor on renderable reverb; treat the room to lower it)\n",
+                     med[MEASURE_RT_BANDS], cnt[MEASURE_RT_BANDS], n)
+          : snprintf(buf, cap, "room: no broadband RT60: no speaker gave a reading (no decay after the direct sound, or under 35 dB of it above the noise)\n");
+    k += snprintf(buf + k, cap - k, "room: median RT60 by octave, Hz=s (speakers with a reading, of %d):", n);
+    static const int hz[7] = { 63, 125, 250, 500, 1000, 2000, 4000 };
+    for (int b = 0; b < 7; ++b)
+        k += cnt[b] ? snprintf(buf + k, cap - k, "  %d=%.2f (%d)", hz[b], med[b], cnt[b])
+                    : snprintf(buf + k, cap - k, "  %d=- (0)", hz[b]);
+    snprintf(buf + k, cap - k, "\n");
+}
+
 static void cap_run(ImGuiTestContext* ctx, const char* button, double secs) {
     ctx->ItemClick(button);
     const double t0 = ImGui::GetTime();
@@ -4505,12 +4605,37 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_zy_out.json");
         ctx->ItemCheck("**/simulate");
         ctx->ItemUncheck("**/room##cap");
+        ctx->ItemCheck("**/room report");                         /* anechoic: measured, with nothing to read */
         cap_run(ctx, "**/Run calibration", 120.0);
+        ctx->ItemUncheck("**/room report");                       /* after the run: the worker's snapshot holds */
+        ctx->Yield(2);
         printf("capture test: ZM-1 trims: state %d, %s\n", J.state.load(), J.msg);
         IM_CHECK_EQ(J.state.load(), 2);
         IM_CHECK_EQ(J.done_count.load(), SMALL_N);
         IM_CHECK(J.ran_zylia);
         IM_CHECK_EQ(J.table_src, 0);                              /* no survey: the built-in table */
+        /* An anechoic room report is MEASURED with no decay, not missing: every row keeps its tooltip,
+         * which says so and still lists all seven covered bands, and the summary reads no reading in
+         * any band (bwa_calibrate's dead_zylia run prints the same lines) */
+        IM_CHECK(J.room_ran);
+        {
+            static char want[1024];
+            cap_expected_room_sum(J.room, SMALL_N, want, sizeof want);
+            printf("capture test: anechoic room summary:\n%s", J.room_sum);
+            IM_CHECK_STR_EQ(J.room_sum, want);
+            IM_CHECK(strstr(J.room_sum, "room: no broadband RT60") == J.room_sum);
+            IM_CHECK(strstr(J.room_sum, "of 6):  63=- (0)  125=- (0)  250=- (0)  500=- (0)  1000=- (0)  2000=- (0)  4000=- (0)\n") != NULL);
+            for (int i = 0; i < SMALL_N; ++i) {
+                CapTipLine ln[CAP_TIP_MAX];
+                const int nl = cap_room_tip_lines(J.room[i], J.room_ran, ln);
+                IM_CHECK_EQ(nl, 1 + 1 + 7 + 1);                   /* header, the no-decay note, 63 Hz to 4 kHz, broadband */
+                if (nl < 3) continue;
+                IM_CHECK(strstr(ln[1].s, "no decay after the direct sound in any band") != NULL);
+                IM_CHECK(strncmp(ln[2].s, "   63 Hz", 8) == 0);
+                IM_CHECK(strncmp(ln[nl - 2].s, " 4000 Hz", 8) == 0);
+                for (int l = 2; l < nl; ++l) IM_CHECK(strstr(ln[l].s, "no decay after the direct sound") != NULL);
+            }
+        }
         float smin = 1e9f;
         for (int i = 0; i < SMALL_N; ++i) if (J.spread_db[i] < smin) smin = J.spread_db[i];
         IM_CHECK_GT(smin, 0.1f);                                  /* 19 capsules measured, not one input */
@@ -4556,15 +4681,43 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_zy_gui.json");
         ctx->ItemCheck("**/simulate");
         ctx->ItemCheck("**/room##cap");
+        ctx->ItemCheck("**/room report");                         /* reads the captures; the trims do not see it */
         for (int a = 0; a < 3; ++a) ctx->ItemInputValue(ctx->GetIDByInt(a, J.mic_scope_id), mic[a]);
         ctx->Yield(2);
         IM_CHECK(J.mic_set);
         cap_run(ctx, "**/Run calibration", 240.0);
+        ctx->ItemUncheck("**/room report");
         printf("capture test: ZM-1 trims in the room: state %d, %s\n", J.state.load(), J.msg);
         IM_CHECK_EQ(J.state.load(), 2);
         IM_CHECK(J.ran_zylia && J.ran_room);
         IM_CHECK(J.corr_applied);                                 /* a model and a set mic: re-aimed, like --mic */
         IM_CHECK_LT(dist3(J.mic_run, mic), 1e-6f);
+        /* the room report behind the rt60 cell's tooltip: the octave bands the sweep covers carry a
+         * reading with the range for it, in agreement with the broadband figure; 8 kHz, which it
+         * does not cover, carries nothing */
+        printf("capture test: room report, speaker 0: broadband %.3f s, 1 kHz %.3f s (%.0f dB), 4 kHz %.3f s (%.0f dB)\n",
+               J.room[0].rt60, J.room[0].band_rt60[4], J.room[0].band_range_db[4], J.room[0].band_rt60[6], J.room[0].band_range_db[6]);
+        IM_CHECK_GT(J.rt60[0], 0.1f);
+        for (int b = 3; b <= 6; ++b) {
+            IM_CHECK_GE(J.room[0].band_range_db[b], (float)MEASURE_RT_MIN_RANGE_DB);
+            IM_CHECK_LT(fabsf(J.room[0].band_rt60[b] - J.rt60[0]), 0.25f * J.rt60[0]);
+        }
+        IM_CHECK_EQ(J.room[0].band_rt60[7], 0.f);
+        IM_CHECK_EQ(J.room[0].band_range_db[7], 0.f);
+        /* the summary line the tab shows is the CLI's, over these rows: held against medians taken here */
+        ctx->Yield(2);
+        IM_CHECK(J.room_ran);                                     /* unchecked after Run: the snapshot holds */
+        {
+            static char want[1024];
+            cap_expected_room_sum(J.room, SMALL_N, want, sizeof want);
+            printf("capture test: room summary:\n%s", J.room_sum);
+            IM_CHECK_STR_EQ(J.room_sum, want);
+            IM_CHECK(strstr(J.room_sum, "room: median RT60 ~ ") == J.room_sum);
+            CapTipLine ln[CAP_TIP_MAX];
+            const int nl = cap_room_tip_lines(J.room[0], J.room_ran, ln);
+            IM_CHECK_EQ(nl, 1 + 7 + 1);                           /* header, 63 Hz to 4 kHz, broadband: no 8 kHz */
+            for (int l = 0; l < nl; ++l) IM_CHECK(strstr(ln[l].s, "8000") == NULL && strstr(ln[l].s, "no decay") == NULL);
+        }
         const double t0 = ImGui::GetTime();
         while (WaitForSingleObject(ph, 0) == WAIT_TIMEOUT && ImGui::GetTime() - t0 < 300.0) ctx->Yield();
         DWORD code = 99;
@@ -4613,8 +4766,16 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_zyv_trims.json");
         ctx->ItemCheck("**/simulate");
         ctx->ItemUncheck("**/room##cap");
+        ctx->ItemUncheck("**/room report");
         cap_run(ctx, "**/Run calibration", 120.0);
+        ctx->Yield(2);
         IM_CHECK_EQ(J.state.load(), 2);
+        {   /* no room report: no tooltip and no summary, where an anechoic report shows both */
+            CapTipLine ln[CAP_TIP_MAX];
+            IM_CHECK(!J.room_ran);
+            IM_CHECK_EQ(cap_room_tip_lines(J.room[0], J.room_ran, ln), 0);
+            IM_CHECK_EQ(J.room_sum[0], 0);
+        }
         /* the corrupted copy: the same trims, speaker BAD's delay 0.3 ms late */
         static float gdb[BWA_MAX_CHANNELS], dms[BWA_MAX_CHANNELS];
         memcpy(gdb, J.gain_db, sizeof gdb); memcpy(dms, J.trim_ms, sizeof dms);
@@ -5790,6 +5951,17 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->Yield(2);
 
         ses_ui_run(ctx, SES_TRIMS, 120.0);
+        /* The trims step runs --room, and the session's simulated rig is ANECHOIC, so the right
+         * answer here is the explicit no-reading: "; RT60 -" and nothing after it. A figure of any
+         * size is a guess (it read "RT60 0.00 s" before the no-decay rules), and nothing at all means
+         * bwa_calibrate's "room: no broadband RT60" line and the session's parse of it came apart.
+         * The session keeps its anechoic rig: a room would move every pinned figure of this test.
+         * The figure branch is held in two halves: session/finish_rules parses a canned
+         * "room: median RT60 ~" line, and the calibrate_room ctest pins that bwa_calibrate prints it. */
+        {
+            const std::string& sm = SES.step[SES_TRIMS].summary;
+            IM_CHECK(sm.size() >= 8 && sm.compare(sm.size() - 8, 8, "; RT60 -") == 0);
+        }
         ses_ui_run(ctx, SES_VERIFY, 120.0);
         ses_ui_run(ctx, SES_GRID, 180.0);
         ses_ui_run(ctx, SES_VALIDATE, 180.0);
@@ -6010,6 +6182,19 @@ static void register_tests(ImGuiTestEngine* e) {
         ses_finish(&S, SES_TRIMS, 0, "", false);
         IM_CHECK_EQ(S.step[SES_TRIMS].status, SES_PASSED);
         IM_CHECK(S.step[SES_TRIMS].produced.size() == 1 && S.step[SES_TRIMS].produced[0].hash == ses_hash_file(ses_join(S.folder, "trims.json")));
+        /* the room report in the trims summary: the figure off bwa_calibrate's line (the calibrate_room
+         * ctest pins that the tool prints this prefix), or its explicit no-reading */
+        ses_begin(&S, SES_TRIMS, "test", std::vector<SesFile>());
+        ses_finish(&S, SES_TRIMS, 0, "trims: gain_db in [-1.00, 0.00]  max delay 0.1 ms\n"
+                   "room: median RT60 ~ 0.357 s over 26 of 26 speakers (the floor on renderable reverb; treat the room to lower it)\n", false);
+        IM_CHECK(S.step[SES_TRIMS].summary.find("; RT60 0.36 s") != std::string::npos);
+        ses_begin(&S, SES_TRIMS, "test", std::vector<SesFile>());
+        ses_finish(&S, SES_TRIMS, 0, "trims: gain_db in [-1.00, 0.00]  max delay 0.1 ms\n"
+                   "room: no broadband RT60: no speaker gave a reading\n", false);
+        IM_CHECK(S.step[SES_TRIMS].summary.find("; RT60 -") != std::string::npos);
+        ses_begin(&S, SES_TRIMS, "test", std::vector<SesFile>());
+        ses_finish(&S, SES_TRIMS, 0, "trims: gain_db in [-1.00, 0.00]  max delay 0.1 ms\n", false);
+        IM_CHECK(S.step[SES_TRIMS].summary.find("RT60") == std::string::npos);
         /* the localize summary reads the residual the ZM-1 way: the Dante Via leg's tens of ms are a
          * correct run, past the arrival window's allowance is LARGE, below the driver's loop NEGATIVE */
         const char* const lines[3] = { "-> residual +61.20 ms\n", "-> residual +190.00 ms\n", "-> residual -2.00 ms\n" };

@@ -595,12 +595,45 @@ it. Do not expect it to be audible.
 - **`--aim-sheet out.csv`**: no audio. Writes the installer's aiming sheet and prints a readiness
   summary. See "The aiming sheet" below.
 - **`--room`**: RT60 (Schroeder) + early reflections from the captured IRs. It measures **how live
-  your room is**. **Do not copy the measured RT60 into the engine's reverb settings.** The room's
-  own decay is a **floor**: you cannot render a space deader than the room you're in. Nearby
-  surfaces that throw early reflections smear localization. If the room is too live, **treat it
-  physically**: you cannot DSP reverb away for a moving listener (it is non-invertible and
-  position-dependent). The binaural monitor (headphones, room-free) is the clean reference.
-  Compare the array with the monitor to measure how much the room adds.
+  your room is**, and at which frequencies. **Do not copy the measured RT60 into the engine's
+  reverb settings.** The room's own decay is a **floor**: you cannot render a space deader than
+  the room you're in. Nearby surfaces that throw early reflections smear localization. If the room
+  is too live, **treat it physically**: you cannot DSP reverb away for a moving listener (it is
+  non-invertible and position-dependent). The binaural monitor (headphones, room-free) is the
+  clean reference. Compare the array with the monitor to measure how much the room adds.
+  - **Octave bands.** Each speaker prints a broadband RT60 and one per octave band, 63 Hz to
+    4 kHz. You pick treatment by band: a long 125 Hz figure asks for bass traps, a long 2 kHz
+    figure for wall absorption. There is no 8 kHz band, because its top edge (11.3 kHz) is past
+    the sweep's valid band of 40 Hz to 10 kHz. The broadband figure is read over that valid band
+    too, because the part above it is mostly noise.
+  - **What a figure is.** T20: the decay curve's slope from -5 to -25 dB, scaled to 60 dB. Each
+    band is filtered backward in time, so the filter's own ringing is not read as decay.
+  - **Noise.** Noise in the IR tail makes the figure read long. The tool finds where the decay
+    meets the noise floor (Lundeby's method), stops there, subtracts the noise, and adds back the
+    decay it cut off. Each analysis also stops where the capture stops covering its band: 0.65 s
+    of IR for broadband, 0.77 s at 4 kHz, 1.68 s at 63 Hz, less the system latency.
+  - **No reading.** T20 needs about 35 dB of decay above the noise. A band with less prints `-`
+    and the range it had, for example `125=-(28dB)`. Raise the sweep level or quiet the room and
+    run again. A decay too long for the capture also reads `-`: past about 1.2 s at 4 kHz, and
+    past about 1.0 s broadband.
+  - **No decay at all.** `-(0dB)` means there is nothing to measure, which is different from too
+    much noise. An anechoic capture (`--simulate` without `--sim-room`) gives it in every band,
+    and the summary prints `room: no broadband RT60`. A band reads `-(0dB)` when the energy after
+    the direct sound is more than 30 dB under the band's total, or when it dies in under 30 ms
+    (45 ms at 63 Hz). A real room is nowhere near either limit.
+  - **Range.** The range counts from the start of the reverberation, not from the direct sound.
+    It reads 10 log(1 + D/R) under a room-acoustics meter's figure: 3 dB when direct and
+    reverberant energy are equal.
+  - **The summary.** The last two lines give the median across speakers, broadband and per band,
+    and how many speakers gave a reading. A median keeps one corner speaker, or one capture with
+    a door slam in it, from moving the room's figure.
+  - **Check it in simulate.** `--simulate --sim-room` uses one absorption at every frequency, so
+    every band should read about the Sabine RT60 the run prints.
+    `--layout examples/cave_layout.json --simulate --sim-room --mic 0.6 1.2 0.4 --room` prints
+    Sabine 0.36 s, and medians of 0.36 s broadband and 0.34, 0.29, 0.33, 0.35, 0.38, 0.36 and
+    0.35 s from 63 Hz to 4 kHz. The spread comes from the simulator: every speaker shares one
+    late-tail noise sequence, which wobbles in a narrow band. The `calibrate_room` ctest pins these
+    figures.
 - **`--check-aim`** (with `--localize`, and a layout carrying a `directivity` model): fit each
   speaker's acoustic axis from the captures `--localize` already took. Diagnostic only: nothing is
   written back.
@@ -1188,7 +1221,10 @@ it in. The power mean is a level, not a response. `--room-eq-grid` works: it rea
 the MEAN of the 19 capsule captures, and at 200 Hz the sphere is acoustically transparent (ka under
 0.2). `--room` and `--save-irs` read the same capsule mean. It is the center pressure below about
 2 kHz and a direction-dependent beam above it, so treat the RT60, the reflection levels and the
-saved IRs above 2 kHz as approximate.
+saved IRs above 2 kHz as approximate. That covers the 2 kHz and 4 kHz bands of the room report.
+Nobody has compared the mean with a single capsule on the rig yet, and the simulator cannot show
+the difference: it gives every capsule the same late tail. The comparison is an open item in
+[`hardware-validation.md`](./hardware-validation.md).
 
 **A dead capsule stops the run.** One whose level is non-finite or more than 20 dB under the
 capsules' median would cost the power mean only 0.2 dB, but its "arrival" is the peak of noise, and
@@ -2683,6 +2719,9 @@ The rules follow the CLI's:
   set the mic.
 - With the ZM-1, **eq** is refused, and the room report and saved IRs read the capsules' mean.
   `--room-eq` and `--room-eq-grid` stay in the CLI.
+- **room report** shows the `--room` summary above the table: the same two median lines, over the
+  speakers measured so far. **eq** and **save IRs** measure the room too, so they show it as well. Hover a speaker's rt60 cell for its octave bands, every band the sweep
+  covers. An anechoic capture says "no decay after the direct sound in any band" there.
 - The ZM-1's capsule table: the tab's optional survey field takes a ROOM-AXES survey and refuses
   a body-frame one, which needs a pose. While the Placement panel tracks, the panel's survey
   applies instead, by the `--track` rules: a body-frame table is re-aimed by the pose the gate

@@ -1075,7 +1075,10 @@ void ses_finish(Session* S, int k, int exit_code, const std::string& out, bool c
         break;
     case SES_TRIMS:
         P.summary = last_line_with(out, "trims: gain_db in ");
-        if (last_nums(out, "room: mean RT60 ~ ", "%lf", v, 1)) { snprintf(b, sizeof b, "; RT60 %.2f s", v[0]); P.summary += b; }
+        /* --room's two outcomes, both said: a figure, or bwa_calibrate's own "no reading" line (an
+         * anechoic run, a capture too noisy). A summary with neither means the wording moved. */
+        if (last_nums(out, "room: median RT60 ~ ", "%lf", v, 1)) { snprintf(b, sizeof b, "; RT60 %.2f s", v[0]); P.summary += b; }
+        else if (out.find("room: no broadband RT60") != std::string::npos) P.summary += "; RT60 -";
         break;
     case SES_VERIFY:
         P.summary = last_line_with(out, "verify: arrival spread ");

@@ -56,6 +56,13 @@
 #                 speaker excluded verify flags nobody and prints no row for it. A layout with no trims gets
 #                 a warning instead of an anchor. A grid position measured again with a speaker excluded keeps that
 #                 speaker's sections and trims. Then the refusals: a mode that sweeps nothing, a speaker out of range.
+#   room          --room, the room report. LAYOUT is examples/cave_layout.json here, the command
+#                 docs/calibration.md quotes. In the simulated room every one of the 26 speakers reads,
+#                 the broadband median and each band's from 63 Hz to 4 kHz land within 0.02 s of the
+#                 figures the doc prints, the 8 kHz band is not in the report, and 125 Hz stays within
+#                 25% of the Sabine figure the run prints. Anechoic (no --sim-room), omni and ZM-1, there
+#                 is NO reading: "room: no broadband RT60", every band "- (0)", and no speaker line
+#                 carries a figure.
 #   utf8_path     the layout, the rows file and the output under a non-ASCII directory, with non-ASCII
 #                 names: the tool's argv is UTF-8 (the activeCodePage manifest), so a one-row grid run
 #                 reads both and writes the layout.
@@ -2529,6 +2536,77 @@ elseif(MODE STREQUAL "utf8_path")
   if(NOT rv EQUAL 0 OR NOT EXISTS "${D}/frame_${E}.csv")
     message(FATAL_ERROR "calibrate_cli_test: utf8_path: bwa_speaker_survey exited ${rv} on the non-ASCII plan, or wrote no csv (log: ${WORK}/survey.log)\n${err}")
   endif()
+
+elseif(MODE STREQUAL "room")
+  # centi(<out> <seconds>): a printed "0.357" or "0.34" as whole hundredths of a second, rounded.
+  # math(EXPR) reads a leading zero as decimal, so the digits are never stripped.
+  function(centi out v)
+    if(NOT "${v}" MATCHES "^([0-9]+)\\.([0-9][0-9])([0-9]?)")
+      message(FATAL_ERROR "calibrate_cli_test: room: '${v}' is not a figure in seconds")
+    endif()
+    set(i "${CMAKE_MATCH_1}")
+    set(f "${CMAKE_MATCH_2}")
+    set(t "${CMAKE_MATCH_3}0")
+    math(EXPR c "${i} * 100 + 1${f} - 100")
+    string(SUBSTRING "${t}" 0 1 t)
+    if(t GREATER 4)
+      math(EXPR c "${c} + 1")
+    endif()
+    set(${out} ${c} PARENT_SCOPE)
+  endfunction()
+  # near(<what> <printed seconds> <want, hundredths> <tolerance, hundredths>)
+  function(near what v want tol)
+    centi(c "${v}")
+    math(EXPR d "${c} - ${want}")
+    if(d LESS 0)
+      math(EXPR d "-${d}")
+    endif()
+    if(d GREATER tol)
+      message(FATAL_ERROR "calibrate_cli_test: room: ${what} reads ${v} s, and ${want}/100 s within ${tol}/100 was expected (log: ${WORK}/room.log)")
+    endif()
+  endfunction()
+
+  run(room 0 --layout "${LAYOUT}" --out "${WORK}/room.json" ${SIM} --mic ${MIC} --room)
+  expect(room "Sabine RT60 0\\.36 s" "the simulated room's Sabine figure moved, and the figures below are tied to it")
+  if(NOT "${room_OUT}" MATCHES "room: median RT60 ~ ([0-9.]+) s over 26 of 26 speakers")
+    message(FATAL_ERROR "calibrate_cli_test: room: no 'room: median RT60 ~ X s over 26 of 26 speakers' line (log: ${WORK}/room.log)")
+  endif()
+  near("the broadband median" "${CMAKE_MATCH_1}" 36 2)
+  # the band line, exactly the seven covered bands in order, each read by all 26 speakers: an 8 kHz
+  # entry, a missing band or a count under 26 breaks the match
+  if(NOT "${room_OUT}" MATCHES "room: median RT60 by octave, Hz=s \\(speakers with a reading, of 26\\):  63=([0-9.]+) \\(26\\)  125=([0-9.]+) \\(26\\)  250=([0-9.]+) \\(26\\)  500=([0-9.]+) \\(26\\)  1000=([0-9.]+) \\(26\\)  2000=([0-9.]+) \\(26\\)  4000=([0-9.]+) \\(26\\)\n")
+    message(FATAL_ERROR "calibrate_cli_test: room: the by-octave summary is not seven bands, 63 Hz to 4 kHz, each over 26 speakers (log: ${WORK}/room.log)")
+  endif()
+  set(got "${CMAKE_MATCH_1};${CMAKE_MATCH_2};${CMAKE_MATCH_3};${CMAKE_MATCH_4};${CMAKE_MATCH_5};${CMAKE_MATCH_6};${CMAKE_MATCH_7}")
+  set(want 34 29 33 35 38 36 35)             # docs/calibration.md, "Check it in simulate"
+  set(hz 63 125 250 500 1000 2000 4000)
+  foreach(k RANGE 6)
+    list(GET got ${k} g)
+    list(GET want ${k} w)
+    list(GET hz ${k} h)
+    near("the ${h} Hz median" "${g}" ${w} 2)
+    near("the ${h} Hz median against Sabine" "${g}" 36 9)
+  endforeach()
+  expect(room "RT60 by octave \\(Hz=s\\): 63=0\\.[0-9][0-9] 125=0\\.[0-9][0-9] 250=0\\.[0-9][0-9] 500=0\\.[0-9][0-9] 1000=0\\.[0-9][0-9] 2000=0\\.[0-9][0-9] 4000=0\\.[0-9][0-9]\n"
+         "a speaker's band line is not seven readings, 63 Hz to 4 kHz")
+  if("${room_OUT}" MATCHES "8000=")
+    message(FATAL_ERROR "calibrate_cli_test: room: the 8 kHz band is in the report, and the sweep does not cover it")
+  endif()
+
+  # anechoic: nothing follows the direct sound, so nothing may be read (it printed 5.8 s at 63 Hz)
+  foreach(mic omni zylia)
+    if(mic STREQUAL "zylia")
+      run(dead_${mic} 0 --layout "${LAYOUT}" --out "${WORK}/dead_${mic}.json" --simulate --zylia --trims --room)
+    else()
+      run(dead_${mic} 0 --layout "${LAYOUT}" --out "${WORK}/dead_${mic}.json" --simulate --room)
+    endif()
+    expect(dead_${mic} "room: no broadband RT60" "an anechoic run gave a broadband figure")
+    expect(dead_${mic} "of 26\\):  63=- \\(0\\)  125=- \\(0\\)  250=- \\(0\\)  500=- \\(0\\)  1000=- \\(0\\)  2000=- \\(0\\)  4000=- \\(0\\)\n"
+           "an anechoic run gave a band figure")
+    if("${dead_${mic}_OUT}" MATCHES "RT60=[0-9]" OR "${dead_${mic}_OUT}" MATCHES "room: median RT60 ~")
+      message(FATAL_ERROR "calibrate_cli_test: room: an anechoic ${mic} run printed an RT60 figure (log: ${WORK}/dead_${mic}.log)")
+    endif()
+  endforeach()
 
 else()
   message(FATAL_ERROR "calibrate_cli_test: unknown MODE '${MODE}'")

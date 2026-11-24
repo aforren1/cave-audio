@@ -1624,6 +1624,13 @@ if(BWA_BUILD_CALIBRATE)
                        -DWORK=${CMAKE_BINARY_DIR}/calib_cli_${_bwa_cli}
                        -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
     endforeach()
+    # --room, the room report, on the layout and command docs/calibration.md quotes: the summary's
+    # figures in the simulated room, and no reading at all anechoic.
+    add_test(NAME calibrate_room
+             COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bwa_calibrate> -DMODE=room
+                     -DLAYOUT=${CMAKE_SOURCE_DIR}/examples/cave_layout.json
+                     -DWORK=${CMAKE_BINARY_DIR}/calib_cli_room
+                     -P ${CMAKE_SOURCE_DIR}/test/calibrate_cli_test.cmake)
     # Non-ASCII paths in argv: only where the UTF-8 code-page manifest is applied (the if(MSVC) block near the
     # end of this file). It runs a second tool too, so a manifest on bwa_calibrate alone fails it.
     if(MSVC)

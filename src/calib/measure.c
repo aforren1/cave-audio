@@ -315,28 +315,283 @@ int measure_response_lim(const float* capture, int ncap, const float* ref, int n
     return ok;
 }
 
-void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out) {
+/* The decay analysis's knobs (rt_decay). measure_test pins what the analysis DOES (truncation,
+ * subtraction, compensation, the late slope, the gate, the fit limits, the band edges and filter,
+ * the IR's extent, the two no-decay rules). It does not pin these values one by one: the tail
+ * tenth, a fit margin of 5 dB, a block of no periods and the broadband high-pass (which only
+ * matters with rumble under 2 f1 in the capture, and no test has any) all pass it. They are
+ * tuning choices from Lundeby's ranges, untested on rig data. */
+#define RT_SQRT2          1.41421356237309505
+#define RT_BLK_MIN_S      0.010    /* the envelope's block: Lundeby's 10 to 50 ms */
+#define RT_BLK_MAX_S      0.050
+#define RT_BLK_PERIODS    2.0      /* ... and at least this many periods of the band center */
+#define RT_BLKS_PER_10DB  5.0
+#define RT_FIT_MARGIN_DB  10.0     /* the slope fit stops this far above the floor */
+#define RT_LATE_SPAN_DB   20.0     /* ... and the late-slope fit starts this far above that */
+#define RT_NOISE_PAST_DB  10.0     /* the floor is re-read from this much decay past the crossing */
+#define RT_RANGE_CAP_DB   99.0
+/* The two rules that say "there is no decay here" (rt_decay). An anechoic capture, or a dead room,
+ * still leaves something after the direct sample: the deconvolution's own skirt, a capsule
+ * cluster's spread, the filter's last bit of the direct sound. It has range to spare and fits a
+ * line, and before these rules it printed 5.8 s at 63 Hz and 0.3 ms from 125 Hz up.
+ *   RT_RESIDUE_DB: the band's energy from the direct arrival on, against its energy over the
+ *     whole IR. Backward filtering puts the direct sound's own band energy AHEAD of the arrival,
+ *     so what follows is the room's part: -10 dB in a room whose direct sound is 10 dB over its
+ *     reverberation, and -113 dB (1 kHz) to -178 dB (63 Hz) for a lone tap. 30 dB sits between.
+ *   RT_MIN_S and RT_MIN_OVER_BW: a decay shorter than the band can resolve. A 19-capsule mean's
+ *     arrival cluster keeps -9 dB at 4 kHz, past the first rule, and decays in under a
+ *     millisecond. The floor is 30 ms, or 2 / bandwidth where that is longer (45 ms at 63 Hz):
+ *     backward filtering reads true down to about B T = 4, and the suite's shortest real decays
+ *     (0.10 s at 63 Hz, 0.06 s at 125 Hz) sit at twice the floor. */
+#define RT_RESIDUE_DB     30.0
+#define RT_MIN_S          0.030
+#define RT_MIN_OVER_BW    2.0
+
+const float measure_rt_band_hz[MEASURE_RT_BANDS] = { 63.f, 125.f, 250.f, 500.f, 1000.f, 2000.f, 4000.f, 8000.f };
+
+/* One RBJ low-pass or high-pass section, designed and run in double. biquad.h has no low-pass or
+ * high-pass, and double costs nothing off the audio thread. It is not a NEED at 48 kHz: the 63 Hz
+ * band's pole pairs sit 0.0015, 0.0041 and 0.0056 from the unit circle, and float coefficients
+ * moved its response 0.008 dB, float state 0.004 dB (measure_test's filter response case). */
+typedef struct { double b0, b1, b2, a1, a2; } RtBq;
+
+static void rt_bq_design(RtBq* q, int highpass, double fc, double Q, double fs) {
+    const double w0 = 2.0 * M_PI * fc / fs, cw = cos(w0), alpha = sin(w0) / (2.0 * Q), a0 = 1.0 + alpha;
+    if (highpass) { q->b0 = (1.0 + cw) / 2.0 / a0; q->b1 = -(1.0 + cw) / a0; q->b2 = q->b0; }
+    else          { q->b0 = (1.0 - cw) / 2.0 / a0; q->b1 =  (1.0 - cw) / a0; q->b2 = q->b0; }
+    q->a1 = -2.0 * cw / a0; q->a2 = (1.0 - alpha) / a0;
+}
+
+static void rt_bq_run(const RtBq* q, double* x, int n) {       /* transposed direct form II, in place */
+    double s1 = 0.0, s2 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double in = x[i], y = q->b0 * in + s1;
+        s1 = q->b1 * in - q->a1 * y + s2;
+        s2 = q->b2 * in - q->a2 * y;
+        x[i] = y;
+    }
+}
+
+/* A 6th-order Butterworth high-pass at f_hp into a 6th-order low-pass at f_lp, x in place; a
+ * side at 0 is left out. For an octave band the edges are fc / sqrt 2 and fc sqrt 2, and the order
+ * is set by the NEIGHBOR band: its center sits half an octave past the edge, where order N is down
+ * 3 N dB, and a neighbor that decays more slowly shows through late in this band's curve. 18 dB is
+ * about what IEC 61260 asks of an octave filter there; order 4 left 12 dB. */
+void measure_rt_bandpass(double* x, int n, double f_hp, double f_lp, double fs) {
+    static const double Q[3] = { 0.51763809020504152, 0.70710678118654752, 1.93185165257813657 };   /* Butterworth 6 */
+    for (int hp = 1; hp >= 0; --hp) {
+        const double f = hp ? f_hp : f_lp;
+        if (!(f > 0.0)) continue;
+        for (int s = 0; s < 3; ++s) {
+            RtBq q;
+            rt_bq_design(&q, hp, f, Q[s], fs);
+            rt_bq_run(&q, x, n);
+        }
+    }
+}
+
+/* A decay rate in dB per sample (negative) to the samples it takes to fall `db`, bounded to [0, cap]
+ * BEFORE the cast: a plateau fits a slope of -1e-12, and (int)(10 / 1e-12) is undefined. */
+static int rt_span(double db, double slope, int cap) {
+    const double v = db / -slope;
+    return !(v > 0.0) ? 0 : (v < (double)cap ? (int)v : cap);
+}
+
+static double rt_blk_mean(const double* cs, int b, int blk) { return (cs[(b + 1) * blk] - cs[b * blk]) / (double)blk; }
+
+/* The decay of one band: cs[i] = the energy of samples [0, i) from the direct arrival (n + 1 entries).
+ * Truncates the Schroeder integral where the decay meets the noise, subtracts the noise's own energy
+ * from what is left, adds back the decay's energy past the cut, and fits T20.
+ *
+ * Why all three: an integral run to the end of the IR adds noise x time, which flattens the curve and
+ * reads long. Cut at the crossing alone, it drops the decay's remaining energy and reads short
+ * (Lundeby et al. 1995 add it back from the late slope). And the noise under the kept part is still
+ * 0.9 dB of the curve at the -25 dB point when the floor is the minimum 10 dB below it (subtraction;
+ * Guski and Vorlaender 2014 found the three together the least biased). */
+static void rt_decay(const double* cs, int n, double fs, double blk_s, double min_rt, double e_whole,
+                     float* rt60, float* range_db) {
+    *rt60 = 0.f; *range_db = 0.f;
+    /* residue (RT_RESIDUE_DB): nothing follows the direct sound in this band. e_whole 0 = not asked.
+     * Range 0, like every "no decay to measure" exit here: 99 would say "clean and not noise-limited". */
+    if (!(e_whole >= 0.0) || !isfinite(e_whole)) return;
+    if (e_whole > 0.0 && cs[n] < e_whole * pow(10.0, -RT_RESIDUE_DB / 10.0)) return;
+    const int min_blk = (int)(blk_s * fs) > 8 ? (int)(blk_s * fs) : 8;
+    const int max_blk = (int)(RT_BLK_MAX_S * fs) > min_blk ? (int)(RT_BLK_MAX_S * fs) : min_blk;
+    /* an Inf or NaN anywhere in the IR is in cs[n]: no measurement, and never the "not noise-limited"
+     * cap, which an Inf total would otherwise reach */
+    if (n < 4 * min_blk || !(cs[n] > 0.0) || !isfinite(cs[n])) return;
+    const int tail = n / 10;                                   /* Lundeby: the floor from the last tenth */
+    double noise = (cs[n] - cs[n - tail]) / (double)tail;
+    int    cut = n;                                            /* the integral's upper limit */
+    double comp = 0.0;                                         /* the decay's energy past it */
+    double head_db = 0.0;                                      /* peak block over the floor, when nothing fits */
+    int    fitted = 0;
+    if (noise > 0.0) {
+        int blk = min_blk, prev = -1;
+        for (int it = 0; it < 6; ++it) {
+            const int nb = n / blk;
+            if (nb < 4) break;
+            int bpk = 0; double pk = 0.0;
+            for (int b = 0; b < nb; ++b) { const double m = rt_blk_mean(cs, b, blk); if (m > pk) { pk = m; bpk = b; } }
+            if (!(pk > 0.0)) break;
+            head_db = 10.0 * log10(pk / noise);
+            /* the fit ends at the first block under floor + RT_FIT_MARGIN_DB, and (from the second
+             * pass on, when there are blocks enough) starts RT_LATE_SPAN_DB above that: the LATE
+             * slope is what crosses the floor, and a two-slope decay's early part is not it */
+            const double thr = noise * pow(10.0, RT_FIT_MARGIN_DB / 10.0);
+            const double thr_late = noise * pow(10.0, (RT_FIT_MARGIN_DB + RT_LATE_SPAN_DB) / 10.0);
+            int b1 = bpk;
+            while (b1 < nb && rt_blk_mean(cs, b1, blk) >= thr) ++b1;
+            int b0 = bpk;
+            if (it > 0) {
+                int bl = bpk;
+                while (bl < b1 && rt_blk_mean(cs, bl, blk) >= thr_late) ++bl;
+                if (b1 - bl >= 3) b0 = bl;
+            }
+            double slope = 0.0, icpt = 0.0;                    /* dB per sample, dB at sample 0 */
+            if (b1 - b0 >= 3) {
+                double sx = 0, sy = 0, sxx = 0, sxy = 0; const double m = (double)(b1 - b0);
+                for (int b = b0; b < b1; ++b) {
+                    const double t = ((double)b + 0.5) * blk, y = 10.0 * log10(rt_blk_mean(cs, b, blk));
+                    sx += t; sy += y; sxx += t * t; sxy += t * y;
+                }
+                const double den = m * sxx - sx * sx;
+                if (den > 0.0) { slope = (m * sxy - sx * sy) / den; icpt = (sy - slope * sx) / m; }
+            }
+            if (!(slope < 0.0)) {
+                /* too short a decay to fit a line through (an anechoic capture), or none: cut where
+                 * the envelope reaches the margin, nothing to extrapolate */
+                if (!fitted) { cut = b1 * blk; comp = 0.0; }
+                break;
+            }
+            fitted = 1;
+            const double k = -slope * log(10.0) / 10.0;        /* energy decay rate per sample */
+            const double tc = (10.0 * log10(noise) - icpt) / slope;
+            if (tc >= (double)(n - tail)) {
+                /* The line meets the "floor" inside the stretch the floor was first read from, the
+                 * last tenth: that stretch is still the decay, and the window ended before any
+                 * noise. Nothing to truncate or subtract (subtracting the decay's own end as noise
+                 * read 2 to 3% short); the part past the window comes from the line. Only the first
+                 * pass may say so: its fit runs over the whole decay, and a later pass's three-block
+                 * late slope can come out flat enough to cross anywhere. Such a pass changes
+                 * nothing. UNPINNED: letting every pass say so passes measure_test. It was seen on
+                 * one decaying-noise room through measure_room at 15 dB capture SNR, where the
+                 * 125 Hz band then read 0.193 s with 99 dB of range for 0.116 s with 46. */
+                if (it == 0) { noise = 0.0; cut = n; comp = pow(10.0, (icpt + slope * (double)n) / 10.0) / k; }
+                break;
+            }
+            cut = tc < (double)blk ? blk : (int)tc; comp = noise / k;
+            /* the floor again, from RT_NOISE_PAST_DB of further decay past the crossing on (at least
+             * the last tenth), so the decay's own skirt is out of it */
+            int ns = cut + rt_span(RT_NOISE_PAST_DB, slope, n);
+            if (ns > n - tail) ns = n - tail;
+            noise = (cs[n] - cs[ns]) / (double)(n - ns);
+            if (!(noise > 0.0)) { noise = 0.0; cut = n; comp = 0.0; break; }
+            if (prev >= 0 && abs(cut - prev) < blk) break;
+            prev = cut;
+            blk = rt_span(10.0 / RT_BLKS_PER_10DB, slope, max_blk);   /* Lundeby: 3 to 10 intervals per 10 dB */
+            if (blk < min_blk) blk = min_blk;
+        }
+    }
+    if (!(noise > 0.0)) noise = 0.0;
+    if (cut < 2) return;
+    #define RT_POS(v) ((v) > 0.0 ? (v) : 0.0)
+    #define RT_EDC(i) (RT_POS(cs[cut] - cs[i] - noise * (double)(cut - (i))) + comp)
+    const double e0 = RT_EDC(0);
+    if (!(e0 > 0.0)) return;
+    /* the usable range: how far the curve falls before the floor, or before the window ends when
+     * no floor is inside it. With neither (a synthetic IR that ends in zeros) the cap says "not
+     * noise-limited". */
+    double range = comp > 0.0 ? -10.0 * log10(comp / e0) : (noise > 0.0 ? head_db : RT_RANGE_CAP_DB);
+    if (range > RT_RANGE_CAP_DB) range = RT_RANGE_CAP_DB;
+    if (!(range > 0.0)) range = 0.0;
+    *range_db = (float)range;
+    if (range < MEASURE_RT_MIN_RANGE_DB) return;
+    /* T20: the least-squares line through the curve from -5 to -25 dB, as ISO 3382 has it */
+    int i5 = -1, i25 = -1, dead = 0;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int i = 0; i < cut; ++i) {
+        const double e = RT_EDC(i);
+        if (!(e > 0.0)) { dead = 1; break; }
+        const double db = 10.0 * log10(e / e0);
+        if (db <= -25.0) { i25 = i; break; }
+        if (i5 < 0 && db <= -5.0) i5 = i;
+        if (i5 >= 0) { const double t = (double)(i - i5); sx += t; sy += db; sxx += t * t; sxy += t * db; }
+    }
+    #undef RT_EDC
+    #undef RT_POS
+    /* the curve fell 25 dB inside a sample or two, or ran out of energy before it got there (a
+     * lone tap leaves nothing after itself): a click, not a decay */
+    if ((i25 >= 0 && i25 - (i5 < 0 ? 0 : i5) < 2) || (i25 < 0 && dead)) { *range_db = 0.f; return; }
+    if (i5 < 0 || i25 < 0) return;
+    const double m = (double)(i25 - i5), den = m * sxx - sx * sx;
+    if (!(den > 0.0)) return;
+    const double slope = (m * sxy - sx * sy) / den;            /* dB per sample */
+    if (!(slope < 0.0)) return;
+    const double rt = -60.0 / slope / fs;
+    if (rt < min_rt) { *range_db = 0.f; return; }               /* RT_MIN_*: shorter than the band resolves */
+    *rt60 = (float)rt;
+}
+
+/* One analysis: the IR from 0 to `end`, band-passed backward in time when a side is given, then the
+ * decay from the direct arrival on. The filter runs over the samples AHEAD of the arrival too. They
+ * change nothing at or after it (run backward, the filter has not reached them yet); they are what
+ * the residue rule compares against. x holds `end` doubles, cs `end + 1`. */
+static void rt_analyze(const float* ir, int end, int direct_idx, double fs, double f_hp, double f_lp,
+                       double blk_s, double min_rt, double* x, double* cs, float* rt60, float* range_db) {
+    const int n = end - direct_idx;
+    if (n <= 0) return;
+    double e_whole = 0.0;
+    for (int i = 0; i < end; ++i) x[i] = (double)ir[end - 1 - i];
+    if (f_hp > 0.0 || f_lp > 0.0) {
+        measure_rt_bandpass(x, end, f_hp, f_lp, fs);
+        for (int i = 0; i < end; ++i) e_whole += x[i] * x[i];
+    }
+    cs[0] = 0.0;
+    for (int i = 0; i < n; ++i) { const double s = x[n - 1 - i]; cs[i + 1] = cs[i] + s * s; }
+    rt_decay(cs, n, fs, blk_s, min_rt, e_whole, rt60, range_db);
+}
+
+/* measure_rt60_ex with each analysis ending at its own sample (absolute IR indices, clamped to nir;
+ * band_end NULL = nir): measure_room knows where the sweep stopped covering each band. An end at or
+ * before the direct arrival leaves that analysis with no reading. */
+static void rt60_core(const float* ir, int nir, int direct_idx, double fs, double f_lo, double f_hi,
+                      int bb_end, const int* band_end, RoomResult* out) {
     if (!out) return;                    /* the memset dereferenced out BEFORE any guard */
     memset(out, 0, sizeof *out);
     if (!ir || direct_idx < 0 || direct_idx >= nir - 2 || !(fs > 0.0)) return;
-    const int n = nir - direct_idx;
-
-    /* Schroeder backward energy integration from the direct arrival, then T20 (-5 dB -> -25 dB,
-     * x3 = RT60). edc[i] = energy from sample (direct+i) to the end. */
-    double* edc = (double*)malloc((size_t)n * sizeof(double));
-    if (!edc) return;
-    double acc = 0.0;
-    for (int i = n - 1; i >= 0; --i) { double s = (double)ir[direct_idx + i]; acc += s * s; edc[i] = acc; }
-    if (edc[0] > 0.0) {
-        int i5 = -1, i25 = -1;
-        for (int i = 0; i < n; ++i) {
-            double db = 10.0 * log10(edc[i] / edc[0]);
-            if (i5  < 0 && db <= -5.0)  i5  = i;
-            if (i25 < 0 && db <= -25.0) { i25 = i; break; }
+    double* x  = (double*)malloc((size_t)nir * sizeof(double));
+    double* cs = (double*)malloc((size_t)(nir + 1) * sizeof(double));
+    if (x && cs) {
+        /* The broadband figure, over the VALID band only. Unfiltered it carries the noise outside
+         * [f_lo, f_hi], and a sweep's deconvolution raises noise 3 dB per octave, so the top octave
+         * the sweep does not vouch for was most of the floor; and bb_end is where the capture stops
+         * covering f_hi, which is only the end of the IR once nothing above f_hi is in it. */
+        rt_analyze(ir, bb_end < nir ? bb_end : nir, direct_idx, fs, f_lo > 0.0 ? f_lo : 0.0, f_hi < 0.45 * fs ? f_hi : 0.0,
+                   RT_BLK_MIN_S, RT_MIN_S, x, cs, &out->rt60, &out->range_db);
+        for (int b = 0; b < MEASURE_RT_BANDS; ++b) {
+            const double fc = (double)measure_rt_band_hz[b], lo = fc / RT_SQRT2, hi = fc * RT_SQRT2;
+            /* no reading, never a guess. Past 0.45 fs the low-pass has no design (its edge would be
+             * at or over Nyquist); without this skip it puts out NaN and the band is dropped by the
+             * non-finite check instead, so no test can tell the two apart. */
+            if (!measure_rt_band_covered(fc, f_lo, f_hi, fs)) continue;
+            const int e = band_end ? band_end[b] : nir;
+            /* Filtered BACKWARD in time (Jacobsen and Rasmussen 1987; ISO 3382-1 allows it): an octave
+             * filter rings, and its ringing is a decay of its own. Run in reverse, the ringing lands
+             * AHEAD of the sound that excited it, where a backward integral never looks, and the
+             * shortest decay a band can show drops about four times (B T > 4 against B T > 16).
+             * Measured: a 0.10 s mode at 63 Hz reads 0.101 s backward and 0.077 forward, and a
+             * 0.06 s one at 125 Hz 0.061 and 0.049 (measure_test's ringing cases). Zero-phase
+             * (both directions) leaves half the ringing on the decay side. */
+            double blk_s = RT_BLK_PERIODS / fc;                          /* an envelope needs a few periods a block */
+            if (blk_s < RT_BLK_MIN_S) blk_s = RT_BLK_MIN_S;
+            double min_rt = RT_MIN_OVER_BW / (hi - lo);
+            if (min_rt < RT_MIN_S) min_rt = RT_MIN_S;
+            rt_analyze(ir, e < nir ? e : nir, direct_idx, fs, lo, hi, blk_s, min_rt, x, cs,
+                       &out->band_rt60[b], &out->band_range_db[b]);
         }
-        if (i5 >= 0 && i25 > i5) out->rt60 = (float)(3.0 * (i25 - i5) / fs);   /* T20 -> RT60 */
     }
-    free(edc);
+    free(x); free(cs);
 
     /* early reflections: |ir| peaks after the direct, within the window, above ER_THRESH of it */
     const float direct = fabsf(ir[direct_idx]);
@@ -351,6 +606,57 @@ void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResul
             ++out->er_count;
         }
     }
+}
+
+void measure_rt60_ex(const float* ir, int nir, int direct_idx, double fs, double f_lo, double f_hi, RoomResult* out) {
+    rt60_core(ir, nir, direct_idx, fs, f_lo, f_hi, nir, NULL, out);
+}
+
+void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out) {
+    rt60_core(ir, nir, direct_idx, fs, 0.0, 0.5 * fs, nir, NULL, out);
+}
+
+int measure_rt_band_covered(double fc, double f_lo, double f_hi, double fs) {
+    const double lo = fc / RT_SQRT2, hi = fc * RT_SQRT2;
+    return lo >= f_lo && hi <= f_hi && (!(fs > 0.0) || hi <= 0.45 * fs);
+}
+
+static float room_value(const RoomResult* r, int b) { return b < MEASURE_RT_BANDS ? r->band_rt60[b] : r->rt60; }
+
+/* Rank selection by counting, so the rows are never copied or reordered: n is a speaker count, and
+ * the O(n^2) is under 5000 compares at 64. The even case is 0.5f * (a + b) in float, the arithmetic
+ * bwa_calibrate printed its medians with before this moved here. */
+static void room_median(const RoomResult* rows, int n, int b, float* med, int* cnt) {
+    int m = 0;
+    for (int i = 0; i < n; ++i) if (room_value(&rows[i], b) > 0.f) ++m;
+    *cnt = m;
+    *med = 0.f;
+    if (!m) return;
+    const int k1 = (m - 1) / 2, k2 = m / 2;          /* the same rank when m is odd */
+    float a = 0.f, c = 0.f;
+    for (int i = 0; i < n; ++i) {
+        const float x = room_value(&rows[i], b);
+        if (!(x > 0.f)) continue;
+        int lt = 0, le = 0;
+        for (int j = 0; j < n; ++j) {
+            const float y = room_value(&rows[j], b);
+            if (!(y > 0.f)) continue;
+            lt += y < x;
+            le += y <= x;
+        }
+        if (lt <= k1 && k1 < le) a = x;
+        if (lt <= k2 && k2 < le) c = x;
+    }
+    *med = (m & 1) ? c : 0.5f * (a + c);
+}
+
+void measure_room_summary(const RoomResult* rows, int n, RoomSummary* out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!rows || n <= 0) return;
+    out->speakers = n;
+    for (int b = 0; b < MEASURE_RT_BANDS; ++b) room_median(rows, n, b, &out->band_rt60[b], &out->band_count[b]);
+    room_median(rows, n, MEASURE_RT_BANDS, &out->rt60, &out->count);
 }
 
 #define CORR_N 8192                           /* generous so the inverted spectrum + cepstrum are smooth */
@@ -593,7 +899,34 @@ int measure_room(const float* capture, int ncap, const float* ref, int nref,
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, NULL, NULL, NULL, &ir);
     if (!L) return 0;
     int direct = ir_peak(ir, 0, ncap < L ? ncap : L);
-    measure_rt60(ir, L, direct, fs, out);
+    /* Where each decay analysis must stop. The deconvolution puts the capture's sound at time
+     * lag + t(f) on lag `lag`, t(f) being when the sweep passes f, so past ncap - t(f) a band has
+     * neither the room's decay nor the capture's noise in it: the capture ended first. A floor read
+     * there is silence, and the truncation would trust it. The low bands keep the longest IR. Lags
+     * past ncap are the negative ones (the sweep's harmonic products), never the room. */
+    const int npos = ncap < L ? ncap : L;
+    int band_end[MEASURE_RT_BANDS], bb_end = npos;
+    const double f_lo = 2.0 * f1, f_hi = 0.5 * f2;
+    if (f1 > 0.0 && f2 > f1) {
+        const double per = (double)nref / log(f2 / f1);
+        bb_end = npos - (int)(per * log(f_hi / f1));
+        for (int b = 0; b < MEASURE_RT_BANDS; ++b) {
+            double top = (double)measure_rt_band_hz[b] * RT_SQRT2;
+            if (top > f2) top = f2; else if (top < f1) top = f1;
+            band_end[b] = npos - (int)(per * log(top / f1));
+        }
+    } else {
+        for (int b = 0; b < MEASURE_RT_BANDS; ++b) band_end[b] = npos;
+    }
+    /* The end is taken from each band's TOP edge, the first frequency of the band the capture stops
+     * covering. Taking it from the center or the bottom edge runs 75 or 150 ms longer, into lags
+     * where part of the band's noise is gone; in measure_test that moves a range by 1 dB and no
+     * reading by more than 0.001 s, so the choice is unpinned. What is pinned is having an end at
+     * all (every analysis run to the capture's end reads 1.4 s for 0.30 at 4 kHz).
+     * A sweep under an octave wide puts f_hi below f1, and the log above goes negative. */
+    if (bb_end > npos) bb_end = npos;
+    for (int b = 0; b < MEASURE_RT_BANDS; ++b) if (band_end[b] > npos) band_end[b] = npos;
+    rt60_core(ir, L, direct, fs, f_lo, f_hi, bb_end, band_end, out);
     if (ir_out && ir_cap > 0)                                   /* retain the kernel from the direct arrival */
         for (int k = 0; k < ir_cap; ++k) ir_out[k] = (direct + k < L) ? ir[direct + k] : 0.f;
     free(ir);
